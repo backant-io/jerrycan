@@ -60,8 +60,7 @@ assert_eq!(res.status(), jerrycan::http::StatusCode::CREATED);
 - Bad query string → `400 JC0400`. You never write these error branches.
 
 ## Anti-patterns
-- Don't take `RequestCtx` in handlers to "grab things manually" — if a value
-  isn't expressible as an extractor, define a dependency for it.
+- `RequestCtx` does not implement `FromRequest`, so it cannot appear in a handler signature — this is a compile error, not a style rule. If a value isn't expressible as an extractor, define a dependency for it.
 - One `Path<T>` per route in v0 (one `{param}`-typed extractor); multi-param
   tuples arrive in Phase 1 — until then design routes with one variable segment
   per handler or read both via two nested modules.
