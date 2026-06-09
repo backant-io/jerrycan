@@ -11,6 +11,9 @@ pub mod middleware;
 pub mod module;
 pub mod response;
 pub mod router;
+pub mod test_client;
+
+pub use http;
 
 pub use app::{App, BuiltApp};
 pub use dep::Dep;
@@ -21,3 +24,4 @@ pub use middleware::{Middleware, MiddlewareFuture, Next};
 pub use module::Module;
 pub use response::{Created, IntoResponse, Json, NoContent, Response};
 pub use router::{MethodRouter, delete, get, patch, post, put};
+pub use test_client::{TestApp, TestResponse};

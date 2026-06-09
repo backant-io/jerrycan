@@ -114,8 +114,6 @@ fn insert_flat(trie: &mut Trie, flat: FlatRoute) -> Result<()> {
 }
 
 /// The frozen, immutable runtime form. Cheap to share across connections.
-// `trie`/`overrides`/`dispatch` are exercised by TestApp in Task 13 (and serve in Task 14).
-#[allow(dead_code)]
 pub struct BuiltApp {
     pub(crate) trie: Trie,
     pub(crate) overrides: Arc<HashMap<TypeId, AnyArc>>,
@@ -131,7 +129,6 @@ impl std::fmt::Debug for BuiltApp {
 
 impl BuiltApp {
     /// Route + run middleware chain + handler for one request.
-    #[allow(dead_code)]
     pub(crate) async fn dispatch(&self, parts: http::request::Parts, body: Bytes) -> Response {
         let method = parts.method.clone();
         let path = parts.uri.path().to_string();
