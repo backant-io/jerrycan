@@ -5,9 +5,11 @@
 pub mod dep;
 pub mod error;
 pub mod extract;
+pub mod handler;
 pub mod response;
 
 pub use dep::Dep;
 pub use error::{Error, Result};
 pub use extract::{FromRequest, Path, Query, RequestCtx};
+pub use handler::Handler;
 pub use response::{Created, IntoResponse, Json, NoContent, Response};
