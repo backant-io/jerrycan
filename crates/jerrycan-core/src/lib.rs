@@ -2,6 +2,7 @@
 //! injection, middleware. See https://jerrycan.cc
 #![forbid(unsafe_code)]
 
+pub mod app;
 pub mod dep;
 pub mod error;
 pub mod extract;
@@ -11,6 +12,7 @@ pub mod module;
 pub mod response;
 pub mod router;
 
+pub use app::{App, BuiltApp};
 pub use dep::Dep;
 pub use error::{Error, Result};
 pub use extract::{FromRequest, Path, Query, RequestCtx};

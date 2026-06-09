@@ -67,8 +67,6 @@ impl Module {
 }
 
 /// One route after flattening: absolute path + effective env + middleware chain.
-// Constructed by flatten and consumed by the App builder in Task 12.
-#[allow(dead_code)]
 pub(crate) struct FlatRoute {
     pub(crate) path: String,
     pub(crate) methods: MethodRouter,
@@ -76,8 +74,6 @@ pub(crate) struct FlatRoute {
     pub(crate) middleware: Arc<[Arc<dyn Middleware>]>,
 }
 
-// Used by flatten; the App builder consumes flattened routes in Task 12.
-#[allow(dead_code)]
 pub(crate) fn join_paths(prefix: &str, rel: &str) -> String {
     let a = prefix.trim_end_matches('/');
     let b = rel.trim_start_matches('/');
@@ -92,8 +88,6 @@ pub(crate) fn join_paths(prefix: &str, rel: &str) -> String {
 impl Module {
     /// Resolution order baked at build time: app env ← parent modules ← this
     /// module (inner wins); middleware: app's, then parents', then this module's.
-    // The App builder calls this in Task 12.
-    #[allow(dead_code)]
     pub(crate) fn flatten(
         self,
         prefix: &str,

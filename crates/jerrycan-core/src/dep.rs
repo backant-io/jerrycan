@@ -45,8 +45,6 @@ impl DepEnv {
     }
 
     /// Later entries shadow earlier ones — used to layer module envs over the app env.
-    // Consumed by Module::flatten, which the App builder calls in Task 12.
-    #[allow(dead_code)]
     pub(crate) fn merge_from(&mut self, inner: &DepEnv) {
         for (k, v) in &inner.singletons {
             self.singletons.insert(*k, v.clone());
@@ -68,8 +66,6 @@ pub struct DepResolver {
 }
 
 impl DepResolver {
-    // Used by tests now; the server constructs resolvers per request in a later task.
-    #[allow(dead_code)]
     pub(crate) fn new(env: Arc<DepEnv>, overrides: Arc<HashMap<TypeId, AnyArc>>) -> Self {
         Self {
             env,

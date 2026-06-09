@@ -20,8 +20,6 @@ pub struct RequestCtx {
 }
 
 impl RequestCtx {
-    // Used by tests now; the server builds a context per request in a later task.
-    #[allow(dead_code)]
     pub(crate) fn new(parts: http::request::Parts, body: Bytes, deps: DepResolver) -> Self {
         Self {
             parts,

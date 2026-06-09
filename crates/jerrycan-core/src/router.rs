@@ -61,16 +61,12 @@ impl MethodRouter {
 
 /// A flattened route: method table + the effective dependency environment and
 /// middleware chain for this path (computed at build time, spec §4.2).
-// Built by the router and consumed by the per-request dispatch layer in a later phase task.
-#[allow(dead_code)]
 pub(crate) struct Endpoint {
     pub(crate) methods: HashMap<Method, BoxHandlerFn>,
     pub(crate) env: Arc<DepEnv>,
     pub(crate) middleware: Arc<[Arc<dyn Middleware>]>,
 }
 
-// Built by the router and walked by the per-request dispatch layer in a later phase task.
-#[allow(dead_code)]
 #[derive(Default)]
 pub(crate) struct Trie {
     root: Node,
@@ -83,8 +79,6 @@ struct Node {
     endpoint: Option<Endpoint>,
 }
 
-// Returned by `Trie::find` and matched by the per-request dispatch layer in a later phase task.
-#[allow(dead_code)]
 pub(crate) enum RouteMatch<'a> {
     Found {
         endpoint: &'a Endpoint,
@@ -94,14 +88,10 @@ pub(crate) enum RouteMatch<'a> {
     NotFound,
 }
 
-// Used by `Trie::insert`/`find`; the server wires routing in a later phase task.
-#[allow(dead_code)]
 fn segments(path: &str) -> impl Iterator<Item = &str> {
     path.split('/').filter(|s| !s.is_empty())
 }
 
-// `insert` runs at build time, `find` per request; the server wires both in a later phase task.
-#[allow(dead_code)]
 impl Trie {
     pub(crate) fn insert(&mut self, path: &str, endpoint: Endpoint) -> Result<()> {
         let mut node = &mut self.root;
