@@ -27,8 +27,6 @@ pub struct DepEnv {
 
 impl DepEnv {
     /// Register an already-built value; shared by every request (singleton scope).
-    // Used by tests now; the app builder wires it up in a later phase task.
-    #[allow(dead_code)]
     pub(crate) fn insert_value<T: Send + Sync + 'static>(&mut self, value: T) {
         let id = TypeId::of::<T>();
         self.singletons.insert(id, Arc::new(value));
@@ -36,7 +34,6 @@ impl DepEnv {
     }
 
     /// Register an async factory; runs at most once per request (request scope).
-    #[allow(dead_code)]
     pub(crate) fn insert_factory<F, Args, T>(&mut self, factory: F)
     where
         F: DepFactory<Args, T>,
@@ -48,7 +45,7 @@ impl DepEnv {
     }
 
     /// Later entries shadow earlier ones — used to layer module envs over the app env.
-    // Consumed by the module/routing scope layer in a later phase task.
+    // Consumed by Module::flatten, which the App builder calls in Task 12.
     #[allow(dead_code)]
     pub(crate) fn merge_from(&mut self, inner: &DepEnv) {
         for (k, v) in &inner.singletons {
