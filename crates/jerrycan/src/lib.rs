@@ -10,3 +10,16 @@ pub mod prelude {
     pub use jerrycan_core::prelude::*;
     pub use jerrycan_macros::main;
 }
+
+/// Compile-checks every example in docs/ai/*.md (spec §8: executable docs).
+#[cfg(doctest)]
+mod doc_tests {
+    macro_rules! doc_page {
+        ($name:ident, $path:literal) => {
+            #[doc = include_str!($path)]
+            mod $name {}
+        };
+    }
+    doc_page!(page_01_app, "../../../docs/ai/01-app.md");
+    doc_page!(page_02_modules, "../../../docs/ai/02-modules.md");
+}
