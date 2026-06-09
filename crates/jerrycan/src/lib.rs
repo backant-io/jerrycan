@@ -24,4 +24,7 @@ mod doc_tests {
     doc_page!(page_02_modules, "../../../docs/ai/02-modules.md");
     doc_page!(page_03_extractors, "../../../docs/ai/03-extractors.md");
     doc_page!(page_04_dependencies, "../../../docs/ai/04-dependencies.md");
+    doc_page!(page_05_errors, "../../../docs/ai/05-errors.md");
+    doc_page!(page_06_middleware, "../../../docs/ai/06-middleware.md");
+    doc_page!(page_07_testing, "../../../docs/ai/07-testing.md");
 }
