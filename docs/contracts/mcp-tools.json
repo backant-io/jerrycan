@@ -21,6 +21,7 @@
         "properties": {
           "status": { "enum": ["complete", "questions"] },
           "design": { "$ref": "https://jerrycan.cc/schemas/design-v0.json" },
+          "design_path": { "type": "string", "description": "Filesystem path where the validated design.json was written. Present whenever status is complete; scaffold consumes it as design_path." },
           "questions": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "question": { "type": "string" } }, "required": ["id", "question"] } },
           "next_step": { "type": "string" }
         },
@@ -54,10 +55,11 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "kind": { "enum": ["route", "subroute", "dependency", "middleware"] },
+          "kind": { "enum": ["route", "subroute", "dependency"] },
           "path": { "type": "string", "description": "route: module name (todos); subroute: parent/child (todos/comments)." },
           "module": { "type": "string", "description": "Owning module for kind=dependency|middleware." },
-          "design_slice": { "type": "object", "description": "The design.json fragment for the new unit." }
+          "design_slice": { "type": "object", "description": "The design.json fragment for the new unit." },
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
         },
         "required": ["kind", "path"],
         "additionalProperties": false
@@ -77,7 +79,10 @@
       "description": "Generate the failing acceptance test suite for a module from its design slice — one test per endpoint and error case. TDD: run before implementing handlers.",
       "inputSchema": {
         "type": "object",
-        "properties": { "module": { "type": "string" } },
+        "properties": {
+          "module": { "type": "string" },
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
+        },
         "required": ["module"],
         "additionalProperties": false
       },
@@ -96,7 +101,10 @@
       "description": "The verification gate: build + clippy(deny) + cargo-audit + cargo-deny + tests + jerrycan lints. Scope to one module for fast iteration. Diagnostics are machine-readable with doc links.",
       "inputSchema": {
         "type": "object",
-        "properties": { "module": { "type": "string", "description": "Omit for the full workspace." } },
+        "properties": {
+          "module": { "type": "string", "description": "Omit for the full workspace." },
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
+        },
         "additionalProperties": false
       },
       "outputSchema": {
@@ -128,7 +136,10 @@
       "description": "Produce hardened deploy artifacts (+ CycloneDX SBOM). Refuses to run unless the full-workspace check is green.",
       "inputSchema": {
         "type": "object",
-        "properties": { "target": { "enum": ["docker", "binary", "k8s", "systemd"] } },
+        "properties": {
+          "target": { "enum": ["docker", "binary", "k8s", "systemd"] },
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
+        },
         "required": ["target"],
         "additionalProperties": false
       },
@@ -187,7 +198,13 @@
     {
       "name": "jerrycan_list_routes",
       "description": "The live route tree of the current app: method, path, owning module, handler. The resume-work map for agents.",
-      "inputSchema": { "type": "object", "additionalProperties": false },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
+        },
+        "additionalProperties": false
+      },
       "outputSchema": {
         "type": "object",
         "properties": {

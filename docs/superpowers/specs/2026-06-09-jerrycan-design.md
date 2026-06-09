@@ -257,7 +257,7 @@ The MCP enforces **design-first → TDD → verify → package**:
 3. **`jerrycan_generate`** — the Angular-generator equivalent for incremental work: adds a route module, subroute, or dependency to an existing app from its design slice, regenerating mounting and workspace members deterministically.
 4. **`jerrycan_gen_tests`** — generates the **failing test suite per module** from the design (one test per endpoint/error case) *before any handler exists*. The design becomes executable acceptance criteria.
 5. *(agent implements handlers, guided by docs tools)*
-6. **`jerrycan_check`** — runs the verification gate (full or `--module`-scoped); returns **structured diagnostics** (JSON: error code, file, span, suggested fix, doc link). Compiler errors become teaching moments.
+6. **`jerrycan_check`** — runs the verification gate (full or `--module`-scoped); returns **structured diagnostics** (JSON: error code, file, line, suggested fix, doc link (span-based diagnostics are a contract-v1 candidate)). Compiler errors become teaching moments.
 7. **`jerrycan_package`** — only succeeds after the full-workspace check is green; emits artifacts.
 
 Always available:

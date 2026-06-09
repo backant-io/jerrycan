@@ -15,3 +15,9 @@
 - 01-app: document `serve_with(listener)` and `JERRYCAN_ADDR` in prose
 - 05-errors: enumerate all Error constructors (bad_request, unprocessable, internal, payload_too_large, method_not_allowed)
 - 01-app: replace `.provide(())` in the signature sketch with a meaningful type
+
+## Contract v1 candidates (deliberately deferred from v0)
+
+- design-schema: middleware (module- and app-scoped) as first-class design objects; jerrycan_generate kind "middleware" returns then too
+- design-schema: structured rate-limit config (v0: rate limits ride as opaque dependency names)
+- jerrycan_check diagnostics: span (line+column ranges) instead of single line, pending macro span preservation
