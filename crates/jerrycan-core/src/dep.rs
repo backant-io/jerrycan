@@ -322,4 +322,37 @@ mod tests {
         let err = ctx.resolve::<Loopy>().await.err().unwrap();
         assert_eq!(err.code(), "JC1002");
     }
+
+    #[tokio::test]
+    async fn overrides_shadow_both_values_and_factories() {
+        // Real env: Db value + Session factory.
+        let mut env = nested_env();
+        env.insert_value(Db { url: "pg://prod" });
+
+        // Overrides replace them without touching the env.
+        let mut overrides: HashMap<TypeId, AnyArc> = HashMap::new();
+        overrides.insert(
+            TypeId::of::<Db>(),
+            Arc::new(Db {
+                url: "sqlite::memory:",
+            }),
+        );
+        overrides.insert(
+            TypeId::of::<Session>(),
+            Arc::new(Session {
+                token: "fake".into(),
+            }),
+        );
+
+        let req = http::Request::builder().uri("/").body(()).unwrap();
+        let (parts, ()) = req.into_parts();
+        let mut ctx = RequestCtx::new(
+            parts,
+            bytes::Bytes::new(),
+            DepResolver::new(Arc::new(env), Arc::new(overrides)),
+        );
+
+        let user = ctx.resolve::<User>().await.unwrap();
+        assert_eq!(user.name, "fake@sqlite::memory:");
+    }
 }
