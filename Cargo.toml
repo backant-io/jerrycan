@@ -15,3 +15,14 @@ version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 homepage = "https://jerrycan.cc"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
