@@ -21,7 +21,11 @@ pub struct Error {
 impl Error {
     /// Build an error with an explicit status and stable code.
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into() }
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -31,7 +35,11 @@ impl Error {
         Self::new(StatusCode::NOT_FOUND, "JC0404", "not found")
     }
     pub fn method_not_allowed() -> Self {
-        Self::new(StatusCode::METHOD_NOT_ALLOWED, "JC0405", "method not allowed")
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "JC0405",
+            "method not allowed",
+        )
     }
     pub fn payload_too_large() -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "JC0413", "payload too large")
@@ -51,9 +59,15 @@ impl Error {
         )
     }
 
-    pub fn status(&self) -> StatusCode { self.status }
-    pub fn code(&self) -> &'static str { self.code }
-    pub fn message(&self) -> &str { &self.message }
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl fmt::Display for Error {
@@ -76,7 +90,10 @@ mod tests {
         assert_eq!(Error::bad_request("nope").status(), StatusCode::BAD_REQUEST);
         assert_eq!(Error::payload_too_large().code(), "JC0413");
         assert_eq!(Error::unprocessable("bad field").code(), "JC0422");
-        assert_eq!(Error::internal("boom").status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            Error::internal("boom").status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         let e = Error::missing_dependency("app::Db");
         assert_eq!(e.code(), "JC1001");
         assert_eq!(e.status(), StatusCode::INTERNAL_SERVER_ERROR);

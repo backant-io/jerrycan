@@ -3,7 +3,7 @@
 
 use crate::error::Error;
 use bytes::Bytes;
-use http::{header, HeaderValue, StatusCode};
+use http::{HeaderValue, StatusCode, header};
 use http_body_util::Full;
 use serde::Serialize;
 
@@ -41,18 +41,28 @@ fn json_body<T: Serialize>(status: StatusCode, value: &T) -> Response {
 }
 
 impl IntoResponse for Response {
-    fn into_response(self) -> Response { self }
+    fn into_response(self) -> Response {
+        self
+    }
 }
 
 impl IntoResponse for &'static str {
     fn into_response(self) -> Response {
-        full(StatusCode::OK, "text/plain; charset=utf-8", self.as_bytes().to_vec())
+        full(
+            StatusCode::OK,
+            "text/plain; charset=utf-8",
+            self.as_bytes().to_vec(),
+        )
     }
 }
 
 impl IntoResponse for String {
     fn into_response(self) -> Response {
-        full(StatusCode::OK, "text/plain; charset=utf-8", self.into_bytes())
+        full(
+            StatusCode::OK,
+            "text/plain; charset=utf-8",
+            self.into_bytes(),
+        )
     }
 }
 
@@ -65,11 +75,15 @@ impl IntoResponse for StatusCode {
 }
 
 impl<T: Serialize> IntoResponse for Json<T> {
-    fn into_response(self) -> Response { json_body(StatusCode::OK, &self.0) }
+    fn into_response(self) -> Response {
+        json_body(StatusCode::OK, &self.0)
+    }
 }
 
 impl<T: Serialize> IntoResponse for Created<T> {
-    fn into_response(self) -> Response { json_body(StatusCode::CREATED, &self.0) }
+    fn into_response(self) -> Response {
+        json_body(StatusCode::CREATED, &self.0)
+    }
 }
 
 impl IntoResponse for NoContent {
@@ -88,7 +102,13 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        json_body(self.status(), &ErrorBody { code: self.code(), message: self.message() })
+        json_body(
+            self.status(),
+            &ErrorBody {
+                code: self.code(),
+                message: self.message(),
+            },
+        )
     }
 }
 
@@ -119,7 +139,7 @@ mod tests {
         // Full's collect future is immediately ready; poll it once by hand.
         let mut fut = Box::pin(fut);
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
         match fut.as_mut().poll(&mut cx) {
             std::task::Poll::Ready(Ok(c)) => c.to_bytes(),
             _ => panic!("Full body was not immediately ready"),
@@ -130,14 +150,19 @@ mod tests {
     fn str_becomes_200_text() {
         let r = "hello".into_response();
         assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(r.headers()[header::CONTENT_TYPE], "text/plain; charset=utf-8");
+        assert_eq!(
+            r.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
         assert_eq!(body_of(&r), "hello");
     }
 
     #[test]
     fn json_wrapper_sets_content_type() {
         #[derive(Serialize)]
-        struct Todo { id: u32 }
+        struct Todo {
+            id: u32,
+        }
         let r = Json(Todo { id: 7 }).into_response();
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(r.headers()[header::CONTENT_TYPE], "application/json");
@@ -147,8 +172,13 @@ mod tests {
     #[test]
     fn created_is_201_and_no_content_is_204() {
         #[derive(Serialize)]
-        struct T { ok: bool }
-        assert_eq!(Created(T { ok: true }).into_response().status(), StatusCode::CREATED);
+        struct T {
+            ok: bool,
+        }
+        assert_eq!(
+            Created(T { ok: true }).into_response().status(),
+            StatusCode::CREATED
+        );
         let r = NoContent.into_response();
         assert_eq!(r.status(), StatusCode::NO_CONTENT);
         assert_eq!(body_of(&r), "");
