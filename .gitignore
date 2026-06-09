@@ -1,0 +1,6 @@
+# Reference clones (separate upstream repos)
+flask/
+werkzeug/
+
+# Build artifacts
+target/
