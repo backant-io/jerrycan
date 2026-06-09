@@ -59,6 +59,15 @@ impl Error {
         )
     }
 
+    /// Dependency factories recursed past the depth limit (cycle, or absurd chain).
+    pub fn dependency_cycle() -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "JC1002",
+            "dependency cycle or chain deeper than 32",
+        )
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -98,6 +107,7 @@ mod tests {
         assert_eq!(e.code(), "JC1001");
         assert_eq!(e.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(e.message().contains("app::Db"));
+        assert_eq!(Error::dependency_cycle().code(), "JC1002");
     }
 
     #[test]
