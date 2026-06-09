@@ -1,0 +1,9 @@
+[package]
+name = "jerrycan-core"
+description = "Core framework of the jerrycan platform: routing, extractors, dependency injection, middleware. Name reservation; real releases begin at 0.1.0. https://jerrycan.cc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]

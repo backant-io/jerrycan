@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-09
 **Status:** Approved (design phase)
-**Repo:** `~/github/frask` (directory rename to `jerrycan` pending; contains reference clones of `flask/` and `werkzeug/`)
+**Repo:** `~/github/jerrycan` (contains reference clones of `flask/` and `werkzeug/`)
 
 ---
 

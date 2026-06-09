@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/jerrycan",
+    "crates/jerrycan-core",
+    "crates/jerrycan-macros",
+    "crates/jerrycan-db",
+    "crates/jerrycan-auth",
+    "crates/jerrycan-validate",
+    "crates/jerrycan-observe",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+homepage = "https://jerrycan.cc"

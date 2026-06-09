@@ -1,0 +1,9 @@
+[package]
+name = "jerrycan"
+description = "The AI-native Rust backend platform: framework, CLI, and MCP server. Name reservation; development at https://jerrycan.cc — real releases begin at 0.1.0."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
