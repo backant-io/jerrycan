@@ -53,3 +53,32 @@ async fn oversized_bodies_are_rejected_with_413() {
     assert!(text.contains("413"), "got: {text}");
     server.abort();
 }
+
+#[tokio::test]
+async fn oversized_chunked_bodies_without_content_length_are_rejected_with_413() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = App::new().route(
+        "/echo",
+        jerrycan_core::post(|b: jerrycan_core::Json<String>| async move { b }),
+    );
+    let server = tokio::spawn(async move { app.serve_with(listener).await });
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = "POST /echo HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    let _ = stream.write_all(head.as_bytes()).await;
+    // 20 chunks of 64 KiB = 1.25 MiB > 1 MiB cap; server may reset mid-write.
+    let chunk = "x".repeat(64 * 1024);
+    let chunk_frame = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
+    for _ in 0..20 {
+        if stream.write_all(chunk_frame.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+    let _ = stream.write_all(b"0\r\n\r\n").await;
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf).await;
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.contains("413"), "got: {text}");
+    server.abort();
+}

@@ -112,6 +112,7 @@ impl App {
             let (stream, _) = listener
                 .accept()
                 .await
+                // TODO(phase1): tolerate transient accept() errors (EMFILE/ECONNABORTED) with backoff instead of exiting the server.
                 .map_err(|e| Error::internal(format!("accept failed: {e}")))?;
             let app = built.clone();
             tokio::spawn(async move {
