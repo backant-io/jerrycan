@@ -33,6 +33,18 @@ impl DepEnv {
         self.factories.remove(&id);
     }
 
+    /// Register an async factory; runs at most once per request (request scope).
+    #[allow(dead_code)]
+    pub(crate) fn insert_factory<F, Args, T>(&mut self, factory: F)
+    where
+        F: DepFactory<Args, T>,
+        T: Send + Sync + 'static,
+    {
+        let id = TypeId::of::<T>();
+        self.factories.insert(id, factory.into_provider());
+        self.singletons.remove(&id);
+    }
+
     /// Later entries shadow earlier ones — used to layer module envs over the app env.
     // Consumed by the module/routing scope layer in a later phase task.
     #[allow(dead_code)]
@@ -130,6 +142,49 @@ impl<T: Send + Sync + 'static> FromRequest for Dep<T> {
     }
 }
 
+/// Async functions registrable as providers. `Args` is the tuple of extractor
+/// parameters; `T` the produced dependency. Implemented for arities 0..=8.
+pub trait DepFactory<Args, T>: Send + Sync + 'static {
+    fn into_provider(self) -> ProviderFn;
+}
+
+macro_rules! impl_dep_factory {
+    ($($A:ident),*) => {
+        impl<F, Fut, T, $($A,)*> DepFactory<($($A,)*), T> for F
+        where
+            F: Fn($($A),*) -> Fut + Clone + Send + Sync + 'static,
+            Fut: Future<Output = Result<T>> + Send,
+            T: Send + Sync + 'static,
+            $($A: FromRequest + 'static,)*
+        {
+            fn into_provider(self) -> ProviderFn {
+                #[allow(unused_variables)]
+                Arc::new(move |ctx: &mut RequestCtx| {
+                    let f = self.clone();
+                    Box::pin(async move {
+                        #[allow(non_snake_case, unused_variables)]
+                        {
+                            $(let $A = <$A as FromRequest>::from_request(ctx).await?;)*
+                            let value = f($($A),*).await?;
+                            Ok(Arc::new(value) as AnyArc)
+                        }
+                    })
+                })
+            }
+        }
+    };
+}
+
+impl_dep_factory!();
+impl_dep_factory!(A1);
+impl_dep_factory!(A1, A2);
+impl_dep_factory!(A1, A2, A3);
+impl_dep_factory!(A1, A2, A3, A4);
+impl_dep_factory!(A1, A2, A3, A4, A5);
+impl_dep_factory!(A1, A2, A3, A4, A5, A6);
+impl_dep_factory!(A1, A2, A3, A4, A5, A6, A7);
+impl_dep_factory!(A1, A2, A3, A4, A5, A6, A7, A8);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +229,97 @@ mod tests {
         let a = ctx.resolve::<Config>().await.unwrap();
         let b = ctx.resolve::<Config>().await.unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct Db {
+        url: &'static str,
+    }
+    struct Session {
+        token: String,
+    }
+    struct User {
+        name: String,
+    }
+
+    static SESSION_RESOLVES: AtomicUsize = AtomicUsize::new(0);
+
+    async fn make_session() -> crate::Result<Session> {
+        SESSION_RESOLVES.fetch_add(1, Ordering::SeqCst);
+        Ok(Session {
+            token: "t-1".into(),
+        })
+    }
+
+    async fn current_user(session: Dep<Session>, db: Dep<Db>) -> crate::Result<User> {
+        Ok(User {
+            name: format!("{}@{}", session.token, db.url),
+        })
+    }
+
+    fn nested_env() -> DepEnv {
+        let mut env = DepEnv::default();
+        env.insert_value(Db { url: "pg://prod" });
+        env.insert_factory(make_session);
+        env.insert_factory(current_user);
+        env
+    }
+
+    #[tokio::test]
+    async fn factories_nest_and_resolve_async() {
+        let mut ctx = test_ctx(nested_env());
+        let user = ctx.resolve::<User>().await.unwrap();
+        assert_eq!(user.name, "t-1@pg://prod");
+    }
+
+    #[tokio::test]
+    async fn nested_deps_are_memoized_once_per_request() {
+        // A test-local counter + session factory so the shared `SESSION_RESOLVES`
+        // (mutated by parallel tests) can't pollute these exact-count assertions.
+        static LOCAL_RESOLVES: AtomicUsize = AtomicUsize::new(0);
+        async fn local_session() -> crate::Result<Session> {
+            LOCAL_RESOLVES.fetch_add(1, Ordering::SeqCst);
+            Ok(Session {
+                token: "t-1".into(),
+            })
+        }
+        fn local_env() -> DepEnv {
+            let mut env = DepEnv::default();
+            env.insert_value(Db { url: "pg://prod" });
+            env.insert_factory(local_session);
+            env.insert_factory(current_user);
+            env
+        }
+
+        LOCAL_RESOLVES.store(0, Ordering::SeqCst);
+        let mut ctx = test_ctx(local_env());
+        // Both of these need Session (one directly, one through current_user).
+        let _s = ctx.resolve::<Session>().await.unwrap();
+        let _u = ctx.resolve::<User>().await.unwrap();
+        assert_eq!(
+            LOCAL_RESOLVES.load(Ordering::SeqCst),
+            1,
+            "memoized within request"
+        );
+
+        // A new request resolves afresh — request scope, not singleton.
+        let mut ctx2 = test_ctx(local_env());
+        let _u2 = ctx2.resolve::<User>().await.unwrap();
+        assert_eq!(LOCAL_RESOLVES.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn self_referential_factory_hits_cycle_guard() {
+        struct Loopy;
+        async fn loopy(_again: Dep<Loopy>) -> crate::Result<Loopy> {
+            Ok(Loopy)
+        }
+        let mut env = DepEnv::default();
+        env.insert_factory(loopy);
+        let mut ctx = test_ctx(env);
+        let err = ctx.resolve::<Loopy>().await.err().unwrap();
+        assert_eq!(err.code(), "JC1002");
     }
 }
