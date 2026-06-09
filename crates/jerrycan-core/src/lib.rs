@@ -1,6 +1,6 @@
 //! Core framework of the jerrycan platform: routing, extractors, dependency
 //! injection, middleware. Generated apps import this through the `jerrycan`
-//! facade crate — see https://jerrycan.cc
+//! facade crate — see <https://jerrycan.cc>
 #![forbid(unsafe_code)]
 
 pub mod app;
