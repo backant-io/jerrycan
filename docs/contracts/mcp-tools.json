@@ -57,7 +57,7 @@
         "properties": {
           "kind": { "enum": ["route", "subroute", "dependency"] },
           "path": { "type": "string", "description": "route: module name (todos); subroute: parent/child (todos/comments)." },
-          "module": { "type": "string", "description": "Owning module for kind=dependency|middleware." },
+          "module": { "type": "string", "description": "Owning module for kind=dependency." },
           "design_slice": { "type": "object", "description": "The design.json fragment for the new unit." },
           "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
         },
