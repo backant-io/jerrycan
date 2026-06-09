@@ -1,2 +1,7 @@
-//! Core framework of the jerrycan platform: routing, extractors, dependency injection, middleware. Name reservation; real releases begin at 0.1.0. https://jerrycan.cc
+//! Core framework of the jerrycan platform: routing, extractors, dependency
+//! injection, middleware. See https://jerrycan.cc
 #![forbid(unsafe_code)]
+
+pub mod error;
+
+pub use error::{Error, Result};
