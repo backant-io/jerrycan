@@ -64,7 +64,7 @@ impl Error {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "JC1002",
-            "dependency cycle or chain deeper than 32",
+            "dependency cycle or chain too deep",
         )
     }
 

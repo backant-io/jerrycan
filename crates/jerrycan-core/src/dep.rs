@@ -1,5 +1,7 @@
 //! Dependency injection (spec §4.3) — async, nested, per-request memoized,
 //! override-able in tests. Resolution order: cache → overrides → singletons → factories.
+//! Singletons and factories are disjoint by construction (`insert_value`/`insert_factory`
+//! each remove the opposite key), so there is no singleton-vs-factory tiebreak to define.
 
 use crate::error::{Error, Result};
 use crate::extract::{FromRequest, RequestCtx};
@@ -244,10 +246,7 @@ mod tests {
         name: String,
     }
 
-    static SESSION_RESOLVES: AtomicUsize = AtomicUsize::new(0);
-
     async fn make_session() -> crate::Result<Session> {
-        SESSION_RESOLVES.fetch_add(1, Ordering::SeqCst);
         Ok(Session {
             token: "t-1".into(),
         })

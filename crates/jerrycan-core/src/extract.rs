@@ -126,6 +126,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn path_missing_param_is_500() {
+        // No params captured by the router → internal error (route declared a param
+        // the trie never filled), surfaced as JC0500.
+        let mut c = ctx("/todos", "");
+        let err = Path::<i64>::from_request(&mut c).await.err().unwrap();
+        assert_eq!(err.code(), "JC0500");
+    }
+
+    #[tokio::test]
     async fn query_deserializes_struct() {
         #[derive(serde::Deserialize)]
         struct Page {
