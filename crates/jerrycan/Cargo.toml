@@ -7,3 +7,10 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
+jerrycan-core = { path = "../jerrycan-core", version = "0.0.0" }
+jerrycan-macros = { path = "../jerrycan-macros", version = "0.0.0" }
+
+[dev-dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
