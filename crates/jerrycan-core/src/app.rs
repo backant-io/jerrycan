@@ -91,6 +91,54 @@ impl App {
             overrides: Arc::new(HashMap::new()),
         })
     }
+
+    /// Bind from config and serve forever. Address: `JERRYCAN_ADDR` env var,
+    /// default `127.0.0.1:8000`. (Full layered config lands in Phase 1; the
+    /// env-var layer is the contract that already works.)
+    pub async fn serve(self) -> Result<()> {
+        let addr = std::env::var("JERRYCAN_ADDR").unwrap_or_else(|_| "127.0.0.1:8000".to_string());
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .map_err(|e| Error::internal(format!("failed to bind {addr}: {e}")))?;
+        self.serve_with(listener).await
+    }
+
+    /// Serve on an existing listener (tests, socket activation, port 0).
+    pub async fn serve_with(self, listener: tokio::net::TcpListener) -> Result<()> {
+        const BODY_LIMIT: usize = 1024 * 1024; // 1 MiB — spec §4.4 secure default
+
+        let built = Arc::new(self.build()?);
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| Error::internal(format!("accept failed: {e}")))?;
+            let app = built.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let service = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        let app = app.clone();
+                        async move {
+                            let (parts, body) = req.into_parts();
+                            use http_body_util::BodyExt;
+                            let limited = http_body_util::Limited::new(body, BODY_LIMIT);
+                            let response = match limited.collect().await {
+                                Ok(collected) => app.dispatch(parts, collected.to_bytes()).await,
+                                Err(_) => Error::payload_too_large().into_response(),
+                            };
+                            Ok::<_, std::convert::Infallible>(response)
+                        }
+                    },
+                );
+                // Connection errors (resets, parse failures) are per-connection
+                // noise, not app failures; hyper already responded 4xx where it could.
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
+            });
+        }
+    }
 }
 
 fn insert_flat(trie: &mut Trie, flat: FlatRoute) -> Result<()> {
