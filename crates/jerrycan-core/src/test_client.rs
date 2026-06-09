@@ -88,8 +88,9 @@ impl TestResponse {
         let (parts, body) = res.into_parts();
         let body = body
             .collect()
+            // Full<Bytes>'s Body::Error is Infallible — collecting cannot fail.
             .await
-            .expect("collect response body")
+            .expect("collect response body (Full<Bytes> is infallible)")
             .to_bytes();
         Self {
             status: parts.status,

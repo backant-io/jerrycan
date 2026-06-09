@@ -54,3 +54,20 @@ async fn override_can_replace_a_factory_product_directly() {
     let res = t.get("/me/").await;
     assert_eq!(res.json::<String>(), "fake");
 }
+
+#[tokio::test]
+async fn override_wins_even_over_module_scoped_providers() {
+    struct Flag(&'static str);
+    async fn read(f: Dep<Flag>) -> Json<String> {
+        Json(f.0.to_string())
+    }
+    let m = Module::new("m")
+        .provide(Flag("module"))
+        .route("/", get(read));
+    let t = App::new()
+        .provide(Flag("app"))
+        .mount("/m", m)
+        .into_test()
+        .override_dep(Flag("test"));
+    assert_eq!(t.get("/m/").await.json::<String>(), "test");
+}

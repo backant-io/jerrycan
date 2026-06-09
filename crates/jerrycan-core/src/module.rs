@@ -61,6 +61,8 @@ impl Module {
         self
     }
 
+    /// The module's name. Reserved for diagnostics and route-map introspection
+    /// in a later phase; it currently has no runtime consumer.
     pub fn name(&self) -> &str {
         &self.name
     }
