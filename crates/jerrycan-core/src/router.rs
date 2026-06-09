@@ -131,27 +131,52 @@ impl Trie {
     }
 
     pub(crate) fn find<'a>(&'a self, path: &str, method: &Method) -> RouteMatch<'a> {
-        let mut node = &self.root;
+        let segs: Vec<&str> = segments(path).collect();
         let mut params: Vec<(String, String)> = Vec::new();
-        for seg in segments(path) {
-            if let Some(next) = node.statics.get(seg) {
-                node = next;
-            } else if let Some((name, child)) = &node.param {
-                params.push((name.clone(), seg.to_string()));
-                node = child;
-            } else {
-                return RouteMatch::NotFound;
+        match find_node(&self.root, &segs, &mut params) {
+            Some(node) => {
+                let ep = node
+                    .endpoint
+                    .as_ref()
+                    .expect("find_node only returns endpoint nodes");
+                if ep.methods.contains_key(method) {
+                    RouteMatch::Found {
+                        endpoint: ep,
+                        params,
+                    }
+                } else {
+                    RouteMatch::MethodMissing
+                }
             }
-        }
-        match &node.endpoint {
-            Some(ep) if ep.methods.contains_key(method) => RouteMatch::Found {
-                endpoint: ep,
-                params,
-            },
-            Some(_) => RouteMatch::MethodMissing,
             None => RouteMatch::NotFound,
         }
     }
+}
+
+/// Depth-first with backtracking: static child first; if that subtree fails,
+/// retry via the param child (capturing the segment). Only nodes WITH an
+/// endpoint count as matches, so a static dead-end falls back to the param route.
+fn find_node<'a>(
+    node: &'a Node,
+    segs: &[&str],
+    params: &mut Vec<(String, String)>,
+) -> Option<&'a Node> {
+    let Some((head, rest)) = segs.split_first() else {
+        return node.endpoint.is_some().then_some(node);
+    };
+    if let Some(child) = node.statics.get(*head)
+        && let Some(found) = find_node(child, rest, params)
+    {
+        return Some(found);
+    }
+    if let Some((name, child)) = &node.param {
+        params.push((name.clone(), (*head).to_string()));
+        if let Some(found) = find_node(child, rest, params) {
+            return Some(found);
+        }
+        params.pop();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -226,6 +251,42 @@ mod tests {
             .insert("/todos/{todo_id}", endpoint(&[Method::DELETE]))
             .unwrap_err();
         assert!(err.message().contains("id"));
+    }
+
+    #[test]
+    fn static_dead_end_backtracks_to_param_branch() {
+        let mut t = Trie::default();
+        t.insert("/a/b/c", endpoint(&[Method::GET])).unwrap();
+        t.insert("/a/{x}/d", endpoint(&[Method::GET])).unwrap();
+        match t.find("/a/b/d", &Method::GET) {
+            RouteMatch::Found { params, .. } => {
+                assert_eq!(params, vec![("x".to_string(), "b".to_string())]);
+            }
+            _ => panic!("expected /a/{{x}}/d to match /a/b/d via backtracking"),
+        }
+        assert!(matches!(
+            t.find("/a/b/c", &Method::GET),
+            RouteMatch::Found { .. }
+        ));
+    }
+
+    #[test]
+    fn static_wins_over_param_when_both_match() {
+        let mut t = Trie::default();
+        t.insert("/users/me", endpoint(&[Method::GET])).unwrap();
+        t.insert("/users/{id}", endpoint(&[Method::GET])).unwrap();
+        match t.find("/users/me", &Method::GET) {
+            RouteMatch::Found { params, .. } => {
+                assert!(params.is_empty(), "static match captures nothing")
+            }
+            _ => panic!("expected static /users/me"),
+        }
+        match t.find("/users/42", &Method::GET) {
+            RouteMatch::Found { params, .. } => {
+                assert_eq!(params, vec![("id".to_string(), "42".to_string())])
+            }
+            _ => panic!("expected param /users/{{id}}"),
+        }
     }
 
     #[test]

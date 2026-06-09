@@ -275,8 +275,8 @@ mod tests {
 
     #[tokio::test]
     async fn nested_deps_are_memoized_once_per_request() {
-        // A test-local counter + session factory so the shared `SESSION_RESOLVES`
-        // (mutated by parallel tests) can't pollute these exact-count assertions.
+        // A test-local counter (`LOCAL_RESOLVES`) + session factory so parallel tests
+        // can't pollute these exact-count assertions.
         static LOCAL_RESOLVES: AtomicUsize = AtomicUsize::new(0);
         async fn local_session() -> crate::Result<Session> {
             LOCAL_RESOLVES.fetch_add(1, Ordering::SeqCst);
