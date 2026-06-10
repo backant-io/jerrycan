@@ -120,6 +120,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::List {
             what: ListCmd::Routes,
         } => cmd_list_routes(cli.json),
+        Cmd::Dev { addr } => cmd_dev(addr.as_deref()),
         Cmd::Check { module } => cmd_check(module.as_deref(), cli.json),
         Cmd::Test { module } => cmd_test(module.as_deref()),
         Cmd::Docs { topic, search } => cmd_docs(topic.as_deref(), search.as_deref(), cli.json),
@@ -453,5 +454,40 @@ fn cmd_test(module: Option<&str>) -> Result<(), Failure> {
         Ok(())
     } else {
         Err(Failure::gate("test suite failed"))
+    }
+}
+
+fn cmd_dev(addr: Option<&str>) -> Result<(), Failure> {
+    use jerrycan::platform::newest_mtime;
+    let root = app_root()?;
+    eprintln!("jerrycan dev: watching {} (Ctrl-C to stop)", root.display());
+    loop {
+        let stamp = newest_mtime(&root);
+        let mut child = {
+            let mut c = std::process::Command::new("cargo");
+            c.current_dir(&root).args(["run", "-p", "app"]);
+            if let Some(a) = addr {
+                c.env("JERRYCAN_ADDR", a);
+            }
+            c.spawn()
+                .map_err(|e| Failure::environment(format!("cargo run failed to start: {e}")))?
+        };
+        // Poll for changes (or child exit, e.g. compile error) every 500ms.
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Ok(Some(status)) = child.try_wait() {
+                eprintln!("app exited ({status}); waiting for changes…");
+                while newest_mtime(&root) <= stamp {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                break;
+            }
+            if newest_mtime(&root) > stamp {
+                eprintln!("change detected — restarting");
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
     }
 }
