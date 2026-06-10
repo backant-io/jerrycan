@@ -121,10 +121,14 @@ fn run_one(spec: &str) -> Result<(), String> {
         let rv: serde_json::Value = serde_json::from_slice(&routes.stdout).unwrap();
         let first = rv["routes"][0]["path"].as_str().unwrap_or("/").to_string();
         let body = http_get(&addr, &first);
-        if body.starts_with("HTTP/1.1 2") || body.starts_with("HTTP/1.1 404") {
-            Ok(())
-        } else {
+        if !(body.starts_with("HTTP/1.1 2") || body.starts_with("HTTP/1.1 404")) {
             Err(format!("serve smoke bad status: {body}"))
+        } else if spec == "tasks" {
+            // Persist-smoke: prove the PUT handler actually writes through the repo.
+            // create → update → get must return the *updated* value, not the original.
+            persist_smoke(&addr)
+        } else {
+            Ok(())
         }
     } else {
         Err("app did not start".into())
@@ -158,4 +162,46 @@ fn http_get(addr: &str, path: &str) -> String {
     let mut buf = Vec::new();
     let _ = s.read_to_end(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn http_request(addr: &str, method: &str, path: &str, json_body: &str) -> String {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: l\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json_body}",
+        json_body.len()
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// create → update → get against the `tasks` app, asserting the PUT persists.
+/// The first inserted task gets id 1 (in-memory repo seeds next_id at 1).
+fn persist_smoke(addr: &str) -> Result<(), String> {
+    let created = http_request(addr, "POST", "/tasks/", r#"{"title":"first","done":false}"#);
+    if !created.starts_with("HTTP/1.1 201") {
+        return Err(format!("persist-smoke create not 201: {created}"));
+    }
+    let updated = http_request(
+        addr,
+        "PUT",
+        "/tasks/1",
+        r#"{"title":"renamed","done":true}"#,
+    );
+    if !updated.starts_with("HTTP/1.1 200") {
+        return Err(format!("persist-smoke update not 200: {updated}"));
+    }
+    let fetched = http_get(addr, "/tasks/1");
+    if !fetched.starts_with("HTTP/1.1 200") {
+        return Err(format!("persist-smoke get not 200: {fetched}"));
+    }
+    // The mutation must be visible in the GET body, not silently dropped.
+    if !fetched.contains("renamed") {
+        return Err(format!(
+            "persist-smoke: PUT did not persist; GET still shows the old value: {fetched}"
+        ));
+    }
+    Ok(())
 }

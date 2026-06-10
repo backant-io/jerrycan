@@ -21,10 +21,11 @@ pub(crate) async fn update_task(
     Path(id): Path<i64>,
     Json(body): Json<Task>,
 ) -> Result<Json<Task>> {
-    if repo.get(id).is_none() {
-        return Err(Error::not_found());
+    if repo.update(id, body.clone()) {
+        Ok(Json(body))
+    } else {
+        Err(Error::not_found())
     }
-    Ok(Json(body))
 }
 
 pub(crate) async fn delete_task(repo: Dep<TaskRepo>, Path(id): Path<i64>) -> Result<NoContent> {

@@ -21,10 +21,11 @@ pub(crate) async fn update_note(
     Path(id): Path<i64>,
     Json(body): Json<Note>,
 ) -> Result<Json<Note>> {
-    if repo.get(id).is_none() {
-        return Err(Error::not_found());
+    if repo.update(id, body.clone()) {
+        Ok(Json(body))
+    } else {
+        Err(Error::not_found())
     }
-    Ok(Json(body))
 }
 
 pub(crate) async fn delete_note(repo: Dep<NoteRepo>, Path(id): Path<i64>) -> Result<NoContent> {

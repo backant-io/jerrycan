@@ -21,10 +21,11 @@ pub(crate) async fn update_item(
     Path(id): Path<i64>,
     Json(body): Json<Item>,
 ) -> Result<Json<Item>> {
-    if repo.get(id).is_none() {
-        return Err(Error::not_found());
+    if repo.update(id, body.clone()) {
+        Ok(Json(body))
+    } else {
+        Err(Error::not_found())
     }
-    Ok(Json(body))
 }
 
 pub(crate) async fn delete_item(repo: Dep<ItemRepo>, Path(id): Path<i64>) -> Result<NoContent> {
