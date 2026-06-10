@@ -239,3 +239,24 @@ async fn malformed_path_encoding_is_400_jc0400() {
     assert_eq!(res.status(), jerrycan_core::http::StatusCode::BAD_REQUEST);
     assert!(res.text().contains("JC0400"));
 }
+
+#[tokio::test]
+async fn multi_param_paths_extract_in_route_order() {
+    use jerrycan_core::Path;
+    async fn pair(Path((a, b)): Path<(i64, String)>) -> String {
+        format!("{a}:{b}")
+    }
+    async fn triple(Path((a, b, c)): Path<(i64, i64, i64)>) -> String {
+        format!("{}", a + b + c)
+    }
+    let t = App::new()
+        .route("/pair/{a}/{b}", get(pair))
+        .route("/sum/{x}/{y}/{z}", get(triple))
+        .into_test();
+
+    assert_eq!(t.get("/pair/7/seven").await.text(), "7:seven");
+    assert_eq!(t.get("/sum/1/2/3").await.text(), "6");
+
+    let res = t.get("/pair/notanumber/x").await;
+    assert_eq!(res.status(), jerrycan_core::http::StatusCode::BAD_REQUEST);
+}

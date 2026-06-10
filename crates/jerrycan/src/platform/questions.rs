@@ -184,14 +184,8 @@ fn validate_module(
             ));
         }
         let param_count = ep.path.matches('{').count();
-        if param_count > 1 {
-            qs.push(q(
-                format!("{eptr}/path"),
-                format!(
-                    "Path `{}` has {param_count} parameters — v0 supports one path parameter per endpoint (multi-param Path is on the roadmap). Split the route or use a subroute.",
-                    ep.path
-                ),
-            ));
+        if param_count > 3 {
+            qs.push(q(format!("{eptr}/path"), format!("Path `{}` has {param_count} parameters — at most three path parameters per endpoint are supported. Split the route or use a subroute.", ep.path)));
         }
         if ep.path.matches('{').count() != ep.path.matches('}').count() {
             qs.push(q(
@@ -363,13 +357,21 @@ mod tests {
     }
 
     #[test]
-    fn v0_limits_one_path_param_and_validates_mount_prefix() {
+    fn paths_allow_up_to_three_params_and_validate_mount_prefix() {
+        // Two params: now legal (multi-param Path landed in core).
         let d = design(&MINIMAL.replace("\"path\": \"/{id}\"", "\"path\": \"/{id}/tags/{tag}\""));
         assert!(
-            validate(&d)
+            !validate(&d)
                 .iter()
-                .any(|q| q.question.contains("one path parameter")),
-            "v0 single-param limit"
+                .any(|q| q.question.contains("path parameter")),
+            "two params must be accepted now"
+        );
+        // Four params: rejected.
+        let d4 = design(&MINIMAL.replace("\"path\": \"/{id}\"", "\"path\": \"/{a}/{b}/{c}/{d}\""));
+        assert!(
+            validate(&d4)
+                .iter()
+                .any(|q| q.question.contains("three path parameters"))
         );
 
         let d2 = design(&MINIMAL.replace(

@@ -72,6 +72,19 @@ assert_eq!(t.get("/items").await.text(), "limit=None offset=0"); // no query str
 # }); }
 ```
 
+Multiple path parameters extract as a tuple, in route order:
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+async fn cell(Path((row, col)): Path<(i64, i64)>) -> String {
+    format!("r{row}c{col}")
+}
+
+let t = App::new().route("/grid/{row}/{col}", get(cell)).into_test();
+assert_eq!(t.get("/grid/3/9").await.text(), "r3c9");
+# }); }
+```
+
 ## Errors you'll hit
 - `Path<T>` parse failure → `400 JC0400` ("invalid path parameter") automatically.
 - Malformed/mistyped JSON body → `422 JC0422` with the serde message.
@@ -79,6 +92,6 @@ assert_eq!(t.get("/items").await.text(), "limit=None offset=0"); // no query str
 
 ## Anti-patterns
 - `RequestCtx` does not implement `FromRequest`, so it cannot appear in a handler signature — this is a compile error, not a style rule. If a value isn't expressible as an extractor, define a dependency for it.
-- One `Path<T>` per route in v0 (one `{param}`-typed extractor); multi-param
-  tuples arrive in Phase 1 — until then design routes with one variable segment
-  per handler or read both via two nested modules.
+- Up to three `{params}` per route: one → `Path<T>`, two/three → tuple form
+  `Path<(A, B)>` in route order. More than three params is a design smell —
+  split the route or use a subroute.

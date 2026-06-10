@@ -7,7 +7,6 @@ use crate::response::Json;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use std::future::Future;
-use std::str::FromStr;
 
 /// The mutable view of one in-flight request. Handlers receive extractors,
 /// not this type; middleware and the DI resolver work through it.
@@ -46,25 +45,80 @@ pub trait FromRequest: Sized + Send {
     fn from_request(ctx: &mut RequestCtx) -> impl Future<Output = Result<Self>> + Send;
 }
 
-/// Typed path parameter: `Path<i64>` grabs the first `{param}` in the route.
-/// (Multi-param `Path<(A, B)>` lands in Phase 1; one param per route segment
-/// covers the spike and the docs say so.)
+/// Typed path parameter: `Path<i64>` grabs the first `{param}` in the route;
+/// `Path<(A, B)>` / `Path<(A, B, C)>` grab two/three `{param}`s in route order.
+/// Param types are the sealed [`PathParam`] set (integers, `String`, `bool`,
+/// floats, `char`); custom newtypes are a contract-v1 candidate.
 pub struct Path<T>(pub T);
 
-impl<T> FromRequest for Path<T>
-where
-    T: FromStr + Send,
-    T::Err: std::fmt::Display,
-{
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Types extractable from one path segment. Sealed closed set in v0: integers,
+/// `String`, `bool`, floats, `char`. Open/custom param types (id newtypes) are a
+/// contract-v1 candidate via serde-based extraction.
+pub trait PathParam: sealed::Sealed + Sized + Send {
+    fn parse_param(name: &str, raw: &str) -> Result<Self>;
+}
+
+macro_rules! impl_path_param {
+    ($($t:ty),* $(,)?) => {$(
+        impl sealed::Sealed for $t {}
+        impl PathParam for $t {
+            fn parse_param(name: &str, raw: &str) -> Result<Self> {
+                raw.parse::<$t>().map_err(|e| {
+                    Error::bad_request(format!("invalid path parameter `{name}`: {e}"))
+                })
+            }
+        }
+    )*};
+}
+impl_path_param!(
+    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool, char, String,
+);
+
+impl<T: PathParam> FromRequest for Path<T> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
         let (name, raw) = ctx
             .params
             .first()
             .ok_or_else(|| Error::internal("route has no path parameters"))?;
-        raw.parse::<T>()
-            .map(Path)
-            .map_err(|e| Error::bad_request(format!("invalid path parameter `{name}`: {e}")))
+        T::parse_param(name, raw).map(Path)
     }
+}
+
+impl<A: PathParam, B: PathParam> FromRequest for Path<(A, B)> {
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        let [a, b] = take_params::<2>(ctx)?;
+        Ok(Path((
+            A::parse_param(&a.0, &a.1)?,
+            B::parse_param(&b.0, &b.1)?,
+        )))
+    }
+}
+
+impl<A: PathParam, B: PathParam, C: PathParam> FromRequest for Path<(A, B, C)> {
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        let [a, b, c] = take_params::<3>(ctx)?;
+        Ok(Path((
+            A::parse_param(&a.0, &a.1)?,
+            B::parse_param(&b.0, &b.1)?,
+            C::parse_param(&c.0, &c.1)?,
+        )))
+    }
+}
+
+/// First N captured params, cloned in route order. Fewer than N is a routing
+/// bug (the route declared fewer `{params}` than the handler expects) — 500.
+fn take_params<const N: usize>(ctx: &RequestCtx) -> Result<[(String, String); N]> {
+    if ctx.params.len() < N {
+        return Err(Error::internal(format!(
+            "route captures {} path parameter(s) but the handler expects {N}",
+            ctx.params.len()
+        )));
+    }
+    Ok(std::array::from_fn(|i| ctx.params[i].clone()))
 }
 
 /// Typed query string: `Query<MyParams>` via serde.
@@ -111,7 +165,7 @@ mod tests {
     async fn path_extracts_typed_param() {
         let mut c = ctx("/todos/42", "");
         c.params.push(("id".into(), "42".into()));
-        let Path(id): Path<i64> = Path::from_request(&mut c).await.unwrap();
+        let Path(id): Path<i64> = Path::<i64>::from_request(&mut c).await.unwrap();
         assert_eq!(id, 42);
     }
 

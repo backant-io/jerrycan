@@ -35,10 +35,17 @@ fn return_type(ep: &Endpoint) -> String {
     }
 }
 
-fn path_param(ep: &Endpoint) -> Option<String> {
-    let start = ep.path.find('{')?;
-    let end = ep.path[start..].find('}')? + start;
-    Some(ep.path[start + 1..end].to_string())
+fn path_params(ep: &Endpoint) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = ep.path.as_str();
+    while let Some(start) = rest.find('{') {
+        let Some(end_rel) = rest[start..].find('}') else {
+            break;
+        };
+        out.push(rest[start + 1..start + end_rel].to_string());
+        rest = &rest[start + end_rel + 1..];
+    }
+    out
 }
 
 fn handler_params(m: &ModuleDesign, ep: &Endpoint) -> String {
@@ -46,8 +53,15 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint) -> String {
     if let Some(e) = endpoint_repo_entity(m, ep) {
         params.push(format!("_repo: Dep<{e}Repo>"));
     }
-    if let Some(p) = path_param(ep) {
-        params.push(format!("Path(_{p}): Path<i64>"));
+    let params_in_path = path_params(ep);
+    match params_in_path.len() {
+        0 => {}
+        1 => params.push(format!("Path(_{}): Path<i64>", params_in_path[0])),
+        n => {
+            let names: Vec<String> = params_in_path.iter().map(|p| format!("_{p}")).collect();
+            let types = vec!["i64"; n].join(", ");
+            params.push(format!("Path(({})): Path<({})>", names.join(", "), types));
+        }
     }
     if let Some(ref rb) = ep.request_body {
         params.push(format!("Json(_body): Json<{}>", rb.entity));
@@ -444,6 +458,30 @@ mod tests {
             "{h}"
         );
         assert!(h.contains("not implemented — replace this stub"));
+    }
+
+    #[test]
+    fn multi_param_endpoints_map_to_path_tuples() {
+        let mut m = todos();
+        m.endpoints.push(Endpoint {
+            operation_id: "move_todo".into(),
+            method: HttpMethod::POST,
+            path: "/{id}/position/{slot}".into(),
+            auth_required: false,
+            required_roles: vec![],
+            request_body: None,
+            success: Success {
+                status: 204,
+                entity: None,
+                list: false,
+            },
+            errors: vec![],
+        });
+        let h = handlers_rs(&m);
+        assert!(
+            h.contains("pub(crate) async fn move_todo(_repo: Dep<TodoRepo>, Path((_id, _slot)): Path<(i64, i64)>) -> Result<NoContent>"),
+            "{h}"
+        );
     }
 
     #[test]
