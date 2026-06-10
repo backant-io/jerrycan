@@ -156,16 +156,24 @@ impl Trie {
     }
 
     pub(crate) fn find<'a>(&'a self, path: &str, method: &Method) -> RouteMatch<'a> {
-        let mut segs: Vec<String> = Vec::new();
+        if !path.contains('%') {
+            let segs: Vec<&str> = segments(path).collect();
+            return self.find_in(&segs, method);
+        }
+        let mut decoded: Vec<String> = Vec::new();
         for raw in segments(path) {
             match decode_segment(raw) {
-                Some(decoded) => segs.push(decoded),
+                Some(d) => decoded.push(d),
                 None => return RouteMatch::Malformed,
             }
         }
-        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        let segs: Vec<&str> = decoded.iter().map(String::as_str).collect();
+        self.find_in(&segs, method)
+    }
+
+    fn find_in<'a>(&'a self, segs: &[&str], method: &Method) -> RouteMatch<'a> {
         let mut params: Vec<(String, String)> = Vec::new();
-        match find_node(&self.root, &segs, &mut params) {
+        match find_node(&self.root, segs, &mut params) {
             Some(node) => {
                 let ep = node
                     .endpoint
