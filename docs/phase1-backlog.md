@@ -1,8 +1,8 @@
-# Phase backlog
+# Backlog
 
-## Phase 4 (per roadmap)
-
-- Router + percent-decoder fuzzing (cargo-fuzz; roadmap Phase 4 owns fuzzing)
+Deferred work past the v0.1.0 release. Phase 4 hardening (router/percent-decoder
+fuzzing, agent evals, diagnostics) is done; the facade version literal is bumped
+to 0.1.0. What remains below is genuinely out of scope for v0.
 
 ## Contract v1 candidates (deliberately deferred from v0)
 

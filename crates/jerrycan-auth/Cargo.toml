@@ -1,6 +1,6 @@
 [package]
 name = "jerrycan-auth"
-description = "Authentication extension for the jerrycan framework: argon2 password hashing, encrypted sessions, JWT, role guards. Real releases begin at 0.1.0. https://jerrycan.cc"
+description = "Authentication extension for the jerrycan framework: argon2 password hashing, encrypted sessions, JWT, role guards. https://jerrycan.cc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

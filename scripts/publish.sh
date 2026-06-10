@@ -18,9 +18,8 @@ CRATES=(jerrycan-core jerrycan-macros jerrycan-db jerrycan-auth jerrycan-validat
 for c in "${CRATES[@]}"; do
   echo "=== publishing $c ==="
   tries=0
-  until cargo publish -p "$c"; do
-    rc=$?
-    out=$(cargo publish -p "$c" 2>&1 || true)
+  until out=$(cargo publish -p "$c" 2>&1); do
+    echo "$out"
     if echo "$out" | grep -qi "already.*uploaded\|already exists"; then
       echo "SKIP $c (already published)"; break
     fi

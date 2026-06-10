@@ -1,6 +1,6 @@
 [package]
 name = "jerrycan-validate"
-description = "Validation extension for the jerrycan framework: Validate trait, Valid extractor, structured 422s, OpenAPI serving. Real releases begin at 0.1.0. https://jerrycan.cc"
+description = "Validation extension for the jerrycan framework: Validate trait, Valid extractor, structured 422s, OpenAPI serving. https://jerrycan.cc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
