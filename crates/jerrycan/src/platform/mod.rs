@@ -14,6 +14,7 @@ pub mod openapi;
 pub mod questions;
 pub mod scaffold;
 pub mod templates;
+pub mod testgen;
 
 /// Exit codes per docs/contracts/cli-ux.md.
 pub const EXIT_OK: i32 = 0;
