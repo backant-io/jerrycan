@@ -71,8 +71,6 @@ impl SessionStore {
         format!("{COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
     }
 
-    // Consumed by the `Session` extractor in a later task; reserved here with the store.
-    #[allow(dead_code)]
     pub(crate) fn read_cookie(&self, cookie_header: &str) -> Option<String> {
         cookie_header
             .split(';')
