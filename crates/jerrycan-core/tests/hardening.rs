@@ -74,3 +74,47 @@ async fn fast_handlers_are_unaffected_by_the_default_timeout() {
     let t = App::new().route("/", get(|| async { "quick" })).into_test();
     assert_eq!(t.get("/").await.text(), "quick");
 }
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+async fn raw_get(addr: &str, path: &str) -> String {
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[tokio::test]
+async fn handler_panics_become_500_and_the_server_survives() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = App::new()
+        .route(
+            "/boom",
+            get(|| async {
+                if true {
+                    panic!("kaboom")
+                }
+                "x"
+            }),
+        )
+        .route("/fine", get(|| async { "still here" }));
+    let server = tokio::spawn(async move { app.serve_with(listener).await });
+
+    let res = raw_get(&addr, "/boom").await;
+    assert!(
+        res.starts_with("HTTP/1.1 500"),
+        "panic must become a 500: {res}"
+    );
+    assert!(res.contains("JC0500"), "{res}");
+
+    let res = raw_get(&addr, "/fine").await;
+    assert!(
+        res.starts_with("HTTP/1.1 200") && res.ends_with("still here"),
+        "server must survive: {res}"
+    );
+    server.abort();
+}

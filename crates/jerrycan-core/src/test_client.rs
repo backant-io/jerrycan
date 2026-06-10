@@ -1,5 +1,7 @@
 //! In-memory test client (spec §4.1 "Test client"): no sockets, no network.
 //! `override_dep` is THE testing seam — fake any dependency, run real requests.
+//!
+//! Panics in handlers propagate in tests by design — the serve path converts them to 500 JC0500.
 
 use crate::app::{App, BuiltApp};
 use crate::response::Response;

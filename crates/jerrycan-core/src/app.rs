@@ -155,8 +155,30 @@ impl App {
                             use http_body_util::BodyExt;
                             let limited = http_body_util::Limited::new(body, BODY_LIMIT);
                             let response = match limited.collect().await {
-                                Ok(collected) => app.dispatch(parts, collected.to_bytes()).await,
-                                Err(_) => Error::payload_too_large().into_response(),
+                                Ok(collected) => {
+                                    let app = app.clone();
+                                    let body = collected.to_bytes();
+                                    match tokio::spawn(
+                                        async move { app.dispatch(parts, body).await },
+                                    )
+                                    .await
+                                    {
+                                        Ok(response) => response,
+                                        Err(_join_error) => {
+                                            // A panic in agent-written handler code costs one
+                                            // response, never the connection or the server.
+                                            let mut response =
+                                                Error::internal("handler panicked").into_response();
+                                            apply_security_headers(&mut response);
+                                            response
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    let mut response = Error::payload_too_large().into_response();
+                                    apply_security_headers(&mut response);
+                                    response
+                                }
                             };
                             Ok::<_, std::convert::Infallible>(response)
                         }
