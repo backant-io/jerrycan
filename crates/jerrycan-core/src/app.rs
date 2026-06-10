@@ -22,6 +22,7 @@ pub struct App {
     env: DepEnv,
     middleware: Vec<Arc<dyn Middleware>>,
     security_headers: bool,
+    handler_timeout: std::time::Duration,
 }
 
 impl Default for App {
@@ -32,6 +33,7 @@ impl Default for App {
             env: DepEnv::default(),
             middleware: Vec::new(),
             security_headers: true,
+            handler_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -45,6 +47,13 @@ impl App {
     /// must be explicit — that is the contract.
     pub fn security_headers(mut self, on: bool) -> Self {
         self.security_headers = on;
+        self
+    }
+
+    /// Per-request handler time budget (default 30s — spec §4.4). Exceeding it
+    /// returns 503 JC0503 without killing the connection or the server.
+    pub fn handler_timeout(mut self, budget: std::time::Duration) -> Self {
+        self.handler_timeout = budget;
         self
     }
 
@@ -109,6 +118,7 @@ impl App {
             trie,
             overrides: Arc::new(HashMap::new()),
             security_headers: self.security_headers,
+            handler_timeout: self.handler_timeout,
         })
     }
 
@@ -187,6 +197,7 @@ pub struct BuiltApp {
     pub(crate) trie: Trie,
     pub(crate) overrides: Arc<HashMap<TypeId, AnyArc>>,
     pub(crate) security_headers: bool,
+    pub(crate) handler_timeout: std::time::Duration,
 }
 
 // The trie holds type-erased handler fns and overrides are `dyn Any`, so the
@@ -243,12 +254,15 @@ impl BuiltApp {
                     .methods
                     .get(&method)
                     .expect("find() checked the method");
-                Next {
+                let run = Next {
                     chain: &endpoint.middleware,
                     endpoint: handler,
                 }
-                .run(&mut ctx)
-                .await
+                .run(&mut ctx);
+                match tokio::time::timeout(self.handler_timeout, run).await {
+                    Ok(response) => response,
+                    Err(_) => Error::handler_timeout().into_response(),
+                }
             }
         }
     }

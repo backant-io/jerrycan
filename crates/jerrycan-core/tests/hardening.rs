@@ -48,3 +48,29 @@ async fn security_headers_can_be_explicitly_disabled() {
     let res = t.get("/").await;
     assert!(res.headers().get("x-frame-options").is_none());
 }
+
+use std::time::Duration;
+
+#[tokio::test]
+async fn slow_handlers_hit_the_timeout_with_jc0503() {
+    async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        "too late"
+    }
+    let t = App::new()
+        .route("/slow", get(slow))
+        .handler_timeout(Duration::from_millis(50))
+        .into_test();
+    let res = t.get("/slow").await;
+    assert_eq!(
+        res.status(),
+        jerrycan_core::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(res.text().contains("JC0503"), "{}", res.text());
+}
+
+#[tokio::test]
+async fn fast_handlers_are_unaffected_by_the_default_timeout() {
+    let t = App::new().route("/", get(|| async { "quick" })).into_test();
+    assert_eq!(t.get("/").await.text(), "quick");
+}
