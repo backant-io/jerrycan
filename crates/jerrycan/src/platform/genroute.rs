@@ -283,7 +283,7 @@ fn rel(path: &Path, root: &Path) -> String {
 }
 
 /// Write (or refresh) one top-level route crate under `routes_dir`
-/// (= <app>/crates/routes). Returns paths written, relative to routes_dir's parent's parent.
+/// (= `<app>/crates/routes`). Returns paths written, relative to routes_dir's parent's parent.
 /// Precondition: the design has passed `questions::validate` — generation assumes
 /// validated names and entity references.
 pub fn write_module(routes_dir: &Path, m: &ModuleDesign) -> Result<Vec<String>, String> {

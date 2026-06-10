@@ -17,11 +17,17 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install verification tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests (unit + integration + doc-tests)
         run: cargo test --workspace
+      - name: Conformance (heavy: generated apps must build, check, and serve)
+        run: cargo test -p jerrycan --test conformance -- --include-ignored
       - name: Docs build (broken intra-doc links are errors)
         run: cargo doc --workspace --no-deps

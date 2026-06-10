@@ -114,8 +114,8 @@ jerrycan_package  → hardened artifacts + SBOM, only when everything is green
 | Phase | Scope | Status |
 |---|---|---|
 | **0 — Contracts** | Core API spike (DI, modules, routing, serving) + AI docs + MCP/CLI contracts | ✅ complete |
-| **1 — Core loop** | `jerrycan` CLI (new/generate/dev/check) + MCP server | next |
-| **2 — Data & TDD** | jerrycan-db, jerrycan-validate + OpenAPI, per-module test generation | |
+| **1 — Core loop** | `jerrycan` CLI (new/generate/dev/check) + MCP server | ✅ core loop (framework hardening → Phase 1b) |
+| **2 — Data & TDD** | jerrycan-db, jerrycan-validate + OpenAPI, per-module test generation | next |
 | **3 — Production** | jerrycan-auth, jerrycan-observe, `jerrycan package` (Docker/k8s/binary/systemd) | |
 | **4 — Hardening** | Fuzzing, agent evals, diagnostics polish → v0.1.0 | |
 
