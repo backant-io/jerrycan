@@ -37,12 +37,11 @@ pub fn document(metadata: &Value, root_name: &str, root_version: &str) -> Value 
     })
 }
 
-/// Run `cargo metadata` for an app and produce the pretty SBOM JSON.
-pub fn generate(
-    app_root: &std::path::Path,
-    root_name: &str,
-    root_version: &str,
-) -> Result<String, String> {
+/// Run `cargo metadata` for an app and produce the pretty SBOM JSON. The root
+/// version is derived from the `root_name` package's own metadata entry (so it
+/// tracks the real app version rather than a hardcoded literal); `0.0.0` is the
+/// fallback when that package isn't present.
+pub fn generate(app_root: &std::path::Path, root_name: &str) -> Result<String, String> {
     let output = std::process::Command::new("cargo")
         .current_dir(app_root)
         .args(["metadata", "--format-version", "1"])
@@ -56,10 +55,21 @@ pub fn generate(
     }
     let metadata: Value =
         serde_json::from_slice(&output.stdout).map_err(|e| format!("cargo metadata parse: {e}"))?;
-    let doc = document(&metadata, root_name, root_version);
+    let root_version = root_version(&metadata, root_name);
+    let doc = document(&metadata, root_name, &root_version);
     let mut s = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     s.push('\n');
     Ok(s)
+}
+
+/// The version of the root package as cargo sees it, or `0.0.0` if absent.
+fn root_version(metadata: &Value, root_name: &str) -> String {
+    metadata["packages"]
+        .as_array()
+        .and_then(|pkgs| pkgs.iter().find(|p| p["name"].as_str() == Some(root_name)))
+        .and_then(|p| p["version"].as_str())
+        .unwrap_or("0.0.0")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -101,6 +111,14 @@ mod tests {
                 .starts_with("pkg:cargo/serde@1.0.0")
         );
         assert_eq!(serde["licenses"][0]["expression"], "MIT OR Apache-2.0");
+    }
+
+    #[test]
+    fn root_version_is_derived_from_the_app_package() {
+        let meta: Value = serde_json::from_str(META).unwrap();
+        assert_eq!(root_version(&meta, "app"), "0.1.0");
+        // missing root package → conservative fallback, never a panic.
+        assert_eq!(root_version(&meta, "missing"), "0.0.0");
     }
 
     #[test]

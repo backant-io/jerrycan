@@ -11,7 +11,7 @@ fn design() -> Design {
 
 #[test]
 fn dockerfile_is_distroless_nonroot_static() {
-    let df = package::dockerfile(&design(), false);
+    let df = package::dockerfile(&design());
     assert!(
         df.contains("FROM rust:") && df.contains(" AS build"),
         "{df}"

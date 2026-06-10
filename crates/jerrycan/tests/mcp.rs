@@ -165,10 +165,37 @@ fn scaffold_generate_and_list_through_mcp() {
             .any(|r| r["path"] == "/tags/")
     );
 
-    // Phase-gated tools answer honestly instead of pretending.
-    let (err, payload) = c.call_tool("jerrycan_package", serde_json::json!({"target": "binary"}));
-    assert!(err);
-    assert!(payload["error"].as_str().unwrap().contains("Phase 3"));
+    c.shutdown();
+}
+
+#[test]
+fn package_refuses_when_check_is_red() {
+    // The package tool gates on a green full-workspace check. A freshly scaffolded
+    // app still has unimplemented handler stubs, so check fails — the tool must
+    // refuse with a check-failure error rather than emitting artifacts. This
+    // exercises the CLI/MCP-shared run_package wiring without a multi-minute build.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("design.json"), GOLDEN).unwrap();
+    let mut c = McpClient::start_in(tmp.path());
+    let app_dir = tmp.path().join("todo-api");
+    let (err, _) = c.call_tool(
+        "jerrycan_scaffold",
+        serde_json::json!({
+            "design_path": tmp.path().join("design.json").to_str().unwrap(),
+            "directory": app_dir.to_str().unwrap(),
+        }),
+    );
+    assert!(!err);
+
+    let (err, payload) = c.call_tool(
+        "jerrycan_package",
+        serde_json::json!({"target": "k8s", "directory": app_dir.to_str().unwrap()}),
+    );
+    assert!(err, "packaging a red-check app must error: {payload}");
+    assert!(
+        payload["error"].as_str().unwrap().contains("check"),
+        "error names the failed check gate: {payload}"
+    );
     c.shutdown();
 }
 
