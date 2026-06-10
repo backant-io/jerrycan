@@ -5,6 +5,7 @@
 
 use sha2::{Digest, Sha256};
 
+pub mod jwt;
 pub mod password;
 pub mod session;
 
