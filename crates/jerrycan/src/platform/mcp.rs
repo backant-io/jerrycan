@@ -1,5 +1,6 @@
 //! Hand-rolled MCP server: newline-delimited JSON-RPC 2.0 over stdio.
-//! tools/list serves the embedded contract file — drift is impossible.
+//! tools/list serves the embedded contract file (all four fields — name,
+//! description, inputSchema, outputSchema — are forwarded) — drift is impossible.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
@@ -48,7 +49,7 @@ pub fn handle_message(line: &str) -> Option<String> {
     }
     let result = match method {
         "initialize" => json!({
-            "protocolVersion": params["protocolVersion"].as_str().unwrap_or(PROTOCOL_VERSION),
+            "protocolVersion": PROTOCOL_VERSION,
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "jerrycan", "version": env!("CARGO_PKG_VERSION") },
         }),
@@ -65,6 +66,7 @@ pub fn handle_message(line: &str) -> Option<String> {
                         "name": t["name"],
                         "description": t["description"],
                         "inputSchema": t["inputSchema"],
+                        "outputSchema": t["outputSchema"],
                     })
                 })
                 .collect();
@@ -73,12 +75,27 @@ pub fn handle_message(line: &str) -> Option<String> {
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let (is_error, payload) = super::mcp_dispatch::dispatch(name, &params["arguments"]);
-            json!({
-                "content": [{ "type": "text", "text": payload.to_string() }],
-                "isError": is_error,
-            })
+            if is_error {
+                json!({
+                    "content": [{ "type": "text", "text": payload.to_string() }],
+                    "isError": true,
+                })
+            } else {
+                // 2025-06-18 pairs outputSchema with structuredContent; keep the
+                // text mirror so non-structured clients still get the payload.
+                json!({
+                    "content": [{ "type": "text", "text": payload.to_string() }],
+                    "structuredContent": payload,
+                    "isError": false,
+                })
+            }
         }
         _ => {
+            // A request-shaped notification (has an id) gets a benign ack rather
+            // than method-not-found.
+            if method.starts_with("notifications/") {
+                return Some(rpc_result(id, json!({})));
+            }
             return Some(rpc_error(
                 id,
                 -32601,

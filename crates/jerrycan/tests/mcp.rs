@@ -29,9 +29,11 @@ impl McpClient {
         };
         let init = c.request(
             "initialize",
-            serde_json::json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+            serde_json::json!({"protocolVersion": "2099-01-01", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
         );
         assert_eq!(init["serverInfo"]["name"], "jerrycan");
+        // The server answers ITS OWN protocol version, never the client's echo.
+        assert_eq!(init["protocolVersion"], "2025-06-18");
         c.notify("notifications/initialized", serde_json::json!({}));
         c
     }
@@ -91,6 +93,14 @@ fn initialize_list_and_unknown_method() {
         .collect();
     assert_eq!(names.len(), 9, "all 9 contract tools served");
     assert!(names.contains(&"jerrycan_design") && names.contains(&"jerrycan_check"));
+    // Every tool forwards its outputSchema (the contract defines one for each).
+    for t in tools["tools"].as_array().unwrap() {
+        assert!(
+            t["outputSchema"].is_object(),
+            "tool {} must forward outputSchema: {t}",
+            t["name"]
+        );
+    }
 
     // Unknown method → -32601, server keeps running.
     let msg =
@@ -110,6 +120,15 @@ fn initialize_list_and_unknown_method() {
 fn docs_tools_work_through_mcp() {
     let tmp = tempfile::tempdir().unwrap();
     let mut c = McpClient::start_in(tmp.path());
+
+    // A successful tools/call mirrors its payload into structuredContent.
+    let result = c.request(
+        "tools/call",
+        serde_json::json!({"name": "jerrycan_docs_search", "arguments": {"query": "override_dep"}}),
+    );
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["structuredContent"]["results"][0]["page"], "testing");
+
     let (err, payload) = c.call_tool(
         "jerrycan_docs_search",
         serde_json::json!({"query": "override_dep"}),
