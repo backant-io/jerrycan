@@ -1,0 +1,9 @@
+# cargo-audit policy for the framework workspace (CI runs `cargo audit`).
+[advisories]
+ignore = [
+    # rsa: Marvin timing attack, no fixed release. Present in Cargo.lock only
+    # through sqlx's optional mysql driver, which no jerrycan crate or feature
+    # ever enables — it is never compiled into any artifact (cargo tree -i rsa
+    # is empty). Re-evaluate when sqlx ships a fixed rsa.
+    "RUSTSEC-2023-0071",
+]

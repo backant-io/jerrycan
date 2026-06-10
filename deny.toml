@@ -1,0 +1,10 @@
+# dependency policy for the framework workspace (CI runs `cargo deny check`).
+# Mirrors the policy jerrycan scaffolds into generated apps.
+[licenses]
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "ISC", "Zlib", "CDLA-Permissive-2.0"]
+[advisories]
+yanked = "deny"
+[bans]
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
