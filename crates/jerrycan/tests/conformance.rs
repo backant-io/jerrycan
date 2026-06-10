@@ -118,6 +118,176 @@ fn fresh_scaffold_passes_jerrycan_check() {
     assert!(out.status.success());
 }
 
+/// Scaffold the golden app in auth+observe mode (in-memory repos) against the
+/// LOCAL framework with auth+observe features.
+#[cfg(feature = "auth")]
+fn scaffold_golden_auth(tmp: &Path) -> PathBuf {
+    let mut design: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    design["dependencies"] = serde_json::json!(["auth", "observe"]);
+    design["auth"] = serde_json::json!({ "model": "session", "roles": ["admin"] });
+    for ep in design["modules"][0]["endpoints"].as_array_mut().unwrap() {
+        if ep["operation_id"] == "create_todo" {
+            ep["auth_required"] = serde_json::json!(true);
+        }
+        if ep["operation_id"] == "delete_todo" {
+            ep["required_roles"] = serde_json::json!(["admin"]);
+        }
+    }
+    // The comments subroute's create is mutating too: JL0004 demands every
+    // mutating route in an auth design be guarded, so mark it auth_required.
+    for ep in design["modules"][0]["subroutes"][0]["endpoints"]
+        .as_array_mut()
+        .unwrap()
+    {
+        if ep["operation_id"] == "create_comment" {
+            ep["auth_required"] = serde_json::json!(true);
+        }
+    }
+    for ep in design["modules"][1]["endpoints"].as_array_mut().unwrap() {
+        if ep["operation_id"] == "create_user" {
+            ep["auth_required"] = serde_json::json!(true);
+        }
+    }
+    let design_path = tmp.join("design.json");
+    std::fs::write(&design_path, serde_json::to_string_pretty(&design).unwrap()).unwrap();
+    let app = tmp.join("todo-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    app
+}
+
+/// Spec §4 Phase 3: an agent builds an AUTH-guarded, OBSERVED API. The generated
+/// app must build, pass the full gate (JL0004 satisfied — every mutation guarded),
+/// reject credential-less mutations with 401, accept admin-cookied ones, and
+/// expose observe's /healthz and /metrics.
+#[cfg(feature = "auth")]
+#[test]
+#[ignore = "heavy: auth+observe golden app builds, checks, and serves guarded routes"]
+fn auth_observe_app_builds_checks_and_guards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = scaffold_golden_auth(tmp.path());
+    for (fixture, target) in [
+        (
+            "auth/todos_handlers.rs",
+            "crates/routes/todos/src/handlers.rs",
+        ),
+        (
+            "auth/comments_handlers.rs",
+            "crates/routes/todos/src/subroutes/comments/handlers.rs",
+        ),
+        (
+            "auth/users_handlers.rs",
+            "crates/routes/users/src/handlers.rs",
+        ),
+    ] {
+        std::fs::copy(
+            repo_root().join("conformance/fixtures").join(fixture),
+            app.join(target),
+        )
+        .unwrap();
+    }
+
+    // Full gate green (JL0004 must be satisfied — guarded mutations).
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        payload["ok"], true,
+        "diagnostics: {}",
+        payload["diagnostics"]
+    );
+
+    // Serve and exercise guard behavior over real HTTP.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let addr = format!("127.0.0.1:{port}");
+    let mut server = Command::new("cargo")
+        .current_dir(&app)
+        .env("JERRYCAN_ADDR", &addr)
+        .env("JERRYCAN_SECRET", "a-very-long-development-secret-string!!")
+        .args(["run", "-p", "app"])
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(&addr).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    let http = |req: String| -> String {
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    // Public list works without auth.
+    assert!(
+        http("GET /todos/ HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n".into())
+            .starts_with("HTTP/1.1 200")
+    );
+    // Guarded create without a cookie → 401.
+    let body = r#"{"title":"x","done":false}"#;
+    let create = |cookie: &str| {
+        format!(
+            "POST /todos/ HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{body}",
+            body.len(),
+            cookie
+        )
+    };
+    assert!(
+        http(create("")).starts_with("HTTP/1.1 401"),
+        "no cookie → 401"
+    );
+    // Mint an admin cookie with the same secret and create successfully. The app
+    // has no /login route, so build the session cookie via jerrycan-auth in-test.
+    let cookie = {
+        let auth = jerrycan::auth::Auth::with_secret("a-very-long-development-secret-string!!");
+        let token = auth
+            .sessions()
+            .encode(&serde_json::json!({ "id": 1, "role": "admin" }))
+            .unwrap();
+        format!("Cookie: jerrycan_session={token}\r\n")
+    };
+    assert!(
+        http(create(&cookie)).starts_with("HTTP/1.1 201"),
+        "admin cookie → 201"
+    );
+    // Observe endpoints live.
+    assert_eq!(
+        http("GET /healthz HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n".into())
+            .lines()
+            .next()
+            .unwrap(),
+        "HTTP/1.1 200 OK"
+    );
+    assert!(
+        http("GET /metrics HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n".into())
+            .contains("jerrycan_requests_total")
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
 /// THE Phase 1 exit criterion: an agent builds a working multi-module CRUD
 /// service via MCP only (design → scaffold → implement → check → serve).
 #[test]
@@ -465,4 +635,258 @@ fn agent_builds_postgres_backed_api_test_first() {
         st.success(),
         "acceptance suite must be green against Postgres"
     );
+}
+
+/// Spec §11 Phase 3 exit: the golden app deploys to Docker + k8s + bare server
+/// from one command. Each leg is gated on its tool; missing tools SKIP that leg
+/// loudly. The binary (bare-server) leg is unconditional.
+///
+/// DOCKER leg — pre-publish reality: the EMITTED `deploy/Dockerfile` does an
+/// in-container `cargo build` of the generated app, which depends on `jerrycan`.
+/// Today jerrycan is UNPUBLISHED (crates.io has only 0.0.0 reservations) and the
+/// conformance scaffold wires a host PATH dep via `JERRYCAN_FRAMEWORK_DEP` that
+/// lives OUTSIDE the `COPY . .` build context — so `docker build -f
+/// deploy/Dockerfile` cannot fetch the framework and FAILS. The emitted
+/// Dockerfile is correct for the post-0.1.0 world and stays the default artifact.
+/// To PROVE the deploy-anywhere intent TODAY (a containerized jerrycan app serves
+/// over HTTP) we build a THIN runtime image from the host-built binary instead:
+/// the `--binary` artifact is copied into a minimal image and run. This needs a
+/// Linux-runnable binary; on a non-Linux host the host binary is the host OS's
+/// format and cannot run in a Linux container, so the docker leg SKIPs loudly.
+#[test]
+#[ignore = "heavy: package the golden app and prove binary/docker/k8s deploy paths"]
+fn golden_app_deploys_everywhere() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Reuse the memory-mode golden app (deploy paths are storage-agnostic).
+    let app = scaffold_golden(tmp.path());
+    for (fixture, target) in [
+        ("todos_handlers.rs", "crates/routes/todos/src/handlers.rs"),
+        (
+            "comments_handlers.rs",
+            "crates/routes/todos/src/subroutes/comments/handlers.rs",
+        ),
+        ("users_handlers.rs", "crates/routes/users/src/handlers.rs"),
+    ] {
+        std::fs::copy(
+            repo_root().join("conformance/fixtures").join(fixture),
+            app.join(target),
+        )
+        .unwrap();
+    }
+
+    // ONE command emits every artifact (after a green check gate).
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .args([
+            "--json",
+            "package",
+            "--binary",
+            "--docker",
+            "--k8s",
+            "--systemd",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "package failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let artifacts = payload["artifacts"].as_array().unwrap();
+    for expected in [
+        "deploy/Dockerfile",
+        "deploy/k8s.yaml",
+        "deploy/todo-api.service",
+        "deploy/todo-api",
+        "deploy/sbom.json",
+    ] {
+        assert!(
+            artifacts.iter().any(|a| a == expected) || app.join(expected).exists(),
+            "missing {expected}"
+        );
+    }
+    // SBOM is valid CycloneDX.
+    let sbom: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(app.join("deploy/sbom.json")).unwrap())
+            .unwrap();
+    assert_eq!(sbom["bomFormat"], "CycloneDX");
+    assert!(
+        sbom["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "tokio")
+    );
+
+    // BARE SERVER leg: run the built binary directly, curl it.
+    let port = pick_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut bin = Command::new(app.join("deploy/todo-api"))
+        .env("JERRYCAN_ADDR", &addr)
+        .spawn()
+        .expect("packaged binary runs");
+    await_listen(&addr, 60);
+    assert!(
+        http_get(&addr, "/todos/").starts_with("HTTP/1.1 200"),
+        "bare binary serves"
+    );
+    let _ = bin.kill();
+    let _ = bin.wait();
+
+    // DOCKER leg (gated): build a THIN runtime image from the host-built binary
+    // and run it (see the function doc for why we don't use the emitted, publish-
+    // gated, in-container-build Dockerfile here). Needs docker AND a Linux host
+    // (the host binary must be executable inside a Linux container).
+    if !tool_present("docker") {
+        eprintln!("SKIP docker leg: docker not present");
+    } else if std::env::consts::OS != "linux" {
+        eprintln!(
+            "SKIP docker leg: host is {} — the host-built binary is not a Linux \
+             executable and cannot run in a Linux container (CI proves this leg on Linux)",
+            std::env::consts::OS
+        );
+    } else {
+        // distroless/static needs a fully static (musl) binary; a dynamically
+        // linked gnu binary needs a glibc base. Pick the base to match.
+        let base = if musl_built(&app) {
+            "gcr.io/distroless/static:nonroot"
+        } else {
+            "debian:stable-slim"
+        };
+        let test_dockerfile = format!(
+            "FROM {base}\nCOPY deploy/todo-api /usr/local/bin/todo-api\n\
+             EXPOSE 8000\nENV JERRYCAN_ADDR=0.0.0.0:8000\n\
+             ENTRYPOINT [\"/usr/local/bin/todo-api\"]\n"
+        );
+        std::fs::write(app.join("Dockerfile.thin"), &test_dockerfile).unwrap();
+        let tag = "jerrycan-conformance:test";
+        let build = Command::new("docker")
+            .current_dir(&app)
+            .args(["build", "-f", "Dockerfile.thin", "-t", tag, "."])
+            .status()
+            .unwrap();
+        assert!(build.success(), "thin-image docker build");
+        let port = pick_port();
+        let run = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--rm",
+                "-p",
+                &format!("{port}:8000"),
+                "--name",
+                "jerrycan-conformance",
+                tag,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "docker run: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let addr = format!("127.0.0.1:{port}");
+        await_listen(&addr, 60);
+        let body = http_get(&addr, "/todos/");
+        let _ = Command::new("docker")
+            .args(["stop", "jerrycan-conformance"])
+            .status();
+        let _ = Command::new("docker").args(["rmi", "-f", tag]).status();
+        assert!(
+            body.starts_with("HTTP/1.1 200"),
+            "containerized app serves: {body}"
+        );
+    }
+
+    // K8S leg (gated): validate the manifests parse + are structurally appl-able.
+    // `kubectl apply --dry-run=client` still performs API-resource discovery
+    // against the cluster (it queries `/api` to map kinds), so it needs a
+    // reachable cluster — `--dry-run=client` is NOT cluster-free. We therefore
+    // gate on cluster reachability, not merely on kubectl being installed
+    // (`kubectl --version` is also not a valid flag — probe `version --client`).
+    if kubectl_present() && cluster_reachable() {
+        let out = Command::new("kubectl")
+            .current_dir(&app)
+            .args(["apply", "--dry-run=client", "-f", "deploy/k8s.yaml"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "kubectl dry-run: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    } else {
+        // Structural fallback: every YAML doc parses and has kind+apiVersion.
+        let y = std::fs::read_to_string(app.join("deploy/k8s.yaml")).unwrap();
+        let docs: Vec<&str> = y.split("\n---\n").collect();
+        assert_eq!(docs.len(), 3, "Deployment + Service + NetworkPolicy");
+        for d in docs {
+            assert!(
+                d.contains("apiVersion:") && d.contains("kind:"),
+                "valid manifest doc"
+            );
+        }
+        eprintln!(
+            "SKIP kubectl dry-run: no reachable cluster — used structural manifest validation"
+        );
+    }
+}
+
+// Small helpers for the deploy-anywhere test (no earlier-phase equivalents exist
+// in this file; the auth_observe test inlines its own closures).
+fn pick_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+fn tool_present(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+/// kubectl rejects `--version`; its client-only probe is `version --client`.
+fn kubectl_present() -> bool {
+    Command::new("kubectl")
+        .args(["version", "--client"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+/// `kubectl apply --dry-run=client` still discovers API resources from the
+/// cluster, so the dry-run leg only runs when a cluster is reachable.
+fn cluster_reachable() -> bool {
+    Command::new("kubectl")
+        .args(["cluster-info"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+fn await_listen(addr: &str, secs: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    panic!("nothing listening on {addr} after {secs}s");
+}
+fn http_get(addr: &str, path: &str) -> String {
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+/// True when `jerrycan package --binary` produced a static musl binary (so a
+/// distroless/static runtime base is appropriate); false ⇒ a gnu host binary.
+fn musl_built(app: &Path) -> bool {
+    app.join("target/x86_64-unknown-linux-musl/release/app")
+        .exists()
 }

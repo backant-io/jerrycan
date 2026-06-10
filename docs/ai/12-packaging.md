@@ -1,0 +1,40 @@
+# Packaging & Deployment
+
+`jerrycan package` turns a checked app into deployable artifacts. It runs the
+full verification gate first (build + clippy + audit + deny + tests + lints) and
+refuses to package a failing app. Nothing is deployed — artifacts land in
+`deploy/`, and you push them with your own tooling.
+
+## Targets
+- `--binary` — a release binary (static musl when available, host-target
+  fallback otherwise), copied to `deploy/<name>`.
+- `--docker` — `deploy/Dockerfile`: multi-stage, static musl build, distroless
+  non-root runtime, binds `0.0.0.0:8000`.
+- `--k8s` — `deploy/k8s.yaml`: Deployment + Service + NetworkPolicy, hardened
+  (`runAsNonRoot`, `readOnlyRootFilesystem`, dropped capabilities, resource
+  limits, `/healthz` probes).
+- `--systemd` — `deploy/<name>.service`: `DynamicUser`, `ProtectSystem=strict`,
+  `NoNewPrivileges`, `PrivateTmp`, restart-on-failure.
+
+Every run also emits `deploy/sbom.json` — a CycloneDX 1.5 software bill of
+materials from the full dependency graph.
+
+## Example
+```text
+jerrycan package --binary --docker --k8s --systemd
+# → deploy/{<name>, Dockerfile, k8s.yaml, <name>.service, sbom.json}
+docker build -f deploy/Dockerfile -t myapp .
+kubectl apply -f deploy/k8s.yaml
+```
+
+> The emitted `Dockerfile` does an in-container `cargo build`, so it fetches
+> `jerrycan` like any dependency — it works once `jerrycan` is published to
+> crates.io (or vendored into the build context). Until then, deploy via the
+> `--binary` artifact (copy it into a minimal runtime image yourself, or run it
+> under the systemd unit).
+
+## Production checklist
+- Set `JERRYCAN_SECRET` (>= 32 bytes) and `JERRYCAN_ENV=prod` (the systemd unit
+  sets the latter; provide the secret via your secrets manager).
+- Set `JERRYCAN_DATABASE_URL` for db-backed apps.
+- The container binds `0.0.0.0:8000`; the Service maps port 80 → 8000.

@@ -21,6 +21,14 @@ jerrycan-core = { path = "crates/jerrycan-core", version = "0.0.0" }
 jerrycan-macros = { path = "crates/jerrycan-macros", version = "0.0.0" }
 jerrycan-db = { path = "crates/jerrycan-db", version = "0.0.0" }
 jerrycan-validate = { path = "crates/jerrycan-validate", version = "0.0.0" }
+jerrycan-auth = { path = "crates/jerrycan-auth", version = "0.0.0" }
+jerrycan-observe = { path = "crates/jerrycan-observe", version = "0.0.0" }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server"] }
@@ -31,3 +39,5 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

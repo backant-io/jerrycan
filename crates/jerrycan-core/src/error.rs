@@ -49,6 +49,18 @@ impl Error {
     pub fn unprocessable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "JC0422", message)
     }
+    /// Authentication is required or failed (spec §4.4 auth).
+    pub fn unauthorized() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "JC0401",
+            "authentication required",
+        )
+    }
+    /// Authenticated but not permitted.
+    pub fn forbidden() -> Self {
+        Self::new(StatusCode::FORBIDDEN, "JC0403", "forbidden")
+    }
     /// The handler exceeded the configured time budget (spec §4.4 timeouts).
     pub fn handler_timeout() -> Self {
         Self::new(
@@ -134,6 +146,10 @@ mod tests {
             Error::handler_timeout().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+        assert_eq!(Error::unauthorized().code(), "JC0401");
+        assert_eq!(Error::unauthorized().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(Error::forbidden().code(), "JC0403");
+        assert_eq!(Error::forbidden().status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

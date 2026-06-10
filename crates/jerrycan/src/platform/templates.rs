@@ -116,6 +116,20 @@ publish = false
 serde.workspace = true
 "#;
 
+/// Auth mode: the shared crate also depends on `jerrycan` (workspace, carrying
+/// the app's `auth` feature) so the `CurrentUser = Session<SessionUser>` alias
+/// resolves and every module's guard agrees on one session type.
+pub const SHARED_CARGO_AUTH: &str = r#"[package]
+name = "shared"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+jerrycan.workspace = true
+serde.workspace = true
+"#;
+
 pub const SHARED_LIB: &str = r#"//! Cross-module DTOs only — keep deliberately tiny (a jerrycan lint guards growth).
 #![forbid(unsafe_code)]
 "#;

@@ -45,75 +45,107 @@ struct TestOut {
     code: String,
     todos: Vec<String>,
     count: usize,
+    /// Auth mode: success tests on guarded endpoints carry a session cookie and
+    /// every guarded endpoint also gets a no-cookie 401 test.
+    auth: bool,
+}
+
+/// A request expression `t.<verb>(...)`. In auth mode a guarded endpoint threads
+/// the test cookie via the `_with` helper variants; otherwise the plain verb.
+fn request_expr(unit: &ModuleDesign, ep: &Endpoint, path: &str, guarded_and_auth: bool) -> String {
+    let body = || {
+        ep.request_body
+            .as_ref()
+            .map(|rb| fixture_json(unit, &rb.entity))
+            .unwrap_or_else(|| "{}".to_string())
+    };
+    if guarded_and_auth {
+        let cookie = "&[(\"cookie\", &test_cookie())]";
+        match ep.method {
+            HttpMethod::GET => format!("t.get_with(\"{path}\", {cookie}).await"),
+            HttpMethod::DELETE => format!("t.delete_with(\"{path}\", {cookie}).await"),
+            HttpMethod::POST => format!(
+                "t.post_json_with(\"{path}\", &serde_json::json!({}), {cookie}).await",
+                body()
+            ),
+            HttpMethod::PUT => format!(
+                "t.put_json_with(\"{path}\", &serde_json::json!({}), {cookie}).await",
+                body()
+            ),
+            HttpMethod::PATCH => format!(
+                "t.patch_json_with(\"{path}\", &serde_json::json!({}), {cookie}).await",
+                body()
+            ),
+        }
+    } else {
+        match ep.method {
+            HttpMethod::GET => format!("t.get(\"{path}\").await"),
+            HttpMethod::DELETE => format!("t.delete(\"{path}\").await"),
+            HttpMethod::POST => {
+                format!(
+                    "t.post_json(\"{path}\", &serde_json::json!({})).await",
+                    body()
+                )
+            }
+            HttpMethod::PUT => {
+                format!(
+                    "t.put_json(\"{path}\", &serde_json::json!({})).await",
+                    body()
+                )
+            }
+            HttpMethod::PATCH => {
+                format!(
+                    "t.patch_json(\"{path}\", &serde_json::json!({})).await",
+                    body()
+                )
+            }
+        }
+    }
 }
 
 fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
+    let auth = out.auth;
     let seed = creator(unit).map(|ep| {
         let body = fixture_json(
             unit,
             &ep.request_body.as_ref().expect("creator has body").entity,
         );
-        format!("    t.post_json(\"{base}/\", &serde_json::json!({body})).await; // seed id 1\n")
+        // In auth mode a guarded creator needs the cookie to seed successfully.
+        if auth && ep.is_guarded() {
+            format!(
+                "    t.post_json_with(\"{base}/\", &serde_json::json!({body}), &[(\"cookie\", &test_cookie())]).await; // seed id 1\n"
+            )
+        } else {
+            format!("    t.post_json(\"{base}/\", &serde_json::json!({body})).await; // seed id 1\n")
+        }
     });
 
     for ep in &unit.endpoints {
         let full_path = format!("{}{}", base.trim_end_matches('/'), ep.path);
         let fn_base = &ep.operation_id;
         let status = ep.success.status;
+        let guarded = auth && ep.is_guarded();
 
         if param_count(ep) == 0 {
-            let body_arg = ep
-                .request_body
-                .as_ref()
-                .map(|rb| fixture_json(unit, &rb.entity));
-            let body_or_empty = body_arg.unwrap_or_else(|| "{}".to_string());
-            let request = match ep.method {
-                HttpMethod::GET => format!("t.get(\"{full_path}\").await"),
-                HttpMethod::DELETE => format!("t.delete(\"{full_path}\").await"),
-                HttpMethod::POST => {
-                    format!(
-                        "t.post_json(\"{full_path}\", &serde_json::json!({body_or_empty})).await"
-                    )
-                }
-                HttpMethod::PUT => {
-                    format!(
-                        "t.put_json(\"{full_path}\", &serde_json::json!({body_or_empty})).await"
-                    )
-                }
-                HttpMethod::PATCH => format!(
-                    "t.patch_json(\"{full_path}\", &serde_json::json!({body_or_empty})).await"
-                ),
-            };
+            let request = request_expr(unit, ep, &full_path, guarded);
             out.code.push_str(&format!(
                 "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n}}\n\n"
             ));
             out.count += 1;
+            if guarded {
+                push_401_test(out, unit, ep, &full_path, false);
+            }
         } else if param_count(ep) == 1 && seed.is_some() {
             let seeded_path = full_path.replacen(&regex_free_param(&ep.path), "1", 1);
-            let request = match ep.method {
-                HttpMethod::GET => format!("t.get(\"{seeded_path}\").await"),
-                HttpMethod::DELETE => format!("t.delete(\"{seeded_path}\").await"),
-                HttpMethod::PUT | HttpMethod::PATCH | HttpMethod::POST => {
-                    let b = ep
-                        .request_body
-                        .as_ref()
-                        .map(|rb| fixture_json(unit, &rb.entity))
-                        .unwrap_or_else(|| "{}".into());
-                    format!(
-                        "t.{}(\"{seeded_path}\", &serde_json::json!({b})).await",
-                        match ep.method {
-                            HttpMethod::PUT => "put_json",
-                            HttpMethod::PATCH => "patch_json",
-                            _ => "post_json",
-                        }
-                    )
-                }
-            };
+            let request = request_expr(unit, ep, &seeded_path, guarded);
             out.code.push_str(&format!(
                 "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n}}\n\n",
                 seed = seed.as_deref().unwrap_or("")
             ));
             out.count += 1;
+            if guarded {
+                push_401_test(out, unit, ep, &seeded_path, seed.is_some());
+            }
         } else if param_count(ep) >= 1 {
             out.todos.push(format!(
                 "// AGENT TODO: {fn_base} ({:?} {full_path}) needs a creator at \"/\" to seed ids — encode its success case in your own test file.",
@@ -124,9 +156,22 @@ fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
         for ec in &ep.errors {
             if ec.status == 404 && param_count(ep) == 1 {
                 let missing_path = full_path.replacen(&regex_free_param(&ep.path), "999999", 1);
-                let request = match ep.method {
-                    HttpMethod::DELETE => format!("t.delete(\"{missing_path}\").await"),
-                    _ => format!("t.get(\"{missing_path}\").await"),
+                // Guarded endpoints run the auth guard before not-found logic, so
+                // a credential-less request would 401; thread the cookie here.
+                let request = if guarded {
+                    match ep.method {
+                        HttpMethod::DELETE => format!(
+                            "t.delete_with(\"{missing_path}\", &[(\"cookie\", &test_cookie())]).await"
+                        ),
+                        _ => format!(
+                            "t.get_with(\"{missing_path}\", &[(\"cookie\", &test_cookie())]).await"
+                        ),
+                    }
+                } else {
+                    match ep.method {
+                        HttpMethod::DELETE => format!("t.delete(\"{missing_path}\").await"),
+                        _ => format!("t.get(\"{missing_path}\").await"),
+                    }
                 };
                 out.code.push_str(&format!(
                     "#[tokio::test]\nasync fn {fn_base}_missing_id_is_404() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 404, \"design: {fn_base} lists 404 ({when}); body: {{}}\", res.text());\n}}\n\n",
@@ -148,6 +193,17 @@ fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
     }
 }
 
+/// A `{op}_without_auth_is_401` test: the guard extractor runs first, so a
+/// credential-less request is rejected before any handler logic — no seed needed.
+fn push_401_test(out: &mut TestOut, unit: &ModuleDesign, ep: &Endpoint, path: &str, _seeded: bool) {
+    let fn_base = &ep.operation_id;
+    let request = request_expr(unit, ep, path, false); // no cookie
+    out.code.push_str(&format!(
+        "#[tokio::test]\nasync fn {fn_base}_without_auth_is_401() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 401, \"design: {fn_base} is guarded — no cookie must 401; body: {{}}\", res.text());\n}}\n\n"
+    ));
+    out.count += 1;
+}
+
 /// "{id}" as it appears inside the full path (the literal brace token).
 fn regex_free_param(path: &str) -> String {
     let start = path.find('{').expect("parameterized path");
@@ -155,17 +211,42 @@ fn regex_free_param(path: &str) -> String {
     path[start..=end].to_string()
 }
 
+/// The fixed dev secret the test app and `test_cookie()` share so the minted
+/// session cookie decrypts against the app's `Auth` extension.
+const TEST_SECRET: &str = "a-very-long-development-secret-string!!";
+
+/// In auth mode: a test-only login shim that mints a session cookie directly via
+/// the `Auth` extension (no app `/login` route needed), plus the `.extend(Auth)`
+/// the app() helper adds so the SAME secret decrypts the cookie.
+fn auth_preamble_login() -> String {
+    format!(
+        "fn test_cookie() -> String {{\n    let auth = jerrycan::auth::Auth::with_secret(\"{TEST_SECRET}\");\n    let token = auth.sessions().encode(&shared::SessionUser {{ id: 1, role: \"admin\".into() }}).expect(\"encode\");\n    format!(\"jerrycan_session={{token}}\")\n}}\n\n"
+    )
+}
+
 fn preamble(design: &Design, module: &ModuleDesign) -> String {
     let mount = module.effective_mount();
+    let auth_login = if design.wants_auth() {
+        auth_preamble_login()
+    } else {
+        String::new()
+    };
+    // The auth extension must register before the guards resolve it; it leads the
+    // App chain (and shares TEST_SECRET with test_cookie()).
+    let auth_extend = if design.wants_auth() {
+        format!(".extend(jerrycan::auth::Auth::with_secret(\"{TEST_SECRET}\"))")
+    } else {
+        String::new()
+    };
     if design.wants_db() {
         let mut migration_items = String::new();
         collect_migration_items(module, &mut migration_items);
         format!(
-            "async fn app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n    App::new().extend(db).mount(\"{mount}\", module()).into_test()\n}}\n"
+            "{auth_login}async fn app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n    App::new(){auth_extend}.extend(db).mount(\"{mount}\", module()).into_test()\n}}\n"
         )
     } else {
         format!(
-            "async fn app() -> TestApp {{\n    App::new().mount(\"{mount}\", module()).into_test()\n}}\n"
+            "{auth_login}async fn app() -> TestApp {{\n    App::new(){auth_extend}.mount(\"{mount}\", module()).into_test()\n}}\n"
         )
     }
 }
@@ -197,6 +278,7 @@ pub fn acceptance_rs(design: &Design, module: &ModuleDesign) -> String {
         code: String::new(),
         todos: Vec::new(),
         count: 0,
+        auth: design.wants_auth(),
     };
     unit_tests(module, &module.effective_mount(), &mut out);
     let todos = if out.todos.is_empty() {

@@ -197,6 +197,7 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                         .expect("validated above");
                     let mode = genroute::GenMode {
                         db: design.wants_db(),
+                        auth: design.wants_auth(),
                     };
                     let created =
                         match genroute::write_module(&root.join("crates/routes"), top, mode) {
@@ -294,13 +295,37 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                 Err(e) => err_payload(e),
             }
         }
-        "jerrycan_package" => (
-            true,
-            json!({
-                "error": "jerrycan_package arrives in Phase 3 (per the roadmap)",
-                "next_step": "verify with jerrycan_check; packaging targets land with jerrycan-observe/auth",
-            }),
-        ),
+        "jerrycan_package" => {
+            let root = root_from(args);
+            let design = match Design::from_path(&root.join("design.json")) {
+                Ok(d) => d,
+                Err(e) => return err_payload(e),
+            };
+            // The frozen contract takes ONE singular `target`; map it to the
+            // matching bool and run the same orchestration as the CLI.
+            let (docker, k8s, systemd, binary) = match args["target"].as_str() {
+                Some("docker") => (true, false, false, false),
+                Some("k8s") => (false, true, false, false),
+                Some("systemd") => (false, false, true, false),
+                Some("binary") => (false, false, false, true),
+                other => {
+                    return err_payload(format!(
+                        "`target` must be one of docker|binary|k8s|systemd, got {other:?}"
+                    ));
+                }
+            };
+            match super::package::run_package(&root, &design, docker, k8s, systemd, binary) {
+                Ok((artifacts, sbom)) => (
+                    false,
+                    json!({
+                        "artifacts": artifacts,
+                        "sbom": sbom,
+                        "next_step": "deploy with your own tooling (kubectl apply -f deploy/k8s.yaml, docker build, scp the binary + systemd unit)",
+                    }),
+                ),
+                Err(e) => err_payload(e),
+            }
+        }
 
         other => (true, json!({ "error": format!("unknown tool `{other}`") })),
     }

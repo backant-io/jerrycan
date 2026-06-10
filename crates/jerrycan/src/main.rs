@@ -4,7 +4,7 @@
 use clap::{Parser, Subcommand};
 use jerrycan::platform::design::Design;
 use jerrycan::platform::{
-    EXIT_OK, EXIT_USAGE, Failure, checkpipe, genroute, mounting, questions, scaffold,
+    EXIT_OK, EXIT_USAGE, Failure, checkpipe, genroute, mounting, package, questions, scaffold,
 };
 use std::path::{Path, PathBuf};
 
@@ -73,6 +73,21 @@ enum Cmd {
     Db {
         #[command(subcommand)]
         what: DbCmd,
+    },
+    /// Emit hardened deployment artifacts + SBOM after a green check
+    Package {
+        /// Emit a hardened multi-stage Dockerfile
+        #[arg(long)]
+        docker: bool,
+        /// Build a release binary (musl static, host fallback)
+        #[arg(long)]
+        binary: bool,
+        /// Emit hardened Kubernetes manifests (Deployment/Service/NetworkPolicy)
+        #[arg(long)]
+        k8s: bool,
+        /// Emit a hardened systemd unit
+        #[arg(long)]
+        systemd: bool,
     },
     /// Serve MCP over stdio
     Mcp,
@@ -150,6 +165,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Db {
             what: DbCmd::Migrate { url },
         } => cmd_db_migrate(url.as_deref(), cli.json),
+        Cmd::Package {
+            docker,
+            binary,
+            k8s,
+            systemd,
+        } => cmd_package(docker, binary, k8s, systemd, cli.json),
         Cmd::Mcp => jerrycan::platform::mcp::serve_stdio().map_err(Failure::environment),
     }
 }
@@ -280,6 +301,7 @@ fn cmd_generate_route(module_path: &str, json_mode: bool) -> Result<(), Failure>
         .expect("checked above");
     let mode = genroute::GenMode {
         db: design.wants_db(),
+        auth: design.wants_auth(),
     };
     let created = genroute::write_module(&root.join("crates/routes"), top_module, mode)
         .map_err(Failure::gate)?;
@@ -347,6 +369,7 @@ fn cmd_add(extension: &str, json_mode: bool) -> Result<(), Failure> {
     // for EXISTING modules — agents migrate those by hand; new scaffolds get SQL).
     let mode = genroute::GenMode {
         db: design.wants_db(),
+        auth: design.wants_auth(),
     };
     for m in &design.modules {
         genroute::write_module(&root.join("crates/routes"), m, mode).map_err(Failure::gate)?;
@@ -409,6 +432,33 @@ fn cmd_db_migrate(url: Option<&str>, json_mode: bool) -> Result<(), Failure> {
             "applied {} migration(s)",
             payload["applied"].as_array().map(Vec::len).unwrap_or(0)
         ),
+    );
+    Ok(())
+}
+
+fn cmd_package(
+    docker: bool,
+    binary: bool,
+    k8s: bool,
+    systemd: bool,
+    json_mode: bool,
+) -> Result<(), Failure> {
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+
+    // The CLI and the MCP `jerrycan_package` tool share this one orchestration.
+    let (artifacts, sbom) = package::run_package(&root, &design, docker, k8s, systemd, binary)
+        .map_err(Failure::gate)?;
+
+    let payload = serde_json::json!({
+        "artifacts": artifacts,
+        "sbom": sbom,
+        "next_step": "deploy with your own tooling (kubectl apply -f deploy/k8s.yaml, docker build, scp the binary + systemd unit)",
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!("packaged {} artifact(s)", artifacts.len()),
     );
     Ok(())
 }

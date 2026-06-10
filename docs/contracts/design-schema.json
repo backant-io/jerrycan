@@ -30,7 +30,8 @@
             "none",
             "session",
             "jwt"
-          ]
+          ],
+          "description": "A non-'none' model ('session'|'jwt') activates auth-mode generation: it implies the 'auth' dependency, wires the Auth extension, and turns auth_required/required_roles endpoints into guarded handlers (Session/Bearer extractors + require_role)."
         },
         "roles": {
           "type": "array",
@@ -55,7 +56,7 @@
       "items": {
         "type": "string"
       },
-      "description": "App-scoped dependency names. Reserved names: 'db' (SQL storage via jerrycan-db: SQL repos, migrations, Db dependency) and 'validate' (OpenAPI document served at /openapi.json). Other names are stubs the generator reminds you to provide."
+      "description": "App-scoped dependency names. Reserved names: 'db' (SQL storage via jerrycan-db: SQL repos, migrations, Db dependency), 'validate' (OpenAPI document served at /openapi.json), 'auth' (session/JWT guards + the Auth extension; also implied by a non-'none' auth.model), and 'observe' (access-log middleware + /healthz and Prometheus /metrics). Other names are stubs the generator reminds you to provide."
     }
   },
   "$defs": {

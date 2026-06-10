@@ -7,6 +7,13 @@ use super::templates::*;
 use std::fs;
 use std::path::Path;
 
+/// The session-user type + guard alias appended to the shared crate's lib.rs in
+/// auth mode. `CurrentUser` is what handler stubs extract, so every module's
+/// guard agrees on one app-wide session payload.
+fn shared_auth_types() -> &'static str {
+    "\n/// The session payload (app-wide). Generated because the design declares auth.\n#[derive(serde::Serialize, serde::Deserialize, Clone)]\npub struct SessionUser {\n    pub id: i64,\n    pub role: String,\n}\n\n/// The guard extractor handlers use: a decrypted session.\npub type CurrentUser = jerrycan::auth::Session<SessionUser>;\n"
+}
+
 /// Canonical on-disk form of design.json (pretty, trailing newline) — both
 /// scaffold and the MCP design tool write exactly this, so diffs stay clean.
 pub fn canonical_design_json(design: &Design) -> String {
@@ -65,13 +72,7 @@ pub fn scaffold(target: &Path, design: &Design) -> Result<Vec<String>, String> {
         Ok(())
     };
 
-    let mut features: Vec<&str> = Vec::new();
-    if design.wants_db() {
-        features.push("db");
-    }
-    if design.wants_validate() {
-        features.push("validate");
-    }
+    let features = design.facade_features();
     let dep_line = jerrycan_dep_spec(&features);
     write(
         "Cargo.toml",
@@ -90,14 +91,25 @@ pub fn scaffold(target: &Path, design: &Design) -> Result<Vec<String>, String> {
         "crates/app/Cargo.toml",
         &render(APP_CARGO, &[("route_deps", "")])?,
     )?;
-    write("crates/shared/Cargo.toml", SHARED_CARGO)?;
-    write("crates/shared/src/lib.rs", SHARED_LIB)?;
+    // Auth mode: the shared crate gains `jerrycan` (for the Session alias) and a
+    // session-user type + CurrentUser alias all guards across modules agree on.
+    if design.wants_auth() {
+        write("crates/shared/Cargo.toml", SHARED_CARGO_AUTH)?;
+        write(
+            "crates/shared/src/lib.rs",
+            &format!("{SHARED_LIB}{}", shared_auth_types()),
+        )?;
+    } else {
+        write("crates/shared/Cargo.toml", SHARED_CARGO)?;
+        write("crates/shared/src/lib.rs", SHARED_LIB)?;
+    }
     // `write` (which borrows `created`) is unused past here, so NLL ends the
     // borrow and policy files can extend `created` directly.
     created.extend(write_policy_files(target, design)?);
 
     let mode = genroute::GenMode {
         db: design.wants_db(),
+        auth: design.wants_auth(),
     };
     let routes_dir = target.join("crates/routes");
     for m in &design.modules {

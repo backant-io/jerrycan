@@ -2,9 +2,10 @@
 //! JL0001 route-crate lib.rs exports more than `module()`
 //! JL0002 handler names don't match design operation_ids
 //! JL0003 a generated (tool-owned) file was hand-edited
+//! JL0004 an auth design leaves a mutating route unguarded
 
 use super::checkpipe::Diagnostic;
-use super::design::{Design, ModuleDesign};
+use super::design::{Design, HttpMethod, ModuleDesign};
 use super::mounting;
 use std::path::Path;
 
@@ -33,7 +34,43 @@ pub fn run(root: &Path, design: &Design) -> Vec<Diagnostic> {
         lint_handlers(root, m, &format!("crates/routes/{}/src", m.name), &mut out);
     }
     lint_generated_drift(root, design, &mut out);
+    lint_unguarded_mutations(design, &mut out);
     out
+}
+
+/// JL0004: in an auth design, a mutating route (POST/PUT/PATCH/DELETE) whose
+/// design endpoint is NOT guarded (no auth_required, no required_roles).
+fn lint_unguarded_mutations(design: &Design, out: &mut Vec<Diagnostic>) {
+    if !design.wants_auth() {
+        return;
+    }
+    fn walk(m: &ModuleDesign, out: &mut Vec<Diagnostic>) {
+        for ep in &m.endpoints {
+            let mutating = matches!(
+                ep.method,
+                HttpMethod::POST | HttpMethod::PUT | HttpMethod::PATCH | HttpMethod::DELETE
+            );
+            if mutating && !ep.is_guarded() {
+                out.push(d(
+                    "JL0004",
+                    Some("design.json".into()),
+                    None,
+                    format!(
+                        "mutating route `{}` in module `{}` has no auth guard (design declares auth)",
+                        ep.operation_id, m.name
+                    ),
+                    "set auth_required: true or required_roles in design.json",
+                    "jerrycan docs auth",
+                ));
+            }
+        }
+        for sub in &m.subroutes {
+            walk(sub, out);
+        }
+    }
+    for m in &design.modules {
+        walk(m, out);
+    }
 }
 
 /// JL0001: scan a route crate's lib.rs for public items besides `pub fn module()`.

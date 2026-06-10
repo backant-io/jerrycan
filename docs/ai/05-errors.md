@@ -56,6 +56,8 @@ assert_eq!(all[0].code(), "JC0400");
 | Code | Status | Produced when |
 |---|---|---|
 | JC0400 | 400 | Bad path param / query string / malformed percent-encoding in path |
+| JC0401 | 401 | Authentication required or failed (jerrycan::auth) |
+| JC0403 | 403 | Authenticated but not permitted (require_role) |
 | JC0404 | 404 | No route matched, or `Error::not_found()` |
 | JC0405 | 405 | Path exists, method doesn't |
 | JC0408 | 408 | Request body wasn't received within the read budget (default 30s) |

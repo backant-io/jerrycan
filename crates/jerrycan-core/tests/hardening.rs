@@ -241,6 +241,22 @@ async fn malformed_path_encoding_is_400_jc0400() {
 }
 
 #[tokio::test]
+async fn test_requests_can_carry_headers() {
+    use jerrycan_core::{App, Headers, get};
+    async fn echo_auth(headers: Headers) -> String {
+        headers.get("authorization").unwrap_or("none").to_string()
+    }
+    let t = App::new().route("/h", get(echo_auth)).into_test();
+    assert_eq!(t.get("/h").await.text(), "none");
+    assert_eq!(
+        t.get_with("/h", &[("authorization", "Bearer xyz")])
+            .await
+            .text(),
+        "Bearer xyz"
+    );
+}
+
+#[tokio::test]
 async fn multi_param_paths_extract_in_route_order() {
     use jerrycan_core::Path;
     async fn pair(Path((a, b)): Path<(i64, String)>) -> String {
