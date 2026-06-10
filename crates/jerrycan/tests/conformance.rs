@@ -118,6 +118,176 @@ fn fresh_scaffold_passes_jerrycan_check() {
     assert!(out.status.success());
 }
 
+/// Scaffold the golden app in auth+observe mode (in-memory repos) against the
+/// LOCAL framework with auth+observe features.
+#[cfg(feature = "auth")]
+fn scaffold_golden_auth(tmp: &Path) -> PathBuf {
+    let mut design: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    design["dependencies"] = serde_json::json!(["auth", "observe"]);
+    design["auth"] = serde_json::json!({ "model": "session", "roles": ["admin"] });
+    for ep in design["modules"][0]["endpoints"].as_array_mut().unwrap() {
+        if ep["operation_id"] == "create_todo" {
+            ep["auth_required"] = serde_json::json!(true);
+        }
+        if ep["operation_id"] == "delete_todo" {
+            ep["required_roles"] = serde_json::json!(["admin"]);
+        }
+    }
+    // The comments subroute's create is mutating too: JL0004 demands every
+    // mutating route in an auth design be guarded, so mark it auth_required.
+    for ep in design["modules"][0]["subroutes"][0]["endpoints"]
+        .as_array_mut()
+        .unwrap()
+    {
+        if ep["operation_id"] == "create_comment" {
+            ep["auth_required"] = serde_json::json!(true);
+        }
+    }
+    for ep in design["modules"][1]["endpoints"].as_array_mut().unwrap() {
+        if ep["operation_id"] == "create_user" {
+            ep["auth_required"] = serde_json::json!(true);
+        }
+    }
+    let design_path = tmp.join("design.json");
+    std::fs::write(&design_path, serde_json::to_string_pretty(&design).unwrap()).unwrap();
+    let app = tmp.join("todo-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    app
+}
+
+/// Spec §4 Phase 3: an agent builds an AUTH-guarded, OBSERVED API. The generated
+/// app must build, pass the full gate (JL0004 satisfied — every mutation guarded),
+/// reject credential-less mutations with 401, accept admin-cookied ones, and
+/// expose observe's /healthz and /metrics.
+#[cfg(feature = "auth")]
+#[test]
+#[ignore = "heavy: auth+observe golden app builds, checks, and serves guarded routes"]
+fn auth_observe_app_builds_checks_and_guards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = scaffold_golden_auth(tmp.path());
+    for (fixture, target) in [
+        (
+            "auth/todos_handlers.rs",
+            "crates/routes/todos/src/handlers.rs",
+        ),
+        (
+            "auth/comments_handlers.rs",
+            "crates/routes/todos/src/subroutes/comments/handlers.rs",
+        ),
+        (
+            "auth/users_handlers.rs",
+            "crates/routes/users/src/handlers.rs",
+        ),
+    ] {
+        std::fs::copy(
+            repo_root().join("conformance/fixtures").join(fixture),
+            app.join(target),
+        )
+        .unwrap();
+    }
+
+    // Full gate green (JL0004 must be satisfied — guarded mutations).
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        payload["ok"], true,
+        "diagnostics: {}",
+        payload["diagnostics"]
+    );
+
+    // Serve and exercise guard behavior over real HTTP.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let addr = format!("127.0.0.1:{port}");
+    let mut server = Command::new("cargo")
+        .current_dir(&app)
+        .env("JERRYCAN_ADDR", &addr)
+        .env("JERRYCAN_SECRET", "a-very-long-development-secret-string!!")
+        .args(["run", "-p", "app"])
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(&addr).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    let http = |req: String| -> String {
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    // Public list works without auth.
+    assert!(
+        http("GET /todos/ HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n".into())
+            .starts_with("HTTP/1.1 200")
+    );
+    // Guarded create without a cookie → 401.
+    let body = r#"{"title":"x","done":false}"#;
+    let create = |cookie: &str| {
+        format!(
+            "POST /todos/ HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{body}",
+            body.len(),
+            cookie
+        )
+    };
+    assert!(
+        http(create("")).starts_with("HTTP/1.1 401"),
+        "no cookie → 401"
+    );
+    // Mint an admin cookie with the same secret and create successfully. The app
+    // has no /login route, so build the session cookie via jerrycan-auth in-test.
+    let cookie = {
+        let auth = jerrycan::auth::Auth::with_secret("a-very-long-development-secret-string!!");
+        let token = auth
+            .sessions()
+            .encode(&serde_json::json!({ "id": 1, "role": "admin" }))
+            .unwrap();
+        format!("Cookie: jerrycan_session={token}\r\n")
+    };
+    assert!(
+        http(create(&cookie)).starts_with("HTTP/1.1 201"),
+        "admin cookie → 201"
+    );
+    // Observe endpoints live.
+    assert_eq!(
+        http("GET /healthz HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n".into())
+            .lines()
+            .next()
+            .unwrap(),
+        "HTTP/1.1 200 OK"
+    );
+    assert!(
+        http("GET /metrics HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n".into())
+            .contains("jerrycan_requests_total")
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
 /// THE Phase 1 exit criterion: an agent builds a working multi-module CRUD
 /// service via MCP only (design → scaffold → implement → check → serve).
 #[test]
