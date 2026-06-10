@@ -30,7 +30,8 @@
             "none",
             "session",
             "jwt"
-          ]
+          ],
+          "description": "A non-'none' model ('session'|'jwt') activates auth-mode generation: it implies the 'auth' dependency, wires the Auth extension, and turns auth_required/required_roles endpoints into guarded handlers (Session/Bearer extractors + require_role)."
         },
         "roles": {
           "type": "array",

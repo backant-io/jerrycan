@@ -46,4 +46,12 @@ mod doc_tests {
     doc_page!(page_08_database, "../../../docs/ai/08-database.md");
     #[cfg(feature = "validate")]
     doc_page!(page_09_validation, "../../../docs/ai/09-validation.md");
+    #[cfg(feature = "auth")]
+    doc_page!(page_10_auth, "../../../docs/ai/10-auth.md");
+    #[cfg(feature = "observe")]
+    doc_page!(
+        page_11_observability,
+        "../../../docs/ai/11-observability.md"
+    );
+    doc_page!(page_12_packaging, "../../../docs/ai/12-packaging.md");
 }

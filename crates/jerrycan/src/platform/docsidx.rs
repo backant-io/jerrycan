@@ -29,6 +29,15 @@ pub const PAGES: &[(&str, &str)] = &[
         "validation",
         include_str!("../../../../docs/ai/09-validation.md"),
     ),
+    ("auth", include_str!("../../../../docs/ai/10-auth.md")),
+    (
+        "observability",
+        include_str!("../../../../docs/ai/11-observability.md"),
+    ),
+    (
+        "packaging",
+        include_str!("../../../../docs/ai/12-packaging.md"),
+    ),
 ];
 
 fn slug(heading: &str) -> String {

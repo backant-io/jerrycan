@@ -17,6 +17,10 @@
 - json-typed entity fields in db mode (structured columns)
 - Postgres advisory lock around the migration runner (concurrent replica startups can race the tracking table; today: run migrations as a single pre-deploy step)
 - OpenAPI: merge duplicate-status error descriptions per endpoint (today: last-wins)
+- OAuth2/OIDC flows and refresh tokens (v0 ships sessions + HS256 JWT only)
+- RS256/asymmetric JWT signing (v0 is HS256 symmetric)
+- per-route rate limiting as a first-class extension (today: write a middleware)
+- multi-arch container images (v0 Dockerfile is x86_64; add buildx arm64)
 
 ## Accepted v0 limitations
 

@@ -26,7 +26,7 @@ jerrycan is two inseparable halves:
 
 **Humans don't write the code — agents do**, guided by documentation where every example is a compiling, *running* doc-test, and by machine-readable contracts for every tool.
 
-> **Status: early development.** Phases 0 (core API + frozen contracts), 1 (CLI + MCP core loop), and 2 (data & test-first generation) are complete and fully tested. The crates on crates.io are `0.0.0` name reservations — the first usable release will be `0.1.0`. Don't build on it yet; watch it grow.
+> **Status: early development.** Phases 0 (core API + frozen contracts), 1 (CLI + MCP core loop), 2 (data & test-first generation), and 3 (auth, observability, `jerrycan package`) are complete and fully tested. The crates on crates.io are `0.0.0` name reservations — the first usable release will be `0.1.0`. Don't build on it yet; watch it grow.
 
 ## A taste
 
@@ -80,7 +80,7 @@ assert_eq!(t.get("/todos/").await.status(), jerrycan::http::StatusCode::OK);
 | **Fail loud** | Conflicting routes are build-time errors, before serving. Missing dependencies and cycles are coded errors, not mysteries. |
 | **TDD as a workflow, not a virtue** | The MCP tools enforce design-first → failing acceptance tests → implement → verify → package. The design becomes executable acceptance criteria. |
 | **Multi-agent ready** | Generated apps are crate-per-module workspaces: one agent owns one route crate, the compiler enforces the boundaries, shared files are generator-owned. Parallel agents merge without conflicts. |
-| **Deploy anywhere** | `jerrycan package` (Phase 3) produces static binaries, hardened container images, k8s manifests, or systemd units — with an SBOM. |
+| **Deploy anywhere** | `jerrycan package` produces static binaries, hardened container images, k8s manifests, or systemd units — with an SBOM. |
 
 ## Architecture
 
@@ -90,9 +90,9 @@ crates/
 ├── jerrycan-core     # routing, extractors, DI, modules, middleware, errors, test client
 ├── jerrycan-macros   # #[jerrycan::main]
 ├── jerrycan-db       # SQL + migrations
-├── jerrycan-auth     # sessions, JWT, guards       (Phase 3)
+├── jerrycan-auth     # sessions, JWT, guards
 ├── jerrycan-validate # validation + OpenAPI
-└── jerrycan-observe  # logs, /healthz, /metrics    (Phase 3)
+└── jerrycan-observe  # logs, /healthz, /metrics
 docs/
 ├── ai/               # the AI-native docs — every example is a CI-run doc-test
 └── contracts/        # MCP tool schemas, design.json schema, CLI UX spec
@@ -116,8 +116,8 @@ jerrycan_package  → hardened artifacts + SBOM, only when everything is green
 | **0 — Contracts** | Core API spike (DI, modules, routing, serving) + AI docs + MCP/CLI contracts | ✅ complete |
 | **1 — Core loop** | `jerrycan` CLI (new/generate/dev/check) + MCP server | ✅ complete (incl. 1b hardening) |
 | **2 — Data & TDD** | jerrycan-db, jerrycan-validate + OpenAPI, per-module test generation | ✅ complete |
-| **3 — Production** | jerrycan-auth, jerrycan-observe, `jerrycan package` (Docker/k8s/binary/systemd) | next |
-| **4 — Hardening** | Fuzzing, agent evals, diagnostics polish → v0.1.0 | |
+| **3 — Production** | jerrycan-auth, jerrycan-observe, `jerrycan package` (Docker/k8s/binary/systemd) | ✅ complete |
+| **4 — Hardening** | Fuzzing, agent evals, diagnostics polish → v0.1.0 | next |
 
 The full plan lives in the [design spec](docs/superpowers/specs/2026-06-09-jerrycan-design.md); deferred items are tracked in the [phase 1 backlog](docs/phase1-backlog.md).
 
