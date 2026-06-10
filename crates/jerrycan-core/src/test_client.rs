@@ -67,10 +67,44 @@ impl TestApp {
         .await
     }
 
+    /// GET with explicit request headers (auth tests, content negotiation).
+    pub async fn get_with(&self, path: &str, headers: &[(&str, &str)]) -> TestResponse {
+        self.request_with(Method::GET, path, None, headers).await
+    }
+
+    /// POST JSON with explicit request headers.
+    pub async fn post_json_with<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+    ) -> TestResponse {
+        self.request_with(
+            Method::POST,
+            path,
+            Some(serde_json::to_vec(body).expect("serialize")),
+            headers,
+        )
+        .await
+    }
+
     async fn request(&self, method: Method, path: &str, json: Option<Vec<u8>>) -> TestResponse {
+        self.request_with(method, path, json, &[]).await
+    }
+
+    async fn request_with(
+        &self,
+        method: Method,
+        path: &str,
+        json: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> TestResponse {
         let mut builder = http::Request::builder().method(method).uri(path);
         if json.is_some() {
             builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
         }
         let req = builder.body(()).expect("test request build");
         let (parts, ()) = req.into_parts();

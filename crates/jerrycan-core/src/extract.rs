@@ -141,6 +141,22 @@ impl<T: DeserializeOwned + Send> FromRequest for Json<T> {
     }
 }
 
+/// Read-only access to request headers in a handler signature.
+pub struct Headers(pub(crate) http::HeaderMap);
+
+impl Headers {
+    /// Header value as a &str, or None if absent or non-ASCII.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).and_then(|v| v.to_str().ok())
+    }
+}
+
+impl FromRequest for Headers {
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        Ok(Headers(ctx.headers().clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
