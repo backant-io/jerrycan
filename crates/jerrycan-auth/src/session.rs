@@ -1,5 +1,5 @@
 //! Session cookies: server-private state, ChaCha20-Poly1305 AEAD
-//! (confidential + tamper-evident). Wire format: base64url(nonce[12] ‖ ciphertext+tag).
+//! (confidential + tamper-evident). Wire format: `base64url(nonce[12] ‖ ciphertext+tag)`.
 //! The cookie is Secure/HttpOnly/SameSite=Lax by default (spec §4.4).
 
 use base64::Engine;

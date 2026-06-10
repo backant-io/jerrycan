@@ -46,7 +46,7 @@ jobs:
         run: cargo test --workspace --all-features
       - name: "Conformance (heavy: generated apps must build, check, and serve)"
         run: |
-          cargo test -p jerrycan --test conformance -- --include-ignored
+          cargo test -p jerrycan --all-features --test conformance -- --include-ignored
           cargo test -p jerrycan --test genroute_compile -- --include-ignored
       - name: Docs build (broken intra-doc links are errors)
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --all-features

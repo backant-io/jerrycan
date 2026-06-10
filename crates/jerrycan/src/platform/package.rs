@@ -173,7 +173,7 @@ spec:
     )
 }
 
-/// A hardened systemd unit (binary at /usr/local/bin/<name>).
+/// A hardened systemd unit (binary at `/usr/local/bin/<name>`).
 pub fn systemd_unit(design: &Design) -> String {
     let name = &design.name;
     format!(
