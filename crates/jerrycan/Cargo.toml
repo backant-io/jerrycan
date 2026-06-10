@@ -1,10 +1,16 @@
 [package]
 name = "jerrycan"
-description = "The AI-native Rust backend platform: framework, CLI, and MCP server. Name reservation; development at https://jerrycan.cc — real releases begin at 0.1.0."
+description = "The AI-native Rust backend platform: framework, CLI, and MCP server. https://jerrycan.cc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["web", "framework", "backend", "ai", "mcp"]
+categories = ["web-programming::http-server", "command-line-utilities"]
+readme = "README.md"
 
 [features]
 # Generated apps depend on this crate with `default-features = false` (lib facade

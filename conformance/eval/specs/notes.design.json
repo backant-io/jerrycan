@@ -1,0 +1,52 @@
+{
+  "name": "notes",
+  "contract_version": 0,
+  "description": "Reference app: notes (CRUD) with a per-note tags subroute.",
+  "auth": { "model": "none" },
+  "modules": [
+    {
+      "name": "notes",
+      "entities": [
+        { "name": "Note", "fields": [
+          { "name": "title", "type": "string" },
+          { "name": "content", "type": "string" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_notes", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Note", "list": true } },
+        { "operation_id": "create_note", "method": "POST", "path": "/",
+          "request_body": { "entity": "Note" },
+          "success": { "status": 201, "entity": "Note" } },
+        { "operation_id": "show_note", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Note" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] },
+        { "operation_id": "update_note", "method": "PUT", "path": "/{id}",
+          "request_body": { "entity": "Note" },
+          "success": { "status": 200, "entity": "Note" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] },
+        { "operation_id": "delete_note", "method": "DELETE", "path": "/{id}",
+          "success": { "status": 204 },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] }
+      ],
+      "subroutes": [
+        {
+          "name": "tags",
+          "entities": [
+            { "name": "Tag", "fields": [{ "name": "label", "type": "string" }] }
+          ],
+          "endpoints": [
+            { "operation_id": "list_tags", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Tag", "list": true } },
+            { "operation_id": "create_tag", "method": "POST", "path": "/",
+              "request_body": { "entity": "Tag" },
+              "success": { "status": 201, "entity": "Tag" } },
+            { "operation_id": "delete_tag", "method": "DELETE", "path": "/{id}",
+              "success": { "status": 204 },
+              "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] }
+          ]
+        }
+      ]
+    }
+  ]
+}

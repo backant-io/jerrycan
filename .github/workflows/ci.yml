@@ -44,9 +44,21 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Tests (unit + integration + doc-tests)
         run: cargo test --workspace --all-features
-      - name: "Conformance (heavy: generated apps must build, check, and serve)"
+      - name: Build benches
+        run: cargo build --workspace --benches --all-features
+      - name: "Conformance (heavy: generated apps must build, check, serve, and pass the scripted eval)"
         run: |
           cargo test -p jerrycan --all-features --test conformance -- --include-ignored
           cargo test -p jerrycan --test genroute_compile -- --include-ignored
+          cargo test -p jerrycan --test eval -- --include-ignored
       - name: Docs build (broken intra-doc links are errors)
         run: cargo doc --workspace --no-deps --all-features
+
+  fuzz-build:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Build fuzz targets
+        run: cargo install cargo-fuzz && cargo +nightly fuzz build

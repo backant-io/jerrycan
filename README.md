@@ -26,7 +26,7 @@ jerrycan is two inseparable halves:
 
 **Humans don't write the code — agents do**, guided by documentation where every example is a compiling, *running* doc-test, and by machine-readable contracts for every tool.
 
-> **Status: early development.** Phases 0 (core API + frozen contracts), 1 (CLI + MCP core loop), 2 (data & test-first generation), and 3 (auth, observability, `jerrycan package`) are complete and fully tested. The crates on crates.io are `0.0.0` name reservations — the first usable release will be `0.1.0`. Don't build on it yet; watch it grow.
+> **Status: 0.1.0, first release.** Phases 0 (core API + frozen contracts), 1 (CLI + MCP core loop), 2 (data & test-first generation), 3 (auth, observability, `jerrycan package`), and 4 (fuzzing, agent evals, diagnostics polish) are complete and fully tested. This is the first usable release — crates are at `0.1.0` (publish-pending; the maintainer runs `scripts/publish.sh`). Early but real; expect rough edges as it grows.
 
 ## A taste
 
@@ -117,16 +117,39 @@ jerrycan_package  → hardened artifacts + SBOM, only when everything is green
 | **1 — Core loop** | `jerrycan` CLI (new/generate/dev/check) + MCP server | ✅ complete (incl. 1b hardening) |
 | **2 — Data & TDD** | jerrycan-db, jerrycan-validate + OpenAPI, per-module test generation | ✅ complete |
 | **3 — Production** | jerrycan-auth, jerrycan-observe, `jerrycan package` (Docker/k8s/binary/systemd) | ✅ complete |
-| **4 — Hardening** | Fuzzing, agent evals, diagnostics polish → v0.1.0 | next |
+| **4 — Hardening** | Fuzzing, agent evals, diagnostics polish → v0.1.0 | ✅ complete |
+| **v0.1.0** | First release (publish-pending: maintainer runs `scripts/publish.sh`) | 🚀 |
 
-The full plan lives in the [design spec](docs/superpowers/specs/2026-06-09-jerrycan-design.md); deferred items are tracked in the [phase 1 backlog](docs/phase1-backlog.md).
+The full plan lives in the [design spec](docs/superpowers/specs/2026-06-09-jerrycan-design.md); deferred items are tracked in the [backlog](docs/phase1-backlog.md).
+
+## Install
+
+> These work once 0.1.0 is published (publish is maintainer-pending).
+
+```bash
+# In an app — the framework facade with the extensions you need:
+cargo add jerrycan --features db,auth,validate,observe
+
+# The CLI + MCP server (the generation platform):
+cargo install jerrycan
+```
+
+## Agent eval
+
+The headline metric: an opus agent, given **only** the published docs surface
+(`jerrycan docs …` — no framework source, no test fixtures), scaffolds and
+fully implements backends that build, pass `jerrycan check`, and serve real
+CRUD over HTTP. Latest run: **5/5 (100%)** — see
+[`conformance/eval/results.md`](conformance/eval/results.md) (floor 4/5, target ≥ 90%).
 
 ## Development
 
 ```bash
 cargo test --workspace --all-features   # CI runs this — every docs example is a doc-test
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
+cargo bench                             # criterion benches (routing, extraction)
+cargo +nightly fuzz run <target>        # fuzz targets live in fuzz/ (outside the workspace)
 ```
 
 The project is built docs-first and test-first: documentation examples are the executable specification.

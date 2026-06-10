@@ -1,10 +1,15 @@
 [package]
 name = "jerrycan-core"
-description = "Core framework of the jerrycan platform: routing, extractors, dependency injection, middleware. Name reservation; real releases begin at 0.1.0. https://jerrycan.cc"
+description = "Core of the jerrycan framework: routing, extractors, dependency injection, middleware. https://jerrycan.cc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["web", "framework", "async", "http"]
+categories = ["web-programming::http-server"]
 
 [dependencies]
 tokio.workspace = true
@@ -19,3 +24,8 @@ serde_urlencoded.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "core_bench"
+harness = false

@@ -42,6 +42,16 @@ fn db_mode_emits_sql_repos_with_di_factories() {
         repo.contains("last_insert_id()"),
         "sqlite insert branch: {repo}"
     );
+    assert!(
+        repo.contains("pub async fn update(&self, id: i64, item: Todo)"),
+        "PUT/PATCH handlers need a persisting update: {repo}"
+    );
+    assert!(
+        repo.contains(
+            "UPDATE \\\"todos\\\" SET \\\"title\\\" = ?, \\\"done\\\" = ? WHERE \\\"id\\\" = ?"
+        ),
+        "update sets every field in bind order with id in the WHERE: {repo}"
+    );
     assert!(repo.contains("map_err(db_error)"), "{repo}");
     let lib = fs::read_to_string(root.join("crates/routes/todos/src/lib.rs")).unwrap();
     assert!(lib.contains(".provide_dep(repo::todo_repo)"), "{lib}");

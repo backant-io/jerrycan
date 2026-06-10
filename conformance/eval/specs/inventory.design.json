@@ -1,0 +1,48 @@
+{
+  "name": "inventory",
+  "contract_version": 0,
+  "description": "Reference app: an inventory of items (CRUD, integer quantity) and categories.",
+  "auth": { "model": "none" },
+  "modules": [
+    {
+      "name": "items",
+      "entities": [
+        { "name": "Item", "fields": [
+          { "name": "sku", "type": "string" },
+          { "name": "name", "type": "string" },
+          { "name": "quantity", "type": "integer" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_items", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Item", "list": true } },
+        { "operation_id": "create_item", "method": "POST", "path": "/",
+          "request_body": { "entity": "Item" },
+          "success": { "status": 201, "entity": "Item" } },
+        { "operation_id": "show_item", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Item" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] },
+        { "operation_id": "update_item", "method": "PUT", "path": "/{id}",
+          "request_body": { "entity": "Item" },
+          "success": { "status": 200, "entity": "Item" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] },
+        { "operation_id": "delete_item", "method": "DELETE", "path": "/{id}",
+          "success": { "status": 204 },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] }
+      ]
+    },
+    {
+      "name": "categories",
+      "entities": [
+        { "name": "Category", "fields": [{ "name": "name", "type": "string" }] }
+      ],
+      "endpoints": [
+        { "operation_id": "list_categories", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Category", "list": true } },
+        { "operation_id": "create_category", "method": "POST", "path": "/",
+          "request_body": { "entity": "Category" },
+          "success": { "status": 201, "entity": "Category" } }
+      ]
+    }
+  ]
+}

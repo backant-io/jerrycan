@@ -71,7 +71,9 @@ impl SessionStore {
         format!("{COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
     }
 
-    pub(crate) fn read_cookie(&self, cookie_header: &str) -> Option<String> {
+    /// Extract the session cookie value from a `Cookie` request header.
+    /// Public so sibling crates (and the fuzz-smoke suite) can exercise the parser.
+    pub fn read_cookie(&self, cookie_header: &str) -> Option<String> {
         cookie_header
             .split(';')
             .filter_map(|kv| kv.trim().split_once('='))

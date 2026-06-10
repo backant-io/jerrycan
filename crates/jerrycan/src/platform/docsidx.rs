@@ -38,6 +38,10 @@ pub const PAGES: &[(&str, &str)] = &[
         "packaging",
         include_str!("../../../../docs/ai/12-packaging.md"),
     ),
+    (
+        "error-codes",
+        include_str!("../../../../docs/ai/13-error-codes.md"),
+    ),
 ];
 
 fn slug(heading: &str) -> String {

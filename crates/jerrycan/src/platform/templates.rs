@@ -24,7 +24,7 @@ pub fn jerrycan_dep_spec(features: &[&str]) -> String {
 
 pub(crate) fn jerrycan_dep_spec_from(env: Option<String>) -> String {
     env.unwrap_or_else(|| {
-        "jerrycan = { version = \"0.0.0\", default-features = false }".to_string()
+        "jerrycan = { version = \"0.1.0\", default-features = false }".to_string()
     })
 }
 
@@ -215,7 +215,7 @@ mod tests {
         let default = jerrycan_dep_spec_from(None);
         assert_eq!(
             default,
-            "jerrycan = { version = \"0.0.0\", default-features = false }"
+            "jerrycan = { version = \"0.1.0\", default-features = false }"
         );
         let local = jerrycan_dep_spec_from(Some(
             "jerrycan = { path = \"/x\", default-features = false }".into(),
@@ -225,10 +225,10 @@ mod tests {
 
     #[test]
     fn features_inject_into_the_dep_line() {
-        let line = "jerrycan = { version = \"0.0.0\", default-features = false }";
+        let line = "jerrycan = { version = \"0.1.0\", default-features = false }";
         assert_eq!(
             inject_features(line, &["db", "validate"]),
-            "jerrycan = { version = \"0.0.0\", default-features = false, features = [\"db\", \"validate\"] }"
+            "jerrycan = { version = \"0.1.0\", default-features = false, features = [\"db\", \"validate\"] }"
         );
         assert_eq!(inject_features(line, &[]), line);
     }

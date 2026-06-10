@@ -194,6 +194,15 @@ impl {n}Repo {{
     pub fn remove(&self, id: i64) -> bool {{
         self.items.lock().unwrap().remove(&id).is_some()
     }}
+    pub fn update(&self, id: i64, item: {n}) -> bool {{
+        match self.items.lock().unwrap().get_mut(&id) {{
+            Some(slot) => {{
+                *slot = item;
+                true
+            }}
+            None => false,
+        }}
+    }}
 }}
 
 impl Default for {n}Repo {{
@@ -267,6 +276,14 @@ fn sql_repo(e: &Entity) -> String {
     let table = format!("\\\"{}\\\"", table_name(entity));
     let cols = column_list(e);
     let placeholders = e.fields.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    // SET assignments for UPDATE: quoted column = ? in field order, matching `binds`.
+    // `\"` because this lands inside a Rust string literal in the generated source.
+    let set_clause = e
+        .fields
+        .iter()
+        .map(|f| format!("\\\"{}\\\" = ?", f.name))
+        .collect::<Vec<_>>()
+        .join(", ");
     let ctor = row_constructor(e);
     let bind_lines = binds(e);
     format!(
@@ -323,6 +340,15 @@ impl {entity}Repo {{
     pub async fn remove(&self, id: i64) -> Result<bool> {{
         let result = jerrycan::db::sqlx::query(&self.db.sql("DELETE FROM {table} WHERE \"id\" = ?"))
             .bind(id)
+            .execute(self.db.pool())
+            .await
+            .map_err(db_error)?;
+        Ok(result.rows_affected() > 0)
+    }}
+
+    pub async fn update(&self, id: i64, item: {entity}) -> Result<bool> {{
+        let result = jerrycan::db::sqlx::query(&self.db.sql("UPDATE {table} SET {set_clause} WHERE \"id\" = ?"))
+{bind_lines}            .bind(id)
             .execute(self.db.pool())
             .await
             .map_err(db_error)?;
@@ -849,6 +875,7 @@ mod tests {
             "pub fn get(",
             "pub fn insert(",
             "pub fn remove(",
+            "pub fn update(",
         ] {
             assert!(repo.contains(method), "{repo}");
         }

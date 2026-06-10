@@ -1,0 +1,50 @@
+{
+  "name": "tasks",
+  "contract_version": 0,
+  "description": "Reference app: tasks (CRUD with a PUT done-toggle) grouped under projects.",
+  "auth": { "model": "none" },
+  "modules": [
+    {
+      "name": "tasks",
+      "entities": [
+        { "name": "Task", "fields": [
+          { "name": "title", "type": "string" },
+          { "name": "done", "type": "boolean", "required": false }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_tasks", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Task", "list": true } },
+        { "operation_id": "create_task", "method": "POST", "path": "/",
+          "request_body": { "entity": "Task" },
+          "success": { "status": 201, "entity": "Task" } },
+        { "operation_id": "show_task", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Task" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] },
+        { "operation_id": "update_task", "method": "PUT", "path": "/{id}",
+          "request_body": { "entity": "Task" },
+          "success": { "status": 200, "entity": "Task" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] },
+        { "operation_id": "delete_task", "method": "DELETE", "path": "/{id}",
+          "success": { "status": 204 },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] }
+      ]
+    },
+    {
+      "name": "projects",
+      "entities": [
+        { "name": "Project", "fields": [{ "name": "name", "type": "string" }] }
+      ],
+      "endpoints": [
+        { "operation_id": "list_projects", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Project", "list": true } },
+        { "operation_id": "create_project", "method": "POST", "path": "/",
+          "request_body": { "entity": "Project" },
+          "success": { "status": 201, "entity": "Project" } },
+        { "operation_id": "delete_project", "method": "DELETE", "path": "/{id}",
+          "success": { "status": 204 },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] }
+      ]
+    }
+  ]
+}

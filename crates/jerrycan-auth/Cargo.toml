@@ -1,13 +1,18 @@
 [package]
 name = "jerrycan-auth"
-description = "Authentication extension for the jerrycan framework: argon2 password hashing, encrypted sessions, JWT, role guards. Real releases begin at 0.1.0. https://jerrycan.cc"
+description = "Authentication extension for the jerrycan framework: argon2 password hashing, encrypted sessions, JWT, role guards. https://jerrycan.cc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["auth", "jwt", "session", "argon2"]
+categories = ["authentication"]
 
 [dependencies]
-jerrycan-core = { path = "../jerrycan-core", version = "0.0.0" }
+jerrycan-core = { path = "../jerrycan-core", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 argon2.workspace = true
@@ -19,3 +24,8 @@ rand.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+criterion = { workspace = true }
+
+[[bench]]
+name = "auth_bench"
+harness = false
