@@ -55,6 +55,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs app",
     },
     CodeInfo {
+        code: "JC0409",
+        title: "conflict",
+        cause: "the write violates a unique key (e.g. a re-POSTed id)",
+        fix: "use a fresh key, or treat as already-created (idempotent retry)",
+        doc: "jerrycan docs database",
+    },
+    CodeInfo {
         code: "JC0413",
         title: "payload too large",
         cause: "the request body exceeded the size limit (default 1 MiB)",

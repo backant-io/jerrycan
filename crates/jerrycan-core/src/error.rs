@@ -43,6 +43,10 @@ impl Error {
             "method not allowed",
         )
     }
+    /// The write conflicts with existing state (e.g. a unique key already taken).
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "JC0409", message)
+    }
     pub fn payload_too_large() -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "JC0413", "payload too large")
     }

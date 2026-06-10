@@ -34,13 +34,16 @@ fn db_mode_emits_sql_repos_with_di_factories() {
         repo.contains("SELECT \\\"title\\\", \\\"done\\\" FROM \\\"todos\\\""),
         "{repo}"
     );
+    // One insert path for both backends: RETURNING (translated by db.sql);
+    // the sqlx Any driver's last_insert_id is None on sqlite, so it must
+    // never be relied on (it made creates echo id 0).
     assert!(
         repo.contains("RETURNING \\\"id\\\""),
-        "postgres insert branch: {repo}"
+        "insert uses RETURNING: {repo}"
     );
     assert!(
-        repo.contains("last_insert_id()"),
-        "sqlite insert branch: {repo}"
+        !repo.contains(".last_insert_id()"),
+        "sqlite must not rely on last_insert_id: {repo}"
     );
     assert!(
         repo.contains("pub async fn update(&self, id: i64, item: Todo)"),

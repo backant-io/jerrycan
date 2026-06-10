@@ -187,10 +187,17 @@ pub fn translate_placeholders(query: &str, backend: Backend) -> String {
     }
 }
 
-/// Map any sqlx error to the stable JC0510 without leaking internals; the
-/// underlying detail goes to stderr for the operator.
+/// Map any sqlx error to a stable JC code without leaking internals; the
+/// underlying detail goes to stderr for the operator. Unique-key violations
+/// are the client's fault (a re-POSTed id), not a server fault — they map to
+/// 409 JC0409 so duplicate writes can't pollute 5xx alerting.
 pub fn db_error(e: sqlx::Error) -> Error {
     eprintln!("jerrycan-db: {e}");
+    if let sqlx::Error::Database(ref db) = e
+        && db.is_unique_violation()
+    {
+        return Error::conflict("conflict: a row with this key already exists");
+    }
     Error::new(
         jerrycan_core::http::StatusCode::INTERNAL_SERVER_ERROR,
         "JC0510",
@@ -260,6 +267,30 @@ mod tests {
         let e = db_error(sqlx::Error::RowNotFound);
         assert_eq!(e.code(), "JC0510");
         assert_eq!(e.message(), "database error");
+    }
+
+    /// A duplicate key is the CLIENT's fault: it must surface as 409 JC0409,
+    /// not a 500 — a re-POSTed id must never trip server-fault alerting.
+    #[tokio::test]
+    async fn unique_violations_map_to_409_conflict() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE u (id INTEGER PRIMARY KEY, t TEXT)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO u (id, t) VALUES (1, 'a')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let dup = sqlx::query("INSERT INTO u (id, t) VALUES (1, 'b')")
+            .execute(db.pool())
+            .await
+            .expect_err("duplicate pk must fail");
+        let e = db_error(dup);
+        assert_eq!(e.code(), "JC0409");
+        assert_eq!(e.status().as_u16(), 409);
+        // Still no internals in the message.
+        assert!(!e.message().contains("sqlite"), "{}", e.message());
     }
 
     fn demo_migrations() -> Vec<Migration> {
