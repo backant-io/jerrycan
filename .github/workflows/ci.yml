@@ -28,6 +28,8 @@ jobs:
       - name: Tests (unit + integration + doc-tests)
         run: cargo test --workspace
       - name: Conformance (heavy: generated apps must build, check, and serve)
-        run: cargo test -p jerrycan --test conformance -- --include-ignored
+        run: |
+          cargo test -p jerrycan --test conformance -- --include-ignored
+          cargo test -p jerrycan --test genroute_compile -- --include-ignored
       - name: Docs build (broken intra-doc links are errors)
         run: cargo doc --workspace --no-deps

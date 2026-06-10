@@ -26,7 +26,7 @@ jerrycan is two inseparable halves:
 
 **Humans don't write the code — agents do**, guided by documentation where every example is a compiling, *running* doc-test, and by machine-readable contracts for every tool.
 
-> **Status: early development.** Phase 0 (core API spike + frozen contracts) is complete and fully tested. The crates on crates.io are `0.0.0` name reservations — the first usable release will be `0.1.0`. Don't build on it yet; watch it grow.
+> **Status: early development.** Phases 0 (core API + frozen contracts) and 1 (CLI + MCP core loop) are complete and fully tested. The crates on crates.io are `0.0.0` name reservations — the first usable release will be `0.1.0`. Don't build on it yet; watch it grow.
 
 ## A taste
 
@@ -86,7 +86,7 @@ assert_eq!(t.get("/todos/").await.status(), jerrycan::http::StatusCode::OK);
 
 ```
 crates/
-├── jerrycan          # facade + (soon) the CLI/MCP binary — apps depend on this
+├── jerrycan          # facade + the CLI/MCP binary — apps depend on this
 ├── jerrycan-core     # routing, extractors, DI, modules, middleware, errors, test client
 ├── jerrycan-macros   # #[jerrycan::main]
 ├── jerrycan-db       # SQL + migrations            (Phase 2)
@@ -124,7 +124,7 @@ The full plan lives in the [design spec](docs/superpowers/specs/2026-06-09-jerry
 ## Development
 
 ```bash
-cargo test --workspace        # 68 tests, including every docs example as a doc-test
+cargo test --workspace        # 124 tests, including every docs example as a doc-test
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
