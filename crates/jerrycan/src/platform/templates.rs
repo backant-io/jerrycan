@@ -1,1 +1,132 @@
-//! Implemented in a later Phase 1 task.
+//! Embedded scaffolding templates + the {{key}} renderer. Static text only;
+//! per-module code generation lives in genroute.rs.
+
+/// Substitute every `{{key}}`. Unreplaced keys are an error — templates can't rot silently.
+pub fn render(template: &str, vars: &[(&str, &str)]) -> Result<String, String> {
+    let mut out = template.to_string();
+    for (k, v) in vars {
+        out = out.replace(&format!("{{{{{k}}}}}"), v);
+    }
+    if let Some(start) = out.find("{{") {
+        let tail: String = out[start..].chars().take(40).collect();
+        return Err(format!("unsubstituted template key near `{tail}`"));
+    }
+    Ok(out)
+}
+
+/// How generated apps depend on the framework. Overridable for local development
+/// and conformance tests via JERRYCAN_FRAMEWORK_DEP (a full Cargo dep line).
+pub fn jerrycan_dep_spec() -> String {
+    jerrycan_dep_spec_from(std::env::var("JERRYCAN_FRAMEWORK_DEP").ok())
+}
+
+pub(crate) fn jerrycan_dep_spec_from(env: Option<String>) -> String {
+    env.unwrap_or_else(|| {
+        "jerrycan = { version = \"0.0.0\", default-features = false }".to_string()
+    })
+}
+
+pub const WORKSPACE_CARGO: &str = r#"[workspace]
+resolver = "3"
+members = [
+    "crates/app",
+    "crates/shared",
+    # jerrycan:members:begin (generated — do not edit between markers)
+{{members}}    # jerrycan:members:end
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+{{jerrycan_dep}}
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+"#;
+
+pub const JERRYCAN_TOML: &str = r#"# jerrycan app configuration (layered: defaults < this file < JERRYCAN_* env)
+name = "{{name}}"
+"#;
+
+pub const GITIGNORE: &str = "target/\n";
+
+pub const APP_CARGO: &str = r#"[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+jerrycan.workspace = true
+tokio.workspace = true
+shared = { path = "../shared" }
+# jerrycan:route-deps:begin (generated — do not edit between markers)
+{{route_deps}}# jerrycan:route-deps:end
+"#;
+
+pub const SHARED_CARGO: &str = r#"[package]
+name = "shared"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+"#;
+
+pub const SHARED_LIB: &str = r#"//! Cross-module DTOs only — keep deliberately tiny (a jerrycan lint guards growth).
+#![forbid(unsafe_code)]
+"#;
+
+pub const ROUTE_CARGO: &str = r#"[package]
+name = "route-{{name}}"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+jerrycan.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shared = { path = "../../shared" }
+
+[dev-dependencies]
+tokio.workspace = true
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_substitutes_all_keys_and_rejects_leftovers() {
+        let out = render(
+            "hi {{who}}, {{who}}! v{{n}}",
+            &[("who", "agent"), ("n", "0")],
+        )
+        .unwrap();
+        assert_eq!(out, "hi agent, agent! v0");
+        let err = render("oops {{missing}}", &[]).unwrap_err();
+        assert!(err.contains("missing"));
+    }
+
+    #[test]
+    fn jerrycan_dep_spec_defaults_and_honors_env_override() {
+        // NB: env mutation — run serially-safe by using a unique var read at call time.
+        let default = jerrycan_dep_spec_from(None);
+        assert_eq!(
+            default,
+            "jerrycan = { version = \"0.0.0\", default-features = false }"
+        );
+        let local = jerrycan_dep_spec_from(Some(
+            "jerrycan = { path = \"/x\", default-features = false }".into(),
+        ));
+        assert!(local.contains("path = \"/x\""));
+    }
+
+    #[test]
+    fn workspace_template_has_member_markers() {
+        assert!(WORKSPACE_CARGO.contains("# jerrycan:members:begin"));
+        assert!(WORKSPACE_CARGO.contains("# jerrycan:members:end"));
+        assert!(APP_CARGO.contains("# jerrycan:route-deps:begin"));
+    }
+}
