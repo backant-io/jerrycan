@@ -139,11 +139,7 @@ impl App {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| Error::internal(format!("failed to bind {addr}: {e}")))?;
-        self.serve_with_shutdown(listener, async {
-            let _ = tokio::signal::ctrl_c().await;
-            eprintln!("jerrycan: shutdown signal received — draining");
-        })
-        .await
+        self.serve_with_shutdown(listener, shutdown_signal()).await
     }
 
     /// Serve on an existing listener forever (tests, port 0, socket activation).
@@ -165,6 +161,7 @@ impl App {
 
         let built = Arc::new(self.build()?);
         let mut connections = tokio::task::JoinSet::new();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::pin!(shutdown);
 
         loop {
@@ -181,6 +178,7 @@ impl App {
                         Err(e) => return Err(Error::internal(format!("accept failed fatally: {e}"))),
                     };
                     let app = built.clone();
+                    let mut shutdown_rx = shutdown_rx.clone();
                     connections.spawn(async move {
                         let io = hyper_util::rt::TokioIo::new(stream);
                         let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
@@ -200,14 +198,18 @@ impl App {
                                             Err(_join_error) => {
                                                 let mut response =
                                                     Error::internal("handler panicked").into_response();
-                                                apply_security_headers(&mut response);
+                                                if app.security_headers {
+                                                    apply_security_headers(&mut response);
+                                                }
                                                 response
                                             }
                                         }
                                     }
                                     Ok(Err(_)) => {
                                         let mut response = Error::payload_too_large().into_response();
-                                        apply_security_headers(&mut response);
+                                        if app.security_headers {
+                                            apply_security_headers(&mut response);
+                                        }
                                         response
                                     }
                                     Err(_) => {
@@ -217,31 +219,66 @@ impl App {
                                             "timed out reading the request body",
                                         )
                                         .into_response();
-                                        apply_security_headers(&mut response);
+                                        if app.security_headers {
+                                            apply_security_headers(&mut response);
+                                        }
                                         response
                                     }
                                 };
                                 Ok::<_, std::convert::Infallible>(response)
                             }
                         });
-                        let _ = hyper::server::conn::http1::Builder::new()
+                        let conn = hyper::server::conn::http1::Builder::new()
                             .timer(hyper_util::rt::TokioTimer::new())
                             .header_read_timeout(HEADER_READ_TIMEOUT)
-                            .serve_connection(io, service)
-                            .await;
+                            .serve_connection(io, service);
+                        tokio::pin!(conn);
+                        loop {
+                            tokio::select! {
+                                result = conn.as_mut() => {
+                                    let _ = result;
+                                    break;
+                                }
+                                _ = shutdown_rx.changed() => {
+                                    // Finish in-flight responses, close idle keep-alives now.
+                                    conn.as_mut().graceful_shutdown();
+                                }
+                            }
+                        }
                     });
                 }
             }
         }
 
+        let _ = shutdown_tx.send(true);
         drop(listener); // stop accepting immediately
         let drain = async { while connections.join_next().await.is_some() {} };
         if tokio::time::timeout(DRAIN_CAP, drain).await.is_err() {
             eprintln!("jerrycan: drain cap reached — aborting remaining connections");
+            // Aborting a connection task detaches (not aborts) its in-flight dispatch spawn; runaway handlers are still bounded by handler_timeout.
             connections.abort_all();
         }
         Ok(())
     }
+}
+
+/// Resolves on Ctrl-C (SIGINT) or, on Unix, SIGTERM — the signals containers
+/// and process managers use to request shutdown.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler installation never fails on unix");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    eprintln!("jerrycan: shutdown signal received — draining");
 }
 
 /// Accept errors that mean "back off and keep serving", not "die":

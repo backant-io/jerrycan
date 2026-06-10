@@ -164,6 +164,42 @@ async fn graceful_shutdown_drains_in_flight_requests() {
 }
 
 #[tokio::test]
+async fn idle_keep_alive_connections_do_not_stall_shutdown() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (trigger, shutdown) = tokio::sync::oneshot::channel::<()>();
+    let app = App::new().route("/", get(|| async { "ok" }));
+    let server = tokio::spawn(async move {
+        app.serve_with_shutdown(listener, async {
+            let _ = shutdown.await;
+        })
+        .await
+    });
+
+    // Complete one request WITHOUT Connection: close, then idle (keep-alive).
+    let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: l\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1024];
+    let _ = s.read(&mut buf).await.unwrap(); // response arrives, connection stays open
+
+    let started = std::time::Instant::now();
+    trigger.send(()).unwrap();
+    let served = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("must drain well under the 10s cap")
+        .unwrap();
+    assert!(served.is_ok());
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "idle keep-alive stalled the drain: {:?}",
+        started.elapsed()
+    );
+    drop(s);
+}
+
+#[tokio::test]
 async fn glacial_request_bodies_are_cut_off() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
