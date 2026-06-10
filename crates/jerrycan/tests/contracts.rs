@@ -91,6 +91,15 @@ fn mcp_tools_contract_holds_its_invariants() {
         by_name("jerrycan_design")["outputSchema"]["properties"]["design_path"].is_object(),
         "jerrycan_design must expose a design_path output for the scaffold hand-off"
     );
+
+    let design_tool = tools
+        .iter()
+        .find(|t| t["name"] == "jerrycan_design")
+        .expect("design tool");
+    assert!(
+        design_tool["inputSchema"]["properties"]["draft"]["type"] == "object",
+        "jerrycan_design must accept a structured draft object (deterministic validation engine)"
+    );
 }
 
 #[test]
@@ -105,6 +114,10 @@ fn design_schema_is_module_grouped_and_recursive() {
     assert_eq!(
         doc["$defs"]["module"]["properties"]["subroutes"]["items"]["$ref"],
         "#/$defs/module"
+    );
+    assert_eq!(
+        doc["$defs"]["module"]["properties"]["mount"]["pattern"],
+        "^/"
     );
     // operation_id is the handler-name contract used by the §5.3 naming lint.
     assert!(doc["$defs"]["endpoint"]["properties"]["operation_id"]["pattern"].is_string());

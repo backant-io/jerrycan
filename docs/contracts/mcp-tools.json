@@ -5,11 +5,12 @@
   "tools": [
     {
       "name": "jerrycan_design",
-      "description": "Turn requirements into a validated design.json. Incomplete designs return pointed questions, not code. Call repeatedly with answers until status=complete.",
+      "description": "Turn requirements into a validated design.json. The agent authors the design; this tool enforces specificity: call without a draft to get the design template, call with a draft to validate it — violations return pointed questions (not code), a complete draft is written to design.json and echoed with design_path. Call repeatedly until status=complete.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "requirements": { "type": "string", "description": "What the backend must do, in natural language." },
+          "draft": { "type": "object", "description": "A structured design draft conforming to design-schema.json. The tool validates it deterministically: violations come back as pointed questions; a complete draft is written to disk and returned with design_path. Omit on a first exploratory call to receive the design template." },
           "answers": { "type": "object", "description": "Answers to a previous call's questions, keyed by question id." },
           "revision_of": { "type": "string", "description": "Path to an existing design.json being revised." }
         },

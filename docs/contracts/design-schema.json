@@ -29,6 +29,7 @@
       "additionalProperties": false,
       "properties": {
         "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "mount": { "type": "string", "pattern": "^/", "description": "Mount prefix for this module (under the app for top-level modules, under the parent for subroutes). Defaults to '/' + name. v0 limitation: path parameters in mount prefixes interact with single-param Path extraction — prefer parameter-free mounts until multi-param Path lands." },
         "description": { "type": "string" },
         "entities": { "type": "array", "items": { "$ref": "#/$defs/entity" } },
         "endpoints": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/endpoint" } },
