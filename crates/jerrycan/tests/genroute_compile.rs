@@ -10,6 +10,7 @@
 
 use jerrycan::platform::design::Design;
 use jerrycan::platform::genroute::{GenMode, write_module};
+use jerrycan::platform::scaffold;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -139,6 +140,107 @@ serde.workspace = true
     if !output.status.success() {
         panic!(
             "emitted crate failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+/// A minimal AUTH-mode design: one module with a guarded POST endpoint. The
+/// endpoint's `auth_required: true` makes it take a `_user: CurrentUser` param,
+/// so handlers.rs imports `shared::CurrentUser`. There are no `required_roles`,
+/// so the stub never calls `require_role` — which is precisely the case that
+/// regressed: emitting `use jerrycan::auth::{require_role, Session};` here left
+/// both imports unused, tripping `clippy -D warnings` on untouched generated code.
+const AUTH_MINIMAL: &str = r#"{
+    "name": "auth-api",
+    "contract_version": 0,
+    "auth": { "model": "session", "roles": ["admin"] },
+    "dependencies": ["auth"],
+    "modules": [{
+        "name": "secrets",
+        "entities": [{ "name": "Secret", "fields": [
+            { "name": "value", "type": "string" }
+        ]}],
+        "endpoints": [
+            { "operation_id": "create_secret", "method": "POST", "path": "/",
+              "auth_required": true,
+              "request_body": { "entity": "Secret" },
+              "success": { "status": 201, "entity": "Secret" } }
+        ]
+    }]
+}"#;
+
+/// Serializes the in-process `JERRYCAN_FRAMEWORK_DEP` env mutation below: the
+/// other test in this binary doesn't read that var, but two ignored tests can
+/// still run on parallel threads, and `set_var` is process-global.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Companion to `generated_module_crate_passes_strict_clippy`, for AUTH mode.
+/// Uses the REAL scaffold (so the `shared` crate gets the genuine
+/// `CurrentUser = Session<SessionUser>` alias and the route crate gets
+/// `features = ["auth"]`) and asserts the raw generated stubs — never touched by
+/// any agent or fixture — pass strict clippy. This is the gate that was missing:
+/// the existing compile test runs with `auth: false`, so it could not catch an
+/// unused auth import.
+#[test]
+#[ignore = "invokes cargo on a scaffolded auth crate; run with --include-ignored"]
+fn generated_auth_module_crate_passes_strict_clippy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("auth-app");
+
+    let design: Design = serde_json::from_str(AUTH_MINIMAL).expect("AUTH_MINIMAL parses");
+    assert!(design.wants_auth(), "design must be in auth mode");
+
+    // Point the scaffold's framework dep at this local crate (carrying the `auth`
+    // feature, injected by scaffold from facade_features) and run the real
+    // scaffold so the shared crate's CurrentUser alias and the route crate's
+    // wiring are exactly what a real `jerrycan new` produces.
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by ENV_LOCK; scaffold reads the var synchronously here.
+        unsafe {
+            std::env::set_var("JERRYCAN_FRAMEWORK_DEP", &dep);
+        }
+        scaffold::scaffold(&app, &design).expect("scaffold auth app");
+    }
+
+    // Sanity: the generated handler stub imports CurrentUser but NOT require_role.
+    let handlers = fs::read_to_string(app.join("crates/routes/secrets/src/handlers.rs"))
+        .expect("read generated handlers.rs");
+    assert!(
+        handlers.contains("use shared::CurrentUser;"),
+        "guarded stub must import the param type it uses:\n{handlers}"
+    );
+    assert!(
+        !handlers.contains("use jerrycan::auth::"),
+        "raw stub must NOT import require_role/Session — it uses neither:\n{handlers}"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // The gate the reviewer ran, scoped to the generated route crate.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "route-secrets",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo clippy");
+
+    if !output.status.success() {
+        panic!(
+            "scaffolded auth route crate failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );

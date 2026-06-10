@@ -80,15 +80,17 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode) -> String {
     params.join(", ")
 }
 
-/// A leading comment for role-guarded endpoints, reminding the agent to call
-/// `require_role` before proceeding (empty for unguarded / no-role endpoints).
+/// A leading comment for role-guarded endpoints, reminding the agent to add the
+/// `require_role` import and call it before proceeding (empty for unguarded /
+/// no-role endpoints). The stub itself imports only `CurrentUser` (the param
+/// type it uses); the agent adds `require_role` when implementing the guard.
 fn guard_comment(ep: &Endpoint) -> String {
     if ep.required_roles.is_empty() {
         String::new()
     } else {
         let roles = ep.required_roles.join("\", \"");
         format!(
-            "    // guard: requires role \"{roles}\" — call require_role(&_user.role, \"...\")? before proceeding\n"
+            "    // guard: requires role \"{roles}\" — add `use jerrycan::auth::require_role;` and call require_role(&_user.0.role, \"{roles}\")? before proceeding\n"
         )
     }
 }
@@ -105,10 +107,12 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode) -> String {
     if !m.entities.is_empty() {
         uses.push_str("use super::repo::*;\n");
     }
-    // Auth mode: any guarded endpoint pulls in the role helper, the session
-    // extractor, and the shared CurrentUser alias used as the guard param type.
+    // Auth mode: a guarded endpoint takes a `_user: CurrentUser` param, so the
+    // stub imports ONLY that alias (which it uses). It does NOT import
+    // `require_role` — a raw stub doesn't call it, so the import would be unused
+    // and fail `-D warnings`; the agent adds the import (see guard_comment) when
+    // implementing the role check.
     if mode.auth && m.endpoints.iter().any(|ep| ep.is_guarded()) {
-        uses.push_str("use jerrycan::auth::{require_role, Session};\n");
         uses.push_str("use shared::CurrentUser;\n");
     }
     let mut out = format!(
