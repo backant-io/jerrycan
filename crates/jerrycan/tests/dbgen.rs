@@ -78,22 +78,24 @@ fn db_mode_emits_dual_dialect_migrations_from_entities() {
     )
     .unwrap();
     assert!(
-        sqlite.contains("CREATE TABLE \"todos\"")
-            && sqlite.contains("PRIMARY KEY AUTOINCREMENT"),
+        sqlite.contains("CREATE TABLE \"todos\"") && sqlite.contains("PRIMARY KEY AUTOINCREMENT"),
         "{sqlite}"
     );
     assert!(sqlite.to_lowercase().contains("\"title\" text not null"));
     // Booleans are stored as BIGINT (0/1) on both backends: the sqlx `Any` driver
     // can't round-trip a Rust `bool` against SQLite, so the repo binds `as i64`.
     assert!(
-        sqlite.to_lowercase().contains("\"done\" bigint not null default 0"),
+        sqlite
+            .to_lowercase()
+            .contains("\"done\" bigint not null default 0"),
         "optional bool field stores as integer with a default: {sqlite}"
     );
+    assert!(postgres.to_lowercase().contains("bigserial"), "{postgres}");
     assert!(
-        postgres.to_lowercase().contains("bigserial"),
-        "{postgres}"
+        postgres
+            .to_lowercase()
+            .contains("\"done\" bigint not null default 0")
     );
-    assert!(postgres.to_lowercase().contains("\"done\" bigint not null default 0"));
     // Subroute entities get their own module-owned migration:
     assert!(root.join("crates/routes/todos/migrations/sqlite").exists());
     let users = fs::read_to_string(

@@ -22,7 +22,10 @@ pub fn crate_ident(module_name: &str) -> String {
 /// The entity's declared `id` field, if the design provides one — it becomes
 /// the table's primary key (no synthetic pk is added alongside it).
 fn declared_id(e: &Entity) -> Option<FieldType> {
-    e.fields.iter().find(|f| f.name == "id").map(|f| f.field_type)
+    e.fields
+        .iter()
+        .find(|f| f.name == "id")
+        .map(|f| f.field_type)
 }
 
 /// The Rust type repos and `/{id}` handlers key on: the declared id field's
@@ -304,7 +307,10 @@ fn update_pairs(e: &Entity) -> String {
         .filter(|f| f.name != "id")
         .map(|f| {
             if f.field_type == FieldType::Boolean {
-                format!("(Alias::new(\"{n}\"), (item.{n} as i64).into())", n = f.name)
+                format!(
+                    "(Alias::new(\"{n}\"), (item.{n} as i64).into())",
+                    n = f.name
+                )
             } else {
                 format!("(Alias::new(\"{n}\"), item.{n}.into())", n = f.name)
             }
@@ -1025,14 +1031,25 @@ mod tests {
         );
         let ddl = migration_ddl(&m, false).unwrap();
         assert!(
-            ddl.to_lowercase().contains("\"id\" text not null primary key"),
+            ddl.to_lowercase()
+                .contains("\"id\" text not null primary key"),
             "text pk, no autoincrement: {ddl}"
         );
         assert!(!ddl.contains("AUTOINCREMENT"), "{ddl}");
         assert_eq!(ddl.matches("\"id\"").count(), 1, "{ddl}");
 
-        let repo = repo_rs(&m, GenMode { db: true, ..GenMode::default() }).unwrap();
-        assert!(repo.contains("pub async fn get(&self, id: String)"), "{repo}");
+        let repo = repo_rs(
+            &m,
+            GenMode {
+                db: true,
+                ..GenMode::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            repo.contains("pub async fn get(&self, id: String)"),
+            "{repo}"
+        );
         assert!(
             repo.contains("pub async fn insert(&self, item: Todo) -> Result<String>"),
             "{repo}"
