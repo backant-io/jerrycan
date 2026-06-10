@@ -132,6 +132,17 @@ pub fn validate(d: &Design) -> Vec<Question> {
                             format!("{ptr}/entities/{i}/fields/{j}/type"),
                             format!("Field `{}` has type json — json fields are not yet supported in db mode (store as string, or drop the db dependency; structured json columns are a contract-v1 candidate).", f.name),
                         ));
+                    } else if f.name == "id"
+                        && !matches!(
+                            f.field_type,
+                            FieldType::Integer | FieldType::String | FieldType::Uuid
+                        )
+                    {
+                        // A declared `id` becomes the table's primary key.
+                        qs.push(q(
+                            format!("{ptr}/entities/{i}/fields/{j}/type"),
+                            format!("Field `id` of entity `{}` becomes the table's primary key in db mode — it must be integer, string, or uuid.", e.name),
+                        ));
                     }
                 }
             }

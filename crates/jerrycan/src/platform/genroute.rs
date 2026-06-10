@@ -19,6 +19,21 @@ pub fn crate_ident(module_name: &str) -> String {
     format!("route_{}", module_name.replace('-', "_"))
 }
 
+/// The entity's declared `id` field, if the design provides one — it becomes
+/// the table's primary key (no synthetic pk is added alongside it).
+fn declared_id(e: &Entity) -> Option<FieldType> {
+    e.fields.iter().find(|f| f.name == "id").map(|f| f.field_type)
+}
+
+/// The Rust type repos and `/{id}` handlers key on: the declared id field's
+/// rust_type (String for text pks), i64 for integer or synthetic ids.
+fn key_rust_type(e: &Entity) -> &'static str {
+    match declared_id(e) {
+        Some(t) => t.rust_type(),
+        None => "i64",
+    }
+}
+
 fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a str> {
     if m.entities.is_empty() {
         return None;
@@ -65,12 +80,27 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode) -> String {
         params.push("_user: CurrentUser".to_string());
     }
     let params_in_path = path_params(ep);
+    // A param named `id` keys the endpoint's entity, so it takes that entity's
+    // key type (String for text pks); other params stay i64.
+    let key = endpoint_repo_entity(m, ep)
+        .and_then(|name| m.entities.iter().find(|e| e.name == name))
+        .map(key_rust_type)
+        .unwrap_or("i64");
+    let param_type = |p: &str| if p == "id" { key } else { "i64" };
     match params_in_path.len() {
         0 => {}
-        1 => params.push(format!("Path(_{}): Path<i64>", params_in_path[0])),
-        n => {
+        1 => params.push(format!(
+            "Path(_{p}): Path<{ty}>",
+            p = params_in_path[0],
+            ty = param_type(&params_in_path[0])
+        )),
+        _ => {
             let names: Vec<String> = params_in_path.iter().map(|p| format!("_{p}")).collect();
-            let types = vec!["i64"; n].join(", ");
+            let types = params_in_path
+                .iter()
+                .map(|p| param_type(p))
+                .collect::<Vec<_>>()
+                .join(", ");
             params.push(format!("Path(({})): Path<({})>", names.join(", "), types));
         }
     }
@@ -286,6 +316,7 @@ fn sql_repo(e: &Entity) -> String {
         .join(", ");
     let ctor = row_constructor(e);
     let bind_lines = binds(e);
+    let key = key_rust_type(e);
     format!(
         r#"pub struct {entity}Repo {{
     db: Db,
@@ -307,7 +338,7 @@ impl {entity}Repo {{
         Ok(rows.into_iter().map(|row| {ctor}).collect())
     }}
 
-    pub async fn get(&self, id: i64) -> Result<Option<{entity}>> {{
+    pub async fn get(&self, id: {key}) -> Result<Option<{entity}>> {{
         let row = jerrycan::db::sqlx::query(&self.db.sql("SELECT {cols} FROM {table} WHERE \"id\" = ?"))
             .bind(id)
             .fetch_optional(self.db.pool())
@@ -316,28 +347,19 @@ impl {entity}Repo {{
         Ok(row.map(|row| {ctor}))
     }}
 
-    pub async fn insert(&self, item: {entity}) -> Result<i64> {{
-        match self.db.backend() {{
-            Backend::Postgres => {{
-                let row = jerrycan::db::sqlx::query(
-                    &self.db.sql("INSERT INTO {table} ({cols}) VALUES ({placeholders}) RETURNING \"id\""),
-                )
-{bind_lines}                .fetch_one(self.db.pool())
-                .await
-                .map_err(db_error)?;
-                Ok(row.get("id"))
-            }}
-            Backend::Sqlite => {{
-                let result = jerrycan::db::sqlx::query("INSERT INTO {table} ({cols}) VALUES ({placeholders})")
-{bind_lines}                .execute(self.db.pool())
-                .await
-                .map_err(db_error)?;
-                Ok(result.last_insert_id().unwrap_or_default())
-            }}
-        }}
+    pub async fn insert(&self, item: {entity}) -> Result<{key}> {{
+        // RETURNING works on both backends (sqlite >= 3.35); the sqlx `Any`
+        // driver's last_insert_id is None on sqlite, so never rely on it.
+        let row = jerrycan::db::sqlx::query(
+            &self.db.sql("INSERT INTO {table} ({cols}) VALUES ({placeholders}) RETURNING \"id\""),
+        )
+{bind_lines}        .fetch_one(self.db.pool())
+        .await
+        .map_err(db_error)?;
+        Ok(row.get("id"))
     }}
 
-    pub async fn remove(&self, id: i64) -> Result<bool> {{
+    pub async fn remove(&self, id: {key}) -> Result<bool> {{
         let result = jerrycan::db::sqlx::query(&self.db.sql("DELETE FROM {table} WHERE \"id\" = ?"))
             .bind(id)
             .execute(self.db.pool())
@@ -346,7 +368,7 @@ impl {entity}Repo {{
         Ok(result.rows_affected() > 0)
     }}
 
-    pub async fn update(&self, id: i64, item: {entity}) -> Result<bool> {{
+    pub async fn update(&self, id: {key}, item: {entity}) -> Result<bool> {{
         let result = jerrycan::db::sqlx::query(&self.db.sql("UPDATE {table} SET {set_clause} WHERE \"id\" = ?"))
 {bind_lines}            .bind(id)
             .execute(self.db.pool())
@@ -368,7 +390,7 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode) -> Option<String> {
         return Some(memory_repo_rs(m));
     }
     let mut out = String::from(
-        "//! Data access — generated SQL over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sqlx::Row;\nuse jerrycan::db::{db_error, Backend, Db};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
+        "//! Data access — generated SQL over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sqlx::Row;\nuse jerrycan::db::{db_error, Db};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
     );
     for e in &m.entities {
         out.push_str(&sql_repo(e));
@@ -403,16 +425,21 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool) -> Option<String> {
     for e in &m.entities {
         // Identifiers are double-quoted (matches the SQL repo); cross-backend safe
         // and shields reserved words like a column named `order`.
-        let pk = if backend_is_pg {
-            "\"id\" BIGSERIAL PRIMARY KEY"
-        } else {
-            "\"id\" INTEGER PRIMARY KEY AUTOINCREMENT"
+        // A declared `id` field IS the pk (typed as declared); only entities
+        // without one get the synthetic autoincrement pk. Emitting both would
+        // be a duplicate-column error.
+        let pk = match declared_id(e) {
+            Some(t) if t != FieldType::Integer => {
+                format!("\"id\" {} PRIMARY KEY", column_type(t))
+            }
+            _ if backend_is_pg => "\"id\" BIGSERIAL PRIMARY KEY".to_string(),
+            _ => "\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".to_string(),
         };
         out.push_str(&format!(
             "CREATE TABLE \"{}\" (\n    {pk}",
             table_name(&e.name)
         ));
-        for f in &e.fields {
+        for f in e.fields.iter().filter(|f| f.name != "id") {
             out.push_str(&format!(
                 ",\n    \"{}\" {} NOT NULL",
                 f.name,
@@ -913,6 +940,61 @@ mod tests {
                 .contains("pub fn module()"),
             "tool-owned: restored"
         );
+    }
+
+    /// Real agent designs declare `id` on their entities (the docs' Todo does).
+    /// Emitting the synthetic pk alongside it is a duplicate-column error that
+    /// breaks every migration at apply time — the declared field must BE the pk.
+    #[test]
+    fn declared_id_field_becomes_the_pk_not_a_duplicate_column() {
+        let mut m = todos();
+        m.entities[0].fields.insert(
+            0,
+            Field {
+                name: "id".into(),
+                field_type: FieldType::Integer,
+                required: true,
+            },
+        );
+        let ddl = migration_ddl(&m, false).unwrap();
+        assert_eq!(
+            ddl.matches("\"id\"").count(),
+            1,
+            "one id column only:\n{ddl}"
+        );
+        assert!(ddl.contains("\"id\" INTEGER PRIMARY KEY AUTOINCREMENT"), "{ddl}");
+        let pg = migration_ddl(&m, true).unwrap();
+        assert!(pg.contains("\"id\" BIGSERIAL PRIMARY KEY"), "{pg}");
+    }
+
+    /// Text ids (uuid/string) are the pk with their declared type, and the
+    /// whole generated surface keys on String — repo signatures, the insert
+    /// return (sqlite has no last_insert_id for text pks), and Path extractors.
+    #[test]
+    fn text_id_keys_the_table_repo_and_handlers_consistently() {
+        let mut m = todos();
+        m.entities[0].fields.insert(
+            0,
+            Field {
+                name: "id".into(),
+                field_type: FieldType::Uuid,
+                required: true,
+            },
+        );
+        let ddl = migration_ddl(&m, false).unwrap();
+        assert!(ddl.contains("\"id\" TEXT PRIMARY KEY"), "{ddl}");
+        assert_eq!(ddl.matches("\"id\"").count(), 1, "{ddl}");
+
+        let repo = repo_rs(&m, GenMode { db: true, ..GenMode::default() }).unwrap();
+        assert!(repo.contains("pub async fn get(&self, id: String)"), "{repo}");
+        assert!(
+            repo.contains("pub async fn insert(&self, item: Todo) -> Result<String>"),
+            "{repo}"
+        );
+        assert!(!repo.contains(".last_insert_id()"), "{repo}");
+
+        let h = handlers_rs(&m, GenMode::default());
+        assert!(h.contains("Path(_id): Path<String>"), "{h}");
     }
 
     #[test]

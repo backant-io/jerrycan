@@ -105,6 +105,15 @@ fn request_expr(unit: &ModuleDesign, ep: &Endpoint, path: &str, guarded_and_auth
 
 fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
     let auth = out.auth;
+    // The path-param value a seeded row answers to: the fixture id for entities
+    // that declare one (text pks seed their fixture string), "1" otherwise
+    // (matching the synthetic/integer pk the creator's fixture inserts).
+    let seed_id = creator(unit)
+        .and_then(|ep| ep.request_body.as_ref())
+        .and_then(|rb| unit.entities.iter().find(|e| e.name == rb.entity))
+        .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
+        .map(|f| fixture_value(f.field_type).trim_matches('"'))
+        .unwrap_or("1");
     let seed = creator(unit).map(|ep| {
         let body = fixture_json(
             unit,
@@ -128,15 +137,28 @@ fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
 
         if param_count(ep) == 0 {
             let request = request_expr(unit, ep, &full_path, guarded);
+            // A creator that echoes its entity must echo the id it was given —
+            // catches inserts that return a backend default (0) instead.
+            let id_echo = (ep.method == HttpMethod::POST)
+                .then(|| ep.request_body.as_ref())
+                .flatten()
+                .filter(|rb| ep.success.entity.as_deref() == Some(rb.entity.as_str()))
+                .and_then(|rb| unit.entities.iter().find(|e| e.name == rb.entity))
+                .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
+                .map(|f| format!(
+                    "    let body: serde_json::Value = serde_json::from_str(&res.text()).expect(\"json body\");\n    assert_eq!(body[\"id\"], serde_json::json!({}), \"design: created {} echoes its id\");\n",
+                    fixture_value(f.field_type), ep.success.entity.as_deref().unwrap_or("entity")
+                ))
+                .unwrap_or_default();
             out.code.push_str(&format!(
-                "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n}}\n\n"
+                "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n{id_echo}}}\n\n"
             ));
             out.count += 1;
             if guarded {
                 push_401_test(out, unit, ep, &full_path, false);
             }
         } else if param_count(ep) == 1 && seed.is_some() {
-            let seeded_path = full_path.replacen(&regex_free_param(&ep.path), "1", 1);
+            let seeded_path = full_path.replacen(&regex_free_param(&ep.path), seed_id, 1);
             let request = request_expr(unit, ep, &seeded_path, guarded);
             out.code.push_str(&format!(
                 "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n}}\n\n",
