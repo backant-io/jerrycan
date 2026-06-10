@@ -62,8 +62,24 @@ enum Cmd {
         #[arg(long)]
         search: Option<String>,
     },
+    /// Wire an extension into the app (db, validate)
+    Add { extension: String },
+    /// Database commands
+    Db {
+        #[command(subcommand)]
+        what: DbCmd,
+    },
     /// Serve MCP over stdio
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum DbCmd {
+    /// Apply module-owned migrations (env JERRYCAN_DATABASE_URL or --url)
+    Migrate {
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -124,6 +140,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Check { module } => cmd_check(module.as_deref(), cli.json),
         Cmd::Test { module } => cmd_test(module.as_deref()),
         Cmd::Docs { topic, search } => cmd_docs(topic.as_deref(), search.as_deref(), cli.json),
+        Cmd::Add { extension } => cmd_add(&extension, cli.json),
+        Cmd::Db {
+            what: DbCmd::Migrate { url },
+        } => cmd_db_migrate(url.as_deref(), cli.json),
         Cmd::Mcp => jerrycan::platform::mcp::serve_stdio().map_err(Failure::environment),
     }
 }
@@ -298,6 +318,79 @@ fn cmd_generate_dep(name: &str, module: &str, json_mode: bool) -> Result<(), Fai
         json_mode,
         &payload,
         &format!("recorded dependency `{name}` on module `{module}`"),
+    );
+    Ok(())
+}
+
+fn cmd_add(extension: &str, json_mode: bool) -> Result<(), Failure> {
+    if !matches!(extension, "db" | "validate") {
+        return Err(Failure::usage(format!(
+            "unknown extension `{extension}` — available: db, validate"
+        )));
+    }
+    let root = app_root()?;
+    let design_path = root.join("design.json");
+    let mut design = load_design(&design_path)?;
+    if !design.dependencies.iter().any(|d| d == extension) {
+        design.dependencies.push(extension.to_string());
+    }
+    std::fs::write(&design_path, scaffold::canonical_design_json(&design))
+        .map_err(|e| Failure::gate(e.to_string()))?;
+    // Regenerate every tool-owned surface for the new mode, and refresh route
+    // crates' tool-owned files (repos/migrations are create-once and untouched
+    // for EXISTING modules — agents migrate those by hand; new scaffolds get SQL).
+    let mode = genroute::GenMode {
+        db: design.wants_db(),
+    };
+    for m in &design.modules {
+        genroute::write_module(&root.join("crates/routes"), m, mode).map_err(Failure::gate)?;
+    }
+    let modified = mounting::regenerate(&root, &design).map_err(Failure::gate)?;
+    let payload = serde_json::json!({
+        "created": [],
+        "modified": modified.iter().cloned().chain(["design.json".to_string()]).collect::<Vec<_>>(),
+        "next_step": format!("`{extension}` wired — review the regenerated mounting, then jerrycan check"),
+    });
+    emit(json_mode, &payload, &format!("added `{extension}`"));
+    Ok(())
+}
+
+fn cmd_db_migrate(url: Option<&str>, json_mode: bool) -> Result<(), Failure> {
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+    if !design.wants_db() {
+        return Err(Failure::usage(
+            "this app has no `db` dependency — run `jerrycan add db` first",
+        ));
+    }
+    // Collect module-owned migrations exactly as the generated migrations.rs does.
+    let pairs = mounting::collect_migrations(&root).map_err(Failure::gate)?;
+    let url = url
+        .map(str::to_string)
+        .or_else(|| std::env::var("JERRYCAN_DATABASE_URL").ok())
+        .ok_or_else(|| Failure::usage("provide --url or set JERRYCAN_DATABASE_URL"))?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Failure::environment(e.to_string()))?;
+    let applied = runtime
+        .block_on(async {
+            let db = jerrycan::db::Db::connect(&url).await?;
+            db.migrate_owned(&pairs).await
+        })
+        .map_err(|e| Failure::gate(e.message().to_string()))?;
+    let payload = serde_json::json!({
+        "applied": applied,
+        "next_step": if applied.is_empty() { "database already up to date" } else { "migrations applied — jerrycan check" },
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!(
+            "applied {} migration(s)",
+            payload["applied"].as_array().map(Vec::len).unwrap_or(0)
+        ),
     );
     Ok(())
 }

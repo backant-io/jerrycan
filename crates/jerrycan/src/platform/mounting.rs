@@ -4,8 +4,33 @@
 
 use super::design::Design;
 use super::genroute::crate_ident;
+use super::templates::set_features;
 use std::fs;
 use std::path::Path;
+
+/// Rewrite the workspace's `jerrycan = { … }` dependency line so its facade
+/// features (`db`/`validate`) match the design's mode. Leaves other lines and
+/// the path/version form untouched.
+fn sync_facade_features(ws: &str, design: &Design) -> String {
+    let mut features: Vec<&str> = Vec::new();
+    if design.wants_db() {
+        features.push("db");
+    }
+    if design.wants_validate() {
+        features.push("validate");
+    }
+    ws.lines()
+        .map(|line| {
+            if line.trim_start().starts_with("jerrycan = {") {
+                set_features(line, &features)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + if ws.ends_with('\n') { "\n" } else { "" }
+}
 
 /// The complete, tool-owned app/src/main.rs for this design.
 pub fn expected_main(design: &Design) -> String {
@@ -123,6 +148,33 @@ pub fn expected_migrations_rs(app_root: &Path, design: &Design) -> Result<Option
     )))
 }
 
+/// Load every module-owned migration's contents (the SAME scan as the
+/// aggregated `migrations.rs`, twin-required, module-sorted). Consumed by
+/// `jerrycan db migrate` to apply migrations from disk at runtime.
+pub fn collect_migrations(app_root: &Path) -> Result<Vec<crate::db::OwnedMigration>, String> {
+    let routes = app_root.join("crates/routes");
+    let mut out = Vec::new();
+    for m in scan_migrations(app_root)? {
+        let module_snake = m.module.replace('-', "_");
+        let sqlite_path = routes
+            .join(&m.module)
+            .join(format!("migrations/sqlite/{}.sql", m.file_stem));
+        let postgres_path = routes
+            .join(&m.module)
+            .join(format!("migrations/postgres/{}.sql", m.file_stem));
+        let sqlite = fs::read_to_string(&sqlite_path)
+            .map_err(|e| format!("read {}: {e}", sqlite_path.display()))?;
+        let postgres = fs::read_to_string(&postgres_path)
+            .map_err(|e| format!("read {}: {e}", postgres_path.display()))?;
+        out.push(crate::db::OwnedMigration {
+            name: format!("{module_snake}_{}", m.file_stem),
+            sqlite,
+            postgres,
+        });
+    }
+    Ok(out)
+}
+
 /// Replace the lines between marker lines (markers stay). Fails loud if markers vanished.
 fn splice(content: &str, begin: &str, end: &str, replacement: &str) -> Result<String, String> {
     let b = content.find(begin).ok_or_else(|| {
@@ -181,7 +233,7 @@ pub fn regenerate(app_root: &Path, design: &Design) -> Result<Vec<String>, Strin
     fs::write(&openapi_path, super::openapi::document_json(design)).map_err(|e| e.to_string())?;
     modified.push("openapi.json".to_string());
 
-    // 2. workspace members.
+    // 2. workspace members + facade features (kept in sync with the mode).
     let ws_path = app_root.join("Cargo.toml");
     let ws =
         fs::read_to_string(&ws_path).map_err(|e| format!("read {}: {e}", ws_path.display()))?;
@@ -195,8 +247,9 @@ pub fn regenerate(app_root: &Path, design: &Design) -> Result<Vec<String>, Strin
         "# jerrycan:members:end",
         &members,
     )?;
-    if ws2 != ws {
-        fs::write(&ws_path, &ws2).map_err(|e| e.to_string())?;
+    let ws3 = sync_facade_features(&ws2, design);
+    if ws3 != ws {
+        fs::write(&ws_path, &ws3).map_err(|e| e.to_string())?;
         modified.push("Cargo.toml".to_string());
     }
 

@@ -226,6 +226,118 @@ fn list_routes_walks_the_module_tree() {
 }
 
 #[test]
+fn add_db_flips_the_design_and_regenerates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design_path = tmp.path().join("design.json");
+    std::fs::write(&design_path, GOLDEN).unwrap();
+    let app_dir = tmp.path().join("todo-api");
+    assert!(
+        jerrycan()
+            .args(["new"])
+            .arg(&app_dir)
+            .arg("--design")
+            .arg(&design_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = jerrycan()
+        .current_dir(&app_dir)
+        .args(["--json", "add", "db"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        payload["modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "design.json")
+    );
+
+    let dj: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(app_dir.join("design.json")).unwrap())
+            .unwrap();
+    assert!(
+        dj["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d == "db")
+    );
+    let main_rs = std::fs::read_to_string(app_dir.join("crates/app/src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains("Db::from_env"),
+        "mounting regenerated in db mode: {main_rs}"
+    );
+    let ws = std::fs::read_to_string(app_dir.join("Cargo.toml")).unwrap();
+    assert!(ws.contains("features = [\"db\"]"), "{ws}");
+
+    let out = jerrycan()
+        .current_dir(&app_dir)
+        .args(["add", "nonsense"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn db_migrate_applies_module_migrations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut design: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    design["dependencies"] = serde_json::json!(["db"]);
+    let design_path = tmp.path().join("design.json");
+    std::fs::write(&design_path, serde_json::to_string_pretty(&design).unwrap()).unwrap();
+    let app_dir = tmp.path().join("todo-api");
+    assert!(
+        jerrycan()
+            .args(["new"])
+            .arg(&app_dir)
+            .arg("--design")
+            .arg(&design_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let db_file = tmp.path().join("test.db");
+    let url = format!("sqlite://{}?mode=rwc", db_file.display());
+    let out = jerrycan()
+        .current_dir(&app_dir)
+        .args(["--json", "db", "migrate", "--url", &url])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let applied = payload["applied"].as_array().unwrap();
+    assert!(
+        applied
+            .iter()
+            .any(|a| a.as_str().unwrap().contains("todos")),
+        "{applied:?}"
+    );
+
+    // Idempotent: second run applies nothing.
+    let out = jerrycan()
+        .current_dir(&app_dir)
+        .args(["--json", "db", "migrate", "--url", &url])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(payload["applied"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn docs_command_prints_pages_and_searches() {
     let out = jerrycan().args(["docs", "dependencies"]).output().unwrap();
     assert!(out.status.success());

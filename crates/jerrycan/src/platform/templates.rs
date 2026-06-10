@@ -44,6 +44,26 @@ pub(crate) fn inject_features(dep_line: &str, features: &[&str]) -> String {
     }
 }
 
+/// Rewrite the facade features on an existing dep line to exactly `features`
+/// (dropping any prior `, features = [...]` first). `jerrycan add` calls this
+/// when a reserved dependency flips the app's mode after scaffold.
+pub(crate) fn set_features(dep_line: &str, features: &[&str]) -> String {
+    inject_features(&strip_features(dep_line), features)
+}
+
+/// Remove a trailing `, features = [...]` segment (the form `inject_features`
+/// emits) from a single-line inline-table dep line.
+fn strip_features(dep_line: &str) -> String {
+    if let Some(pos) = dep_line.find(", features = [")
+        && let Some(close) = dep_line.rfind('}')
+        && pos < close
+    {
+        let head = dep_line[..pos].trim_end();
+        return format!("{head} }}");
+    }
+    dep_line.to_string()
+}
+
 pub const WORKSPACE_CARGO: &str = r#"[workspace]
 resolver = "3"
 members = [

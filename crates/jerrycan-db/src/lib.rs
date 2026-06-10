@@ -79,11 +79,40 @@ pub struct Migration {
     pub postgres: &'static str,
 }
 
+/// Runtime-loaded migration (CLI `jerrycan db migrate` reads module files from
+/// disk). The owned twin of [`Migration`]; both delegate to the same runner.
+#[derive(Debug, Clone)]
+pub struct OwnedMigration {
+    pub name: String,
+    pub sqlite: String,
+    pub postgres: String,
+}
+
 impl Db {
     /// Apply pending migrations in slice order; returns the names applied.
     /// Tracking table `_jerrycan_migrations` remembers what ran. A failure
     /// stops the run and records nothing for the failed entry.
     pub async fn migrate(&self, migrations: &[Migration]) -> Result<Vec<String>> {
+        self.migrate_iter(migrations.iter().map(|m| (m.name, m.sqlite, m.postgres)))
+            .await
+    }
+
+    /// Owned-migration twin of [`migrate`](Self::migrate) — same runner.
+    pub async fn migrate_owned(&self, migrations: &[OwnedMigration]) -> Result<Vec<String>> {
+        self.migrate_iter(
+            migrations
+                .iter()
+                .map(|m| (m.name.as_str(), m.sqlite.as_str(), m.postgres.as_str())),
+        )
+        .await
+    }
+
+    /// The shared core: apply each `(name, sqlite, postgres)` in order, skipping
+    /// already-recorded names. A failure stops the run, recording nothing for it.
+    async fn migrate_iter<'a>(
+        &self,
+        items: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+    ) -> Result<Vec<String>> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS _jerrycan_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)",
         )
@@ -92,10 +121,10 @@ impl Db {
         .map_err(db_error)?;
 
         let mut applied = Vec::new();
-        for m in migrations {
+        for (name, sqlite, postgres) in items {
             let seen =
                 sqlx::query(&self.sql("SELECT name FROM _jerrycan_migrations WHERE name = ?"))
-                    .bind(m.name)
+                    .bind(name)
                     .fetch_optional(&self.pool)
                     .await
                     .map_err(db_error)?;
@@ -103,25 +132,25 @@ impl Db {
                 continue;
             }
             let statement = match self.backend {
-                Backend::Sqlite => m.sqlite,
-                Backend::Postgres => m.postgres,
+                Backend::Sqlite => sqlite,
+                Backend::Postgres => postgres,
             };
             sqlx::query(statement)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| {
-                    eprintln!("jerrycan-db: migration `{}` failed", m.name);
+                    eprintln!("jerrycan-db: migration `{name}` failed");
                     db_error(e)
                 })?;
             sqlx::query(
                 &self.sql("INSERT INTO _jerrycan_migrations (name, applied_at) VALUES (?, ?)"),
             )
-            .bind(m.name)
+            .bind(name)
             .bind(chrono_free_timestamp())
             .execute(&self.pool)
             .await
             .map_err(db_error)?;
-            applied.push(m.name.to_string());
+            applied.push(name.to_string());
         }
         Ok(applied)
     }
@@ -265,6 +294,31 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_migrations_apply_in_order_and_only_once() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let owned = vec![
+            OwnedMigration {
+                name: "0001_create_todos".into(),
+                sqlite:
+                    "CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL)"
+                        .into(),
+                postgres: "CREATE TABLE todos (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)"
+                    .into(),
+            },
+            OwnedMigration {
+                name: "0002_add_done".into(),
+                sqlite: "ALTER TABLE todos ADD COLUMN done BOOLEAN NOT NULL DEFAULT 0".into(),
+                postgres: "ALTER TABLE todos ADD COLUMN done BOOLEAN NOT NULL DEFAULT FALSE".into(),
+            },
+        ];
+        let applied = db.migrate_owned(&owned).await.unwrap();
+        assert_eq!(applied, vec!["0001_create_todos", "0002_add_done"]);
+        // Re-running applies nothing (shares the tracking table with `migrate`).
+        let applied = db.migrate_owned(&owned).await.unwrap();
+        assert!(applied.is_empty());
     }
 
     #[tokio::test]
