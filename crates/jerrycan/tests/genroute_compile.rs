@@ -9,7 +9,7 @@
 //! Predates Task 9's fuller scaffold-driven compile gate; cheap insurance until then.
 
 use jerrycan::platform::design::Design;
-use jerrycan::platform::genroute::write_module;
+use jerrycan::platform::genroute::{GenMode, write_module};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -62,8 +62,11 @@ fn generated_module_crate_passes_strict_clippy() {
 
     // 1. Emit the todos route crate (model.rs + repo.rs + stub handlers.rs).
     let design: Design = serde_json::from_str(MINIMAL).expect("MINIMAL parses");
+    let mode = GenMode {
+        db: design.wants_db(),
+    };
     let module = design.modules.into_iter().next().expect("todos module");
-    let created = write_module(&routes, &module).expect("write_module");
+    let created = write_module(&routes, &module, mode).expect("write_module");
     assert!(
         created.iter().any(|p| p.ends_with("todos/src/repo.rs")),
         "the entity-bearing module must emit repo.rs (the dead-code case): {created:?}"
@@ -86,7 +89,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-jerrycan = {{ path = "{jerrycan_dir}", default-features = false }}
+jerrycan = {{ path = "{jerrycan_dir}", default-features = false, features = ["db"] }}
 tokio = {{ version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }}
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"

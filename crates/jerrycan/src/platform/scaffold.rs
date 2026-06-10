@@ -37,7 +37,14 @@ pub fn scaffold(target: &Path, design: &Design) -> Result<Vec<String>, String> {
         Ok(())
     };
 
-    let dep_line = jerrycan_dep_spec();
+    let mut features: Vec<&str> = Vec::new();
+    if design.wants_db() {
+        features.push("db");
+    }
+    if design.wants_validate() {
+        features.push("validate");
+    }
+    let dep_line = jerrycan_dep_spec(&features);
     write(
         "Cargo.toml",
         &render(
@@ -59,9 +66,12 @@ pub fn scaffold(target: &Path, design: &Design) -> Result<Vec<String>, String> {
     write("crates/shared/Cargo.toml", SHARED_CARGO)?;
     write("crates/shared/src/lib.rs", SHARED_LIB)?;
 
+    let mode = genroute::GenMode {
+        db: design.wants_db(),
+    };
     let routes_dir = target.join("crates/routes");
     for m in &design.modules {
-        created.extend(genroute::write_module(&routes_dir, m)?);
+        created.extend(genroute::write_module(&routes_dir, m, mode)?);
     }
     created.extend(mounting::regenerate(target, design)?);
     created.sort();

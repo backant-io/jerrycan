@@ -252,8 +252,11 @@ fn cmd_generate_route(module_path: &str, json_mode: bool) -> Result<(), Failure>
         .iter()
         .find(|m| m.name == top)
         .expect("checked above");
-    let created =
-        genroute::write_module(&root.join("crates/routes"), top_module).map_err(Failure::gate)?;
+    let mode = genroute::GenMode {
+        db: design.wants_db(),
+    };
+    let created = genroute::write_module(&root.join("crates/routes"), top_module, mode)
+        .map_err(Failure::gate)?;
     let modified = mounting::regenerate(&root, &design).map_err(Failure::gate)?;
     let payload = serde_json::json!({
         "created": created,

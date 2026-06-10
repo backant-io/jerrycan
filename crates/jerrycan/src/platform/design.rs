@@ -174,6 +174,16 @@ impl ModuleDesign {
 }
 
 impl Design {
+    /// Reserved dependency name `db` switches generation to SQL mode.
+    pub fn wants_db(&self) -> bool {
+        self.dependencies.iter().any(|d| d == "db")
+    }
+
+    /// Reserved dependency name `validate` mounts the OpenAPI document.
+    pub fn wants_validate(&self) -> bool {
+        self.dependencies.iter().any(|d| d == "validate")
+    }
+
     pub fn from_path(path: &std::path::Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;

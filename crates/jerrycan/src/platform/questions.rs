@@ -89,6 +89,28 @@ pub fn validate(d: &Design) -> Vec<Question> {
             &mut qs,
         );
     }
+
+    if d.wants_db() {
+        fn check_json_fields(m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+            for (i, e) in m.entities.iter().enumerate() {
+                for (j, f) in e.fields.iter().enumerate() {
+                    if matches!(f.field_type, FieldType::Json) {
+                        qs.push(q(
+                            format!("{ptr}/entities/{i}/fields/{j}/type"),
+                            format!("Field `{}` has type json — json fields are not yet supported in db mode (store as string, or drop the db dependency; structured json columns are a contract-v1 candidate).", f.name),
+                        ));
+                    }
+                }
+            }
+            for (i, sub) in m.subroutes.iter().enumerate() {
+                check_json_fields(sub, &format!("{ptr}/subroutes/{i}"), qs);
+            }
+        }
+        for (i, m) in d.modules.iter().enumerate() {
+            check_json_fields(m, &format!("/modules/{i}"), &mut qs);
+        }
+    }
+
     qs
 }
 
@@ -407,6 +429,18 @@ mod tests {
                 .iter()
                 .any(|q| q.question.contains("unbalanced braces")),
             "unbalanced braces must be flagged"
+        );
+    }
+
+    #[test]
+    fn json_fields_are_rejected_in_db_mode() {
+        // MINIMAL already declares `["db"]`; flip a field to json.
+        let d = design(&MINIMAL.replace("\"type\": \"boolean\"", "\"type\": \"json\""));
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.question.contains("json") && q.question.contains("db mode")),
+            "db mode can't store json fields yet"
         );
     }
 

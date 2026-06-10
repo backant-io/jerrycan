@@ -3,9 +3,15 @@
 //! (always rewritten); handlers/model/repo/deps are AGENT-owned (create-once).
 
 use super::design::*;
-use super::templates::{ROUTE_CARGO, jerrycan_dep_spec, render};
+use super::templates::{ROUTE_CARGO, render};
 use std::fs;
 use std::path::Path;
+
+/// Generation mode derived from the design's reserved dependencies.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GenMode {
+    pub db: bool,
+}
 
 /// snake/ident helpers: crate `route-todo-list` → ident `route_todo_list`.
 pub fn crate_ident(module_name: &str) -> String {
@@ -122,10 +128,7 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
     Some(out)
 }
 
-pub(crate) fn repo_rs(m: &ModuleDesign) -> Option<String> {
-    if m.entities.is_empty() {
-        return None;
-    }
+fn memory_repo_rs(m: &ModuleDesign) -> String {
     let mut out = String::from(
         "//! In-memory data access (Phase 1; jerrycan-db replaces this in Phase 2).\nuse super::model::*;\nuse std::collections::BTreeMap;\nuse std::sync::Mutex;\nuse std::sync::atomic::{AtomicI64, Ordering};\n\n",
     );
@@ -169,7 +172,243 @@ impl Default for {n}Repo {{
 "#
         ));
     }
+    out
+}
+
+/// SQL table name for an entity: lowercased + pluralized (`Todo` → `todos`).
+fn table_name(entity: &str) -> String {
+    format!("{}s", entity.to_lowercase())
+}
+
+fn column_list(e: &Entity) -> String {
+    e.fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn row_constructor(e: &Entity) -> String {
+    let fields = e
+        .fields
+        .iter()
+        .map(|f| format!("{name}: row.get(\"{name}\")", name = f.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{} {{ {fields} }}", e.name)
+}
+
+fn binds(e: &Entity) -> String {
+    e.fields
+        .iter()
+        .map(|f| format!("            .bind(item.{})\n", f.name))
+        .collect()
+}
+
+fn sql_repo(e: &Entity) -> String {
+    let entity = &e.name;
+    let snake = entity.to_lowercase();
+    let table = table_name(entity);
+    let cols = column_list(e);
+    let placeholders = e.fields.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let ctor = row_constructor(e);
+    let bind_lines = binds(e);
+    format!(
+        r#"pub struct {entity}Repo {{
+    db: Db,
+}}
+
+/// DI factory — registered by the tool-owned lib.rs via `.provide_dep`.
+pub(crate) async fn {snake}_repo(db: Dep<Db>) -> Result<{entity}Repo> {{
+    Ok({entity}Repo {{ db: (*db).clone() }})
+}}
+
+// Stub handlers don't call the repo yet; remove this allow as you implement them.
+#[allow(dead_code)]
+impl {entity}Repo {{
+    pub async fn all(&self) -> Result<Vec<{entity}>> {{
+        let rows = jerrycan::db::sqlx::query("SELECT {cols} FROM {table} ORDER BY id")
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(|row| {ctor}).collect())
+    }}
+
+    pub async fn get(&self, id: i64) -> Result<Option<{entity}>> {{
+        let row = jerrycan::db::sqlx::query(&self.db.sql("SELECT {cols} FROM {table} WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(self.db.pool())
+            .await
+            .map_err(db_error)?;
+        Ok(row.map(|row| {ctor}))
+    }}
+
+    pub async fn insert(&self, item: {entity}) -> Result<i64> {{
+        match self.db.backend() {{
+            Backend::Postgres => {{
+                let row = jerrycan::db::sqlx::query(
+                    &self.db.sql("INSERT INTO {table} ({cols}) VALUES ({placeholders}) RETURNING id"),
+                )
+{bind_lines}                .fetch_one(self.db.pool())
+                .await
+                .map_err(db_error)?;
+                Ok(row.get("id"))
+            }}
+            Backend::Sqlite => {{
+                let result = jerrycan::db::sqlx::query("INSERT INTO {table} ({cols}) VALUES ({placeholders})")
+{bind_lines}                .execute(self.db.pool())
+                .await
+                .map_err(db_error)?;
+                Ok(result.last_insert_id().unwrap_or_default())
+            }}
+        }}
+    }}
+
+    pub async fn remove(&self, id: i64) -> Result<bool> {{
+        let result = jerrycan::db::sqlx::query(&self.db.sql("DELETE FROM {table} WHERE id = ?"))
+            .bind(id)
+            .execute(self.db.pool())
+            .await
+            .map_err(db_error)?;
+        Ok(result.rows_affected() > 0)
+    }}
+}}
+
+"#,
+    )
+}
+
+pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode) -> Option<String> {
+    if m.entities.is_empty() {
+        return None;
+    }
+    if !mode.db {
+        return Some(memory_repo_rs(m));
+    }
+    let mut out = String::from(
+        "//! Data access — generated SQL over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sqlx::Row;\nuse jerrycan::db::{db_error, Backend, Db};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
+    );
+    for e in &m.entities {
+        out.push_str(&sql_repo(e));
+    }
     Some(out)
+}
+
+/// Dual-dialect `CREATE TABLE` DDL for one module's entities (None if it has none).
+fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool) -> Option<String> {
+    if m.entities.is_empty() {
+        return None;
+    }
+    fn column_type(t: FieldType) -> &'static str {
+        match t {
+            FieldType::String | FieldType::Datetime | FieldType::Uuid => "TEXT",
+            FieldType::Integer => "BIGINT",
+            FieldType::Float => "DOUBLE PRECISION",
+            FieldType::Boolean => "BOOLEAN",
+            FieldType::Json => "TEXT", // unreachable: validated out in db mode
+        }
+    }
+    fn default_for(t: FieldType, pg: bool) -> &'static str {
+        match t {
+            FieldType::Boolean => {
+                if pg {
+                    "FALSE"
+                } else {
+                    "0"
+                }
+            }
+            FieldType::Integer => "0",
+            FieldType::Float => "0",
+            _ => "''",
+        }
+    }
+    let mut out = String::new();
+    for e in &m.entities {
+        let pk = if backend_is_pg {
+            "id BIGSERIAL PRIMARY KEY"
+        } else {
+            "id INTEGER PRIMARY KEY AUTOINCREMENT"
+        };
+        out.push_str(&format!("CREATE TABLE {} (\n    {pk}", table_name(&e.name)));
+        for f in &e.fields {
+            out.push_str(&format!(
+                ",\n    {} {} NOT NULL",
+                f.name,
+                column_type(f.field_type)
+            ));
+            if !f.required {
+                out.push_str(&format!(
+                    " DEFAULT {}",
+                    default_for(f.field_type, backend_is_pg)
+                ));
+            }
+        }
+        out.push_str("\n);\n\n");
+    }
+    Some(out)
+}
+
+/// Emit the module's own migration file plus one file per entity-bearing
+/// subroute (`0001_create_tables_{sub}.sql`), both dialects, recursing.
+/// Migrations are agent-owned create-once — never clobbered once applied.
+fn write_module_migrations(
+    crate_dir: &Path,
+    m: &ModuleDesign,
+    created: &mut Vec<String>,
+    root: &Path,
+) -> Result<(), String> {
+    if let Some(ddl) = migration_ddl(m, false) {
+        write_agent_owned(
+            &crate_dir.join("migrations/sqlite/0001_create_tables.sql"),
+            &ddl,
+            created,
+            root,
+        )?;
+    }
+    if let Some(ddl) = migration_ddl(m, true) {
+        write_agent_owned(
+            &crate_dir.join("migrations/postgres/0001_create_tables.sql"),
+            &ddl,
+            created,
+            root,
+        )?;
+    }
+    write_subtree_migrations(crate_dir, m, created, root)
+}
+
+/// Subroute migrations land in the OWNING (top) crate's migrations dir, named
+/// `0001_create_tables_{sub_snake}.sql`, recursing to arbitrary depth.
+fn write_subtree_migrations(
+    crate_dir: &Path,
+    m: &ModuleDesign,
+    created: &mut Vec<String>,
+    root: &Path,
+) -> Result<(), String> {
+    for sub in &m.subroutes {
+        let sub_snake = sub.name.replace('-', "_");
+        if let Some(ddl) = migration_ddl(sub, false) {
+            write_agent_owned(
+                &crate_dir.join(format!(
+                    "migrations/sqlite/0001_create_tables_{sub_snake}.sql"
+                )),
+                &ddl,
+                created,
+                root,
+            )?;
+        }
+        if let Some(ddl) = migration_ddl(sub, true) {
+            write_agent_owned(
+                &crate_dir.join(format!(
+                    "migrations/postgres/0001_create_tables_{sub_snake}.sql"
+                )),
+                &ddl,
+                created,
+                root,
+            )?;
+        }
+        write_subtree_migrations(crate_dir, sub, created, root)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn deps_rs(m: &ModuleDesign) -> String {
@@ -217,13 +456,20 @@ fn route_lines(m: &ModuleDesign, indent: &str) -> String {
     out
 }
 
-fn module_body(m: &ModuleDesign, indent: &str) -> String {
+fn module_body(m: &ModuleDesign, indent: &str, mode: GenMode) -> String {
     let mut body = format!("{indent}Module::new(\"{}\")\n", m.name);
     for e in &m.entities {
-        body.push_str(&format!(
-            "{indent}    .provide(repo::{}Repo::new())\n",
-            e.name
-        ));
+        if mode.db {
+            body.push_str(&format!(
+                "{indent}    .provide_dep(repo::{}_repo)\n",
+                e.name.to_lowercase()
+            ));
+        } else {
+            body.push_str(&format!(
+                "{indent}    .provide(repo::{}Repo::new())\n",
+                e.name
+            ));
+        }
     }
     body.push_str(&route_lines(m, &format!("{indent}    ")));
     for sub in &m.subroutes {
@@ -247,21 +493,21 @@ fn mod_decls(m: &ModuleDesign) -> String {
     out
 }
 
-pub(crate) fn lib_rs(m: &ModuleDesign) -> String {
+pub(crate) fn lib_rs(m: &ModuleDesign, mode: GenMode) -> String {
     format!(
         "//! Route module `{name}` — TOOL-OWNED, regenerated by `jerrycan generate`.\n//! The sole public item is `module()`; agent code lives in handlers/model/repo/deps.\n#![forbid(unsafe_code)]\n\n{mods}\nuse jerrycan::prelude::*;\n\n/// Build this module's routes, subroutes, and scoped dependencies.\npub fn module() -> Module {{\n    deps::configure(\n{body}    )\n}}\n",
         name = m.name,
         mods = mod_decls(m),
-        body = module_body(m, "        "),
+        body = module_body(m, "        ", mode),
     )
 }
 
-fn subroute_mod_rs(m: &ModuleDesign) -> String {
+fn subroute_mod_rs(m: &ModuleDesign, mode: GenMode) -> String {
     format!(
         "//! Subroute `{name}` — TOOL-OWNED mod.rs; same fractal shape as a module.\n\n{mods}\nuse jerrycan::prelude::*;\n\npub(crate) fn module() -> Module {{\n    deps::configure(\n{body}    )\n}}\n",
         name = m.name,
         mods = mod_decls(m),
-        body = module_body(m, "        "),
+        body = module_body(m, "        ", mode),
     )
 }
 
@@ -300,7 +546,11 @@ fn rel(path: &Path, root: &Path) -> String {
 /// (= `<app>/crates/routes`). Returns paths written, relative to routes_dir's parent's parent.
 /// Precondition: the design has passed `questions::validate` — generation assumes
 /// validated names and entity references.
-pub fn write_module(routes_dir: &Path, m: &ModuleDesign) -> Result<Vec<String>, String> {
+pub fn write_module(
+    routes_dir: &Path,
+    m: &ModuleDesign,
+    mode: GenMode,
+) -> Result<Vec<String>, String> {
     let root = routes_dir
         .ancestors()
         .nth(2)
@@ -312,12 +562,13 @@ pub fn write_module(routes_dir: &Path, m: &ModuleDesign) -> Result<Vec<String>, 
 
     let cargo = render(ROUTE_CARGO, &[("name", &m.name)])?;
     write_tool_owned(&crate_dir.join("Cargo.toml"), &cargo, &mut created, &root)?;
-    write_tool_owned(&src.join("lib.rs"), &lib_rs(m), &mut created, &root)?;
-    write_unit_files(&src, m, &mut created, &root)?;
-    write_subroutes(&src, m, &mut created, &root)?;
-    // jerrycan_dep_spec is consumed by the workspace manifest (scaffold), not here;
-    // referenced so the module split stays honest:
-    let _ = jerrycan_dep_spec;
+    write_tool_owned(&src.join("lib.rs"), &lib_rs(m, mode), &mut created, &root)?;
+    write_unit_files(&src, m, mode, &mut created, &root)?;
+    write_subroutes(&src, m, mode, &mut created, &root)?;
+    // db mode: agent-owned create-once migrations for this crate (module + subroutes).
+    if mode.db {
+        write_module_migrations(&crate_dir, m, &mut created, &root)?;
+    }
     Ok(created)
 }
 
@@ -325,6 +576,7 @@ pub fn write_module(routes_dir: &Path, m: &ModuleDesign) -> Result<Vec<String>, 
 fn write_unit_files(
     dir: &Path,
     m: &ModuleDesign,
+    mode: GenMode,
     created: &mut Vec<String>,
     root: &Path,
 ) -> Result<(), String> {
@@ -333,7 +585,7 @@ fn write_unit_files(
     if let Some(model) = model_rs(m) {
         write_agent_owned(&dir.join("model.rs"), &model, created, root)?;
     }
-    if let Some(repo) = repo_rs(m) {
+    if let Some(repo) = repo_rs(m, mode) {
         write_agent_owned(&dir.join("repo.rs"), &repo, created, root)?;
     }
     Ok(())
@@ -342,6 +594,7 @@ fn write_unit_files(
 fn write_subroutes(
     src: &Path,
     m: &ModuleDesign,
+    mode: GenMode,
     created: &mut Vec<String>,
     root: &Path,
 ) -> Result<(), String> {
@@ -356,9 +609,14 @@ fn write_subroutes(
     write_tool_owned(&sub_root.join("mod.rs"), &decls, created, root)?;
     for sub in &m.subroutes {
         let dir = sub_root.join(sub.name.replace('-', "_"));
-        write_tool_owned(&dir.join("mod.rs"), &subroute_mod_rs(sub), created, root)?;
-        write_unit_files(&dir, sub, created, root)?;
-        write_subroutes(&dir, sub, created, root)?; // arbitrary depth
+        write_tool_owned(
+            &dir.join("mod.rs"),
+            &subroute_mod_rs(sub, mode),
+            created,
+            root,
+        )?;
+        write_unit_files(&dir, sub, mode, created, root)?;
+        write_subroutes(&dir, sub, mode, created, root)?; // arbitrary depth
     }
     Ok(())
 }
@@ -487,7 +745,7 @@ mod tests {
     #[test]
     fn lib_rs_groups_routes_by_path_and_mounts_subroutes() {
         let m = todos();
-        let lib = lib_rs(&m);
+        let lib = lib_rs(&m, GenMode::default());
         assert!(lib.contains("pub fn module() -> Module"), "{lib}");
         assert!(
             lib.contains(".route(\"/\", get(handlers::list_todos).post(handlers::create_todo))"),
@@ -519,7 +777,7 @@ mod tests {
             model.contains("#[serde(default)]\n    pub done: bool"),
             "{model}"
         );
-        let repo = repo_rs(&m).unwrap();
+        let repo = repo_rs(&m, GenMode::default()).unwrap();
         assert!(repo.contains("pub struct TodoRepo"));
         assert!(
             repo.contains("#[allow(dead_code)]"),
@@ -541,7 +799,7 @@ mod tests {
         let routes = tmp.path().join("crates/routes");
         let m = todos();
 
-        let created = write_module(&routes, &m).unwrap();
+        let created = write_module(&routes, &m, GenMode::default()).unwrap();
         assert!(created.iter().any(|p| p.ends_with("todos/src/lib.rs")));
         assert!(
             created
@@ -555,7 +813,7 @@ mod tests {
         let lib = routes.join("todos/src/lib.rs");
         fs::write(&lib, "// hand edit\n").unwrap();
 
-        write_module(&routes, &m).unwrap();
+        write_module(&routes, &m, GenMode::default()).unwrap();
         assert_eq!(
             fs::read_to_string(&handlers).unwrap(),
             "// AGENT CODE\n",
@@ -574,7 +832,7 @@ mod tests {
         let m = todos();
         let sub = &m.subroutes[0];
         assert!(model_rs(sub).is_none());
-        assert!(repo_rs(sub).is_none());
+        assert!(repo_rs(sub, GenMode::default()).is_none());
         let h = handlers_rs(sub);
         assert!(
             h.contains("pub(crate) async fn list_comments() -> Result<Json<serde_json::Value>>"),

@@ -16,14 +16,32 @@ pub fn render(template: &str, vars: &[(&str, &str)]) -> Result<String, String> {
 
 /// How generated apps depend on the framework. Overridable for local development
 /// and conformance tests via JERRYCAN_FRAMEWORK_DEP (a full Cargo dep line).
-pub fn jerrycan_dep_spec() -> String {
-    jerrycan_dep_spec_from(std::env::var("JERRYCAN_FRAMEWORK_DEP").ok())
+/// `features` are injected into the dep line (e.g. `db`, `validate`).
+pub fn jerrycan_dep_spec(features: &[&str]) -> String {
+    let base = jerrycan_dep_spec_from(std::env::var("JERRYCAN_FRAMEWORK_DEP").ok());
+    inject_features(&base, features)
 }
 
 pub(crate) fn jerrycan_dep_spec_from(env: Option<String>) -> String {
     env.unwrap_or_else(|| {
         "jerrycan = { version = \"0.0.0\", default-features = false }".to_string()
     })
+}
+
+/// The env override must be a single-line inline table ending in `}`.
+pub(crate) fn inject_features(dep_line: &str, features: &[&str]) -> String {
+    if features.is_empty() {
+        return dep_line.to_string();
+    }
+    let list = features
+        .iter()
+        .map(|f| format!("\"{f}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match dep_line.rfind('}') {
+        Some(pos) => format!("{}, features = [{list}] }}", dep_line[..pos].trim_end()),
+        None => format!("{dep_line} # jerrycan: could not inject features = [{list}]"),
+    }
 }
 
 pub const WORKSPACE_CARGO: &str = r#"[workspace]
@@ -107,6 +125,7 @@ shared = { path = "../../shared" }
 
 [dev-dependencies]
 tokio.workspace = true
+serde_json.workspace = true
 "#;
 
 #[cfg(test)]
@@ -137,6 +156,16 @@ mod tests {
             "jerrycan = { path = \"/x\", default-features = false }".into(),
         ));
         assert!(local.contains("path = \"/x\""));
+    }
+
+    #[test]
+    fn features_inject_into_the_dep_line() {
+        let line = "jerrycan = { version = \"0.0.0\", default-features = false }";
+        assert_eq!(
+            inject_features(line, &["db", "validate"]),
+            "jerrycan = { version = \"0.0.0\", default-features = false, features = [\"db\", \"validate\"] }"
+        );
+        assert_eq!(inject_features(line, &[]), line);
     }
 
     #[test]

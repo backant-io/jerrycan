@@ -95,18 +95,37 @@ fn lint_handlers(root: &Path, m: &ModuleDesign, src_rel: &str, out: &mut Vec<Dia
     }
 }
 
-/// JL0003: tool-owned app/src/main.rs must equal the regenerator's output exactly.
+/// JL0003: tool-owned app/src/main.rs (and, in db mode, app/src/migrations.rs)
+/// must equal the regenerator's output exactly.
 fn lint_generated_drift(root: &Path, design: &Design, out: &mut Vec<Diagnostic>) {
-    let rel = "crates/app/src/main.rs";
-    let on_disk = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
+    let drift = d(
+        "JL0003",
+        Some("crates/app/src/main.rs".into()),
+        None,
+        "generated file drifted from the design (hand-edited, or design.json changed without regenerating)".into(),
+        "run `jerrycan generate route <module>` to regenerate mounting; never hand-edit GENERATED files",
+        "jerrycan docs app#anti-patterns",
+    );
+    let main_rel = "crates/app/src/main.rs";
+    let on_disk = std::fs::read_to_string(root.join(main_rel)).unwrap_or_default();
     if on_disk != mounting::expected_main(design) {
-        out.push(d(
-            "JL0003",
-            Some(rel.into()),
-            None,
-            "generated file drifted from the design (hand-edited, or design.json changed without regenerating)".into(),
-            "run `jerrycan generate route <module>` to regenerate mounting; never hand-edit GENERATED files",
-            "jerrycan docs app#anti-patterns",
-        ));
+        out.push(drift);
+    }
+
+    if design.wants_db()
+        && let Ok(Some(expected)) = mounting::expected_migrations_rs(root, design)
+    {
+        let mig_rel = "crates/app/src/migrations.rs";
+        let on_disk = std::fs::read_to_string(root.join(mig_rel)).unwrap_or_default();
+        if on_disk != expected {
+            out.push(d(
+                "JL0003",
+                Some(mig_rel.into()),
+                None,
+                "generated file drifted from the design (hand-edited, or migrations changed without regenerating)".into(),
+                "run `jerrycan generate route <module>` to regenerate the migration aggregate; never hand-edit GENERATED files",
+                "jerrycan docs app#anti-patterns",
+            ));
+        }
     }
 }

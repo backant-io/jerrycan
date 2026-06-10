@@ -195,10 +195,14 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                         .iter()
                         .find(|m| m.name == top_name)
                         .expect("validated above");
-                    let created = match genroute::write_module(&root.join("crates/routes"), top) {
-                        Ok(c) => c,
-                        Err(e) => return err_payload(e),
+                    let mode = genroute::GenMode {
+                        db: design.wants_db(),
                     };
+                    let created =
+                        match genroute::write_module(&root.join("crates/routes"), top, mode) {
+                            Ok(c) => c,
+                            Err(e) => return err_payload(e),
+                        };
                     let modified = match mounting::regenerate(&root, &design) {
                         Ok(m) => m,
                         Err(e) => return err_payload(e),

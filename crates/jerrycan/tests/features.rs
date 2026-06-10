@@ -1,7 +1,8 @@
 //! The facade's feature-gated extension re-exports: generated apps depend on
 //! `jerrycan = { features = ["db", "validate"] }` and import `jerrycan::db::…`.
 //! This test file only compiles its bodies when the features are on — the
-//! workspace gate runs with --all-features, so CI always checks them.
+//! LOCAL gate runs with --all-features; CI gains --all-features when the
+//! Phase 2 exit lands (Task 13).
 
 #[cfg(feature = "db")]
 #[tokio::test]
