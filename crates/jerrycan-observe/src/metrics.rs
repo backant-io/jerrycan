@@ -12,8 +12,7 @@ pub struct Metrics {
     status_2xx: AtomicU64,
     status_4xx: AtomicU64,
     status_5xx: AtomicU64,
-    status_200: AtomicU64,
-    status_404: AtomicU64,
+    status_other: AtomicU64,
     in_flight: AtomicU64,
     duration_count: AtomicU64,
     duration_sum_micros: AtomicU64,
@@ -26,8 +25,7 @@ impl Metrics {
             status_2xx: AtomicU64::new(0),
             status_4xx: AtomicU64::new(0),
             status_5xx: AtomicU64::new(0),
-            status_200: AtomicU64::new(0),
-            status_404: AtomicU64::new(0),
+            status_other: AtomicU64::new(0),
             in_flight: AtomicU64::new(0),
             duration_count: AtomicU64::new(0),
             duration_sum_micros: AtomicU64::new(0),
@@ -37,20 +35,11 @@ impl Metrics {
 
     /// Record one finished request.
     pub fn record(&self, status: u16, seconds: f64) {
-        match status {
-            200 => {
-                self.status_200.fetch_add(1, Ordering::Relaxed);
-            }
-            404 => {
-                self.status_404.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
         let class = match status {
             200..=299 => &self.status_2xx,
             400..=499 => &self.status_4xx,
             500..=599 => &self.status_5xx,
-            _ => &self.status_2xx,
+            _ => &self.status_other,
         };
         class.fetch_add(1, Ordering::Relaxed);
         self.duration_count.fetch_add(1, Ordering::Relaxed);
@@ -72,15 +61,23 @@ impl Metrics {
     /// Render the current state as Prometheus exposition text.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        let total_200 = self.status_200.load(Ordering::Relaxed);
-        let total_404 = self.status_404.load(Ordering::Relaxed);
+        let total_2xx = self.status_2xx.load(Ordering::Relaxed);
+        let total_4xx = self.status_4xx.load(Ordering::Relaxed);
+        let total_5xx = self.status_5xx.load(Ordering::Relaxed);
+        let total_other = self.status_other.load(Ordering::Relaxed);
         let total = self.duration_count.load(Ordering::Relaxed);
         out.push_str("# TYPE jerrycan_requests_total counter\n");
         out.push_str(&format!(
-            "jerrycan_requests_total{{status=\"200\"}} {total_200}\n"
+            "jerrycan_requests_total{{status=\"2xx\"}} {total_2xx}\n"
         ));
         out.push_str(&format!(
-            "jerrycan_requests_total{{status=\"404\"}} {total_404}\n"
+            "jerrycan_requests_total{{status=\"4xx\"}} {total_4xx}\n"
+        ));
+        out.push_str(&format!(
+            "jerrycan_requests_total{{status=\"5xx\"}} {total_5xx}\n"
+        ));
+        out.push_str(&format!(
+            "jerrycan_requests_total{{status=\"other\"}} {total_other}\n"
         ));
         out.push_str("# TYPE jerrycan_requests_in_flight gauge\n");
         out.push_str(&format!(
@@ -138,11 +135,11 @@ mod tests {
         let text = m.render();
         assert!(text.contains("# TYPE jerrycan_requests_total counter"));
         assert!(
-            text.contains(r#"jerrycan_requests_total{status="200"} 2"#),
+            text.contains(r#"jerrycan_requests_total{status="2xx"} 2"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"jerrycan_requests_total{status="404"} 1"#),
+            text.contains(r#"jerrycan_requests_total{status="4xx"} 1"#),
             "{text}"
         );
         assert!(text.contains("# TYPE jerrycan_request_duration_seconds histogram"));
