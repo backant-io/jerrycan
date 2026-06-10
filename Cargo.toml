@@ -19,6 +19,9 @@ homepage = "https://jerrycan.cc"
 [workspace.dependencies]
 jerrycan-core = { path = "crates/jerrycan-core", version = "0.0.0" }
 jerrycan-macros = { path = "crates/jerrycan-macros", version = "0.0.0" }
+jerrycan-db = { path = "crates/jerrycan-db", version = "0.0.0" }
+jerrycan-validate = { path = "crates/jerrycan-validate", version = "0.0.0" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }

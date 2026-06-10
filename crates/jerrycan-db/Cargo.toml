@@ -1,9 +1,14 @@
 [package]
 name = "jerrycan-db"
-description = "Database extension (SQLite/Postgres, migrations) for the jerrycan framework. Name reservation; real releases begin at 0.1.0. https://jerrycan.cc"
+description = "Database extension for the jerrycan framework: SQLite + Postgres via sqlx, module-owned migrations, Db dependency. Real releases begin at 0.1.0. https://jerrycan.cc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 homepage.workspace = true
 
 [dependencies]
+jerrycan-core = { path = "../jerrycan-core", version = "0.0.0" }
+sqlx.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
