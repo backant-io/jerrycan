@@ -10,6 +10,7 @@ pub mod lints;
 pub mod mcp;
 pub mod mcp_dispatch;
 pub mod mounting;
+pub mod openapi;
 pub mod questions;
 pub mod scaffold;
 pub mod templates;
