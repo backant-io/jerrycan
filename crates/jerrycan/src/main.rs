@@ -124,7 +124,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Check { module } => cmd_check(module.as_deref(), cli.json),
         Cmd::Test { module } => cmd_test(module.as_deref()),
         Cmd::Docs { topic, search } => cmd_docs(topic.as_deref(), search.as_deref(), cli.json),
-        _ => Err(Failure::usage("this command lands in a later Phase 1 task")),
+        Cmd::Mcp => jerrycan::platform::mcp::serve_stdio().map_err(Failure::environment),
     }
 }
 

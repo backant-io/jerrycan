@@ -8,6 +8,7 @@ pub mod docsidx;
 pub mod genroute;
 pub mod lints;
 pub mod mcp;
+pub mod mcp_dispatch;
 pub mod mounting;
 pub mod questions;
 pub mod scaffold;
