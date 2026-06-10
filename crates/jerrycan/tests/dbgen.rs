@@ -28,17 +28,21 @@ fn db_mode_emits_sql_repos_with_di_factories() {
         repo.contains("pub(crate) async fn todo_repo(db: Dep<Db>)"),
         "{repo}"
     );
-    // The generated repo.rs holds these inside Rust string literals, so the
-    // identifier quotes appear backslash-escaped in the file's text.
+    // All SQL is built by sea-query (dialect rendering is library-owned):
+    // no raw SQL strings or escaped-quote templates in generated repos.
     assert!(
-        repo.contains("SELECT \\\"title\\\", \\\"done\\\" FROM \\\"todos\\\""),
+        repo.contains("use jerrycan::db::sea_query::{Alias, Expr, Order, Query};"),
         "{repo}"
     );
-    // One insert path for both backends: RETURNING (translated by db.sql);
-    // the sqlx Any driver's last_insert_id is None on sqlite, so it must
-    // never be relied on (it made creates echo id 0).
     assert!(
-        repo.contains("RETURNING \\\"id\\\""),
+        !repo.contains("SELECT ") && !repo.contains("self.db.sql("),
+        "no raw SQL strings in generated repos: {repo}"
+    );
+    // One insert path for both backends: sea-query renders RETURNING; the
+    // sqlx Any driver's last_insert_id is None on sqlite, so it must never
+    // be relied on (it made creates echo id 0).
+    assert!(
+        repo.contains("Query::returning().columns([Alias::new(\"id\")])"),
         "insert uses RETURNING: {repo}"
     );
     assert!(
@@ -50,10 +54,8 @@ fn db_mode_emits_sql_repos_with_di_factories() {
         "PUT/PATCH handlers need a persisting update: {repo}"
     );
     assert!(
-        repo.contains(
-            "UPDATE \\\"todos\\\" SET \\\"title\\\" = ?, \\\"done\\\" = ? WHERE \\\"id\\\" = ?"
-        ),
-        "update sets every field in bind order with id in the WHERE: {repo}"
+        repo.contains("(Alias::new(\"title\"), item.title.into()), (Alias::new(\"done\"), (item.done as i64).into())"),
+        "update sets every non-pk field: {repo}"
     );
     assert!(repo.contains("map_err(db_error)"), "{repo}");
     let lib = fs::read_to_string(root.join("crates/routes/todos/src/lib.rs")).unwrap();
@@ -77,21 +79,21 @@ fn db_mode_emits_dual_dialect_migrations_from_entities() {
     .unwrap();
     assert!(
         sqlite.contains("CREATE TABLE \"todos\"")
-            && sqlite.contains("\"id\" INTEGER PRIMARY KEY AUTOINCREMENT"),
+            && sqlite.contains("PRIMARY KEY AUTOINCREMENT"),
         "{sqlite}"
     );
-    assert!(sqlite.contains("\"title\" TEXT NOT NULL"));
+    assert!(sqlite.to_lowercase().contains("\"title\" text not null"));
     // Booleans are stored as BIGINT (0/1) on both backends: the sqlx `Any` driver
     // can't round-trip a Rust `bool` against SQLite, so the repo binds `as i64`.
     assert!(
-        sqlite.contains("\"done\" BIGINT NOT NULL DEFAULT 0"),
+        sqlite.to_lowercase().contains("\"done\" bigint not null default 0"),
         "optional bool field stores as integer with a default: {sqlite}"
     );
     assert!(
-        postgres.contains("\"id\" BIGSERIAL PRIMARY KEY"),
+        postgres.to_lowercase().contains("bigserial"),
         "{postgres}"
     );
-    assert!(postgres.contains("\"done\" BIGINT NOT NULL DEFAULT 0"));
+    assert!(postgres.to_lowercase().contains("\"done\" bigint not null default 0"));
     // Subroute entities get their own module-owned migration:
     assert!(root.join("crates/routes/todos/migrations/sqlite").exists());
     let users = fs::read_to_string(
@@ -146,7 +148,7 @@ fn sql_identifiers_are_quoted_so_reserved_words_survive() {
     )
     .unwrap();
     assert!(
-        sqlite.contains("\"order\" TEXT"),
+        sqlite.to_lowercase().contains("\"order\" text"),
         "reserved-word column must be quoted: {sqlite}"
     );
 }

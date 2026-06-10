@@ -252,15 +252,12 @@ fn table_name(entity: &str) -> String {
     format!("{}s", entity.to_lowercase())
 }
 
-/// Comma-joined, double-quoted column identifiers for SELECT/INSERT lists.
-/// Quoting is safe cross-backend (all names are lowercase; pg folds unquoted
-/// idents to lowercase, sqlite is case-insensitive) and shields reserved words.
-/// The quotes are emitted as `\"` because these land INSIDE a Rust string
-/// literal in the generated repo.rs source.
-fn column_list(e: &Entity) -> String {
+/// `Alias::new("col"), …` for the generated repo's column list — sea-query
+/// owns identifier quoting per dialect, so no escaped-quote SQL templates.
+fn alias_cols(e: &Entity) -> String {
     e.fields
         .iter()
-        .map(|f| format!("\\\"{}\\\"", f.name))
+        .map(|f| format!("Alias::new(\"{}\")", f.name))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -283,39 +280,48 @@ fn row_constructor(e: &Entity) -> String {
     format!("{} {{ {fields} }}", e.name)
 }
 
-fn binds(e: &Entity) -> String {
+/// One `SimpleExpr` per field for INSERT values, in column order. Booleans
+/// ride as i64 (sqlx `Any` binds a Rust `bool` with SQLite's `Bool` type
+/// info, which it then can't read back).
+fn value_exprs(e: &Entity) -> String {
     e.fields
         .iter()
         .map(|f| {
-            // Booleans bind as i64 (see `column_type`): sqlx `Any` binds a Rust
-            // `bool` with SQLite's `Bool` type info, which it then can't read back.
             if f.field_type == FieldType::Boolean {
-                format!("            .bind(item.{} as i64)\n", f.name)
+                format!("(item.{} as i64).into()", f.name)
             } else {
-                format!("            .bind(item.{})\n", f.name)
+                format!("item.{}.into()", f.name)
             }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `(Alias, SimpleExpr)` pairs for UPDATE SET — every field except the pk.
+fn update_pairs(e: &Entity) -> String {
+    e.fields
+        .iter()
+        .filter(|f| f.name != "id")
+        .map(|f| {
+            if f.field_type == FieldType::Boolean {
+                format!("(Alias::new(\"{n}\"), (item.{n} as i64).into())", n = f.name)
+            } else {
+                format!("(Alias::new(\"{n}\"), item.{n}.into())", n = f.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn sql_repo(e: &Entity) -> String {
     let entity = &e.name;
     let snake = entity.to_lowercase();
-    // SQL identifiers are double-quoted (see `column_list`): safe cross-backend.
-    // `\"` because this lands inside a Rust string literal in the generated source.
-    let table = format!("\\\"{}\\\"", table_name(entity));
-    let cols = column_list(e);
-    let placeholders = e.fields.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-    // SET assignments for UPDATE: quoted column = ? in field order, matching `binds`.
-    // `\"` because this lands inside a Rust string literal in the generated source.
-    let set_clause = e
-        .fields
-        .iter()
-        .map(|f| format!("\\\"{}\\\" = ?", f.name))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let table = table_name(entity);
+    let n_cols = e.fields.len();
+    let cols = alias_cols(e);
+    let values = value_exprs(e);
+    let set_pairs = update_pairs(e);
     let ctor = row_constructor(e);
-    let bind_lines = binds(e);
     let key = key_rust_type(e);
     format!(
         r#"pub struct {entity}Repo {{
@@ -330,8 +336,21 @@ pub(crate) async fn {snake}_repo(db: Dep<Db>) -> Result<{entity}Repo> {{
 // Stub handlers don't call the repo yet; remove this allow as you implement them.
 #[allow(dead_code)]
 impl {entity}Repo {{
+    fn table() -> Alias {{
+        Alias::new("{table}")
+    }}
+
+    fn cols() -> [Alias; {n_cols}] {{
+        [{cols}]
+    }}
+
     pub async fn all(&self) -> Result<Vec<{entity}>> {{
-        let rows = jerrycan::db::sqlx::query("SELECT {cols} FROM {table} ORDER BY \"id\"")
+        let (sql, values) = Query::select()
+            .columns(Self::cols())
+            .from(Self::table())
+            .order_by(Alias::new("id"), Order::Asc)
+            .build_any_sqlx(self.db.query_builder());
+        let rows = jerrycan::db::sqlx::query_with(&sql, values)
             .fetch_all(self.db.pool())
             .await
             .map_err(db_error)?;
@@ -339,8 +358,12 @@ impl {entity}Repo {{
     }}
 
     pub async fn get(&self, id: {key}) -> Result<Option<{entity}>> {{
-        let row = jerrycan::db::sqlx::query(&self.db.sql("SELECT {cols} FROM {table} WHERE \"id\" = ?"))
-            .bind(id)
+        let (sql, values) = Query::select()
+            .columns(Self::cols())
+            .from(Self::table())
+            .and_where(Expr::col(Alias::new("id")).eq(id))
+            .build_any_sqlx(self.db.query_builder());
+        let row = jerrycan::db::sqlx::query_with(&sql, values)
             .fetch_optional(self.db.pool())
             .await
             .map_err(db_error)?;
@@ -348,20 +371,27 @@ impl {entity}Repo {{
     }}
 
     pub async fn insert(&self, item: {entity}) -> Result<{key}> {{
-        // RETURNING works on both backends (sqlite >= 3.35); the sqlx `Any`
-        // driver's last_insert_id is None on sqlite, so never rely on it.
-        let row = jerrycan::db::sqlx::query(
-            &self.db.sql("INSERT INTO {table} ({cols}) VALUES ({placeholders}) RETURNING \"id\""),
-        )
-{bind_lines}        .fetch_one(self.db.pool())
-        .await
-        .map_err(db_error)?;
+        // sea-query renders RETURNING for both backends; never last_insert_id
+        // (the sqlx `Any` driver returns None for it on sqlite).
+        let (sql, values) = Query::insert()
+            .into_table(Self::table())
+            .columns(Self::cols())
+            .values_panic([{values}])
+            .returning(Query::returning().columns([Alias::new("id")]))
+            .build_any_sqlx(self.db.query_builder());
+        let row = jerrycan::db::sqlx::query_with(&sql, values)
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_error)?;
         Ok(row.get("id"))
     }}
 
     pub async fn remove(&self, id: {key}) -> Result<bool> {{
-        let result = jerrycan::db::sqlx::query(&self.db.sql("DELETE FROM {table} WHERE \"id\" = ?"))
-            .bind(id)
+        let (sql, values) = Query::delete()
+            .from_table(Self::table())
+            .and_where(Expr::col(Alias::new("id")).eq(id))
+            .build_any_sqlx(self.db.query_builder());
+        let result = jerrycan::db::sqlx::query_with(&sql, values)
             .execute(self.db.pool())
             .await
             .map_err(db_error)?;
@@ -369,8 +399,12 @@ impl {entity}Repo {{
     }}
 
     pub async fn update(&self, id: {key}, item: {entity}) -> Result<bool> {{
-        let result = jerrycan::db::sqlx::query(&self.db.sql("UPDATE {table} SET {set_clause} WHERE \"id\" = ?"))
-{bind_lines}            .bind(id)
+        let (sql, values) = Query::update()
+            .table(Self::table())
+            .values([{set_pairs}])
+            .and_where(Expr::col(Alias::new("id")).eq(id))
+            .build_any_sqlx(self.db.query_builder());
+        let result = jerrycan::db::sqlx::query_with(&sql, values)
             .execute(self.db.pool())
             .await
             .map_err(db_error)?;
@@ -390,7 +424,7 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode) -> Option<String> {
         return Some(memory_repo_rs(m));
     }
     let mut out = String::from(
-        "//! Data access — generated SQL over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sqlx::Row;\nuse jerrycan::db::{db_error, Db};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
+        "//! Data access — sea-query builders over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sea_query::{Alias, Expr, Order, Query};\nuse jerrycan::db::sea_query_binder::SqlxBinder;\nuse jerrycan::db::sqlx::Row;\nuse jerrycan::db::{db_error, Db};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
     );
     for e in &m.entities {
         out.push_str(&sql_repo(e));
@@ -398,61 +432,62 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode) -> Option<String> {
     Some(out)
 }
 
-/// Dual-dialect `CREATE TABLE` DDL for one module's entities (None if it has none).
+/// Dual-dialect `CREATE TABLE` DDL for one module's entities (None if it has
+/// none), rendered by sea-query so dialect differences (autoincrement vs
+/// bigserial, quoting) are library-owned, never hand-rolled strings.
 fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool) -> Option<String> {
+    use sea_query::{Alias, ColumnDef, PostgresQueryBuilder, SqliteQueryBuilder, Table};
     if m.entities.is_empty() {
         return None;
     }
-    fn column_type(t: FieldType) -> &'static str {
+    // Booleans are stored as integers (0/1): the sqlx `Any` driver cannot
+    // round-trip a Rust `bool` against SQLite (it rejects the `Bool` type
+    // info on read), so the repo binds `bool as i64` and reads `i64 != 0`.
+    // big_integer round-trips identically on both backends under `Any`.
+    fn typed(c: &mut ColumnDef, t: FieldType) -> &mut ColumnDef {
         match t {
-            FieldType::String | FieldType::Datetime | FieldType::Uuid => "TEXT",
-            // Booleans are stored as integers (0/1): the sqlx `Any` driver cannot
-            // round-trip a Rust `bool` against SQLite (it rejects the `Bool` type
-            // info on read), so the repo binds `bool as i64` and reads `i64 != 0`.
-            // BIGINT round-trips identically on both backends under `Any`.
-            FieldType::Integer | FieldType::Boolean => "BIGINT",
-            FieldType::Float => "DOUBLE PRECISION",
-            FieldType::Json => "TEXT", // unreachable: validated out in db mode
-        }
-    }
-    fn default_for(t: FieldType, _pg: bool) -> &'static str {
-        match t {
-            FieldType::Boolean | FieldType::Integer | FieldType::Float => "0",
-            _ => "''",
+            FieldType::String | FieldType::Datetime | FieldType::Uuid => c.text(),
+            FieldType::Integer | FieldType::Boolean => c.big_integer(),
+            FieldType::Float => c.double(),
+            FieldType::Json => c.text(), // unreachable: validated out in db mode
         }
     }
     let mut out = String::new();
     for e in &m.entities {
-        // Identifiers are double-quoted (matches the SQL repo); cross-backend safe
-        // and shields reserved words like a column named `order`.
+        let mut table = Table::create();
+        table.table(Alias::new(table_name(&e.name)));
         // A declared `id` field IS the pk (typed as declared); only entities
         // without one get the synthetic autoincrement pk. Emitting both would
         // be a duplicate-column error.
-        let pk = match declared_id(e) {
+        let mut pk = ColumnDef::new(Alias::new("id"));
+        match declared_id(e) {
             Some(t) if t != FieldType::Integer => {
-                format!("\"id\" {} PRIMARY KEY", column_type(t))
+                typed(&mut pk, t).not_null().primary_key();
             }
-            _ if backend_is_pg => "\"id\" BIGSERIAL PRIMARY KEY".to_string(),
-            _ => "\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".to_string(),
-        };
-        out.push_str(&format!(
-            "CREATE TABLE \"{}\" (\n    {pk}",
-            table_name(&e.name)
-        ));
-        for f in e.fields.iter().filter(|f| f.name != "id") {
-            out.push_str(&format!(
-                ",\n    \"{}\" {} NOT NULL",
-                f.name,
-                column_type(f.field_type)
-            ));
-            if !f.required {
-                out.push_str(&format!(
-                    " DEFAULT {}",
-                    default_for(f.field_type, backend_is_pg)
-                ));
+            _ => {
+                pk.big_integer().not_null().auto_increment().primary_key();
             }
         }
-        out.push_str("\n);\n\n");
+        table.col(&mut pk);
+        for f in e.fields.iter().filter(|f| f.name != "id") {
+            let mut col = ColumnDef::new(Alias::new(f.name.as_str()));
+            typed(&mut col, f.field_type).not_null();
+            if !f.required {
+                match f.field_type {
+                    FieldType::Integer | FieldType::Boolean => col.default(0i64),
+                    FieldType::Float => col.default(0.0f64),
+                    _ => col.default(""),
+                };
+            }
+            table.col(&mut col);
+        }
+        let sql = if backend_is_pg {
+            table.build(PostgresQueryBuilder)
+        } else {
+            table.build(SqliteQueryBuilder)
+        };
+        out.push_str(&sql);
+        out.push_str(";\n\n");
     }
     Some(out)
 }
@@ -962,9 +997,16 @@ mod tests {
             1,
             "one id column only:\n{ddl}"
         );
-        assert!(ddl.contains("\"id\" INTEGER PRIMARY KEY AUTOINCREMENT"), "{ddl}");
+        assert!(
+            ddl.contains("PRIMARY KEY AUTOINCREMENT"),
+            "sqlite autoincrement pk: {ddl}"
+        );
         let pg = migration_ddl(&m, true).unwrap();
-        assert!(pg.contains("\"id\" BIGSERIAL PRIMARY KEY"), "{pg}");
+        assert!(
+            pg.to_lowercase().contains("bigserial"),
+            "postgres serial pk: {pg}"
+        );
+        assert_eq!(pg.matches("\"id\"").count(), 1, "{pg}");
     }
 
     /// Text ids (uuid/string) are the pk with their declared type, and the
@@ -982,7 +1024,11 @@ mod tests {
             },
         );
         let ddl = migration_ddl(&m, false).unwrap();
-        assert!(ddl.contains("\"id\" TEXT PRIMARY KEY"), "{ddl}");
+        assert!(
+            ddl.to_lowercase().contains("\"id\" text not null primary key"),
+            "text pk, no autoincrement: {ddl}"
+        );
+        assert!(!ddl.contains("AUTOINCREMENT"), "{ddl}");
         assert_eq!(ddl.matches("\"id\"").count(), 1, "{ddl}");
 
         let repo = repo_rs(&m, GenMode { db: true, ..GenMode::default() }).unwrap();

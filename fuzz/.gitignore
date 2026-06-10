@@ -1,2 +1,7 @@
-target/
 artifacts/
+corpus/**
+!corpus/*/sample
+!corpus/*/path
+!corpus/*/golden
+coverage/
+target/

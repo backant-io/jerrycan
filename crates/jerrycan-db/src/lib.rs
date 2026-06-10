@@ -6,6 +6,12 @@
 
 use jerrycan_core::{App, Error, Extension, Result};
 
+// Generated repos build ALL SQL through sea-query (dialect rendering is
+// library-owned: placeholders, RETURNING, quoting). Re-exported so generated
+// crates depend on `jerrycan` alone.
+pub use sea_query;
+pub use sea_query_binder;
+
 /// Which engine the pool speaks. Generated code branches on this for the few
 /// statements that genuinely differ (insert-id strategies, DDL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +73,16 @@ impl Db {
     /// Backend-correct placeholders for a `?`-style query string.
     pub fn sql(&self, query: &str) -> String {
         translate_placeholders(query, self.backend)
+    }
+
+    /// The sea-query builder matching this pool's dialect. Generated repos
+    /// pass it to `build_any_sqlx` so one builder call renders correct SQL
+    /// (placeholders, RETURNING, quoting) for whichever engine is connected.
+    pub fn query_builder(&self) -> &'static dyn sea_query::QueryBuilder {
+        match self.backend {
+            Backend::Sqlite => &sea_query::SqliteQueryBuilder,
+            Backend::Postgres => &sea_query::PostgresQueryBuilder,
+        }
     }
 }
 
@@ -267,6 +283,45 @@ mod tests {
         let e = db_error(sqlx::Error::RowNotFound);
         assert_eq!(e.code(), "JC0510");
         assert_eq!(e.message(), "database error");
+    }
+
+    /// The whole generated-repo chain in one place: sea-query renders the SQL
+    /// and binds the values; sqlx is only the executor. If this breaks, every
+    /// generated repo breaks with it.
+    #[tokio::test]
+    async fn sea_query_builds_and_executes_via_the_any_pool() {
+        use sea_query::{Alias, Expr, Query};
+        use sea_query_binder::SqlxBinder;
+        use sqlx::Row;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE sq (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let (sql, values) = Query::insert()
+            .into_table(Alias::new("sq"))
+            .columns([Alias::new("id"), Alias::new("title")])
+            .values_panic([7.into(), "hello".into()])
+            .returning(Query::returning().columns([Alias::new("id")]))
+            .build_any_sqlx(db.query_builder());
+        let row = sqlx::query_with(&sql, values)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("id"), 7, "RETURNING id round-trips");
+
+        let (sql, values) = Query::select()
+            .columns([Alias::new("id"), Alias::new("title")])
+            .from(Alias::new("sq"))
+            .and_where(Expr::col(Alias::new("id")).eq(7))
+            .build_any_sqlx(db.query_builder());
+        let row = sqlx::query_with(&sql, values)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("title"), "hello");
     }
 
     /// A duplicate key is the CLIENT's fault: it must surface as 409 JC0409,
