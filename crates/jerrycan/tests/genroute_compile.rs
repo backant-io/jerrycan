@@ -10,7 +10,6 @@
 
 use jerrycan::platform::design::Design;
 use jerrycan::platform::genroute::{GenMode, write_module};
-use jerrycan::platform::scaffold;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -171,11 +170,6 @@ const AUTH_MINIMAL: &str = r#"{
     }]
 }"#;
 
-/// Serializes the in-process `JERRYCAN_FRAMEWORK_DEP` env mutation below: the
-/// other test in this binary doesn't read that var, but two ignored tests can
-/// still run on parallel threads, and `set_var` is process-global.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Companion to `generated_module_crate_passes_strict_clippy`, for AUTH mode.
 /// Uses the REAL scaffold (so the `shared` crate gets the genuine
 /// `CurrentUser = Session<SessionUser>` alias and the route crate gets
@@ -189,23 +183,29 @@ fn generated_auth_module_crate_passes_strict_clippy() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let app = tmp.path().join("auth-app");
 
+    // Sanity-check the fixture design parses and is in auth mode before scaffolding.
     let design: Design = serde_json::from_str(AUTH_MINIMAL).expect("AUTH_MINIMAL parses");
     assert!(design.wants_auth(), "design must be in auth mode");
 
-    // Point the scaffold's framework dep at this local crate (carrying the `auth`
-    // feature, injected by scaffold from facade_features) and run the real
-    // scaffold so the shared crate's CurrentUser alias and the route crate's
-    // wiring are exactly what a real `jerrycan new` produces.
+    // Run the real scaffold via the jerrycan BINARY (the same pattern conformance.rs
+    // uses): the framework dep is passed through the CHILD's environment, so no
+    // `unsafe set_var` on this process is needed. The dep points at this local crate
+    // (carrying the `auth` feature, injected by scaffold from facade_features) so the
+    // shared crate's CurrentUser alias and the route crate's wiring are exactly what a
+    // real `jerrycan new` produces.
     let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
     let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
-    {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: serialized by ENV_LOCK; scaffold reads the var synchronously here.
-        unsafe {
-            std::env::set_var("JERRYCAN_FRAMEWORK_DEP", &dep);
-        }
-        scaffold::scaffold(&app, &design).expect("scaffold auth app");
-    }
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, AUTH_MINIMAL);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(status.success(), "jerrycan new must scaffold the auth app");
 
     // Sanity: the generated handler stub imports CurrentUser but NOT require_role.
     let handlers = fs::read_to_string(app.join("crates/routes/secrets/src/handlers.rs"))
