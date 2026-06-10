@@ -17,8 +17,8 @@ name = "jerrycan"
 required-features = ["cli"]
 
 [dependencies]
-jerrycan-core = { path = "../jerrycan-core", version = "0.0.0" }
-jerrycan-macros = { path = "../jerrycan-macros", version = "0.0.0" }
+jerrycan-core.workspace = true
+jerrycan-macros.workspace = true
 clap = { version = "4", features = ["derive"], optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

@@ -17,6 +17,8 @@ license = "MIT OR Apache-2.0"
 homepage = "https://jerrycan.cc"
 
 [workspace.dependencies]
+jerrycan-core = { path = "crates/jerrycan-core", version = "0.0.0" }
+jerrycan-macros = { path = "crates/jerrycan-macros", version = "0.0.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
