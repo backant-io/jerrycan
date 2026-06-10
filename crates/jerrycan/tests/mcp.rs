@@ -140,3 +140,114 @@ fn docs_tools_work_through_mcp() {
     assert!(payload["markdown"].as_str().unwrap().contains("JC0404"));
     c.shutdown();
 }
+
+const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.json");
+
+#[test]
+fn design_tool_questions_then_completes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut c = McpClient::start_in(tmp.path());
+
+    // No draft → the template + a pointed ask, never code.
+    let (err, payload) = c.call_tool(
+        "jerrycan_design",
+        serde_json::json!({"requirements": "todo backend"}),
+    );
+    assert!(!err);
+    assert_eq!(payload["status"], "questions");
+    assert!(
+        payload["questions"][0]["question"]
+            .as_str()
+            .unwrap()
+            .contains("draft")
+    );
+
+    // Broken draft → pointed questions with JSON-pointer ids.
+    let mut bad: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    bad["name"] = serde_json::json!("Todo API");
+    let (err, payload) = c.call_tool(
+        "jerrycan_design",
+        serde_json::json!({"requirements": "todo backend", "draft": bad}),
+    );
+    assert!(!err);
+    assert_eq!(payload["status"], "questions");
+    assert_eq!(payload["questions"][0]["id"], "/name");
+
+    // Complete draft → written to disk, design_path returned.
+    let good: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    let (err, payload) = c.call_tool(
+        "jerrycan_design",
+        serde_json::json!({"requirements": "todo backend", "draft": good}),
+    );
+    assert!(!err);
+    assert_eq!(payload["status"], "complete");
+    let design_path = payload["design_path"].as_str().unwrap();
+    assert!(std::path::Path::new(design_path).exists());
+    assert!(payload["next_step"].as_str().unwrap().contains("scaffold"));
+    c.shutdown();
+}
+
+#[test]
+fn scaffold_generate_and_list_through_mcp() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("design.json"), GOLDEN).unwrap();
+    let mut c = McpClient::start_in(tmp.path());
+
+    let app_dir = tmp.path().join("todo-api");
+    let (err, payload) = c.call_tool(
+        "jerrycan_scaffold",
+        serde_json::json!({
+            "design_path": tmp.path().join("design.json").to_str().unwrap(),
+            "directory": app_dir.to_str().unwrap(),
+        }),
+    );
+    assert!(!err, "{payload}");
+    assert!(payload["created"].as_array().unwrap().len() > 10);
+
+    // Incremental generate with a design_slice (the MCP-only path).
+    let (err, payload) = c.call_tool(
+        "jerrycan_generate",
+        serde_json::json!({
+            "kind": "route",
+            "path": "tags",
+            "directory": app_dir.to_str().unwrap(),
+            "design_slice": { "name": "tags", "endpoints": [
+                { "operation_id": "list_tags", "method": "GET", "path": "/", "success": { "status": 200 } }
+            ]},
+        }),
+    );
+    assert!(!err, "{payload}");
+    assert!(
+        payload["modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "crates/app/src/main.rs")
+    );
+    assert!(app_dir.join("crates/routes/tags/src/lib.rs").exists());
+
+    let (err, payload) = c.call_tool(
+        "jerrycan_list_routes",
+        serde_json::json!({"directory": app_dir.to_str().unwrap()}),
+    );
+    assert!(!err);
+    assert!(
+        payload["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["path"] == "/tags/")
+    );
+
+    // Phase-gated tools answer honestly instead of pretending.
+    let (err, payload) = c.call_tool(
+        "jerrycan_gen_tests",
+        serde_json::json!({"module": "todos", "directory": app_dir.to_str().unwrap()}),
+    );
+    assert!(err);
+    assert!(payload["error"].as_str().unwrap().contains("Phase 2"));
+    let (err, payload) = c.call_tool("jerrycan_package", serde_json::json!({"target": "binary"}));
+    assert!(err);
+    assert!(payload["error"].as_str().unwrap().contains("Phase 3"));
+    c.shutdown();
+}

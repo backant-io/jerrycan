@@ -4,7 +4,7 @@
 use clap::{Parser, Subcommand};
 use jerrycan::platform::design::Design;
 use jerrycan::platform::{
-    EXIT_OK, EXIT_USAGE, Failure, checkpipe, genroute, lints, mounting, questions, scaffold,
+    EXIT_OK, EXIT_USAGE, Failure, checkpipe, genroute, mounting, questions, scaffold,
 };
 use std::path::{Path, PathBuf};
 
@@ -302,39 +302,13 @@ fn cmd_generate_dep(name: &str, module: &str, json_mode: bool) -> Result<(), Fai
 fn cmd_list_routes(json_mode: bool) -> Result<(), Failure> {
     let root = app_root()?;
     let design = load_design(&root.join("design.json"))?;
-    let mut routes = Vec::new();
-    fn walk(
-        m: &jerrycan::platform::design::ModuleDesign,
-        prefix: &str,
-        top: &str,
-        routes: &mut Vec<serde_json::Value>,
-    ) {
-        let base = format!("{}{}", prefix, m.effective_mount());
-        for ep in &m.endpoints {
-            let full = format!("{}{}", base.trim_end_matches('/'), ep.path);
-            routes.push(serde_json::json!({
-                "method": format!("{:?}", ep.method),
-                "path": full,
-                "module": top,
-                "handler": ep.operation_id,
-            }));
-        }
-        for sub in &m.subroutes {
-            walk(sub, &base, top, routes);
-        }
-    }
-    for m in &design.modules {
-        walk(m, "", &m.name, &mut routes);
-    }
+    let routes = genroute::route_map(&design);
     let payload = serde_json::json!({ "routes": routes });
     let mut human = String::new();
-    for r in payload["routes"].as_array().unwrap() {
+    for r in &routes {
         human.push_str(&format!(
             "{:6} {}  →  {}::{}\n",
-            r["method"].as_str().unwrap(),
-            r["path"].as_str().unwrap(),
-            r["module"].as_str().unwrap(),
-            r["handler"].as_str().unwrap()
+            r.method, r.path, r.module, r.handler
         ));
     }
     emit(json_mode, &payload, human.trim_end());
@@ -344,63 +318,17 @@ fn cmd_list_routes(json_mode: bool) -> Result<(), Failure> {
 fn cmd_check(module: Option<&str>, json_mode: bool) -> Result<(), Failure> {
     let root = app_root()?;
     let design = load_design(&root.join("design.json"))?;
-    let root = &root;
-    let design = &design;
 
-    // Order per cli-ux.md: build → clippy → audit → deny → tests → jerrycan lints.
-    // First failing class stops the pipeline; all diagnostics in that class are kept.
-    let mut diagnostics = Vec::new();
-    let mut failed_class: Option<&str> = None;
-
-    #[allow(clippy::type_complexity)]
-    let mut classes: Vec<(
-        &str,
-        Box<dyn FnOnce() -> Result<Vec<checkpipe::Diagnostic>, Failure>>,
-    )> = vec![
-        (
-            "build",
-            Box::new(|| checkpipe::run_build(root, module).map_err(Failure::environment)),
-        ),
-        (
-            "clippy",
-            Box::new(|| checkpipe::run_clippy(root, module).map_err(Failure::environment)),
-        ),
-    ];
-    // audit/deny are workspace-global supply-chain gates; module scope is for fast
-    // iteration per cli-ux.md, so skip them there (run a full check before packaging).
+    // audit/deny are workspace-global supply-chain gates that run_all skips in
+    // module scope; surface that to the human so a full check isn't forgotten.
     if module.is_some() {
         eprintln!(
             "note: audit/deny skipped in module scope — run a full `jerrycan check` before packaging"
         );
-    } else {
-        classes.push(("audit", Box::new(|| tool(checkpipe::run_audit(root)))));
-        classes.push(("deny", Box::new(|| tool(checkpipe::run_deny(root)))));
-    }
-    classes.push((
-        "tests",
-        Box::new(|| checkpipe::run_tests(root, module).map_err(Failure::environment)),
-    ));
-    classes.push(("jerrycan lints", Box::new(|| Ok(lints::run(root, design)))));
-    for (name, step) in classes {
-        let ds = step()?;
-        if !ds.is_empty() {
-            diagnostics = ds;
-            failed_class = Some(name);
-            break;
-        }
     }
 
-    let ok = failed_class.is_none();
-    let next_step = match failed_class {
-        None => "all green — implement remaining stubs, or proceed toward packaging (Phase 3)"
-            .to_string(),
-        Some(c) => format!("fix the {c} diagnostics, then re-run jerrycan check"),
-    };
-    let report = checkpipe::CheckReport {
-        ok,
-        diagnostics,
-        next_step,
-    };
+    // Same shared core the MCP twin runs — drift between CLI and MCP is impossible.
+    let report = checkpipe::run_all(&root, &design, module).map_err(Failure::environment)?;
     if json_mode {
         println!(
             "{}",
@@ -421,21 +349,11 @@ fn cmd_check(module: Option<&str>, json_mode: bool) -> Result<(), Failure> {
             eprintln!("  = docs: {u}");
         }
     }
-    if ok {
+    if report.ok {
         eprintln!("check: all green");
         Ok(())
     } else {
-        Err(Failure::gate(format!(
-            "{} failed",
-            failed_class.expect("set when !ok")
-        )))
-    }
-}
-
-fn tool(step: Result<checkpipe::ToolStep, String>) -> Result<Vec<checkpipe::Diagnostic>, Failure> {
-    match step.map_err(Failure::environment)? {
-        checkpipe::ToolStep::Missing(hint) => Err(Failure::environment(hint)),
-        checkpipe::ToolStep::Ran(ds) => Ok(ds),
+        Err(Failure::gate(report.next_step))
     }
 }
 

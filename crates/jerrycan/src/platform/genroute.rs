@@ -359,6 +359,38 @@ pub fn add_dependency(design: &mut Design, module_path: &str, dep: &str) -> Resu
     Ok(())
 }
 
+/// One row of the live route tree — the same shape the CLI and MCP both emit.
+#[derive(Debug, serde::Serialize)]
+pub struct RouteEntry {
+    pub method: String,
+    pub path: String,
+    pub module: String,
+    pub handler: String,
+}
+
+/// Walk the design's module tree into a flat, mount-resolved route table.
+pub fn route_map(design: &Design) -> Vec<RouteEntry> {
+    fn walk(m: &ModuleDesign, prefix: &str, top: &str, out: &mut Vec<RouteEntry>) {
+        let base = format!("{}{}", prefix, m.effective_mount());
+        for ep in &m.endpoints {
+            out.push(RouteEntry {
+                method: format!("{:?}", ep.method),
+                path: format!("{}{}", base.trim_end_matches('/'), ep.path),
+                module: top.to_string(),
+                handler: ep.operation_id.clone(),
+            });
+        }
+        for sub in &m.subroutes {
+            walk(sub, &base, top, out);
+        }
+    }
+    let mut out = Vec::new();
+    for m in &design.modules {
+        walk(m, "", &m.name, &mut out);
+    }
+    out
+}
+
 pub fn module_by_path<'a>(design: &'a Design, path: &str) -> Option<&'a ModuleDesign> {
     let mut parts = path.split('/');
     let first = parts.next()?;

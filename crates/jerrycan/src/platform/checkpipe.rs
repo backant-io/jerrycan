@@ -226,3 +226,64 @@ pub fn run_audit(root: &Path) -> Result<ToolStep, String> {
 pub fn run_deny(root: &Path) -> Result<ToolStep, String> {
     external_tool(root, "deny", &["check"], "DENY0001", "cargo-deny")
 }
+
+/// The whole gate. Err(String) = environment problem (missing tool), not a gate failure.
+///
+/// audit/deny are workspace-global supply-chain gates; module scope is for fast
+/// iteration per cli-ux.md, so they are SKIPPED whenever `module` is `Some`
+/// (run a full check before packaging). The CLI surfaces a stderr note about it.
+pub fn run_all(
+    root: &Path,
+    design: &crate::platform::design::Design,
+    module: Option<&str>,
+) -> Result<CheckReport, String> {
+    let mut diagnostics = Vec::new();
+    let mut failed_class: Option<&str> = None;
+
+    #[allow(clippy::type_complexity)]
+    let mut steps: Vec<(&str, Box<dyn FnOnce() -> Result<Vec<Diagnostic>, String>>)> = vec![
+        ("build", Box::new(|| run_build(root, module))),
+        ("clippy", Box::new(|| run_clippy(root, module))),
+    ];
+    if module.is_none() {
+        steps.push((
+            "audit",
+            Box::new(|| match run_audit(root)? {
+                ToolStep::Missing(hint) => Err(hint),
+                ToolStep::Ran(ds) => Ok(ds),
+            }),
+        ));
+        steps.push((
+            "deny",
+            Box::new(|| match run_deny(root)? {
+                ToolStep::Missing(hint) => Err(hint),
+                ToolStep::Ran(ds) => Ok(ds),
+            }),
+        ));
+    }
+    steps.push(("tests", Box::new(|| run_tests(root, module))));
+    steps.push((
+        "jerrycan lints",
+        Box::new(|| Ok(super::lints::run(root, design))),
+    ));
+
+    for (name, step) in steps {
+        let ds = step()?;
+        if !ds.is_empty() {
+            diagnostics = ds;
+            failed_class = Some(name);
+            break;
+        }
+    }
+    let ok = failed_class.is_none();
+    let next_step = match failed_class {
+        None => "all green — implement remaining stubs, or proceed toward packaging (Phase 3)"
+            .to_string(),
+        Some(c) => format!("fix the {c} diagnostics, then re-run jerrycan check"),
+    };
+    Ok(CheckReport {
+        ok,
+        diagnostics,
+        next_step,
+    })
+}
