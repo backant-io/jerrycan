@@ -12,6 +12,12 @@ pub use jerrycan_db as db;
 #[cfg(feature = "validate")]
 pub use jerrycan_validate as validate;
 
+#[cfg(feature = "auth")]
+pub use jerrycan_auth as auth;
+
+#[cfg(feature = "observe")]
+pub use jerrycan_observe as observe;
+
 #[cfg(feature = "cli")]
 pub mod platform;
 

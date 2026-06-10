@@ -850,9 +850,11 @@ name = "jerrycan"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "jerrycan-auth",
  "jerrycan-core",
  "jerrycan-db",
  "jerrycan-macros",
+ "jerrycan-observe",
  "jerrycan-validate",
  "serde",
  "serde_json",

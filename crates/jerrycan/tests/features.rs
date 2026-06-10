@@ -22,3 +22,18 @@ fn validate_reexport_is_usable() {
     let v = jerrycan::validate::Violation::new("f", "m");
     assert_eq!(v.field, "f");
 }
+
+#[cfg(feature = "auth")]
+#[test]
+fn auth_reexport_is_usable() {
+    let hash = jerrycan::auth::hash_password("pw").unwrap();
+    assert!(jerrycan::auth::verify_password("pw", &hash).unwrap());
+}
+
+#[cfg(feature = "observe")]
+#[test]
+fn observe_reexport_is_usable() {
+    let m = jerrycan::observe::Metrics::new();
+    m.record(200, 0.01);
+    assert!(m.render().contains("jerrycan_requests_total"));
+}
