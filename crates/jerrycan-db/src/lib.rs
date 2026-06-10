@@ -70,6 +70,72 @@ impl Db {
     }
 }
 
+/// One migration, both dialects. Generated apps embed these via the tool-owned
+/// `app/src/migrations.rs`; modules own the .sql files (spec §5 anatomy).
+#[derive(Debug, Clone, Copy)]
+pub struct Migration {
+    pub name: &'static str,
+    pub sqlite: &'static str,
+    pub postgres: &'static str,
+}
+
+impl Db {
+    /// Apply pending migrations in slice order; returns the names applied.
+    /// Tracking table `_jerrycan_migrations` remembers what ran. A failure
+    /// stops the run and records nothing for the failed entry.
+    pub async fn migrate(&self, migrations: &[Migration]) -> Result<Vec<String>> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS _jerrycan_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_error)?;
+
+        let mut applied = Vec::new();
+        for m in migrations {
+            let seen =
+                sqlx::query(&self.sql("SELECT name FROM _jerrycan_migrations WHERE name = ?"))
+                    .bind(m.name)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(db_error)?;
+            if seen.is_some() {
+                continue;
+            }
+            let statement = match self.backend {
+                Backend::Sqlite => m.sqlite,
+                Backend::Postgres => m.postgres,
+            };
+            sqlx::query(statement)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    eprintln!("jerrycan-db: migration `{}` failed", m.name);
+                    db_error(e)
+                })?;
+            sqlx::query(
+                &self.sql("INSERT INTO _jerrycan_migrations (name, applied_at) VALUES (?, ?)"),
+            )
+            .bind(m.name)
+            .bind(chrono_free_timestamp())
+            .execute(&self.pool)
+            .await
+            .map_err(db_error)?;
+            applied.push(m.name.to_string());
+        }
+        Ok(applied)
+    }
+}
+
+/// RFC3339-ish UTC timestamp without a chrono dependency (seconds precision).
+fn chrono_free_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("unix:{secs}")
+}
+
 /// `?` → `$1, $2, …` for Postgres; identity for SQLite. Quote-blind by design:
 /// generated SQL never embeds string literals (binds carry all values).
 pub fn translate_placeholders(query: &str, backend: Backend) -> String {
@@ -165,5 +231,60 @@ mod tests {
         let e = db_error(sqlx::Error::RowNotFound);
         assert_eq!(e.code(), "JC0510");
         assert_eq!(e.message(), "database error");
+    }
+
+    fn demo_migrations() -> Vec<Migration> {
+        vec![
+            Migration {
+                name: "0001_create_todos",
+                sqlite: "CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL)",
+                postgres: "CREATE TABLE todos (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+            },
+            Migration {
+                name: "0002_add_done",
+                sqlite: "ALTER TABLE todos ADD COLUMN done BOOLEAN NOT NULL DEFAULT 0",
+                postgres: "ALTER TABLE todos ADD COLUMN done BOOLEAN NOT NULL DEFAULT FALSE",
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn migrations_apply_in_order_and_only_once() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let applied = db.migrate(&demo_migrations()).await.unwrap();
+        assert_eq!(applied, vec!["0001_create_todos", "0002_add_done"]);
+
+        // Re-running applies nothing (tracking table remembers).
+        let applied = db.migrate(&demo_migrations()).await.unwrap();
+        assert!(applied.is_empty());
+
+        // The schema is genuinely there.
+        sqlx::query("INSERT INTO todos (title, done) VALUES (?, ?)")
+            .bind("x")
+            .bind(true)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failing_migration_surfaces_jc0510_and_is_not_recorded() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let bad = vec![Migration {
+            name: "0001_broken",
+            sqlite: "CREATE GARBAGE",
+            postgres: "CREATE GARBAGE",
+        }];
+        let err = db.migrate(&bad).await.unwrap_err();
+        assert_eq!(err.code(), "JC0510");
+
+        // Fixing it lets the same name apply afresh — failures are not recorded.
+        let good = vec![Migration {
+            name: "0001_broken",
+            sqlite: "CREATE TABLE ok (x BIGINT)",
+            postgres: "CREATE TABLE ok (x BIGINT)",
+        }];
+        let applied = db.migrate(&good).await.unwrap();
+        assert_eq!(applied, vec!["0001_broken"]);
     }
 }
