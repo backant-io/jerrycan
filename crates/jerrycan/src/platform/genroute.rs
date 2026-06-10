@@ -197,7 +197,15 @@ fn row_constructor(e: &Entity) -> String {
     let fields = e
         .fields
         .iter()
-        .map(|f| format!("{name}: row.get(\"{name}\")", name = f.name))
+        .map(|f| {
+            // Booleans are stored as integers (see `column_type`): sqlx `Any`
+            // can't decode a SQLite `bool`, so read the i64 column and compare.
+            if f.field_type == FieldType::Boolean {
+                format!("{name}: row.get::<i64, _>(\"{name}\") != 0", name = f.name)
+            } else {
+                format!("{name}: row.get(\"{name}\")", name = f.name)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!("{} {{ {fields} }}", e.name)
@@ -206,7 +214,15 @@ fn row_constructor(e: &Entity) -> String {
 fn binds(e: &Entity) -> String {
     e.fields
         .iter()
-        .map(|f| format!("            .bind(item.{})\n", f.name))
+        .map(|f| {
+            // Booleans bind as i64 (see `column_type`): sqlx `Any` binds a Rust
+            // `bool` with SQLite's `Bool` type info, which it then can't read back.
+            if f.field_type == FieldType::Boolean {
+                format!("            .bind(item.{} as i64)\n", f.name)
+            } else {
+                format!("            .bind(item.{})\n", f.name)
+            }
+        })
         .collect()
 }
 
@@ -309,23 +325,18 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool) -> Option<String> {
     fn column_type(t: FieldType) -> &'static str {
         match t {
             FieldType::String | FieldType::Datetime | FieldType::Uuid => "TEXT",
-            FieldType::Integer => "BIGINT",
+            // Booleans are stored as integers (0/1): the sqlx `Any` driver cannot
+            // round-trip a Rust `bool` against SQLite (it rejects the `Bool` type
+            // info on read), so the repo binds `bool as i64` and reads `i64 != 0`.
+            // BIGINT round-trips identically on both backends under `Any`.
+            FieldType::Integer | FieldType::Boolean => "BIGINT",
             FieldType::Float => "DOUBLE PRECISION",
-            FieldType::Boolean => "BOOLEAN",
             FieldType::Json => "TEXT", // unreachable: validated out in db mode
         }
     }
-    fn default_for(t: FieldType, pg: bool) -> &'static str {
+    fn default_for(t: FieldType, _pg: bool) -> &'static str {
         match t {
-            FieldType::Boolean => {
-                if pg {
-                    "FALSE"
-                } else {
-                    "0"
-                }
-            }
-            FieldType::Integer => "0",
-            FieldType::Float => "0",
+            FieldType::Boolean | FieldType::Integer | FieldType::Float => "0",
             _ => "''",
         }
     }
