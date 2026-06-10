@@ -4,7 +4,7 @@
 use clap::{Parser, Subcommand};
 use jerrycan::platform::design::Design;
 use jerrycan::platform::{
-    EXIT_OK, EXIT_USAGE, Failure, checkpipe, genroute, mounting, questions, scaffold,
+    EXIT_OK, EXIT_USAGE, Failure, checkpipe, genroute, mounting, package, questions, sbom, scaffold,
 };
 use std::path::{Path, PathBuf};
 
@@ -73,6 +73,21 @@ enum Cmd {
     Db {
         #[command(subcommand)]
         what: DbCmd,
+    },
+    /// Emit hardened deployment artifacts + SBOM after a green check
+    Package {
+        /// Emit a hardened multi-stage Dockerfile
+        #[arg(long)]
+        docker: bool,
+        /// Build a release binary (musl static, host fallback)
+        #[arg(long)]
+        binary: bool,
+        /// Emit hardened Kubernetes manifests (Deployment/Service/NetworkPolicy)
+        #[arg(long)]
+        k8s: bool,
+        /// Emit a hardened systemd unit
+        #[arg(long)]
+        systemd: bool,
     },
     /// Serve MCP over stdio
     Mcp,
@@ -150,6 +165,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Db {
             what: DbCmd::Migrate { url },
         } => cmd_db_migrate(url.as_deref(), cli.json),
+        Cmd::Package {
+            docker,
+            binary,
+            k8s,
+            systemd,
+        } => cmd_package(docker, binary, k8s, systemd, cli.json),
         Cmd::Mcp => jerrycan::platform::mcp::serve_stdio().map_err(Failure::environment),
     }
 }
@@ -411,6 +432,66 @@ fn cmd_db_migrate(url: Option<&str>, json_mode: bool) -> Result<(), Failure> {
             "applied {} migration(s)",
             payload["applied"].as_array().map(Vec::len).unwrap_or(0)
         ),
+    );
+    Ok(())
+}
+
+fn cmd_package(
+    docker: bool,
+    binary: bool,
+    k8s: bool,
+    systemd: bool,
+    json_mode: bool,
+) -> Result<(), Failure> {
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+
+    // Gate: never package an app that doesn't pass check.
+    let report = checkpipe::run_all(&root, &design, None).map_err(Failure::environment)?;
+    if !report.ok {
+        return Err(Failure::gate(format!(
+            "check failed ({} diagnostics) — fix before packaging",
+            report.diagnostics.len()
+        )));
+    }
+
+    let mut artifacts = Vec::new();
+    let mut text_targets = Vec::new();
+    if docker {
+        text_targets.push("docker");
+    }
+    if k8s {
+        text_targets.push("k8s");
+    }
+    if systemd {
+        text_targets.push("systemd");
+    }
+    if !text_targets.is_empty() {
+        artifacts.extend(
+            package::emit_text_artifacts(&root, &design, &text_targets).map_err(Failure::gate)?,
+        );
+    }
+    if binary {
+        artifacts.push(package::build_binary(&root, &design).map_err(Failure::gate)?);
+    }
+
+    // SBOM always (it's cheap and the safety pipeline wants it).
+    let version = "0.1.0";
+    let sbom = sbom::generate(&root, "app", version).map_err(Failure::gate)?;
+    std::fs::create_dir_all(root.join("deploy")).map_err(|e| Failure::gate(e.to_string()))?;
+    std::fs::write(root.join("deploy/sbom.json"), &sbom)
+        .map_err(|e| Failure::gate(e.to_string()))?;
+    artifacts.push("deploy/sbom.json".to_string());
+
+    let payload = serde_json::json!({
+        "artifacts": artifacts,
+        "sbom": "deploy/sbom.json",
+        "next_step": "deploy with your own tooling (kubectl apply -f deploy/k8s.yaml, docker build, scp the binary + systemd unit)",
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!("packaged {} artifact(s)", artifacts.len()),
     );
     Ok(())
 }
