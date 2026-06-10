@@ -16,6 +16,7 @@ pub struct Error {
     status: StatusCode,
     code: &'static str,
     message: String,
+    details: Option<serde_json::Value>,
 }
 
 impl Error {
@@ -25,6 +26,7 @@ impl Error {
             status,
             code,
             message: message.into(),
+            details: None,
         }
     }
 
@@ -76,6 +78,17 @@ impl Error {
         )
     }
 
+    /// Attach machine-readable detail (e.g. validation violations). Rendered
+    /// as a `details` key in the response body; absent otherwise.
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    pub fn details(&self) -> Option<&serde_json::Value> {
+        self.details.as_ref()
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -121,6 +134,16 @@ mod tests {
             Error::handler_timeout().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn details_attach_and_default_to_none() {
+        let plain = Error::unprocessable("validation failed");
+        assert!(plain.details().is_none());
+        let detailed = Error::unprocessable("validation failed").with_details(
+            serde_json::json!([{ "field": "title", "message": "must not be empty" }]),
+        );
+        assert!(detailed.details().unwrap().is_array());
     }
 
     #[test]

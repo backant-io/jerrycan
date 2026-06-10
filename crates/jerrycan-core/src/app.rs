@@ -40,9 +40,20 @@ impl Default for App {
     }
 }
 
+/// Spec §6: capabilities register through one seam. An extension receives the
+/// builder and returns it — providers, routes, middleware, anything.
+pub trait Extension {
+    fn register(self, app: App) -> App;
+}
+
 impl App {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach an extension: `App::new().extend(Db::from_env().await?)`.
+    pub fn extend<E: Extension>(self, extension: E) -> App {
+        extension.register(self)
     }
 
     /// Secure-by-default headers on every response (spec §4.4). Opting out
@@ -469,6 +480,27 @@ mod tests {
             .route("/x", get(|| async { "b" }));
         let err = app.build().unwrap_err();
         assert!(err.message().contains("/x"));
+    }
+
+    #[tokio::test]
+    async fn extensions_register_through_extend() {
+        struct Greeting(&'static str);
+        struct GreetingExt;
+        impl Extension for GreetingExt {
+            fn register(self, app: App) -> App {
+                app.provide(Greeting("from-extension"))
+            }
+        }
+        async fn read(g: crate::Dep<Greeting>) -> String {
+            // `Dep`'s own `.0` (the inner `Arc`) is `pub(crate)`, so inside this
+            // crate it shadows the field access; deref explicitly to the value.
+            (*g).0.to_string()
+        }
+        let t = App::new()
+            .extend(GreetingExt)
+            .route("/", crate::router::get(read))
+            .into_test();
+        assert_eq!(t.get("/").await.text(), "from-extension");
     }
 
     #[test]

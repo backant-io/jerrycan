@@ -98,6 +98,8 @@ impl IntoResponse for NoContent {
 struct ErrorBody<'a> {
     code: &'a str,
     message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<&'a serde_json::Value>,
 }
 
 impl IntoResponse for Error {
@@ -107,6 +109,7 @@ impl IntoResponse for Error {
             &ErrorBody {
                 code: self.code(),
                 message: self.message(),
+                details: self.details(),
             },
         )
     }
@@ -189,6 +192,19 @@ mod tests {
         let r = Error::not_found().into_response();
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         assert_eq!(body_of(&r), r#"{"code":"JC0404","message":"not found"}"#);
+    }
+
+    #[test]
+    fn error_details_appear_in_the_body_only_when_present() {
+        let r = Error::not_found().into_response();
+        assert_eq!(body_of(&r), r#"{"code":"JC0404","message":"not found"}"#);
+        let r = Error::unprocessable("validation failed")
+            .with_details(serde_json::json!([{ "field": "t" }]))
+            .into_response();
+        assert_eq!(
+            body_of(&r),
+            r#"{"code":"JC0422","message":"validation failed","details":[{"field":"t"}]}"#
+        );
     }
 
     #[test]

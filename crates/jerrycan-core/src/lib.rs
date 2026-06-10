@@ -14,7 +14,7 @@ pub mod response;
 pub mod router;
 pub mod test_client;
 
-pub use app::{App, BuiltApp};
+pub use app::{App, BuiltApp, Extension};
 pub use dep::Dep;
 pub use error::{Error, Result};
 pub use extract::{FromRequest, Path, Query, RequestCtx};
@@ -31,7 +31,8 @@ pub use http;
 /// One import for generated code: `use jerrycan::prelude::*;`
 pub mod prelude {
     pub use crate::{
-        App, Created, Dep, Error, IntoResponse, Json, Middleware, MiddlewareFuture, Module, Next,
-        NoContent, Path, Query, RequestCtx, Result, TestApp, delete, get, patch, post, put,
+        App, Created, Dep, Error, Extension, IntoResponse, Json, Middleware, MiddlewareFuture,
+        Module, Next, NoContent, Path, Query, RequestCtx, Result, TestApp, delete, get, patch,
+        post, put,
     };
 }
