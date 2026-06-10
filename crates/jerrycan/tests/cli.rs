@@ -39,3 +39,188 @@ fn missing_required_arg_is_usage_error_exit_2() {
         "must name the exact missing flag: {err}"
     );
 }
+
+const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.json");
+
+#[test]
+fn new_scaffolds_and_emits_json_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design_path = tmp.path().join("design.json");
+    std::fs::write(&design_path, GOLDEN).unwrap();
+    let app_dir = tmp.path().join("todo-api");
+
+    let out = jerrycan()
+        .args(["--json", "new"])
+        .arg(&app_dir)
+        .arg("--design")
+        .arg(&design_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // --json: stdout is exactly one JSON document matching the MCP outputSchema.
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert!(payload["created"].as_array().unwrap().len() > 10);
+    assert!(payload["next_step"].as_str().unwrap().contains("check"));
+    assert!(app_dir.join("crates/routes/todos/src/lib.rs").exists());
+}
+
+#[test]
+fn new_with_invalid_design_returns_questions_and_exit_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design_path = tmp.path().join("design.json");
+    std::fs::write(&design_path, GOLDEN.replace("\"todo-api\"", "\"Todo API\"")).unwrap();
+
+    let out = jerrycan()
+        .args(["--json", "new"])
+        .arg(tmp.path().join("x"))
+        .arg("--design")
+        .arg(&design_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "incomplete design = gate failure"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["status"], "questions");
+    assert!(
+        payload["questions"][0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("/name")
+    );
+}
+
+#[test]
+fn generate_route_adds_a_module_and_rewires_mounting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design_path = tmp.path().join("design.json");
+    std::fs::write(&design_path, GOLDEN).unwrap();
+    let app_dir = tmp.path().join("todo-api");
+    assert!(
+        jerrycan()
+            .args(["new"])
+            .arg(&app_dir)
+            .arg("--design")
+            .arg(&design_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Add a module to the app's design.json (the agent's edit), then generate.
+    let dj = app_dir.join("design.json");
+    let mut design: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dj).unwrap()).unwrap();
+    design["modules"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name": "tags",
+            "endpoints": [{ "operation_id": "list_tags", "method": "GET", "path": "/",
+                            "success": { "status": 200 } }]
+        }));
+    std::fs::write(&dj, serde_json::to_string_pretty(&design).unwrap()).unwrap();
+
+    let out = jerrycan()
+        .current_dir(&app_dir)
+        .args(["--json", "generate", "route", "tags"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        payload["created"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("routes/tags"))
+    );
+    assert!(
+        payload["modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "crates/app/src/main.rs")
+    );
+    let main_rs = std::fs::read_to_string(app_dir.join("crates/app/src/main.rs")).unwrap();
+    assert!(main_rs.contains(".mount(\"/tags\", route_tags::module())"));
+}
+
+#[test]
+fn generate_route_for_unknown_module_is_usage_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design_path = tmp.path().join("design.json");
+    std::fs::write(&design_path, GOLDEN).unwrap();
+    let app_dir = tmp.path().join("todo-api");
+    assert!(
+        jerrycan()
+            .args(["new"])
+            .arg(&app_dir)
+            .arg("--design")
+            .arg(&design_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = jerrycan()
+        .current_dir(&app_dir)
+        .args(["generate", "route", "ghosts"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("design.json"));
+}
+
+#[test]
+fn list_routes_walks_the_module_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design_path = tmp.path().join("design.json");
+    std::fs::write(&design_path, GOLDEN).unwrap();
+    let app_dir = tmp.path().join("todo-api");
+    assert!(
+        jerrycan()
+            .args(["new"])
+            .arg(&app_dir)
+            .arg("--design")
+            .arg(&design_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = jerrycan()
+        .current_dir(&app_dir)
+        .args(["--json", "list", "routes"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let routes = payload["routes"].as_array().unwrap();
+    let find = |method: &str, path: &str| {
+        routes
+            .iter()
+            .any(|r| r["method"] == method && r["path"] == path)
+    };
+    assert!(find("GET", "/todos/"), "{routes:?}");
+    assert!(find("DELETE", "/todos/{id}"));
+    assert!(
+        find("GET", "/todos/comments/"),
+        "subroute paths compose: {routes:?}"
+    );
+    assert!(find("POST", "/users/"));
+    let todo = routes.iter().find(|r| r["path"] == "/todos/").unwrap();
+    assert_eq!(todo["module"], "todos");
+    assert_eq!(todo["handler"], "list_todos");
+}

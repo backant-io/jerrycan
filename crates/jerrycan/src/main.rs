@@ -2,7 +2,9 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
-use jerrycan::platform::{EXIT_OK, EXIT_USAGE, Failure};
+use jerrycan::platform::design::Design;
+use jerrycan::platform::{EXIT_OK, EXIT_USAGE, Failure, genroute, mounting, questions, scaffold};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -107,11 +109,176 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), Failure> {
-    // Wildcard placeholder: every arm is replaced by its own later Phase 1 task,
-    // so the single-binding match is intentional scaffolding.
-    #[allow(clippy::match_single_binding)]
     match cli.command {
-        // Every arm is replaced by its own task; until then, fail honestly.
+        Cmd::New { name, design } => cmd_new(&name, &design, cli.json),
+        Cmd::Generate { what } => match what {
+            GenerateCmd::Route { path } => cmd_generate_route(&path, cli.json),
+            GenerateCmd::Dep { name, module } => cmd_generate_dep(&name, &module, cli.json),
+        },
+        Cmd::List {
+            what: ListCmd::Routes,
+        } => cmd_list_routes(cli.json),
         _ => Err(Failure::usage("this command lands in a later Phase 1 task")),
     }
+}
+
+fn emit(json_mode: bool, payload: &serde_json::Value, human: &str) {
+    if json_mode {
+        println!("{payload}");
+    }
+    eprintln!("{human}");
+}
+
+fn load_design(path: &Path) -> Result<Design, Failure> {
+    Design::from_path(path).map_err(Failure::usage)
+}
+
+/// Validate; on questions emit the jerrycan_design-shaped payload and exit 1.
+fn require_complete(design: &Design, json_mode: bool) -> Result<(), Failure> {
+    let qs = questions::validate(design);
+    if qs.is_empty() {
+        return Ok(());
+    }
+    let payload = serde_json::json!({
+        "status": "questions",
+        "questions": qs,
+        "next_step": "answer the questions, fix design.json, and re-run",
+    });
+    if json_mode {
+        println!("{payload}");
+    }
+    let mut human = String::from("design is incomplete:\n");
+    for q in &qs {
+        human.push_str(&format!("  {} — {}\n", q.id, q.question));
+    }
+    Err(Failure::gate(human))
+}
+
+fn cmd_new(target: &str, design_path: &str, json_mode: bool) -> Result<(), Failure> {
+    let design = load_design(Path::new(design_path))?;
+    require_complete(&design, json_mode)?;
+    let created = scaffold::scaffold(Path::new(target), &design).map_err(Failure::gate)?;
+    let payload = serde_json::json!({
+        "created": created,
+        "next_step": format!("cd {target} && jerrycan check — then implement the handler stubs"),
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!(
+            "scaffolded {} files into {target}",
+            payload["created"].as_array().map(Vec::len).unwrap_or(0)
+        ),
+    );
+    Ok(())
+}
+
+/// The app root = cwd for post-scaffold commands (the MCP twin takes `directory`).
+fn app_root() -> Result<PathBuf, Failure> {
+    let cwd = std::env::current_dir().map_err(|e| Failure::environment(e.to_string()))?;
+    if cwd.join("design.json").exists() {
+        Ok(cwd)
+    } else {
+        Err(Failure::usage(
+            "no design.json here — run inside a jerrycan app (or scaffold one with `jerrycan new`)",
+        ))
+    }
+}
+
+fn cmd_generate_route(module_path: &str, json_mode: bool) -> Result<(), Failure> {
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+    require_complete(&design, json_mode)?;
+    let top = module_path
+        .split('/')
+        .next()
+        .expect("split yields at least one");
+    if genroute::module_by_path(&design, module_path).is_none() {
+        return Err(Failure::usage(format!(
+            "module `{module_path}` is not in design.json — add it there first (the design is the source of truth)"
+        )));
+    }
+    let top_module = design
+        .modules
+        .iter()
+        .find(|m| m.name == top)
+        .expect("checked above");
+    let created =
+        genroute::write_module(&root.join("crates/routes"), top_module).map_err(Failure::gate)?;
+    let modified = mounting::regenerate(&root, &design).map_err(Failure::gate)?;
+    let payload = serde_json::json!({
+        "created": created,
+        "modified": modified,
+        "next_step": format!("implement crates/routes/{top}/src/handlers.rs, then jerrycan check --module {top}"),
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!("generated `{module_path}` and rewired mounting"),
+    );
+    Ok(())
+}
+
+fn cmd_generate_dep(name: &str, module: &str, json_mode: bool) -> Result<(), Failure> {
+    let root = app_root()?;
+    let mut design = load_design(&root.join("design.json"))?;
+    genroute::add_dependency(&mut design, module, name).map_err(Failure::usage)?;
+    std::fs::write(
+        root.join("design.json"),
+        scaffold::canonical_design_json(&design),
+    )
+    .map_err(|e| Failure::gate(e.to_string()))?;
+    let payload = serde_json::json!({
+        "created": [],
+        "modified": ["design.json"],
+        "next_step": format!("define `{name}` in crates/routes/{}/src/deps.rs (configure hook)", module.split('/').next().unwrap_or(module)),
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!("recorded dependency `{name}` on module `{module}`"),
+    );
+    Ok(())
+}
+
+fn cmd_list_routes(json_mode: bool) -> Result<(), Failure> {
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+    let mut routes = Vec::new();
+    fn walk(
+        m: &jerrycan::platform::design::ModuleDesign,
+        prefix: &str,
+        top: &str,
+        routes: &mut Vec<serde_json::Value>,
+    ) {
+        let base = format!("{}{}", prefix, m.effective_mount());
+        for ep in &m.endpoints {
+            let full = format!("{}{}", base.trim_end_matches('/'), ep.path);
+            routes.push(serde_json::json!({
+                "method": format!("{:?}", ep.method),
+                "path": full,
+                "module": top,
+                "handler": ep.operation_id,
+            }));
+        }
+        for sub in &m.subroutes {
+            walk(sub, &base, top, routes);
+        }
+    }
+    for m in &design.modules {
+        walk(m, "", &m.name, &mut routes);
+    }
+    let payload = serde_json::json!({ "routes": routes });
+    let mut human = String::new();
+    for r in payload["routes"].as_array().unwrap() {
+        human.push_str(&format!(
+            "{:6} {}  →  {}::{}\n",
+            r["method"].as_str().unwrap(),
+            r["path"].as_str().unwrap(),
+            r["module"].as_str().unwrap(),
+            r["handler"].as_str().unwrap()
+        ));
+    }
+    emit(json_mode, &payload, human.trim_end());
+    Ok(())
 }
