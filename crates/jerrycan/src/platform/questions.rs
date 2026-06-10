@@ -193,6 +193,12 @@ fn validate_module(
                 ),
             ));
         }
+        if ep.path.matches('{').count() != ep.path.matches('}').count() {
+            qs.push(q(
+                format!("{eptr}/path"),
+                format!("Path `{}` has unbalanced braces.", ep.path),
+            ));
+        }
         if !seen_routes.insert((ep.method, ep.path.as_str())) {
             qs.push(q(
                 format!("{eptr}/path"),
@@ -374,6 +380,31 @@ mod tests {
             validate(&d2)
                 .iter()
                 .any(|q| q.id.contains("/mount") && q.question.contains("start with '/'"))
+        );
+    }
+
+    #[test]
+    fn nested_subroute_violations_carry_full_json_pointers() {
+        let d = design(&MINIMAL.replace(
+            "\"operation_id\": \"list_comments\"",
+            "\"operation_id\": \"List-Comments\"",
+        ));
+        let qs = validate(&d);
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/subroutes/0/endpoints/0/operation_id"),
+            "{qs:?}"
+        );
+    }
+
+    #[test]
+    fn unbalanced_path_braces_yield_a_question() {
+        let d = design(&MINIMAL.replace("\"path\": \"/{id}\"", "\"path\": \"/{id\""));
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.question.contains("unbalanced braces")),
+            "unbalanced braces must be flagged"
         );
     }
 
