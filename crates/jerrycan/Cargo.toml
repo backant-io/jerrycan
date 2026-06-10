@@ -6,11 +6,25 @@ edition.workspace = true
 license.workspace = true
 homepage.workspace = true
 
+[features]
+# Generated apps depend on this crate with `default-features = false` (lib facade
+# only). The default ON keeps `cargo install jerrycan` working for the platform.
+default = ["cli"]
+cli = ["dep:clap", "dep:serde", "dep:serde_json"]
+
+[[bin]]
+name = "jerrycan"
+required-features = ["cli"]
+
 [dependencies]
 jerrycan-core = { path = "../jerrycan-core", version = "0.0.0" }
 jerrycan-macros = { path = "../jerrycan-macros", version = "0.0.0" }
+clap = { version = "4", features = ["derive"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile = "3"

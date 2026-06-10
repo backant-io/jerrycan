@@ -6,6 +6,9 @@
 pub use jerrycan_core::*;
 pub use jerrycan_macros::main;
 
+#[cfg(feature = "cli")]
+pub mod platform;
+
 pub mod prelude {
     pub use jerrycan_core::prelude::*;
     pub use jerrycan_macros::main;
