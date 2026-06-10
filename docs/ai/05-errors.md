@@ -60,9 +60,10 @@ assert_eq!(all[0].code(), "JC0400");
 | JC0405 | 405 | Path exists, method doesn't |
 | JC0408 | 408 | Request body wasn't received within the read budget (default 30s) |
 | JC0413 | 413 | Body over the limit (default 1 MiB) |
-| JC0422 | 422 | JSON body failed to parse/validate |
+| JC0422 | 422 | JSON body failed to parse, or `Valid<T>` found violations (structured `details` array) |
 | JC0500 | 500 | `Error::internal` / response serialization failure |
 | JC0503 | 503 | Handler exceeded its time budget (default 30s) |
+| JC0510 | 500 | Database failure (jerrycan::db) — detail on stderr, never in the body |
 | JC1001 | 500 | Dependency type has no provider |
 | JC1002 | 500 | Dependency cycle / chain > 32 |
 

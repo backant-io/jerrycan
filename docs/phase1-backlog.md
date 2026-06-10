@@ -12,6 +12,11 @@
 - design-schema: path parameter types (v0 generates i64; string ids need a type field on params)
 - Path param types beyond the sealed PathParam set (serde-based extraction, axum-style) for custom id newtypes
 - security-header granularity (per-route/per-response config) before any Phase 2 HTML serving (today: all-or-nothing app-level opt-out; handler-set values win)
+- derive(Validate) with rule attributes once the design schema carries field constraints
+- compile-time-checked SQL (sqlx query! offline mode) for generated repos
+- json-typed entity fields in db mode (structured columns)
+- Postgres advisory lock around the migration runner (concurrent replica startups can race the tracking table; today: run migrations as a single pre-deploy step)
+- OpenAPI: merge duplicate-status error descriptions per endpoint (today: last-wins)
 
 ## Accepted v0 limitations
 

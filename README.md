@@ -26,7 +26,7 @@ jerrycan is two inseparable halves:
 
 **Humans don't write the code — agents do**, guided by documentation where every example is a compiling, *running* doc-test, and by machine-readable contracts for every tool.
 
-> **Status: early development.** Phases 0 (core API + frozen contracts) and 1 (CLI + MCP core loop) are complete and fully tested. The crates on crates.io are `0.0.0` name reservations — the first usable release will be `0.1.0`. Don't build on it yet; watch it grow.
+> **Status: early development.** Phases 0 (core API + frozen contracts), 1 (CLI + MCP core loop), and 2 (data & test-first generation) are complete and fully tested. The crates on crates.io are `0.0.0` name reservations — the first usable release will be `0.1.0`. Don't build on it yet; watch it grow.
 
 ## A taste
 
@@ -89,9 +89,9 @@ crates/
 ├── jerrycan          # facade + the CLI/MCP binary — apps depend on this
 ├── jerrycan-core     # routing, extractors, DI, modules, middleware, errors, test client
 ├── jerrycan-macros   # #[jerrycan::main]
-├── jerrycan-db       # SQL + migrations            (Phase 2)
+├── jerrycan-db       # SQL + migrations
 ├── jerrycan-auth     # sessions, JWT, guards       (Phase 3)
-├── jerrycan-validate # validation + OpenAPI        (Phase 2)
+├── jerrycan-validate # validation + OpenAPI
 └── jerrycan-observe  # logs, /healthz, /metrics    (Phase 3)
 docs/
 ├── ai/               # the AI-native docs — every example is a CI-run doc-test
@@ -115,8 +115,8 @@ jerrycan_package  → hardened artifacts + SBOM, only when everything is green
 |---|---|---|
 | **0 — Contracts** | Core API spike (DI, modules, routing, serving) + AI docs + MCP/CLI contracts | ✅ complete |
 | **1 — Core loop** | `jerrycan` CLI (new/generate/dev/check) + MCP server | ✅ complete (incl. 1b hardening) |
-| **2 — Data & TDD** | jerrycan-db, jerrycan-validate + OpenAPI, per-module test generation | next |
-| **3 — Production** | jerrycan-auth, jerrycan-observe, `jerrycan package` (Docker/k8s/binary/systemd) | |
+| **2 — Data & TDD** | jerrycan-db, jerrycan-validate + OpenAPI, per-module test generation | ✅ complete |
+| **3 — Production** | jerrycan-auth, jerrycan-observe, `jerrycan package` (Docker/k8s/binary/systemd) | next |
 | **4 — Hardening** | Fuzzing, agent evals, diagnostics polish → v0.1.0 | |
 
 The full plan lives in the [design spec](docs/superpowers/specs/2026-06-09-jerrycan-design.md); deferred items are tracked in the [phase 1 backlog](docs/phase1-backlog.md).
@@ -124,7 +124,7 @@ The full plan lives in the [design spec](docs/superpowers/specs/2026-06-09-jerry
 ## Development
 
 ```bash
-cargo test --workspace        # 124 tests, including every docs example as a doc-test
+cargo test --workspace --all-features   # CI runs this — every docs example is a doc-test
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```

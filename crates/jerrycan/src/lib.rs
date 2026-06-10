@@ -36,4 +36,8 @@ mod doc_tests {
     doc_page!(page_05_errors, "../../../docs/ai/05-errors.md");
     doc_page!(page_06_middleware, "../../../docs/ai/06-middleware.md");
     doc_page!(page_07_testing, "../../../docs/ai/07-testing.md");
+    #[cfg(feature = "db")]
+    doc_page!(page_08_database, "../../../docs/ai/08-database.md");
+    #[cfg(feature = "validate")]
+    doc_page!(page_09_validation, "../../../docs/ai/09-validation.md");
 }
