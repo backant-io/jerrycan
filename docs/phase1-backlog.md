@@ -21,3 +21,7 @@
 - design-schema: middleware (module- and app-scoped) as first-class design objects; jerrycan_generate kind "middleware" returns then too
 - design-schema: structured rate-limit config (v0: rate limits ride as opaque dependency names)
 - jerrycan_check diagnostics: span (line+column ranges) instead of single line, pending macro span preservation
+
+## Generator hygiene
+
+- write_subroutes does not prune subroute directories removed from the design; re-adding a same-named subroute resurrects stale agent-owned handlers (create-once). Prune-or-warn decision needed.

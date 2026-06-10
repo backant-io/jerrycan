@@ -118,11 +118,14 @@ pub(crate) fn repo_rs(m: &ModuleDesign) -> Option<String> {
     for e in &m.entities {
         let n = &e.name;
         out.push_str(&format!(
-            r#"pub struct {n}Repo {{
+            r#"// Stub handlers don't call the repo yet; remove this allow as you implement them.
+#[allow(dead_code)]
+pub struct {n}Repo {{
     items: Mutex<BTreeMap<i64, {n}>>,
     next_id: AtomicI64,
 }}
 
+#[allow(dead_code)]
 impl {n}Repo {{
     pub fn new() -> Self {{
         Self {{ items: Mutex::new(BTreeMap::new()), next_id: AtomicI64::new(1) }}
@@ -281,6 +284,8 @@ fn rel(path: &Path, root: &Path) -> String {
 
 /// Write (or refresh) one top-level route crate under `routes_dir`
 /// (= <app>/crates/routes). Returns paths written, relative to routes_dir's parent's parent.
+/// Precondition: the design has passed `questions::validate` — generation assumes
+/// validated names and entity references.
 pub fn write_module(routes_dir: &Path, m: &ModuleDesign) -> Result<Vec<String>, String> {
     let root = routes_dir
         .ancestors()
@@ -446,6 +451,10 @@ mod tests {
         );
         let repo = repo_rs(&m).unwrap();
         assert!(repo.contains("pub struct TodoRepo"));
+        assert!(
+            repo.contains("#[allow(dead_code)]"),
+            "stub-phase repo must pass -D warnings: {repo}"
+        );
         for method in [
             "pub fn all(",
             "pub fn get(",
