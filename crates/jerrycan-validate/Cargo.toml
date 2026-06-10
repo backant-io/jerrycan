@@ -1,9 +1,15 @@
 [package]
 name = "jerrycan-validate"
-description = "Validation and OpenAPI extension for the jerrycan framework. Name reservation; real releases begin at 0.1.0. https://jerrycan.cc"
+description = "Validation extension for the jerrycan framework: Validate trait, Valid extractor, structured 422s, OpenAPI serving. Real releases begin at 0.1.0. https://jerrycan.cc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 homepage.workspace = true
 
 [dependencies]
+jerrycan-core = { path = "../jerrycan-core", version = "0.0.0" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
