@@ -27,7 +27,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests (unit + integration + doc-tests)
         run: cargo test --workspace
-      - name: Conformance (heavy: generated apps must build, check, and serve)
+      - name: "Conformance (heavy: generated apps must build, check, and serve)"
         run: |
           cargo test -p jerrycan --test conformance -- --include-ignored
           cargo test -p jerrycan --test genroute_compile -- --include-ignored
