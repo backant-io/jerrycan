@@ -47,6 +47,8 @@ pub(crate) fn inject_features(dep_line: &str, features: &[&str]) -> String {
 /// Rewrite the facade features on an existing dep line to exactly `features`
 /// (dropping any prior `, features = [...]` first). `jerrycan add` calls this
 /// when a reserved dependency flips the app's mode after scaffold.
+/// Contract: the JERRYCAN_FRAMEWORK_DEP inline table must keep `features` LAST
+/// (or absent); a front-loaded features key is not stripped.
 pub(crate) fn set_features(dep_line: &str, features: &[&str]) -> String {
     inject_features(&strip_features(dep_line), features)
 }

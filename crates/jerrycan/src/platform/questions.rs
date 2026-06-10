@@ -17,6 +17,15 @@ fn q(id: impl Into<String>, question: impl Into<String>) -> Question {
     }
 }
 
+/// Reserved words that cannot appear as field/entity identifiers: generated
+/// model.rs uses them verbatim as struct/field names and would not compile.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+    "where", "while",
+];
+
 fn is_kebab(s: &str) -> bool {
     !s.is_empty()
         && s.starts_with(|c: char| c.is_ascii_lowercase())
@@ -148,6 +157,15 @@ fn validate_module(
                 format!("Entity `{}` must be PascalCase.", e.name),
             ));
         }
+        if RUST_KEYWORDS.contains(&e.name.as_str()) {
+            qs.push(q(
+                format!("{ptr}/entities/{i}/name"),
+                format!(
+                    "Entity `{}` is a Rust keyword — generated model code cannot use it; rename it (e.g. a domain-specific name).",
+                    e.name
+                ),
+            ));
+        }
         if e.fields.is_empty() {
             qs.push(q(
                 format!("{ptr}/entities/{i}/fields"),
@@ -162,6 +180,15 @@ fn validate_module(
                 qs.push(q(
                     format!("{ptr}/entities/{i}/fields/{j}/name"),
                     format!("Field `{}` must be snake_case.", f.name),
+                ));
+            }
+            if RUST_KEYWORDS.contains(&f.name.as_str()) {
+                qs.push(q(
+                    format!("{ptr}/entities/{i}/fields/{j}/name"),
+                    format!(
+                        "Field `{name}` is a Rust keyword — generated model code cannot use it; rename (e.g. `{name}_field` or a domain-specific name).",
+                        name = f.name
+                    ),
                 ));
             }
         }
@@ -441,6 +468,18 @@ mod tests {
                 .iter()
                 .any(|q| q.question.contains("json") && q.question.contains("db mode")),
             "db mode can't store json fields yet"
+        );
+    }
+
+    #[test]
+    fn rust_keyword_field_names_are_rejected() {
+        // `type` is a Rust keyword — generated `pub type: ...` would not compile.
+        let d = design(&MINIMAL.replace("\"name\": \"title\"", "\"name\": \"type\""));
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.question.contains("Rust keyword") && q.question.contains("`type`")),
+            "keyword field name must be flagged"
         );
     }
 

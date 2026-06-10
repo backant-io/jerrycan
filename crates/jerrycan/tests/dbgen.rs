@@ -28,9 +28,14 @@ fn db_mode_emits_sql_repos_with_di_factories() {
         repo.contains("pub(crate) async fn todo_repo(db: Dep<Db>)"),
         "{repo}"
     );
-    assert!(repo.contains("SELECT title, done FROM todos"), "{repo}");
+    // The generated repo.rs holds these inside Rust string literals, so the
+    // identifier quotes appear backslash-escaped in the file's text.
     assert!(
-        repo.contains("RETURNING id"),
+        repo.contains("SELECT \\\"title\\\", \\\"done\\\" FROM \\\"todos\\\""),
+        "{repo}"
+    );
+    assert!(
+        repo.contains("RETURNING \\\"id\\\""),
         "postgres insert branch: {repo}"
     );
     assert!(
@@ -58,24 +63,27 @@ fn db_mode_emits_dual_dialect_migrations_from_entities() {
     )
     .unwrap();
     assert!(
-        sqlite.contains("CREATE TABLE todos")
-            && sqlite.contains("INTEGER PRIMARY KEY AUTOINCREMENT"),
+        sqlite.contains("CREATE TABLE \"todos\"")
+            && sqlite.contains("\"id\" INTEGER PRIMARY KEY AUTOINCREMENT"),
         "{sqlite}"
     );
-    assert!(sqlite.contains("title TEXT NOT NULL"));
+    assert!(sqlite.contains("\"title\" TEXT NOT NULL"));
     assert!(
-        sqlite.contains("done BOOLEAN NOT NULL DEFAULT 0"),
+        sqlite.contains("\"done\" BOOLEAN NOT NULL DEFAULT 0"),
         "optional field gets a default: {sqlite}"
     );
-    assert!(postgres.contains("id BIGSERIAL PRIMARY KEY"), "{postgres}");
-    assert!(postgres.contains("done BOOLEAN NOT NULL DEFAULT FALSE"));
+    assert!(
+        postgres.contains("\"id\" BIGSERIAL PRIMARY KEY"),
+        "{postgres}"
+    );
+    assert!(postgres.contains("\"done\" BOOLEAN NOT NULL DEFAULT FALSE"));
     // Subroute entities get their own module-owned migration:
     assert!(root.join("crates/routes/todos/migrations/sqlite").exists());
     let users = fs::read_to_string(
         root.join("crates/routes/users/migrations/sqlite/0001_create_tables.sql"),
     )
     .unwrap();
-    assert!(users.contains("CREATE TABLE users"));
+    assert!(users.contains("CREATE TABLE \"users\""));
 }
 
 #[test]
@@ -104,6 +112,28 @@ fn db_mode_wires_main_and_aggregated_migrations() {
     let ws = fs::read_to_string(root.join("Cargo.toml")).unwrap();
     assert!(ws.contains("features = [\"db\", \"validate\"]"), "{ws}");
     assert!(root.join("openapi.json").exists());
+}
+
+#[test]
+fn sql_identifiers_are_quoted_so_reserved_words_survive() {
+    // A field named `order` is a SQL reserved word; quoting is the only thing that
+    // keeps the generated DDL valid. (`order` is not a Rust keyword, so it passes
+    // model-code validation and reaches the SQL layer.)
+    let mut v: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    v["dependencies"] = serde_json::json!(["db"]);
+    v["modules"][0]["entities"][0]["fields"][0]["name"] = serde_json::json!("order");
+    let design: Design = serde_json::from_value(v).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("todo-api");
+    scaffold::scaffold(&root, &design).unwrap();
+    let sqlite = fs::read_to_string(
+        root.join("crates/routes/todos/migrations/sqlite/0001_create_tables.sql"),
+    )
+    .unwrap();
+    assert!(
+        sqlite.contains("\"order\" TEXT"),
+        "reserved-word column must be quoted: {sqlite}"
+    );
 }
 
 #[test]

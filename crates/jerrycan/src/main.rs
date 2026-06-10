@@ -345,11 +345,23 @@ fn cmd_add(extension: &str, json_mode: bool) -> Result<(), Failure> {
     for m in &design.modules {
         genroute::write_module(&root.join("crates/routes"), m, mode).map_err(Failure::gate)?;
     }
-    let modified = mounting::regenerate(&root, &design).map_err(Failure::gate)?;
+    let mut modified = mounting::regenerate(&root, &design).map_err(Failure::gate)?;
+    // Policy files are mode-dependent supply-chain gates; flipping the mode must
+    // rewrite them too (else an existing app keeps memory-mode deny.toml and the
+    // db build fails the license/audit gate).
+    modified.extend(scaffold::write_policy_files(&root, &design).map_err(Failure::gate)?);
+    modified.push("design.json".to_string());
+    modified.sort();
+    modified.dedup();
+    let next_step = if extension == "db" {
+        "`db` wired — policy files updated. NOTE: existing modules keep their in-memory repo.rs (agent-owned); rewrite each crates/routes/<m>/src/repo.rs to the SQL form (or delete it and re-run `jerrycan generate route <m>`) before the build will pass. Then jerrycan check.".to_string()
+    } else {
+        format!("`{extension}` wired — review the regenerated mounting, then jerrycan check")
+    };
     let payload = serde_json::json!({
         "created": [],
-        "modified": modified.iter().cloned().chain(["design.json".to_string()]).collect::<Vec<_>>(),
-        "next_step": format!("`{extension}` wired — review the regenerated mounting, then jerrycan check"),
+        "modified": modified,
+        "next_step": next_step,
     });
     emit(json_mode, &payload, &format!("added `{extension}`"));
     Ok(())

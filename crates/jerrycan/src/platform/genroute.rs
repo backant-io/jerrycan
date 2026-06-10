@@ -180,10 +180,15 @@ fn table_name(entity: &str) -> String {
     format!("{}s", entity.to_lowercase())
 }
 
+/// Comma-joined, double-quoted column identifiers for SELECT/INSERT lists.
+/// Quoting is safe cross-backend (all names are lowercase; pg folds unquoted
+/// idents to lowercase, sqlite is case-insensitive) and shields reserved words.
+/// The quotes are emitted as `\"` because these land INSIDE a Rust string
+/// literal in the generated repo.rs source.
 fn column_list(e: &Entity) -> String {
     e.fields
         .iter()
-        .map(|f| f.name.as_str())
+        .map(|f| format!("\\\"{}\\\"", f.name))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -208,7 +213,9 @@ fn binds(e: &Entity) -> String {
 fn sql_repo(e: &Entity) -> String {
     let entity = &e.name;
     let snake = entity.to_lowercase();
-    let table = table_name(entity);
+    // SQL identifiers are double-quoted (see `column_list`): safe cross-backend.
+    // `\"` because this lands inside a Rust string literal in the generated source.
+    let table = format!("\\\"{}\\\"", table_name(entity));
     let cols = column_list(e);
     let placeholders = e.fields.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
     let ctor = row_constructor(e);
@@ -227,7 +234,7 @@ pub(crate) async fn {snake}_repo(db: Dep<Db>) -> Result<{entity}Repo> {{
 #[allow(dead_code)]
 impl {entity}Repo {{
     pub async fn all(&self) -> Result<Vec<{entity}>> {{
-        let rows = jerrycan::db::sqlx::query("SELECT {cols} FROM {table} ORDER BY id")
+        let rows = jerrycan::db::sqlx::query("SELECT {cols} FROM {table} ORDER BY \"id\"")
             .fetch_all(self.db.pool())
             .await
             .map_err(db_error)?;
@@ -235,7 +242,7 @@ impl {entity}Repo {{
     }}
 
     pub async fn get(&self, id: i64) -> Result<Option<{entity}>> {{
-        let row = jerrycan::db::sqlx::query(&self.db.sql("SELECT {cols} FROM {table} WHERE id = ?"))
+        let row = jerrycan::db::sqlx::query(&self.db.sql("SELECT {cols} FROM {table} WHERE \"id\" = ?"))
             .bind(id)
             .fetch_optional(self.db.pool())
             .await
@@ -247,7 +254,7 @@ impl {entity}Repo {{
         match self.db.backend() {{
             Backend::Postgres => {{
                 let row = jerrycan::db::sqlx::query(
-                    &self.db.sql("INSERT INTO {table} ({cols}) VALUES ({placeholders}) RETURNING id"),
+                    &self.db.sql("INSERT INTO {table} ({cols}) VALUES ({placeholders}) RETURNING \"id\""),
                 )
 {bind_lines}                .fetch_one(self.db.pool())
                 .await
@@ -265,7 +272,7 @@ impl {entity}Repo {{
     }}
 
     pub async fn remove(&self, id: i64) -> Result<bool> {{
-        let result = jerrycan::db::sqlx::query(&self.db.sql("DELETE FROM {table} WHERE id = ?"))
+        let result = jerrycan::db::sqlx::query(&self.db.sql("DELETE FROM {table} WHERE \"id\" = ?"))
             .bind(id)
             .execute(self.db.pool())
             .await
@@ -324,15 +331,20 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool) -> Option<String> {
     }
     let mut out = String::new();
     for e in &m.entities {
+        // Identifiers are double-quoted (matches the SQL repo); cross-backend safe
+        // and shields reserved words like a column named `order`.
         let pk = if backend_is_pg {
-            "id BIGSERIAL PRIMARY KEY"
+            "\"id\" BIGSERIAL PRIMARY KEY"
         } else {
-            "id INTEGER PRIMARY KEY AUTOINCREMENT"
+            "\"id\" INTEGER PRIMARY KEY AUTOINCREMENT"
         };
-        out.push_str(&format!("CREATE TABLE {} (\n    {pk}", table_name(&e.name)));
+        out.push_str(&format!(
+            "CREATE TABLE \"{}\" (\n    {pk}",
+            table_name(&e.name)
+        ));
         for f in &e.fields {
             out.push_str(&format!(
-                ",\n    {} {} NOT NULL",
+                ",\n    \"{}\" {} NOT NULL",
                 f.name,
                 column_type(f.field_type)
             ));

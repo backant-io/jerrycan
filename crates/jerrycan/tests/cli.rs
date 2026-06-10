@@ -279,6 +279,20 @@ fn add_db_flips_the_design_and_regenerates() {
     let ws = std::fs::read_to_string(app_dir.join("Cargo.toml")).unwrap();
     assert!(ws.contains("features = [\"db\"]"), "{ws}");
 
+    let deny = std::fs::read_to_string(app_dir.join("deny.toml")).unwrap();
+    assert!(
+        deny.contains("CDLA-Permissive-2.0"),
+        "db policy applied on add: {deny}"
+    );
+    assert!(
+        app_dir.join(".cargo/audit.toml").exists(),
+        "audit ignore applied on add"
+    );
+    assert!(
+        payload["next_step"].as_str().unwrap().contains("repo.rs"),
+        "must warn about hand-migration"
+    );
+
     let out = jerrycan()
         .current_dir(&app_dir)
         .args(["add", "nonsense"])
