@@ -9,6 +9,7 @@ members = [
     "crates/jerrycan-validate",
     "crates/jerrycan-observe",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.0"

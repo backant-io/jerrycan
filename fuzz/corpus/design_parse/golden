@@ -1,0 +1,58 @@
+{
+  "name": "todo-api",
+  "contract_version": 0,
+  "description": "Conformance golden app: multi-module in-memory CRUD",
+  "auth": { "model": "none" },
+  "modules": [
+    {
+      "name": "todos",
+      "entities": [
+        { "name": "Todo", "fields": [
+          { "name": "title", "type": "string" },
+          { "name": "done", "type": "boolean", "required": false }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_todos", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Todo", "list": true } },
+        { "operation_id": "create_todo", "method": "POST", "path": "/",
+          "request_body": { "entity": "Todo" },
+          "success": { "status": 201, "entity": "Todo" } },
+        { "operation_id": "show_todo", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Todo" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] },
+        { "operation_id": "delete_todo", "method": "DELETE", "path": "/{id}",
+          "success": { "status": 204 },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] }
+      ],
+      "subroutes": [
+        {
+          "name": "comments",
+          "entities": [
+            { "name": "Comment", "fields": [{ "name": "text", "type": "string" }] }
+          ],
+          "endpoints": [
+            { "operation_id": "list_comments", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Comment", "list": true } },
+            { "operation_id": "create_comment", "method": "POST", "path": "/",
+              "request_body": { "entity": "Comment" },
+              "success": { "status": 201, "entity": "Comment" } }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "users",
+      "entities": [
+        { "name": "User", "fields": [{ "name": "username", "type": "string" }] }
+      ],
+      "endpoints": [
+        { "operation_id": "list_users", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "User", "list": true } },
+        { "operation_id": "create_user", "method": "POST", "path": "/",
+          "request_body": { "entity": "User" },
+          "success": { "status": 201, "entity": "User" } }
+      ]
+    }
+  ]
+}
