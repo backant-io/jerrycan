@@ -19,3 +19,8 @@ rand.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+criterion = { workspace = true }
+
+[[bench]]
+name = "auth_bench"
+harness = false
