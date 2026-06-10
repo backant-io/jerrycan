@@ -238,3 +238,119 @@ fn agent_generates_working_crud_service_via_mcp_only() {
     let _ = server.kill();
     let _ = server.wait();
 }
+
+/// The Phase 2 TDD loop: gen-tests makes the design executable and FAILING,
+/// the agent implements, the same tests go green, the gate stays green.
+#[test]
+#[ignore = "heavy: scaffold + gen-tests + red run + implement + green run"]
+fn tdd_loop_goes_red_then_green_on_sqlite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = scaffold_golden_db(tmp.path());
+
+    // 1. Generate acceptance tests for both top-level modules.
+    let mut expected_failing = 0usize;
+    for module in ["todos", "users"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+            .current_dir(&app)
+            .args(["--json", "gen-tests", "--module", module])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        expected_failing += payload["expected_failing"].as_u64().unwrap() as usize;
+    }
+    assert_eq!(expected_failing, 10, "todos 8 + users 2");
+
+    // 2. RED: stubs must fail every acceptance test. `--no-fail-fast` so cargo
+    // runs EVERY test binary (it otherwise halts at the first failing one, and
+    // only the todos binary's `test result: FAILED.` line would be emitted).
+    let out = Command::new("cargo")
+        .current_dir(&app)
+        .args(["test", "--workspace", "--no-fail-fast"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "stub handlers must fail the acceptance suite"
+    );
+    let test_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let failed: usize = test_output
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("test result: FAILED. ")?
+                .split("; ")
+                .nth(1)?
+                .strip_suffix(" failed")
+                .map(|n| n.parse::<usize>().unwrap_or(0))
+        })
+        .sum();
+    assert_eq!(
+        failed, expected_failing,
+        "every generated test red:\n{test_output}"
+    );
+
+    // 3. The agent implements (db fixtures).
+    for (fixture, target) in [
+        (
+            "db/todos_handlers.rs",
+            "crates/routes/todos/src/handlers.rs",
+        ),
+        (
+            "db/comments_handlers.rs",
+            "crates/routes/todos/src/subroutes/comments/handlers.rs",
+        ),
+        (
+            "db/users_handlers.rs",
+            "crates/routes/users/src/handlers.rs",
+        ),
+    ] {
+        let dest = app.join(target);
+        std::fs::copy(
+            repo_root().join("conformance/fixtures").join(fixture),
+            &dest,
+        )
+        .unwrap();
+        // RED's `cargo test` and this copy land in the same wall-clock second, so
+        // bump the mtime forward — cargo's fingerprint is mtime-based and would
+        // otherwise skip recompiling the changed handler and re-run the stubs.
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&dest)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+    }
+
+    // 4. GREEN: the same acceptance tests pass.
+    let st = Command::new("cargo")
+        .current_dir(&app)
+        .args(["test", "--workspace"])
+        .status()
+        .unwrap();
+    assert!(
+        st.success(),
+        "implemented handlers must satisfy the design contract"
+    );
+
+    // 5. And the full gate holds.
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        payload["ok"], true,
+        "diagnostics: {}",
+        payload["diagnostics"]
+    );
+}

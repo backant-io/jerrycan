@@ -1,0 +1,25 @@
+//! Conformance fixture (db mode): the agent's todos handlers.
+use super::model::*;
+use super::repo::*;
+use jerrycan::prelude::*;
+
+pub(crate) async fn list_todos(repo: Dep<TodoRepo>) -> Result<Json<Vec<Todo>>> {
+    Ok(Json(repo.all().await?))
+}
+
+pub(crate) async fn create_todo(repo: Dep<TodoRepo>, Json(body): Json<Todo>) -> Result<Created<Todo>> {
+    repo.insert(body.clone()).await?;
+    Ok(Created(body))
+}
+
+pub(crate) async fn show_todo(repo: Dep<TodoRepo>, Path(id): Path<i64>) -> Result<Json<Todo>> {
+    repo.get(id).await?.map(Json).ok_or_else(Error::not_found)
+}
+
+pub(crate) async fn delete_todo(repo: Dep<TodoRepo>, Path(id): Path<i64>) -> Result<NoContent> {
+    if repo.remove(id).await? {
+        Ok(NoContent)
+    } else {
+        Err(Error::not_found())
+    }
+}
