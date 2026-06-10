@@ -23,6 +23,7 @@ pub struct App {
     middleware: Vec<Arc<dyn Middleware>>,
     security_headers: bool,
     handler_timeout: std::time::Duration,
+    body_read_timeout: std::time::Duration,
 }
 
 impl Default for App {
@@ -34,6 +35,7 @@ impl Default for App {
             middleware: Vec::new(),
             security_headers: true,
             handler_timeout: std::time::Duration::from_secs(30),
+            body_read_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -54,6 +56,12 @@ impl App {
     /// returns 503 JC0503 without killing the connection or the server.
     pub fn handler_timeout(mut self, budget: std::time::Duration) -> Self {
         self.handler_timeout = budget;
+        self
+    }
+
+    /// Time budget for reading a request body (default 30s — spec §4.4).
+    pub fn body_read_timeout(mut self, budget: std::time::Duration) -> Self {
+        self.body_read_timeout = budget;
         self
     }
 
@@ -119,82 +127,120 @@ impl App {
             overrides: Arc::new(HashMap::new()),
             security_headers: self.security_headers,
             handler_timeout: self.handler_timeout,
+            body_read_timeout: self.body_read_timeout,
         })
     }
 
-    /// Bind from config and serve forever. Address: `JERRYCAN_ADDR` env var,
-    /// default `127.0.0.1:8000`. (Full layered config lands in Phase 1; the
-    /// env-var layer is the contract that already works.)
+    /// Bind from config and serve until Ctrl-C, then drain gracefully.
+    /// Address: `JERRYCAN_ADDR` env var, default `127.0.0.1:8000`. (Full layered
+    /// config lands in Phase 1; the env-var layer is the contract that already works.)
     pub async fn serve(self) -> Result<()> {
         let addr = std::env::var("JERRYCAN_ADDR").unwrap_or_else(|_| "127.0.0.1:8000".to_string());
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| Error::internal(format!("failed to bind {addr}: {e}")))?;
-        self.serve_with(listener).await
+        self.serve_with_shutdown(listener, async {
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("jerrycan: shutdown signal received — draining");
+        })
+        .await
     }
 
-    /// Serve on an existing listener (tests, socket activation, port 0).
+    /// Serve on an existing listener forever (tests, port 0, socket activation).
     pub async fn serve_with(self, listener: tokio::net::TcpListener) -> Result<()> {
-        const BODY_LIMIT: usize = 1024 * 1024; // 1 MiB — spec §4.4 secure default
+        self.serve_with_shutdown(listener, std::future::pending())
+            .await
+    }
+
+    /// The serve engine: accept until `shutdown` resolves, then stop accepting,
+    /// drain in-flight connections (10s cap), and return.
+    pub async fn serve_with_shutdown(
+        self,
+        listener: tokio::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<()> {
+        const BODY_LIMIT: usize = 1024 * 1024; // 1 MiB — spec §4.4
+        const DRAIN_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+        const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
         let built = Arc::new(self.build()?);
+        let mut connections = tokio::task::JoinSet::new();
+        tokio::pin!(shutdown);
+
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(accepted) => accepted,
-                Err(e) if is_transient_accept_error(&e) => {
-                    eprintln!("jerrycan: transient accept error ({e}); backing off 50ms");
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
-                }
-                Err(e) => return Err(Error::internal(format!("accept failed fatally: {e}"))),
-            };
-            let app = built.clone();
-            tokio::spawn(async move {
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let service = hyper::service::service_fn(
-                    move |req: hyper::Request<hyper::body::Incoming>| {
-                        let app = app.clone();
-                        async move {
-                            let (parts, body) = req.into_parts();
-                            use http_body_util::BodyExt;
-                            let limited = http_body_util::Limited::new(body, BODY_LIMIT);
-                            let response = match limited.collect().await {
-                                Ok(collected) => {
-                                    let app = app.clone();
-                                    let body = collected.to_bytes();
-                                    match tokio::spawn(
-                                        async move { app.dispatch(parts, body).await },
-                                    )
-                                    .await
-                                    {
-                                        Ok(response) => response,
-                                        Err(_join_error) => {
-                                            // A panic in agent-written handler code costs one
-                                            // response, never the connection or the server.
-                                            let mut response =
-                                                Error::internal("handler panicked").into_response();
-                                            apply_security_headers(&mut response);
-                                            response
+            tokio::select! {
+                () = &mut shutdown => break,
+                accepted = listener.accept() => {
+                    let (stream, _) = match accepted {
+                        Ok(pair) => pair,
+                        Err(e) if is_transient_accept_error(&e) => {
+                            eprintln!("jerrycan: transient accept error ({e}); backing off 50ms");
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
+                        }
+                        Err(e) => return Err(Error::internal(format!("accept failed fatally: {e}"))),
+                    };
+                    let app = built.clone();
+                    connections.spawn(async move {
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                            let app = app.clone();
+                            async move {
+                                let (parts, body) = req.into_parts();
+                                use http_body_util::BodyExt;
+                                let limited = http_body_util::Limited::new(body, BODY_LIMIT);
+                                let collected =
+                                    tokio::time::timeout(app.body_read_timeout, limited.collect()).await;
+                                let response = match collected {
+                                    Ok(Ok(collected)) => {
+                                        let body = collected.to_bytes();
+                                        let app2 = app.clone();
+                                        match tokio::spawn(async move { app2.dispatch(parts, body).await }).await {
+                                            Ok(response) => response,
+                                            Err(_join_error) => {
+                                                let mut response =
+                                                    Error::internal("handler panicked").into_response();
+                                                apply_security_headers(&mut response);
+                                                response
+                                            }
                                         }
                                     }
-                                }
-                                Err(_) => {
-                                    let mut response = Error::payload_too_large().into_response();
-                                    apply_security_headers(&mut response);
-                                    response
-                                }
-                            };
-                            Ok::<_, std::convert::Infallible>(response)
-                        }
-                    },
-                );
-                // Connection errors (resets, parse failures) are per-connection
-                // noise, not app failures; hyper already responded 4xx where it could.
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await;
-            });
+                                    Ok(Err(_)) => {
+                                        let mut response = Error::payload_too_large().into_response();
+                                        apply_security_headers(&mut response);
+                                        response
+                                    }
+                                    Err(_) => {
+                                        let mut response = Error::new(
+                                            http::StatusCode::REQUEST_TIMEOUT,
+                                            "JC0408",
+                                            "timed out reading the request body",
+                                        )
+                                        .into_response();
+                                        apply_security_headers(&mut response);
+                                        response
+                                    }
+                                };
+                                Ok::<_, std::convert::Infallible>(response)
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .timer(hyper_util::rt::TokioTimer::new())
+                            .header_read_timeout(HEADER_READ_TIMEOUT)
+                            .serve_connection(io, service)
+                            .await;
+                    });
+                }
+            }
         }
+
+        drop(listener); // stop accepting immediately
+        let drain = async { while connections.join_next().await.is_some() {} };
+        if tokio::time::timeout(DRAIN_CAP, drain).await.is_err() {
+            eprintln!("jerrycan: drain cap reached — aborting remaining connections");
+            connections.abort_all();
+        }
+        Ok(())
     }
 }
 
@@ -237,6 +283,7 @@ pub struct BuiltApp {
     pub(crate) overrides: Arc<HashMap<TypeId, AnyArc>>,
     pub(crate) security_headers: bool,
     pub(crate) handler_timeout: std::time::Duration,
+    pub(crate) body_read_timeout: std::time::Duration,
 }
 
 // The trie holds type-erased handler fns and overrides are `dyn Any`, so the

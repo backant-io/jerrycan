@@ -118,3 +118,74 @@ async fn handler_panics_become_500_and_the_server_survives() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn graceful_shutdown_drains_in_flight_requests() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (trigger, shutdown) = tokio::sync::oneshot::channel::<()>();
+
+    async fn slow_ok() -> &'static str {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        "drained"
+    }
+    let app = App::new().route("/slow", get(slow_ok));
+    let server = tokio::spawn(async move {
+        app.serve_with_shutdown(listener, async {
+            let _ = shutdown.await;
+        })
+        .await
+    });
+
+    // Start an in-flight request, then trigger shutdown mid-handler.
+    let addr2 = addr.clone();
+    let inflight = tokio::spawn(async move { raw_get(&addr2, "/slow").await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    trigger.send(()).unwrap();
+
+    let res = inflight.await.unwrap();
+    assert!(
+        res.starts_with("HTTP/1.1 200") && res.ends_with("drained"),
+        "in-flight must complete: {res}"
+    );
+
+    // serve_with_shutdown returns Ok after draining…
+    let served = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server drains within the cap")
+        .unwrap();
+    assert!(served.is_ok());
+
+    // …and the listener is gone.
+    assert!(
+        tokio::net::TcpStream::connect(&addr).await.is_err(),
+        "no new connections after shutdown"
+    );
+}
+
+#[tokio::test]
+async fn glacial_request_bodies_are_cut_off() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = App::new()
+        .route(
+            "/echo",
+            jerrycan_core::post(|b: Json<String>| async move { b }),
+        )
+        .body_read_timeout(Duration::from_millis(200));
+    let server = tokio::spawn(async move { app.serve_with(listener).await });
+
+    // Send headers claiming a body, then stall forever.
+    let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    s.write_all(b"POST /echo HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    // No body bytes sent. Server must answer (408-class via JC0400 family) or close within ~1s, not hang.
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut buf)).await;
+    assert!(read.is_ok(), "server must not hang on a stalled body");
+    let text = String::from_utf8_lossy(&buf);
+    // Either an explicit 408 response or a clean close are acceptable cut-offs:
+    assert!(text.is_empty() || text.contains("408"), "got: {text}");
+    server.abort();
+}

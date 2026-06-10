@@ -17,7 +17,7 @@ license = "MIT OR Apache-2.0"
 homepage = "https://jerrycan.cc"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
 http = "1"
