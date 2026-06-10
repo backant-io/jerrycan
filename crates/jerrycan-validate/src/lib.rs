@@ -47,9 +47,8 @@ where
         let inner = T::from_request(ctx).await?;
         match inner.validate() {
             Ok(()) => Ok(Valid(inner)),
-            Err(violations) => Err(Error::unprocessable("validation failed").with_details(
-                serde_json::to_value(violations).expect("violations serialize"),
-            )),
+            Err(violations) => Err(Error::unprocessable("validation failed")
+                .with_details(serde_json::to_value(violations).expect("violations serialize"))),
         }
     }
 }
@@ -90,7 +89,7 @@ fn http_json(body: &'static str) -> jerrycan_core::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jerrycan_core::{get, post, Json};
+    use jerrycan_core::{Json, get, post};
     use serde::Deserialize;
 
     #[derive(Deserialize, Serialize)]
@@ -114,15 +113,32 @@ mod tests {
     #[tokio::test]
     async fn valid_payloads_pass_through() {
         let t = App::new().route("/todos", post(create)).into_test();
-        let res = t.post_json("/todos", &NewTodo { title: "ship".into() }).await;
+        let res = t
+            .post_json(
+                "/todos",
+                &NewTodo {
+                    title: "ship".into(),
+                },
+            )
+            .await;
         assert_eq!(res.status(), jerrycan_core::http::StatusCode::OK);
     }
 
     #[tokio::test]
     async fn violations_become_422_with_structured_details() {
         let t = App::new().route("/todos", post(create)).into_test();
-        let res = t.post_json("/todos", &NewTodo { title: "   ".into() }).await;
-        assert_eq!(res.status(), jerrycan_core::http::StatusCode::UNPROCESSABLE_ENTITY);
+        let res = t
+            .post_json(
+                "/todos",
+                &NewTodo {
+                    title: "   ".into(),
+                },
+            )
+            .await;
+        assert_eq!(
+            res.status(),
+            jerrycan_core::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
         let body: serde_json::Value = res.json();
         assert_eq!(body["code"], "JC0422");
         assert_eq!(body["details"][0]["field"], "title");
@@ -132,7 +148,9 @@ mod tests {
     #[tokio::test]
     async fn openapi_extension_serves_the_document() {
         let t = App::new()
-            .extend(OpenApi::new(r#"{"openapi":"3.1.0","info":{"title":"demo"}}"#))
+            .extend(OpenApi::new(
+                r#"{"openapi":"3.1.0","info":{"title":"demo"}}"#,
+            ))
             .route("/x", get(|| async { "x" }))
             .into_test();
         let res = t.get("/openapi.json").await;

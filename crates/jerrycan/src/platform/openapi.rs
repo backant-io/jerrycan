@@ -156,16 +156,27 @@ mod tests {
         assert_eq!(show["parameters"][0]["name"], "id");
         assert_eq!(show["parameters"][0]["in"], "path");
         assert_eq!(show["parameters"][0]["schema"]["type"], "integer");
-        assert!(show["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
-            .as_str().unwrap().ends_with("Todo"));
+        assert!(
+            show["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+                .as_str()
+                .unwrap()
+                .ends_with("Todo")
+        );
         assert_eq!(show["responses"]["404"]["description"], "unknown id");
 
         let list = &d["paths"]["/todos/"]["get"];
-        assert_eq!(list["responses"]["200"]["content"]["application/json"]["schema"]["type"], "array");
+        assert_eq!(
+            list["responses"]["200"]["content"]["application/json"]["schema"]["type"],
+            "array"
+        );
 
         let create = &d["paths"]["/todos/"]["post"];
-        assert!(create["requestBody"]["content"]["application/json"]["schema"]["$ref"]
-            .as_str().unwrap().ends_with("Todo"));
+        assert!(
+            create["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+                .as_str()
+                .unwrap()
+                .ends_with("Todo")
+        );
         assert!(create["responses"]["201"].is_object());
 
         // Subroute paths compose:
@@ -178,8 +189,13 @@ mod tests {
         let todo = &d["components"]["schemas"]["Todo"]["properties"];
         assert_eq!(todo["title"]["type"], "string");
         assert_eq!(todo["done"]["type"], "boolean");
-        let required = d["components"]["schemas"]["Todo"]["required"].as_array().unwrap();
+        let required = d["components"]["schemas"]["Todo"]["required"]
+            .as_array()
+            .unwrap();
         assert!(required.iter().any(|v| v == "title"));
-        assert!(!required.iter().any(|v| v == "done"), "optional fields are not required");
+        assert!(
+            !required.iter().any(|v| v == "done"),
+            "optional fields are not required"
+        );
     }
 }
