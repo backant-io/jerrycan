@@ -38,6 +38,48 @@ fn scaffold_golden(tmp: &Path) -> PathBuf {
     app
 }
 
+/// Scaffold the golden app in DB+validate mode against the LOCAL framework.
+fn scaffold_golden_db(tmp: &Path) -> PathBuf {
+    let mut design: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    design["dependencies"] = serde_json::json!(["db", "validate"]);
+    let design_path = tmp.join("design.json");
+    std::fs::write(&design_path, serde_json::to_string_pretty(&design).unwrap()).unwrap();
+    let app = tmp.join("todo-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    app
+}
+
+#[test]
+#[ignore = "heavy: db-mode golden app must build and pass the full gate"]
+fn db_mode_scaffold_passes_jerrycan_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = scaffold_golden_db(tmp.path());
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON doc");
+    assert_eq!(
+        payload["ok"], true,
+        "diagnostics: {}",
+        payload["diagnostics"]
+    );
+    assert!(out.status.success());
+}
+
 #[test]
 #[ignore = "heavy: full cargo build of a generated workspace"]
 fn scaffolded_app_builds_with_zero_warnings() {

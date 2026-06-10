@@ -57,7 +57,14 @@ pub fn scaffold(target: &Path, design: &Design) -> Result<Vec<String>, String> {
         &render(JERRYCAN_TOML, &[("name", &design.name)])?,
     )?;
     write(".gitignore", GITIGNORE)?;
-    write("deny.toml", DENY_TOML)?;
+    if design.wants_db() {
+        // db mode pulls sqlx: deny.toml allows webpki-roots' CDLA license, and
+        // audit.toml acknowledges the unfixable rsa advisory (RUSTSEC-2023-0071).
+        write("deny.toml", DENY_TOML_DB)?;
+        write(".cargo/audit.toml", AUDIT_TOML)?;
+    } else {
+        write("deny.toml", DENY_TOML)?;
+    }
     write("design.json", &canonical_design_json(design))?;
     write(
         "crates/app/Cargo.toml",
