@@ -197,6 +197,7 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                         .expect("validated above");
                     let mode = genroute::GenMode {
                         db: design.wants_db(),
+                        auth: design.wants_auth(),
                     };
                     let created =
                         match genroute::write_module(&root.join("crates/routes"), top, mode) {

@@ -99,6 +99,30 @@ pub fn validate(d: &Design) -> Vec<Question> {
         );
     }
 
+    // Role coherence: a guarded endpoint (auth_required or required_roles) needs
+    // an active auth model — `auth.model: none`/absent can't resolve a session.
+    if !d.wants_auth() {
+        fn check_guards(m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+            for (i, ep) in m.endpoints.iter().enumerate() {
+                if ep.is_guarded() {
+                    qs.push(q(
+                        format!("{ptr}/endpoints/{i}"),
+                        format!(
+                            "Endpoint `{}` is guarded (auth_required/required_roles) but the design has no active auth — set auth.model to `session` or `jwt` first.",
+                            ep.operation_id
+                        ),
+                    ));
+                }
+            }
+            for (i, sub) in m.subroutes.iter().enumerate() {
+                check_guards(sub, &format!("{ptr}/subroutes/{i}"), qs);
+            }
+        }
+        for (i, m) in d.modules.iter().enumerate() {
+            check_guards(m, &format!("/modules/{i}"), &mut qs);
+        }
+    }
+
     if d.wants_db() {
         fn check_json_fields(m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
             for (i, e) in m.entities.iter().enumerate() {
@@ -480,6 +504,19 @@ mod tests {
                 .iter()
                 .any(|q| q.question.contains("Rust keyword") && q.question.contains("`type`")),
             "keyword field name must be flagged"
+        );
+    }
+
+    #[test]
+    fn required_roles_need_a_role_in_auth_roles_and_auth_model() {
+        let mut v: serde_json::Value = serde_json::from_str(MINIMAL).unwrap();
+        v["auth"] = serde_json::json!({ "model": "none" });
+        v["modules"][0]["endpoints"][2]["required_roles"] = serde_json::json!(["admin"]);
+        let d: Design = serde_json::from_value(v).unwrap();
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.question.contains("auth.model") || q.question.contains("auth.roles"))
         );
     }
 

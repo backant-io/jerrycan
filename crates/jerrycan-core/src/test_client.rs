@@ -88,6 +88,43 @@ impl TestApp {
         .await
     }
 
+    /// DELETE with explicit request headers (guarded-route auth tests).
+    pub async fn delete_with(&self, path: &str, headers: &[(&str, &str)]) -> TestResponse {
+        self.request_with(Method::DELETE, path, None, headers).await
+    }
+
+    /// PUT JSON with explicit request headers.
+    pub async fn put_json_with<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+    ) -> TestResponse {
+        self.request_with(
+            Method::PUT,
+            path,
+            Some(serde_json::to_vec(body).expect("serialize")),
+            headers,
+        )
+        .await
+    }
+
+    /// PATCH JSON with explicit request headers.
+    pub async fn patch_json_with<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+    ) -> TestResponse {
+        self.request_with(
+            Method::PATCH,
+            path,
+            Some(serde_json::to_vec(body).expect("serialize")),
+            headers,
+        )
+        .await
+    }
+
     async fn request(&self, method: Method, path: &str, json: Option<Vec<u8>>) -> TestResponse {
         self.request_with(method, path, json, &[]).await
     }

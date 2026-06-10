@@ -11,6 +11,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GenMode {
     pub db: bool,
+    pub auth: bool,
 }
 
 /// snake/ident helpers: crate `route-todo-list` → ident `route_todo_list`.
@@ -54,10 +55,14 @@ fn path_params(ep: &Endpoint) -> Vec<String> {
     out
 }
 
-fn handler_params(m: &ModuleDesign, ep: &Endpoint) -> String {
+fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode) -> String {
     let mut params = Vec::new();
     if let Some(e) = endpoint_repo_entity(m, ep) {
         params.push(format!("_repo: Dep<{e}Repo>"));
+    }
+    // Guard param (order: repo, user, path, body): an authenticated session.
+    if mode.auth && ep.is_guarded() {
+        params.push("_user: CurrentUser".to_string());
     }
     let params_in_path = path_params(ep);
     match params_in_path.len() {
@@ -75,7 +80,20 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint) -> String {
     params.join(", ")
 }
 
-pub(crate) fn handlers_rs(m: &ModuleDesign) -> String {
+/// A leading comment for role-guarded endpoints, reminding the agent to call
+/// `require_role` before proceeding (empty for unguarded / no-role endpoints).
+fn guard_comment(ep: &Endpoint) -> String {
+    if ep.required_roles.is_empty() {
+        String::new()
+    } else {
+        let roles = ep.required_roles.join("\", \"");
+        format!(
+            "    // guard: requires role \"{roles}\" — call require_role(&_user.role, \"...\")? before proceeding\n"
+        )
+    }
+}
+
+pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode) -> String {
     let mut uses = String::from("use jerrycan::prelude::*;\n");
     let mentions_entities = m
         .endpoints
@@ -87,15 +105,26 @@ pub(crate) fn handlers_rs(m: &ModuleDesign) -> String {
     if !m.entities.is_empty() {
         uses.push_str("use super::repo::*;\n");
     }
+    // Auth mode: any guarded endpoint pulls in the role helper, the session
+    // extractor, and the shared CurrentUser alias used as the guard param type.
+    if mode.auth && m.endpoints.iter().any(|ep| ep.is_guarded()) {
+        uses.push_str("use jerrycan::auth::{require_role, Session};\n");
+        uses.push_str("use shared::CurrentUser;\n");
+    }
     let mut out = format!(
         "//! Handlers for `{}` — thin: extract → call → respond.\n//! Generated stubs return 500 until implemented.\n{uses}\n",
         m.name
     );
     for ep in &m.endpoints {
+        let guard = if mode.auth {
+            guard_comment(ep)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "pub(crate) async fn {op}({params}) -> {ret} {{\n    Err(Error::internal(\"{op} not implemented — replace this stub\"))\n}}\n\n",
+            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}    Err(Error::internal(\"{op} not implemented — replace this stub\"))\n}}\n\n",
             op = ep.operation_id,
-            params = handler_params(m, ep),
+            params = handler_params(m, ep, mode),
             ret = return_type(ep),
         ));
     }
@@ -603,7 +632,12 @@ fn write_unit_files(
     created: &mut Vec<String>,
     root: &Path,
 ) -> Result<(), String> {
-    write_agent_owned(&dir.join("handlers.rs"), &handlers_rs(m), created, root)?;
+    write_agent_owned(
+        &dir.join("handlers.rs"),
+        &handlers_rs(m, mode),
+        created,
+        root,
+    )?;
     write_agent_owned(&dir.join("deps.rs"), &deps_rs(m), created, root)?;
     if let Some(model) = model_rs(m) {
         write_agent_owned(&dir.join("model.rs"), &model, created, root)?;
@@ -719,7 +753,7 @@ mod tests {
     #[test]
     fn handler_signatures_follow_the_mapping_rules() {
         let m = todos();
-        let h = handlers_rs(&m);
+        let h = handlers_rs(&m, GenMode::default());
         assert!(
             h.contains(
                 "pub(crate) async fn list_todos(_repo: Dep<TodoRepo>) -> Result<Json<Vec<Todo>>>"
@@ -758,7 +792,7 @@ mod tests {
             },
             errors: vec![],
         });
-        let h = handlers_rs(&m);
+        let h = handlers_rs(&m, GenMode::default());
         assert!(
             h.contains("pub(crate) async fn move_todo(_repo: Dep<TodoRepo>, Path((_id, _slot)): Path<(i64, i64)>) -> Result<NoContent>"),
             "{h}"
@@ -856,7 +890,7 @@ mod tests {
         let sub = &m.subroutes[0];
         assert!(model_rs(sub).is_none());
         assert!(repo_rs(sub, GenMode::default()).is_none());
-        let h = handlers_rs(sub);
+        let h = handlers_rs(sub, GenMode::default());
         assert!(
             h.contains("pub(crate) async fn list_comments() -> Result<Json<serde_json::Value>>"),
             "{h}"

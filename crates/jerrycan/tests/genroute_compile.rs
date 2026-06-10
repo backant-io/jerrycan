@@ -62,8 +62,12 @@ fn generated_module_crate_passes_strict_clippy() {
 
     // 1. Emit the todos route crate (model.rs + repo.rs + stub handlers.rs).
     let design: Design = serde_json::from_str(MINIMAL).expect("MINIMAL parses");
+    // This test isolates the db dead-code-vs-stub shape; auth guards are exercised
+    // by the conformance auth_observe test, so keep auth off here (the minimal
+    // shared crate has no CurrentUser alias).
     let mode = GenMode {
         db: design.wants_db(),
+        auth: false,
     };
     let module = design.modules.into_iter().next().expect("todos module");
     let created = write_module(&routes, &module, mode).expect("write_module");

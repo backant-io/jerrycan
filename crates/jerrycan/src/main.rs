@@ -280,6 +280,7 @@ fn cmd_generate_route(module_path: &str, json_mode: bool) -> Result<(), Failure>
         .expect("checked above");
     let mode = genroute::GenMode {
         db: design.wants_db(),
+        auth: design.wants_auth(),
     };
     let created = genroute::write_module(&root.join("crates/routes"), top_module, mode)
         .map_err(Failure::gate)?;
@@ -347,6 +348,7 @@ fn cmd_add(extension: &str, json_mode: bool) -> Result<(), Failure> {
     // for EXISTING modules — agents migrate those by hand; new scaffolds get SQL).
     let mode = genroute::GenMode {
         db: design.wants_db(),
+        auth: design.wants_auth(),
     };
     for m in &design.modules {
         genroute::write_module(&root.join("crates/routes"), m, mode).map_err(Failure::gate)?;

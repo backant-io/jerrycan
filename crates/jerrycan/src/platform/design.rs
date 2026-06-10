@@ -164,6 +164,13 @@ pub struct ErrorCase {
     pub when: String,
 }
 
+impl Endpoint {
+    /// This endpoint needs an authenticated user (and maybe a role).
+    pub fn is_guarded(&self) -> bool {
+        self.auth_required || !self.required_roles.is_empty()
+    }
+}
+
 impl ModuleDesign {
     /// Where this module mounts (under the app, or under its parent for subroutes).
     pub fn effective_mount(&self) -> String {
@@ -182,6 +189,42 @@ impl Design {
     /// Reserved dependency name `validate` mounts the OpenAPI document.
     pub fn wants_validate(&self) -> bool {
         self.dependencies.iter().any(|d| d == "validate")
+    }
+
+    /// Auth mode: a non-`none` auth model, or the reserved `auth` dependency.
+    /// Triggers session-user types in shared, guard params, and the `Auth`
+    /// extension in main.rs.
+    pub fn wants_auth(&self) -> bool {
+        self.auth
+            .as_ref()
+            .map(|a| a.model != AuthModel::None)
+            .unwrap_or(false)
+            || self.dependencies.iter().any(|d| d == "auth")
+    }
+
+    /// Reserved dependency name `observe` wires logging + the metrics/health
+    /// extension. Pure extension wiring — no per-route codegen.
+    pub fn wants_observe(&self) -> bool {
+        self.dependencies.iter().any(|d| d == "observe")
+    }
+
+    /// The facade features this design's mode requires on the `jerrycan` dep,
+    /// in a stable order (scaffold and mounting must agree byte-for-byte).
+    pub fn facade_features(&self) -> Vec<&'static str> {
+        let mut features = Vec::new();
+        if self.wants_db() {
+            features.push("db");
+        }
+        if self.wants_validate() {
+            features.push("validate");
+        }
+        if self.wants_auth() {
+            features.push("auth");
+        }
+        if self.wants_observe() {
+            features.push("observe");
+        }
+        features
     }
 
     pub fn from_path(path: &std::path::Path) -> Result<Self, String> {
