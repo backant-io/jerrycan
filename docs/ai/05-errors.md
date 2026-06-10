@@ -38,6 +38,20 @@ let e = Error::new(jerrycan::http::StatusCode::CONFLICT, "JC0409", "title alread
 assert_eq!(e.code(), "JC0409");
 ```
 
+The full constructor set (prefer these over raw `Error::new`):
+```rust
+# use jerrycan::prelude::*;
+let all = [
+    Error::bad_request("bad input"),      // 400 JC0400
+    Error::not_found(),                   // 404 JC0404
+    Error::method_not_allowed(),          // 405 JC0405
+    Error::payload_too_large(),           // 413 JC0413
+    Error::unprocessable("bad field"),    // 422 JC0422
+    Error::internal("boom"),              // 500 JC0500
+];
+assert_eq!(all[0].code(), "JC0400");
+```
+
 ## Errors you'll hit (the built-in code table)
 | Code | Status | Produced when |
 |---|---|---|

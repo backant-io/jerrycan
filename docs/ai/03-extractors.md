@@ -54,6 +54,24 @@ assert_eq!(res.status(), jerrycan::http::StatusCode::CREATED);
 # }); }
 ```
 
+Query fields are REQUIRED by default — a missing `?limit=` is `400 JC0400`.
+Make pagination optional with `Option<T>` or `#[serde(default)]`:
+```rust
+# use jerrycan::prelude::*;
+# use serde::Deserialize;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+#[derive(Deserialize)]
+struct Page { limit: Option<u32>, #[serde(default)] offset: u32 }
+
+async fn list(Query(p): Query<Page>) -> String {
+    format!("limit={:?} offset={}", p.limit, p.offset)
+}
+
+let t = App::new().route("/items", get(list)).into_test();
+assert_eq!(t.get("/items").await.text(), "limit=None offset=0"); // no query string: fine
+# }); }
+```
+
 ## Errors you'll hit
 - `Path<T>` parse failure → `400 JC0400` ("invalid path parameter") automatically.
 - Malformed/mistyped JSON body → `422 JC0422` with the serde message.

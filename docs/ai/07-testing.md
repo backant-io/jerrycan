@@ -55,6 +55,16 @@ assert_eq!(t.get("/me").await.text(), "test-user");
 # }); }
 ```
 
+Assert on response headers with `headers()`:
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+let t = App::new().route("/", get(|| async { Json(42) })).into_test();
+let res = t.get("/").await;
+assert_eq!(res.headers()["content-type"], "application/json");
+# }); }
+```
+
 ## Errors you'll hit
 - `panic: app failed to build` — your route table has a conflict; the message
   names the path. This is the same failure `serve()` would return.

@@ -56,6 +56,19 @@ assert_eq!(t.get("/special/").await.text(), "module");
 # }); }
 ```
 
+Full CRUD method sets chain off one route entry — `put`/`patch`/`delete` work
+exactly like `get`/`post`:
+```rust
+# use jerrycan::prelude::*;
+# async fn show() -> &'static str { "s" }
+# async fn replace() -> &'static str { "r" }
+# async fn update() -> &'static str { "u" }
+# async fn remove() -> Result<NoContent> { Ok(NoContent) }
+let m = Module::new("items")
+    .route("/{id}", get(show).put(replace).patch(update).delete(remove));
+# let _ = App::new().mount("/items", m).into_test();
+```
+
 ## Errors you'll hit
 - Mounting two routes onto the same final path → build-time conflict error
   naming the path. Rename one route or move the mount prefix.

@@ -8,9 +8,10 @@ rarely edit it; you generate modules instead (see 02-modules).
 ## Signature
 ```rust,no_run
 # use jerrycan::prelude::*;
+# struct AppConfig { greeting: &'static str }
 # async fn noop() -> Result<()> {
 App::new()
-    .provide(())                 // .provide(value) — app-wide singleton dependency
+    .provide(AppConfig { greeting: "hi" })   // .provide(value) — app-wide singleton dependency
     .route("/ping", get(|| async { "pong" }))   // app-level route (prefer modules)
     .serve()                     // binds JERRYCAN_ADDR (default 127.0.0.1:8000)
     .await
@@ -50,6 +51,17 @@ App-level middleware wraps every route (outermost ring):
 # }
 let app = App::new().middleware(Noop).route("/x", get(|| async { "x" }));
 # let _ = app.into_test();
+```
+
+Bind explicitly (tests, port 0, socket activation) with `serve_with`; plain
+`serve()` reads `JERRYCAN_ADDR` (default `127.0.0.1:8000`):
+```rust,no_run
+# use jerrycan::prelude::*;
+# async fn demo() -> Result<()> {
+let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await
+    .map_err(|e| Error::internal(format!("bind: {e}")))?;
+App::new().route("/ping", get(|| async { "pong" })).serve_with(listener).await
+# }
 ```
 
 ## Errors you'll hit
