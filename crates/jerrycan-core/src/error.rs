@@ -47,6 +47,14 @@ impl Error {
     pub fn unprocessable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "JC0422", message)
     }
+    /// The handler exceeded the configured time budget (spec §4.4 timeouts).
+    pub fn handler_timeout() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "JC0503",
+            "handler timed out",
+        )
+    }
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "JC0500", message)
     }
@@ -108,6 +116,11 @@ mod tests {
         assert_eq!(e.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(e.message().contains("app::Db"));
         assert_eq!(Error::dependency_cycle().code(), "JC1002");
+        assert_eq!(Error::handler_timeout().code(), "JC0503");
+        assert_eq!(
+            Error::handler_timeout().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
