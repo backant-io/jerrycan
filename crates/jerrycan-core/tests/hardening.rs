@@ -225,3 +225,17 @@ async fn glacial_request_bodies_are_cut_off() {
     assert!(text.is_empty() || text.contains("408"), "got: {text}");
     server.abort();
 }
+
+#[tokio::test]
+async fn malformed_path_encoding_is_400_jc0400() {
+    use jerrycan_core::Path;
+    async fn show(Path(id): Path<String>) -> String {
+        id
+    }
+    let t = App::new().route("/items/{id}", get(show)).into_test();
+
+    assert_eq!(t.get("/items/ok%20name").await.text(), "ok name");
+    let res = t.get("/items/%zz").await;
+    assert_eq!(res.status(), jerrycan_core::http::StatusCode::BAD_REQUEST);
+    assert!(res.text().contains("JC0400"));
+}

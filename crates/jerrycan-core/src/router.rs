@@ -1,6 +1,7 @@
 //! Method routing + segment trie with `{param}` captures (spec §4.1).
 //! Conflicting routes are detected at build time — fail loud before serving.
-//! NOTE: percent-decoding of path segments is deliberately Phase 1 (with fuzzing).
+//! Path segments are percent-decoded after '/'-splitting; malformed encodings
+//! surface as `RouteMatch::Malformed` (a clean 400, never a panic).
 
 use crate::dep::DepEnv;
 use crate::error::{Error, Result};
@@ -85,11 +86,45 @@ pub(crate) enum RouteMatch<'a> {
         params: Vec<(String, String)>,
     },
     MethodMissing,
+    Malformed,
     NotFound,
 }
 
 fn segments(path: &str) -> impl Iterator<Item = &str> {
     path.split('/').filter(|s| !s.is_empty())
+}
+
+/// Decode %XX sequences in ONE path segment. `None` = malformed (bad hex,
+/// truncated escape, or non-UTF-8 result) — the caller answers 400.
+/// Runs after '/'-splitting, so an encoded slash cannot create segments.
+fn decode_segment(seg: &str) -> Option<String> {
+    if !seg.contains('%') {
+        return Some(seg.to_string());
+    }
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = seg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            // `get` returns None on truncated escapes; `hex` on bad digits.
+            let high = hex(*bytes.get(i + 1)?)?;
+            let low = hex(*bytes.get(i + 2)?)?;
+            out.push(high * 16 + low);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 impl Trie {
@@ -121,7 +156,14 @@ impl Trie {
     }
 
     pub(crate) fn find<'a>(&'a self, path: &str, method: &Method) -> RouteMatch<'a> {
-        let segs: Vec<&str> = segments(path).collect();
+        let mut segs: Vec<String> = Vec::new();
+        for raw in segments(path) {
+            match decode_segment(raw) {
+                Some(decoded) => segs.push(decoded),
+                None => return RouteMatch::Malformed,
+            }
+        }
+        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
         let mut params: Vec<(String, String)> = Vec::new();
         match find_node(&self.root, &segs, &mut params) {
             Some(node) => {
@@ -284,5 +326,52 @@ mod tests {
         let mr = get(|| async { "a" }).post(|| async { "b" });
         let methods: Vec<_> = mr.handlers.iter().map(|(m, _)| m.clone()).collect();
         assert_eq!(methods, vec![Method::GET, Method::POST]);
+    }
+
+    #[test]
+    fn percent_encoded_segments_decode_for_statics_and_params() {
+        let mut t = Trie::default();
+        t.insert("/caf\u{e9}/menu", endpoint(&[Method::GET]))
+            .unwrap();
+        t.insert("/todos/{id}", endpoint(&[Method::GET])).unwrap();
+
+        // %C3%A9 = é in a STATIC segment
+        assert!(matches!(
+            t.find("/caf%C3%A9/menu", &Method::GET),
+            RouteMatch::Found { .. }
+        ));
+
+        // %2F decodes INSIDE the param value without creating a new segment
+        match t.find("/todos/a%2Fb", &Method::GET) {
+            RouteMatch::Found { params, .. } => assert_eq!(params[0].1, "a/b"),
+            other => panic!(
+                "expected param capture, got no match ({})",
+                matches!(other, RouteMatch::NotFound)
+            ),
+        }
+
+        // %20 decodes to a space
+        match t.find("/todos/hello%20world", &Method::GET) {
+            RouteMatch::Found { params, .. } => assert_eq!(params[0].1, "hello world"),
+            _ => panic!("expected match"),
+        }
+    }
+
+    #[test]
+    fn malformed_percent_encodings_are_flagged_not_matched() {
+        let mut t = Trie::default();
+        t.insert("/todos/{id}", endpoint(&[Method::GET])).unwrap();
+        assert!(matches!(
+            t.find("/todos/%zz", &Method::GET),
+            RouteMatch::Malformed
+        ));
+        assert!(matches!(
+            t.find("/todos/%2", &Method::GET),
+            RouteMatch::Malformed
+        )); // truncated
+        assert!(matches!(
+            t.find("/todos/%FF", &Method::GET),
+            RouteMatch::Malformed
+        )); // invalid UTF-8
     }
 }

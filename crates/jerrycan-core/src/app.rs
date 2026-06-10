@@ -366,6 +366,9 @@ impl BuiltApp {
         match self.trie.find(&path, &method) {
             RouteMatch::NotFound => Error::not_found().into_response(),
             RouteMatch::MethodMissing => Error::method_not_allowed().into_response(),
+            RouteMatch::Malformed => {
+                Error::bad_request("malformed percent-encoding in path").into_response()
+            }
             RouteMatch::Found { endpoint, params } => {
                 let mut ctx = RequestCtx::new(
                     parts,
