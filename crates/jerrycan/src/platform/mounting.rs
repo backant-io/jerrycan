@@ -83,8 +83,8 @@ pub fn regenerate(app_root: &Path, design: &Design) -> Result<Vec<String>, Strin
     )?;
     if ws2 != ws {
         fs::write(&ws_path, &ws2).map_err(|e| e.to_string())?;
+        modified.push("Cargo.toml".to_string());
     }
-    modified.push("Cargo.toml".to_string());
 
     // 3. app route-deps.
     let app_cargo_path = app_root.join("crates/app/Cargo.toml");
@@ -102,8 +102,8 @@ pub fn regenerate(app_root: &Path, design: &Design) -> Result<Vec<String>, Strin
     )?;
     if ac2 != ac {
         fs::write(&app_cargo_path, &ac2).map_err(|e| e.to_string())?;
+        modified.push("crates/app/Cargo.toml".to_string());
     }
-    modified.push("crates/app/Cargo.toml".to_string());
 
     Ok(modified)
 }

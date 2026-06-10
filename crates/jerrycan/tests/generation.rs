@@ -72,6 +72,32 @@ fn mounting_is_sorted_and_idempotent() {
 }
 
 #[test]
+fn regenerate_shrinks_cleanly_when_a_module_is_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("todo-api");
+    let mut d = design();
+    scaffold::scaffold(&root, &d).unwrap();
+    d.modules.retain(|m| m.name != "users");
+    mounting::regenerate(&root, &d).unwrap();
+    let main_rs = fs::read_to_string(root.join("crates/app/src/main.rs")).unwrap();
+    assert!(!main_rs.contains("route_users"), "stale mount removed");
+    let ws = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(!ws.contains("crates/routes/users"), "stale member removed");
+    assert!(ws.contains("# jerrycan:members:begin") && ws.contains("# jerrycan:members:end"));
+    let app_cargo = fs::read_to_string(root.join("crates/app/Cargo.toml")).unwrap();
+    assert!(
+        !app_cargo.contains("route-users"),
+        "stale route-dep removed"
+    );
+    // idempotent after shrink
+    mounting::regenerate(&root, &d).unwrap();
+    assert_eq!(
+        main_rs,
+        fs::read_to_string(root.join("crates/app/src/main.rs")).unwrap()
+    );
+}
+
+#[test]
 fn scaffold_refuses_a_nonempty_target() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("busy");

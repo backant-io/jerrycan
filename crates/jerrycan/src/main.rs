@@ -180,7 +180,7 @@ fn app_root() -> Result<PathBuf, Failure> {
         Ok(cwd)
     } else {
         Err(Failure::usage(
-            "no design.json here — run inside a jerrycan app (or scaffold one with `jerrycan new`)",
+            "no design.json here — run inside a jerrycan app (or scaffold one with `jerrycan new`) — if you're in a subdirectory, cd to the app root.",
         ))
     }
 }
@@ -228,10 +228,19 @@ fn cmd_generate_dep(name: &str, module: &str, json_mode: bool) -> Result<(), Fai
         scaffold::canonical_design_json(&design),
     )
     .map_err(|e| Failure::gate(e.to_string()))?;
+    let deps_rel = {
+        let mut parts = module.split('/');
+        let top = parts.next().unwrap_or(module);
+        let mut p = format!("crates/routes/{top}/src");
+        for sub in parts {
+            p.push_str(&format!("/subroutes/{}", sub.replace('-', "_")));
+        }
+        format!("{p}/deps.rs")
+    };
     let payload = serde_json::json!({
         "created": [],
         "modified": ["design.json"],
-        "next_step": format!("define `{name}` in crates/routes/{}/src/deps.rs (configure hook)", module.split('/').next().unwrap_or(module)),
+        "next_step": format!("define `{name}` in {deps_rel} (configure hook)"),
     });
     emit(
         json_mode,
