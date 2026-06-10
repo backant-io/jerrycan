@@ -4,12 +4,15 @@
 use proc_macro::TokenStream;
 
 /// `#[jerrycan::main]` — boots the async runtime around `async fn main`.
-/// Today it delegates to `#[tokio::main]`; the app must (and generated apps
-/// do) depend on tokio directly.
+/// Delegates to `#[tokio::main]`; the app must (and generated apps do) depend
+/// on tokio directly. The user's tokens pass through UNCHANGED, preserving
+/// their spans so compiler diagnostics point at the user's code, not at this
+/// attribute.
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let wrapped = format!("#[::tokio::main]\n{item}");
-    wrapped
+    let mut out: TokenStream = "#[::tokio::main]"
         .parse()
-        .expect("jerrycan::main: item must be a valid async fn")
+        .expect("static attribute tokens always parse");
+    out.extend(item); // original tokens, original spans
+    out
 }
