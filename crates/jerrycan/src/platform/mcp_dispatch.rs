@@ -39,7 +39,7 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
 
         "jerrycan_design" => {
             let Some(draft) = args.get("draft").filter(|d| !d.is_null()) else {
-                let template = include_str!("../../../../conformance/designs/todo-api.design.json");
+                let template = include_str!("../../embedded/designs/todo-api.design.json");
                 return (
                     false,
                     json!({

@@ -5,42 +5,39 @@ use serde::Serialize;
 /// (topic, markdown) — embedded at compile time from the SAME files the
 /// doc-tests execute, so served docs can never drift from verified docs.
 pub const PAGES: &[(&str, &str)] = &[
-    ("app", include_str!("../../../../docs/ai/01-app.md")),
-    ("modules", include_str!("../../../../docs/ai/02-modules.md")),
+    ("app", include_str!("../../embedded/ai/01-app.md")),
+    ("modules", include_str!("../../embedded/ai/02-modules.md")),
     (
         "extractors",
-        include_str!("../../../../docs/ai/03-extractors.md"),
+        include_str!("../../embedded/ai/03-extractors.md"),
     ),
     (
         "dependencies",
-        include_str!("../../../../docs/ai/04-dependencies.md"),
+        include_str!("../../embedded/ai/04-dependencies.md"),
     ),
-    ("errors", include_str!("../../../../docs/ai/05-errors.md")),
+    ("errors", include_str!("../../embedded/ai/05-errors.md")),
     (
         "middleware",
-        include_str!("../../../../docs/ai/06-middleware.md"),
+        include_str!("../../embedded/ai/06-middleware.md"),
     ),
-    ("testing", include_str!("../../../../docs/ai/07-testing.md")),
-    (
-        "database",
-        include_str!("../../../../docs/ai/08-database.md"),
-    ),
+    ("testing", include_str!("../../embedded/ai/07-testing.md")),
+    ("database", include_str!("../../embedded/ai/08-database.md")),
     (
         "validation",
-        include_str!("../../../../docs/ai/09-validation.md"),
+        include_str!("../../embedded/ai/09-validation.md"),
     ),
-    ("auth", include_str!("../../../../docs/ai/10-auth.md")),
+    ("auth", include_str!("../../embedded/ai/10-auth.md")),
     (
         "observability",
-        include_str!("../../../../docs/ai/11-observability.md"),
+        include_str!("../../embedded/ai/11-observability.md"),
     ),
     (
         "packaging",
-        include_str!("../../../../docs/ai/12-packaging.md"),
+        include_str!("../../embedded/ai/12-packaging.md"),
     ),
     (
         "error-codes",
-        include_str!("../../../../docs/ai/13-error-codes.md"),
+        include_str!("../../embedded/ai/13-error-codes.md"),
     ),
 ];
 

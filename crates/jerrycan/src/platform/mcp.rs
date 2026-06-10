@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
 /// The frozen tool contracts, embedded at compile time.
-pub const CONTRACTS: &str = include_str!("../../../../docs/contracts/mcp-tools.json");
+pub const CONTRACTS: &str = include_str!("../../embedded/contracts/mcp-tools.json");
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 

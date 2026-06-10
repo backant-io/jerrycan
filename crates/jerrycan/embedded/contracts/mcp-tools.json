@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jerrycan.cc/schemas/mcp-tools-v0.json",
+  "contract_version": 0,
+  "tools": [
+    {
+      "name": "jerrycan_design",
+      "description": "Turn requirements into a validated design.json. The agent authors the design; this tool enforces specificity: call without a draft to get the design template, call with a draft to validate it — violations return pointed questions (not code), a complete draft is written to design.json and echoed with design_path. Call repeatedly until status=complete.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "requirements": { "type": "string", "description": "What the backend must do, in natural language." },
+          "draft": { "type": "object", "description": "A structured design draft conforming to design-schema.json. The tool validates it deterministically: violations come back as pointed questions; a complete draft is written to disk and returned with design_path. Omit on a first exploratory call to receive the design template." },
+          "answers": { "type": "object", "description": "Answers to a previous call's questions, keyed by question id." },
+          "revision_of": { "type": "string", "description": "Path to an existing design.json being revised." }
+        },
+        "required": ["requirements"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "status": { "enum": ["complete", "questions"] },
+          "design": { "$ref": "https://jerrycan.cc/schemas/design-v0.json" },
+          "design_path": { "type": "string", "description": "Filesystem path where the validated design.json was written. Present whenever status is complete; scaffold consumes it as design_path." },
+          "questions": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "question": { "type": "string" } }, "required": ["id", "question"] } },
+          "next_step": { "type": "string" }
+        },
+        "required": ["status", "next_step"]
+      }
+    },
+    {
+      "name": "jerrycan_scaffold",
+      "description": "Create a new app workspace from a complete design.json: app/ shell, shared/ crate, one route-module crate per design module.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "design_path": { "type": "string" },
+          "directory": { "type": "string", "description": "Target directory for the new workspace." }
+        },
+        "required": ["design_path", "directory"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "created": { "type": "array", "items": { "type": "string" } },
+          "next_step": { "type": "string" }
+        },
+        "required": ["created", "next_step"]
+      }
+    },
+    {
+      "name": "jerrycan_generate",
+      "description": "Incremental generator (Angular-style): add a route module, subroute, or dependency to an existing app. Regenerates mounting and workspace members deterministically.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "kind": { "enum": ["route", "subroute", "dependency"] },
+          "path": { "type": "string", "description": "route: module name (todos); subroute: parent/child (todos/comments)." },
+          "module": { "type": "string", "description": "Owning module for kind=dependency." },
+          "design_slice": { "type": "object", "description": "The design.json fragment for the new unit." },
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
+        },
+        "required": ["kind", "path"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "created": { "type": "array", "items": { "type": "string" } },
+          "modified": { "type": "array", "items": { "type": "string" } },
+          "next_step": { "type": "string" }
+        },
+        "required": ["created", "modified", "next_step"]
+      }
+    },
+    {
+      "name": "jerrycan_gen_tests",
+      "description": "Generate the failing acceptance test suite for a module from its design slice — one test per endpoint and error case. TDD: run before implementing handlers.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "module": { "type": "string" },
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
+        },
+        "required": ["module"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "tests_created": { "type": "array", "items": { "type": "string" } },
+          "expected_failing": { "type": "integer" },
+          "next_step": { "type": "string" }
+        },
+        "required": ["tests_created", "expected_failing", "next_step"]
+      }
+    },
+    {
+      "name": "jerrycan_check",
+      "description": "The verification gate: build + clippy(deny) + cargo-audit + cargo-deny + tests + jerrycan lints. Scope to one module for fast iteration. Diagnostics are machine-readable with doc links.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "module": { "type": "string", "description": "Omit for the full workspace." },
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "code": { "type": "string" },
+                "file": { "type": "string" },
+                "line": { "type": "integer" },
+                "message": { "type": "string" },
+                "suggestion": { "type": "string" },
+                "doc_url": { "type": "string" }
+              },
+              "required": ["code", "message"]
+            }
+          },
+          "next_step": { "type": "string" }
+        },
+        "required": ["ok", "diagnostics", "next_step"]
+      }
+    },
+    {
+      "name": "jerrycan_package",
+      "description": "Produce hardened deploy artifacts (+ CycloneDX SBOM). Refuses to run unless the full-workspace check is green.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": { "enum": ["docker", "binary", "k8s", "systemd"] },
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
+        },
+        "required": ["target"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "artifacts": { "type": "array", "items": { "type": "string" } },
+          "sbom": { "type": "string" },
+          "next_step": { "type": "string" }
+        },
+        "required": ["artifacts", "sbom", "next_step"]
+      }
+    },
+    {
+      "name": "jerrycan_docs_search",
+      "description": "Search the AI-native docs. Returns page+anchor+snippet hits.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string" },
+          "limit": { "type": "integer", "default": 5 }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": { "page": { "type": "string" }, "anchor": { "type": "string" }, "snippet": { "type": "string" } },
+              "required": ["page", "snippet"]
+            }
+          }
+        },
+        "required": ["results"]
+      }
+    },
+    {
+      "name": "jerrycan_docs_get",
+      "description": "Fetch one docs page (optionally one anchored section) as markdown. Pages follow a fixed shape: Purpose, Signature, Minimal example, Variations, Errors you'll hit, Anti-patterns.",
+      "inputSchema": {
+        "type": "object",
+        "properties": { "page": { "type": "string" }, "anchor": { "type": "string" } },
+        "required": ["page"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": { "markdown": { "type": "string" } },
+        "required": ["markdown"]
+      }
+    },
+    {
+      "name": "jerrycan_list_routes",
+      "description": "The live route tree of the current app: method, path, owning module, handler. The resume-work map for agents.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "routes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": { "method": { "type": "string" }, "path": { "type": "string" }, "module": { "type": "string" }, "handler": { "type": "string" } },
+              "required": ["method", "path", "module", "handler"]
+            }
+          }
+        },
+        "required": ["routes"]
+      }
+    }
+  ]
+}
