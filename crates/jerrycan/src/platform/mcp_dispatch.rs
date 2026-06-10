@@ -137,6 +137,7 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
             let path = args["path"].as_str().unwrap_or("");
             match kind {
                 "route" | "subroute" => {
+                    let routes_before = genroute::route_map(&design).len();
                     if let Some(slice) = args.get("design_slice").filter(|s| !s.is_null()) {
                         let module: super::design::ModuleDesign =
                             match serde_json::from_value(slice.clone()) {
@@ -147,6 +148,12 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                                     ));
                                 }
                             };
+                        if kind == "route" && module.name != path {
+                            return err_payload(format!(
+                                "design_slice.name `{}` does not match path `{path}` — set path to the module the slice replaces (slices replace the WHOLE module)",
+                                module.name
+                            ));
+                        }
                         if kind == "route" {
                             design.modules.retain(|m| m.name != module.name);
                             design.modules.push(module);
@@ -196,12 +203,21 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                         Ok(m) => m,
                         Err(e) => return err_payload(e),
                     };
+                    let routes_after = genroute::route_map(&design).len();
+                    let mut next_step = format!(
+                        "implement crates/routes/{top_name}/src/handlers.rs, then jerrycan_check"
+                    );
+                    if routes_after < routes_before {
+                        next_step.push_str(&format!(
+                            " — warning: route count dropped {routes_before} → {routes_after}; a partial design_slice REPLACES the whole module (stale agent files are not deleted)"
+                        ));
+                    }
                     (
                         false,
                         json!({
                             "created": created,
                             "modified": modified,
-                            "next_step": format!("implement crates/routes/{top_name}/src/handlers.rs, then jerrycan_check"),
+                            "next_step": next_step,
                         }),
                     )
                 }

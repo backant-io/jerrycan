@@ -258,7 +258,7 @@ fn cmd_generate_route(module_path: &str, json_mode: bool) -> Result<(), Failure>
     let payload = serde_json::json!({
         "created": created,
         "modified": modified,
-        "next_step": format!("implement crates/routes/{top}/src/handlers.rs, then jerrycan check --module {top}"),
+        "next_step": format!("implement crates/routes/{top}/src/handlers.rs, then jerrycan check --module {top} — note: regeneration mirrors design.json exactly; routes removed there are removed here (stale agent files are not deleted)"),
     });
     emit(
         json_mode,

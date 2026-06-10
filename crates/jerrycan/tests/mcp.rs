@@ -177,3 +177,74 @@ fn scaffold_generate_and_list_through_mcp() {
     assert!(payload["error"].as_str().unwrap().contains("Phase 3"));
     c.shutdown();
 }
+
+#[test]
+fn partial_slice_replacement_warns_about_dropped_routes() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("design.json"), GOLDEN).unwrap();
+    let mut c = McpClient::start_in(tmp.path());
+    let app_dir = tmp.path().join("todo-api");
+    let (err, _) = c.call_tool(
+        "jerrycan_scaffold",
+        serde_json::json!({
+            "design_path": tmp.path().join("design.json").to_str().unwrap(),
+            "directory": app_dir.to_str().unwrap(),
+        }),
+    );
+    assert!(!err);
+
+    // Replace todos with a ONE-endpoint slice: routes drop 8 -> 3 (comments subroute included).
+    let (err, payload) = c.call_tool(
+        "jerrycan_generate",
+        serde_json::json!({
+            "kind": "route",
+            "path": "todos",
+            "directory": app_dir.to_str().unwrap(),
+            "design_slice": { "name": "todos", "endpoints": [
+                { "operation_id": "list_todos", "method": "GET", "path": "/", "success": { "status": 200 } }
+            ]},
+        }),
+    );
+    assert!(!err, "{payload}");
+    let next = payload["next_step"].as_str().unwrap();
+    assert!(
+        next.contains("warning") && next.contains("route count"),
+        "{next}"
+    );
+    c.shutdown();
+}
+
+#[test]
+fn slice_name_path_mismatch_gets_a_pointed_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("design.json"), GOLDEN).unwrap();
+    let mut c = McpClient::start_in(tmp.path());
+    let app_dir = tmp.path().join("todo-api");
+    let (err, _) = c.call_tool(
+        "jerrycan_scaffold",
+        serde_json::json!({
+            "design_path": tmp.path().join("design.json").to_str().unwrap(),
+            "directory": app_dir.to_str().unwrap(),
+        }),
+    );
+    assert!(!err);
+
+    let (err, payload) = c.call_tool(
+        "jerrycan_generate",
+        serde_json::json!({
+            "kind": "route",
+            "path": "widgets",
+            "directory": app_dir.to_str().unwrap(),
+            "design_slice": { "name": "gadgets", "endpoints": [
+                { "operation_id": "list_gadgets", "method": "GET", "path": "/", "success": { "status": 200 } }
+            ]},
+        }),
+    );
+    assert!(err);
+    let msg = payload["error"].as_str().unwrap();
+    assert!(
+        msg.contains("gadgets") && msg.contains("widgets"),
+        "must name both sides: {msg}"
+    );
+    c.shutdown();
+}
