@@ -23,6 +23,16 @@ fn cargo_json_errors_become_diagnostics() {
 }
 
 #[test]
+fn duplicate_compiler_messages_are_deduped() {
+    // cargo can emit the same error across build units (lib + its tests); the
+    // agent should see one diagnostic, not N copies of the same (code,file,line,message).
+    let doubled = format!("{RUSTC_ERR}\n{RUSTC_ERR}");
+    let ds = parse_cargo_json(&doubled, "build");
+    assert_eq!(ds.len(), 1, "identical diagnostics collapse to one");
+    assert_eq!(ds[0].code, "E0308");
+}
+
+#[test]
 fn warnings_are_ignored_but_errors_without_code_still_surface() {
     let mixed = r##"{"reason":"compiler-message","message":{"code":null,"level":"warning","message":"unused","spans":[]}}
 {"reason":"compiler-message","message":{"code":null,"level":"error","message":"aborting due to previous error","spans":[]}}"##;

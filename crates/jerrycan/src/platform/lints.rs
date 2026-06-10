@@ -70,6 +70,7 @@ fn lint_handlers(root: &Path, m: &ModuleDesign, src_rel: &str, out: &mut Vec<Dia
     let rel = format!("{src_rel}/handlers.rs");
     let content = std::fs::read_to_string(root.join(&rel)).unwrap_or_default();
     for ep in &m.endpoints {
+        // Substring match can be fooled by commented-out handlers; the build class is the real guarantee (lib.rs references handlers::<op>).
         if !content.contains(&format!("async fn {}(", ep.operation_id)) {
             out.push(d(
                 "JL0002",

@@ -3,6 +3,7 @@
 //! collected (cli-ux.md). One diagnostics shape, rendered by CLI and MCP alike.
 
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -30,6 +31,9 @@ pub struct CheckReport {
 /// Parse `--message-format=json` output (one JSON object per line).
 pub fn parse_cargo_json(stdout: &str, source: &str) -> Vec<Diagnostic> {
     let mut out = Vec::new();
+    // cargo can repeat the same error across build units (e.g. lib + its tests);
+    // dedup on (code, file, line, message) so the agent sees each error once.
+    let mut seen: HashSet<(String, Option<String>, Option<u64>, String)> = HashSet::new();
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -56,13 +60,19 @@ pub fn parse_cargo_json(stdout: &str, source: &str) -> Vec<Diagnostic> {
         let doc_url = code
             .starts_with('E')
             .then(|| format!("https://doc.rust-lang.org/error_codes/{code}.html"));
+        let file = primary
+            .and_then(|p| p["file_name"].as_str())
+            .map(str::to_string);
+        let line_no = primary.and_then(|p| p["line_start"].as_u64());
+        let message = msg["message"].as_str().unwrap_or("").to_string();
+        if !seen.insert((code.clone(), file.clone(), line_no, message.clone())) {
+            continue;
+        }
         out.push(Diagnostic {
             code,
-            file: primary
-                .and_then(|p| p["file_name"].as_str())
-                .map(str::to_string),
-            line: primary.and_then(|p| p["line_start"].as_u64()),
-            message: msg["message"].as_str().unwrap_or("").to_string(),
+            file,
+            line: line_no,
+            message,
             suggestion,
             doc_url,
         });

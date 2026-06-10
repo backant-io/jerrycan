@@ -14,6 +14,7 @@ a `--json` mode whose output is the same data the MCP tool returns.
   `2` usage error (unknown flag, missing arg) · `3` environment error (no cargo, no git).
 - **Color:** auto (TTY only); `NO_COLOR` honored.
 - **Env:** `JERRYCAN_ADDR` (serve bind), `JERRYCAN_ENV=dev|prod` (error verbosity; prod is the default when packaged).
+- **Exit 3 and stdout:** on environment errors (exit 3) stdout is empty — agents must branch on the exit code before parsing stdout. With `--module`, audit/deny are skipped (workspace-global gates); run a full check before packaging.
 
 ## Commands (v0 surface — mirrors spec §7.1)
 

@@ -308,7 +308,7 @@ fn cmd_check(module: Option<&str>, json_mode: bool) -> Result<(), Failure> {
     let mut failed_class: Option<&str> = None;
 
     #[allow(clippy::type_complexity)]
-    let classes: Vec<(
+    let mut classes: Vec<(
         &str,
         Box<dyn FnOnce() -> Result<Vec<checkpipe::Diagnostic>, Failure>>,
     )> = vec![
@@ -320,14 +320,22 @@ fn cmd_check(module: Option<&str>, json_mode: bool) -> Result<(), Failure> {
             "clippy",
             Box::new(|| checkpipe::run_clippy(root, module).map_err(Failure::environment)),
         ),
-        ("audit", Box::new(|| tool(checkpipe::run_audit(root)))),
-        ("deny", Box::new(|| tool(checkpipe::run_deny(root)))),
-        (
-            "tests",
-            Box::new(|| checkpipe::run_tests(root, module).map_err(Failure::environment)),
-        ),
-        ("jerrycan lints", Box::new(|| Ok(lints::run(root, design)))),
     ];
+    // audit/deny are workspace-global supply-chain gates; module scope is for fast
+    // iteration per cli-ux.md, so skip them there (run a full check before packaging).
+    if module.is_some() {
+        eprintln!(
+            "note: audit/deny skipped in module scope — run a full `jerrycan check` before packaging"
+        );
+    } else {
+        classes.push(("audit", Box::new(|| tool(checkpipe::run_audit(root)))));
+        classes.push(("deny", Box::new(|| tool(checkpipe::run_deny(root)))));
+    }
+    classes.push((
+        "tests",
+        Box::new(|| checkpipe::run_tests(root, module).map_err(Failure::environment)),
+    ));
+    classes.push(("jerrycan lints", Box::new(|| Ok(lints::run(root, design)))));
     for (name, step) in classes {
         let ds = step()?;
         if !ds.is_empty() {
