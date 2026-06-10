@@ -140,7 +140,7 @@ fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
             // A creator that echoes its entity must echo the id it was given —
             // catches inserts that return a backend default (0) instead.
             let id_echo = (ep.method == HttpMethod::POST)
-                .then(|| ep.request_body.as_ref())
+                .then_some(ep.request_body.as_ref())
                 .flatten()
                 .filter(|rb| ep.success.entity.as_deref() == Some(rb.entity.as_str()))
                 .and_then(|rb| unit.entities.iter().find(|e| e.name == rb.entity))
