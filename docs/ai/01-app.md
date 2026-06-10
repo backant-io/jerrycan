@@ -64,6 +64,26 @@ App::new().route("/ping", get(|| async { "pong" })).serve_with(listener).await
 # }
 ```
 
+Secure defaults are ON for every response — security headers
+(`x-content-type-options`, `x-frame-options`, `referrer-policy`,
+`content-security-policy`, `cache-control: no-store`), a 30s per-request budget
+(middleware + handler, `503 JC0503`), a 30s body-read timeout, a 1 MiB body cap,
+and graceful shutdown on Ctrl-C. Opting out is explicit:
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+let t = App::new().route("/", get(|| async { "ok" })).into_test();
+assert_eq!(t.get("/").await.headers()["x-content-type-options"], "nosniff");
+
+let bare = App::new()
+    .route("/", get(|| async { "ok" }))
+    .security_headers(false)                                  // explicit opt-out
+    .handler_timeout(std::time::Duration::from_secs(120))     // explicit re-budget
+    .into_test();
+assert!(bare.get("/").await.headers().get("x-frame-options").is_none());
+# }); }
+```
+
 ## Errors you'll hit
 - Duplicate or ambiguous routes fail at **build/serve time**, not request time —
   `serve()` returns `Err` describing the conflicting path. Fix the route table;
