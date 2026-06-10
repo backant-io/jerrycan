@@ -3,7 +3,9 @@
 
 use clap::{Parser, Subcommand};
 use jerrycan::platform::design::Design;
-use jerrycan::platform::{EXIT_OK, EXIT_USAGE, Failure, genroute, mounting, questions, scaffold};
+use jerrycan::platform::{
+    EXIT_OK, EXIT_USAGE, Failure, checkpipe, genroute, lints, mounting, questions, scaffold,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -118,6 +120,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::List {
             what: ListCmd::Routes,
         } => cmd_list_routes(cli.json),
+        Cmd::Check { module } => cmd_check(module.as_deref(), cli.json),
+        Cmd::Test { module } => cmd_test(module.as_deref()),
         _ => Err(Failure::usage("this command lands in a later Phase 1 task")),
     }
 }
@@ -290,4 +294,112 @@ fn cmd_list_routes(json_mode: bool) -> Result<(), Failure> {
     }
     emit(json_mode, &payload, human.trim_end());
     Ok(())
+}
+
+fn cmd_check(module: Option<&str>, json_mode: bool) -> Result<(), Failure> {
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+    let root = &root;
+    let design = &design;
+
+    // Order per cli-ux.md: build → clippy → audit → deny → tests → jerrycan lints.
+    // First failing class stops the pipeline; all diagnostics in that class are kept.
+    let mut diagnostics = Vec::new();
+    let mut failed_class: Option<&str> = None;
+
+    #[allow(clippy::type_complexity)]
+    let classes: Vec<(
+        &str,
+        Box<dyn FnOnce() -> Result<Vec<checkpipe::Diagnostic>, Failure>>,
+    )> = vec![
+        (
+            "build",
+            Box::new(|| checkpipe::run_build(root, module).map_err(Failure::environment)),
+        ),
+        (
+            "clippy",
+            Box::new(|| checkpipe::run_clippy(root, module).map_err(Failure::environment)),
+        ),
+        ("audit", Box::new(|| tool(checkpipe::run_audit(root)))),
+        ("deny", Box::new(|| tool(checkpipe::run_deny(root)))),
+        (
+            "tests",
+            Box::new(|| checkpipe::run_tests(root, module).map_err(Failure::environment)),
+        ),
+        ("jerrycan lints", Box::new(|| Ok(lints::run(root, design)))),
+    ];
+    for (name, step) in classes {
+        let ds = step()?;
+        if !ds.is_empty() {
+            diagnostics = ds;
+            failed_class = Some(name);
+            break;
+        }
+    }
+
+    let ok = failed_class.is_none();
+    let next_step = match failed_class {
+        None => "all green — implement remaining stubs, or proceed toward packaging (Phase 3)"
+            .to_string(),
+        Some(c) => format!("fix the {c} diagnostics, then re-run jerrycan check"),
+    };
+    let report = checkpipe::CheckReport {
+        ok,
+        diagnostics,
+        next_step,
+    };
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("report serializes")
+        );
+    }
+    for d in &report.diagnostics {
+        eprintln!("error[{}]: {}", d.code, d.message);
+        if let (Some(f), Some(l)) = (&d.file, d.line) {
+            eprintln!("  --> {f}:{l}");
+        } else if let Some(f) = &d.file {
+            eprintln!("  --> {f}");
+        }
+        if let Some(s) = &d.suggestion {
+            eprintln!("  = help: {s}");
+        }
+        if let Some(u) = &d.doc_url {
+            eprintln!("  = docs: {u}");
+        }
+    }
+    if ok {
+        eprintln!("check: all green");
+        Ok(())
+    } else {
+        Err(Failure::gate(format!(
+            "{} failed",
+            failed_class.expect("set when !ok")
+        )))
+    }
+}
+
+fn tool(step: Result<checkpipe::ToolStep, String>) -> Result<Vec<checkpipe::Diagnostic>, Failure> {
+    match step.map_err(Failure::environment)? {
+        checkpipe::ToolStep::Missing(hint) => Err(Failure::environment(hint)),
+        checkpipe::ToolStep::Ran(ds) => Ok(ds),
+    }
+}
+
+fn cmd_test(module: Option<&str>) -> Result<(), Failure> {
+    let root = app_root()?;
+    let mut c = std::process::Command::new("cargo");
+    c.current_dir(&root).arg("test");
+    match module {
+        Some(m) => c.args(["-p", &format!("route-{m}")]),
+        None => c.arg("--workspace"),
+    };
+    let status = c
+        .status()
+        .map_err(|e| Failure::environment(e.to_string()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Failure::gate("test suite failed"))
+    }
 }

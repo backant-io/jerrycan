@@ -50,6 +50,7 @@ pub fn scaffold(target: &Path, design: &Design) -> Result<Vec<String>, String> {
         &render(JERRYCAN_TOML, &[("name", &design.name)])?,
     )?;
     write(".gitignore", GITIGNORE)?;
+    write("deny.toml", DENY_TOML)?;
     write("design.json", &canonical_design_json(design))?;
     write(
         "crates/app/Cargo.toml",

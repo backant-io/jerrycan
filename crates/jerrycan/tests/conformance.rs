@@ -52,3 +52,23 @@ fn scaffolded_app_builds_with_zero_warnings() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+#[ignore = "heavy: full verification pipeline incl. cargo-audit/cargo-deny"]
+fn fresh_scaffold_passes_jerrycan_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = scaffold_golden(tmp.path());
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("check --json emits one JSON document");
+    assert_eq!(
+        payload["ok"], true,
+        "diagnostics: {}",
+        payload["diagnostics"]
+    );
+    assert!(out.status.success());
+}
