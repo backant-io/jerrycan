@@ -3,6 +3,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod checkpipe;
+pub mod codes;
 pub mod design;
 pub mod docsidx;
 pub mod genroute;

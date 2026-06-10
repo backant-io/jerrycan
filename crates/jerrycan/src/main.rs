@@ -67,6 +67,8 @@ enum Cmd {
         #[arg(long)]
         search: Option<String>,
     },
+    /// Explain a diagnostic code (JC#### / JL####)
+    Explain { code: String },
     /// Wire an extension into the app (db, validate)
     Add { extension: String },
     /// Database commands
@@ -161,6 +163,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Test { module } => cmd_test(module.as_deref()),
         Cmd::GenTests { module } => cmd_gen_tests(&module, cli.json),
         Cmd::Docs { topic, search } => cmd_docs(topic.as_deref(), search.as_deref(), cli.json),
+        Cmd::Explain { code } => cmd_explain(&code, cli.json),
         Cmd::Add { extension } => cmd_add(&extension, cli.json),
         Cmd::Db {
             what: DbCmd::Migrate { url },
@@ -214,6 +217,28 @@ fn cmd_docs(topic: Option<&str>, query: Option<&str>, json_mode: bool) -> Result
         println!("{}", serde_json::json!({ "markdown": md }));
     } else {
         println!("{md}");
+    }
+    Ok(())
+}
+
+fn cmd_explain(code: &str, json_mode: bool) -> Result<(), Failure> {
+    let info = jerrycan::platform::codes::lookup(code).ok_or_else(|| {
+        Failure::usage(format!(
+            "unknown code `{code}` — see `jerrycan explain JC0404` for the format"
+        ))
+    })?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "code": info.code, "title": info.title, "cause": info.cause, "fix": info.fix, "doc": info.doc,
+            })
+        );
+    } else {
+        println!("{} — {}", info.code, info.title);
+        println!("\ncause: {}", info.cause);
+        println!("fix:   {}", info.fix);
+        println!("docs:  {}", info.doc);
     }
     Ok(())
 }
