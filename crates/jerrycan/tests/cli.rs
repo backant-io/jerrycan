@@ -21,6 +21,14 @@ fn unknown_flag_is_usage_error_exit_2() {
 }
 
 #[test]
+fn help_lands_on_stdout_not_stderr() {
+    let out = jerrycan().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("jerrycan"));
+    assert!(out.stderr.is_empty(), "help must not pollute stderr");
+}
+
+#[test]
 fn missing_required_arg_is_usage_error_exit_2() {
     // `new` requires --design; no interactive prompts ever (cli-ux.md non-goals).
     let out = jerrycan().args(["new", "demo"]).output().unwrap();

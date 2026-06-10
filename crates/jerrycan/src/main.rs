@@ -86,13 +86,13 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             // --help/--version are "successful" parse errors: print to stdout, exit 0.
-            use clap::error::ErrorKind;
-            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
-                print!("{e}");
-                std::process::exit(EXIT_OK);
+            // clap's own signal tells us which stream the message belongs on.
+            if e.use_stderr() {
+                eprint!("{e}");
+                std::process::exit(EXIT_USAGE);
             }
-            eprint!("{e}");
-            std::process::exit(EXIT_USAGE);
+            print!("{e}");
+            std::process::exit(EXIT_OK);
         }
     };
 
