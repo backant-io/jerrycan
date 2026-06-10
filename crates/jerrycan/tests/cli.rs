@@ -224,3 +224,20 @@ fn list_routes_walks_the_module_tree() {
     assert_eq!(todo["module"], "todos");
     assert_eq!(todo["handler"], "list_todos");
 }
+
+#[test]
+fn docs_command_prints_pages_and_searches() {
+    let out = jerrycan().args(["docs", "dependencies"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("# Dependencies"));
+
+    let out = jerrycan()
+        .args(["--json", "docs", "--search", "override_dep"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["results"][0]["page"], "testing");
+
+    let out = jerrycan().args(["docs", "nope"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}

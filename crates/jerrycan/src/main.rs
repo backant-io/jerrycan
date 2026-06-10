@@ -122,8 +122,52 @@ fn run(cli: Cli) -> Result<(), Failure> {
         } => cmd_list_routes(cli.json),
         Cmd::Check { module } => cmd_check(module.as_deref(), cli.json),
         Cmd::Test { module } => cmd_test(module.as_deref()),
+        Cmd::Docs { topic, search } => cmd_docs(topic.as_deref(), search.as_deref(), cli.json),
         _ => Err(Failure::usage("this command lands in a later Phase 1 task")),
     }
+}
+
+fn cmd_docs(topic: Option<&str>, query: Option<&str>, json_mode: bool) -> Result<(), Failure> {
+    use jerrycan::platform::docsidx;
+    if let Some(q) = query {
+        let results = docsidx::search(q, 5);
+        let payload = serde_json::json!({ "results": results });
+        if json_mode {
+            println!("{payload}");
+        } else {
+            for r in payload["results"].as_array().unwrap() {
+                println!(
+                    "{} ({}#{})",
+                    r["snippet"].as_str().unwrap(),
+                    r["page"].as_str().unwrap(),
+                    r["anchor"].as_str().unwrap_or("")
+                );
+            }
+        }
+        return Ok(());
+    }
+    let Some(topic) = topic else {
+        return Err(Failure::usage(
+            "provide a topic (`jerrycan docs dependencies`) or --search <query>",
+        ));
+    };
+    let (page, anchor) = match topic.split_once('#') {
+        Some((p, a)) => (p, Some(a)),
+        None => (topic, None),
+    };
+    let md = docsidx::get(page, anchor).ok_or_else(|| {
+        let names: Vec<&str> = docsidx::PAGES.iter().map(|(n, _)| *n).collect();
+        Failure::usage(format!(
+            "unknown docs page `{page}` — available: {}",
+            names.join(", ")
+        ))
+    })?;
+    if json_mode {
+        println!("{}", serde_json::json!({ "markdown": md }));
+    } else {
+        println!("{md}");
+    }
+    Ok(())
 }
 
 fn emit(json_mode: bool, payload: &serde_json::Value, human: &str) {
