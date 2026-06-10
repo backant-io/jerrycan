@@ -139,11 +139,15 @@ impl App {
 
         let built = Arc::new(self.build()?);
         loop {
-            let (stream, _) = listener
-                .accept()
-                .await
-                // TODO(phase1): tolerate transient accept() errors (EMFILE/ECONNABORTED) with backoff instead of exiting the server.
-                .map_err(|e| Error::internal(format!("accept failed: {e}")))?;
+            let (stream, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) if is_transient_accept_error(&e) => {
+                    eprintln!("jerrycan: transient accept error ({e}); backing off 50ms");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(e) => return Err(Error::internal(format!("accept failed fatally: {e}"))),
+            };
             let app = built.clone();
             tokio::spawn(async move {
                 let io = hyper_util::rt::TokioIo::new(stream);
@@ -192,6 +196,19 @@ impl App {
             });
         }
     }
+}
+
+/// Accept errors that mean "back off and keep serving", not "die":
+/// aborted/reset handshakes, signal interruptions, and fd exhaustion
+/// (EMFILE/ENFILE — kind-mapping varies by platform, so match raw errno too).
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+    ) || matches!(e.raw_os_error(), Some(23) | Some(24))
 }
 
 fn insert_flat(trie: &mut Trie, flat: FlatRoute) -> Result<()> {
@@ -365,5 +382,25 @@ mod tests {
             .route("/x", get(|| async { "b" }));
         let err = app.build().unwrap_err();
         assert!(err.message().contains("/x"));
+    }
+
+    #[test]
+    fn accept_error_classification_matches_unix_reality() {
+        use std::io::{Error as IoError, ErrorKind};
+        for transient in [
+            IoError::from(ErrorKind::ConnectionAborted),
+            IoError::from(ErrorKind::ConnectionReset),
+            IoError::from(ErrorKind::Interrupted),
+            IoError::from_raw_os_error(24), // EMFILE
+            IoError::from_raw_os_error(23), // ENFILE
+        ] {
+            assert!(is_transient_accept_error(&transient), "{transient:?}");
+        }
+        assert!(!is_transient_accept_error(&IoError::from(
+            ErrorKind::InvalidInput
+        )));
+        assert!(!is_transient_accept_error(&IoError::from(
+            ErrorKind::PermissionDenied
+        )));
     }
 }
