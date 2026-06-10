@@ -61,3 +61,65 @@ fn report_serializes_to_the_mcp_check_shape() {
     // Optional fields are OMITTED when None (matches outputSchema: only code+message required).
     assert!(v["diagnostics"][0].get("suggestion").is_none());
 }
+
+use jerrycan::platform::design::Design;
+use jerrycan::platform::{lints, scaffold};
+
+const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.json");
+
+fn scaffolded() -> (tempfile::TempDir, std::path::PathBuf, Design) {
+    let tmp = tempfile::tempdir().unwrap();
+    let design: Design = serde_json::from_str(GOLDEN).unwrap();
+    let root = tmp.path().join("app");
+    scaffold::scaffold(&root, &design).unwrap();
+    (tmp, root, design)
+}
+
+#[test]
+fn fresh_scaffold_is_lint_clean() {
+    let (_tmp, root, design) = scaffolded();
+    assert!(lints::run(&root, &design).is_empty());
+}
+
+#[test]
+fn jl0001_flags_extra_public_surface() {
+    let (_tmp, root, design) = scaffolded();
+    let lib = root.join("crates/routes/todos/src/lib.rs");
+    let mut content = std::fs::read_to_string(&lib).unwrap();
+    content.push_str("\npub fn leak() {}\n");
+    std::fs::write(&lib, content).unwrap();
+    let ds = lints::run(&root, &design);
+    assert!(
+        ds.iter()
+            .any(|d| d.code == "JL0001" && d.file.as_deref().unwrap().contains("todos/src/lib.rs")),
+        "{ds:?}"
+    );
+}
+
+#[test]
+fn jl0002_flags_missing_handlers() {
+    let (_tmp, root, design) = scaffolded();
+    let handlers = root.join("crates/routes/users/src/handlers.rs");
+    let content = std::fs::read_to_string(&handlers)
+        .unwrap()
+        .replace("list_users", "list_everyone");
+    std::fs::write(&handlers, content).unwrap();
+    let ds = lints::run(&root, &design);
+    assert!(
+        ds.iter()
+            .any(|d| d.code == "JL0002" && d.message.contains("list_users")),
+        "{ds:?}"
+    );
+}
+
+#[test]
+fn jl0003_flags_hand_edited_generated_files() {
+    let (_tmp, root, design) = scaffolded();
+    let main_rs = root.join("crates/app/src/main.rs");
+    let content = std::fs::read_to_string(&main_rs)
+        .unwrap()
+        .replace("App::new()", "App::new() // tweaked");
+    std::fs::write(&main_rs, content).unwrap();
+    let ds = lints::run(&root, &design);
+    assert!(ds.iter().any(|d| d.code == "JL0003"), "{ds:?}");
+}
