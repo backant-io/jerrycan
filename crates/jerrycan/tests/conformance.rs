@@ -354,3 +354,115 @@ fn tdd_loop_goes_red_then_green_on_sqlite() {
         payload["diagnostics"]
     );
 }
+
+/// Spec §11 Phase 2 exit: an agent builds a POSTGRES-backed API test-first,
+/// all green. Runs wherever JERRYCAN_TEST_PG_URL points at a live Postgres
+/// (CI service container); skips loudly elsewhere.
+#[test]
+#[ignore = "heavy: full TDD loop against live Postgres (JERRYCAN_TEST_PG_URL)"]
+fn agent_builds_postgres_backed_api_test_first() {
+    let Ok(pg_url) = std::env::var("JERRYCAN_TEST_PG_URL") else {
+        eprintln!("SKIP: JERRYCAN_TEST_PG_URL not set (CI provides a postgres service)");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let app = scaffold_golden_db(tmp.path());
+
+    for module in ["todos", "users"] {
+        let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+            .current_dir(&app)
+            .args(["gen-tests", "--module", module])
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+    for (fixture, target) in [
+        (
+            "db/todos_handlers.rs",
+            "crates/routes/todos/src/handlers.rs",
+        ),
+        (
+            "db/comments_handlers.rs",
+            "crates/routes/todos/src/subroutes/comments/handlers.rs",
+        ),
+        (
+            "db/users_handlers.rs",
+            "crates/routes/users/src/handlers.rs",
+        ),
+    ] {
+        std::fs::copy(
+            repo_root().join("conformance/fixtures").join(fixture),
+            app.join(target),
+        )
+        .unwrap();
+    }
+
+    // Apply migrations to the real Postgres, then serve against it and drive CRUD.
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .args(["db", "migrate", "--url", &pg_url])
+        .status()
+        .unwrap();
+    assert!(st.success(), "migrations must apply to live Postgres");
+
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let addr = format!("127.0.0.1:{port}");
+    let mut server = Command::new("cargo")
+        .current_dir(&app)
+        .env("JERRYCAN_ADDR", &addr)
+        .env("JERRYCAN_DATABASE_URL", &pg_url)
+        .args(["run", "-p", "app"])
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(&addr).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    let http = |req: String| -> String {
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    let body = r#"{"title":"pg ship","done":false}"#;
+    let res = http(format!(
+        "POST /todos/ HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    assert!(res.starts_with("HTTP/1.1 201"), "{res}");
+    let res = http("GET /todos/1 HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n".into());
+    assert!(
+        res.starts_with("HTTP/1.1 200") && res.contains("pg ship"),
+        "{res}"
+    );
+    let res = http("GET /openapi.json HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n".into());
+    assert!(
+        res.starts_with("HTTP/1.1 200") && res.contains("3.1.0"),
+        "validate extension live: {res}"
+    );
+    let res = http("DELETE /todos/1 HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n".into());
+    assert!(res.starts_with("HTTP/1.1 204"), "{res}");
+
+    // Test-first, all green, against Postgres:
+    let st = Command::new("cargo")
+        .current_dir(&app)
+        .env("JERRYCAN_DATABASE_URL", &pg_url)
+        .args(["test", "--workspace"])
+        .status()
+        .unwrap();
+    let _ = server.kill();
+    let _ = server.wait();
+    assert!(
+        st.success(),
+        "acceptance suite must be green against Postgres"
+    );
+}

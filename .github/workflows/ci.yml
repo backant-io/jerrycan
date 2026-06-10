@@ -7,10 +7,24 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTDOCFLAGS: -D warnings
+  JERRYCAN_TEST_PG_URL: postgres://postgres:jerrycan@localhost:5432/jerrycan_test
 
 jobs:
   gate:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: jerrycan
+          POSTGRES_DB: jerrycan_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,9 +38,9 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Tests (unit + integration + doc-tests)
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
       - name: "Conformance (heavy: generated apps must build, check, and serve)"
         run: |
           cargo test -p jerrycan --test conformance -- --include-ignored
