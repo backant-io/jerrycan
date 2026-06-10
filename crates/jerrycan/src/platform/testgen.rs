@@ -212,6 +212,25 @@ pub fn acceptance_rs(design: &Design, module: &ModuleDesign) -> String {
     )
 }
 
+/// Write tests/acceptance.rs for a TOP-LEVEL module. Returns (rel_path, expected_failing).
+pub fn write_acceptance(
+    root: &std::path::Path,
+    design: &Design,
+    module_name: &str,
+) -> Result<(String, usize), String> {
+    let Some(module) = design.modules.iter().find(|m| m.name == module_name) else {
+        return Err(format!(
+            "module `{module_name}` not found in design.json (top-level modules only)"
+        ));
+    };
+    let content = acceptance_rs(design, module);
+    let rel = format!("crates/routes/{module_name}/tests/acceptance.rs");
+    let path = root.join(&rel);
+    std::fs::create_dir_all(path.parent().expect("parent")).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &content).map_err(|e| e.to_string())?;
+    Ok((rel, test_count(&content)))
+}
+
 /// How many #[tokio::test] functions a generated file contains.
 pub fn test_count(generated: &str) -> usize {
     generated.matches("#[tokio::test]").count()

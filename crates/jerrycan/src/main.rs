@@ -56,6 +56,11 @@ enum Cmd {
         #[arg(long)]
         module: Option<String>,
     },
+    /// Generate failing acceptance tests for a module from the design (TDD)
+    GenTests {
+        #[arg(long)]
+        module: String,
+    },
     /// AI-native docs, offline
     Docs {
         topic: Option<String>,
@@ -139,6 +144,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Dev { addr } => cmd_dev(addr.as_deref()),
         Cmd::Check { module } => cmd_check(module.as_deref(), cli.json),
         Cmd::Test { module } => cmd_test(module.as_deref()),
+        Cmd::GenTests { module } => cmd_gen_tests(&module, cli.json),
         Cmd::Docs { topic, search } => cmd_docs(topic.as_deref(), search.as_deref(), cli.json),
         Cmd::Add { extension } => cmd_add(&extension, cli.json),
         Cmd::Db {
@@ -481,6 +487,24 @@ fn cmd_test(module: Option<&str>) -> Result<(), Failure> {
     } else {
         Err(Failure::gate("test suite failed"))
     }
+}
+
+fn cmd_gen_tests(module: &str, json_mode: bool) -> Result<(), Failure> {
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+    let (rel, count) = jerrycan::platform::testgen::write_acceptance(&root, &design, module)
+        .map_err(Failure::usage)?;
+    let payload = serde_json::json!({
+        "tests_created": [rel],
+        "expected_failing": count,
+        "next_step": format!("cargo test -p route-{module} (expect {count} failures), implement handlers, iterate"),
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!("{count} acceptance tests written to {rel}"),
+    );
+    Ok(())
 }
 
 fn cmd_dev(addr: Option<&str>) -> Result<(), Failure> {

@@ -273,13 +273,27 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
             }
         }
 
-        "jerrycan_gen_tests" => (
-            true,
-            json!({
-                "error": "jerrycan_gen_tests arrives in Phase 2 (per the roadmap)",
-                "next_step": "implement the handler stubs and verify with jerrycan_check",
-            }),
-        ),
+        "jerrycan_gen_tests" => {
+            let root = root_from(args);
+            let design = match Design::from_path(&root.join("design.json")) {
+                Ok(d) => d,
+                Err(e) => return err_payload(e),
+            };
+            let Some(module) = args["module"].as_str() else {
+                return err_payload("`module` is required");
+            };
+            match super::testgen::write_acceptance(&root, &design, module) {
+                Ok((rel, count)) => (
+                    false,
+                    json!({
+                        "tests_created": [rel],
+                        "expected_failing": count,
+                        "next_step": format!("run the tests to see them fail, implement crates/routes/{module}/src/handlers.rs, iterate until green (jerrycan test --module {module})"),
+                    }),
+                ),
+                Err(e) => err_payload(e),
+            }
+        }
         "jerrycan_package" => (
             true,
             json!({
