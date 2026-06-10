@@ -1,0 +1,30 @@
+{
+  "name": "shortener",
+  "contract_version": 0,
+  "description": "Reference app: a URL shortener — create links, list them, resolve by id, delete.",
+  "auth": { "model": "none" },
+  "modules": [
+    {
+      "name": "links",
+      "entities": [
+        { "name": "Link", "fields": [
+          { "name": "slug", "type": "string" },
+          { "name": "target", "type": "string" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_links", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Link", "list": true } },
+        { "operation_id": "create_link", "method": "POST", "path": "/",
+          "request_body": { "entity": "Link" },
+          "success": { "status": 201, "entity": "Link" } },
+        { "operation_id": "resolve_link", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Link" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] },
+        { "operation_id": "delete_link", "method": "DELETE", "path": "/{id}",
+          "success": { "status": 204 },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] }
+      ]
+    }
+  ]
+}

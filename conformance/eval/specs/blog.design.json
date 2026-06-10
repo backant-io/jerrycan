@@ -1,0 +1,65 @@
+{
+  "name": "blog",
+  "contract_version": 0,
+  "description": "Reference app: a blog with posts (CRUD + a comments subroute) and authors.",
+  "auth": { "model": "none" },
+  "modules": [
+    {
+      "name": "posts",
+      "entities": [
+        { "name": "Post", "fields": [
+          { "name": "title", "type": "string" },
+          { "name": "body", "type": "string" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_posts", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Post", "list": true } },
+        { "operation_id": "create_post", "method": "POST", "path": "/",
+          "request_body": { "entity": "Post" },
+          "success": { "status": 201, "entity": "Post" } },
+        { "operation_id": "show_post", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Post" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] },
+        { "operation_id": "update_post", "method": "PUT", "path": "/{id}",
+          "request_body": { "entity": "Post" },
+          "success": { "status": 200, "entity": "Post" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] },
+        { "operation_id": "delete_post", "method": "DELETE", "path": "/{id}",
+          "success": { "status": 204 },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] }
+      ],
+      "subroutes": [
+        {
+          "name": "comments",
+          "entities": [
+            { "name": "Comment", "fields": [{ "name": "text", "type": "string" }] }
+          ],
+          "endpoints": [
+            { "operation_id": "list_comments", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Comment", "list": true } },
+            { "operation_id": "create_comment", "method": "POST", "path": "/",
+              "request_body": { "entity": "Comment" },
+              "success": { "status": 201, "entity": "Comment" } }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "authors",
+      "entities": [
+        { "name": "Author", "fields": [{ "name": "name", "type": "string" }] }
+      ],
+      "endpoints": [
+        { "operation_id": "list_authors", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Author", "list": true } },
+        { "operation_id": "create_author", "method": "POST", "path": "/",
+          "request_body": { "entity": "Author" },
+          "success": { "status": 201, "entity": "Author" } },
+        { "operation_id": "show_author", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Author" },
+          "errors": [{ "status": 404, "code": "JC0404", "when": "unknown id" }] }
+      ]
+    }
+  ]
+}
