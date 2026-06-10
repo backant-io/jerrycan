@@ -16,17 +16,36 @@ use std::sync::Arc;
 
 /// The application builder. Generated `app/src/main.rs` is exactly this:
 /// provide app-level deps, mount modules, serve.
-#[derive(Default)]
 pub struct App {
     routes: Vec<(String, MethodRouter)>,
     mounts: Vec<(String, Module)>,
     env: DepEnv,
     middleware: Vec<Arc<dyn Middleware>>,
+    security_headers: bool,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            routes: Vec::new(),
+            mounts: Vec::new(),
+            env: DepEnv::default(),
+            middleware: Vec::new(),
+            security_headers: true,
+        }
+    }
 }
 
 impl App {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Secure-by-default headers on every response (spec §4.4). Opting out
+    /// must be explicit — that is the contract.
+    pub fn security_headers(mut self, on: bool) -> Self {
+        self.security_headers = on;
+        self
     }
 
     /// App-level route (prefer modules; this exists for tiny services and tests).
@@ -89,6 +108,7 @@ impl App {
         Ok(BuiltApp {
             trie,
             overrides: Arc::new(HashMap::new()),
+            security_headers: self.security_headers,
         })
     }
 
@@ -166,6 +186,7 @@ fn insert_flat(trie: &mut Trie, flat: FlatRoute) -> Result<()> {
 pub struct BuiltApp {
     pub(crate) trie: Trie,
     pub(crate) overrides: Arc<HashMap<TypeId, AnyArc>>,
+    pub(crate) security_headers: bool,
 }
 
 // The trie holds type-erased handler fns and overrides are `dyn Any`, so the
@@ -176,9 +197,36 @@ impl std::fmt::Debug for BuiltApp {
     }
 }
 
+/// Defaults chosen for API-only services; handler-set values always win.
+pub(crate) fn apply_security_headers(res: &mut Response) {
+    const DEFAULTS: [(&str, &str); 5] = [
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+        ("content-security-policy", "default-src 'none'"),
+        ("cache-control", "no-store"),
+    ];
+    for (name, value) in DEFAULTS {
+        let header_name = http::HeaderName::from_static(name);
+        if !res.headers().contains_key(&header_name) {
+            res.headers_mut()
+                .insert(header_name, http::HeaderValue::from_static(value));
+        }
+    }
+}
+
 impl BuiltApp {
-    /// Route + run middleware chain + handler for one request.
+    /// Route + run middleware chain + handler for one request, then apply
+    /// secure-by-default headers at the single dispatch exit (spec §4.4).
     pub(crate) async fn dispatch(&self, parts: http::request::Parts, body: Bytes) -> Response {
+        let mut response = self.dispatch_inner(parts, body).await;
+        if self.security_headers {
+            apply_security_headers(&mut response);
+        }
+        response
+    }
+
+    async fn dispatch_inner(&self, parts: http::request::Parts, body: Bytes) -> Response {
         let method = parts.method.clone();
         let path = parts.uri.path().to_string();
         match self.trie.find(&path, &method) {
