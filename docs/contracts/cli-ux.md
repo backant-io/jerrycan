@@ -30,7 +30,8 @@ a `--json` mode whose output is the same data the MCP tool returns.
 | `jerrycan test` | `--module <m>` | The app's test suite only (subset of check) | — |
 | `jerrycan package` | `--docker\|--binary\|--k8s\|--systemd` | Hardened artifact + CycloneDX SBOM; refuses unless full check is green | jerrycan_package |
 | `jerrycan docs <topic>` | `--search <q>` | Render docs page in terminal / search | jerrycan_docs_get / _search |
-| `jerrycan add <extension>` | | Wire a jerrycan-* extension crate (Phase 2+) | — |
+| `jerrycan add <extension>` | `db` or `validate` | Wire an extension: flips the design dependency, regenerates mounting + policy files | — |
+| `jerrycan db migrate` | `--url <db-url>` (or env) | Apply module-owned migrations via the tracking-table runner | — |
 | `jerrycan mcp` | | Serve MCP over stdio (Phase 1) | — |
 
 ## Diagnostics format (check, human mode)
