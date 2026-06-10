@@ -956,37 +956,60 @@ genroute.rs: extend `handler_signatures_follow_the_mapping_rules`-adjacent cover
 
 - [ ] **Step 3: Implement**
 
-(a) extract.rs — tuple impls after the existing single-param impl:
+(a) extract.rs — **AMENDED after a real E0119**: a `T: FromStr` blanket cannot coexist with tuple impls (rustc's forward-looking coherence: std could add `FromStr` for tuples). Resolution: a SEALED closed `PathParam` set — local trait, so coherence accepts the tuple impls. REPLACE the existing single-param `Path<T: FromStr>` impl entirely with:
 
 ```rust
-impl<A, B> FromRequest for Path<(A, B)>
-where
-    A: FromStr + Send,
-    B: FromStr + Send,
-    A::Err: std::fmt::Display,
-    B::Err: std::fmt::Display,
-{
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Types extractable from one path segment. Sealed closed set in v0: integers,
+/// `String`, `bool`, floats, `char`. Open/custom param types (id newtypes) are a
+/// contract-v1 candidate via serde-based extraction.
+pub trait PathParam: sealed::Sealed + Sized + Send {
+    fn parse_param(name: &str, raw: &str) -> Result<Self>;
+}
+
+macro_rules! impl_path_param {
+    ($($t:ty),* $(,)?) => {$(
+        impl sealed::Sealed for $t {}
+        impl PathParam for $t {
+            fn parse_param(name: &str, raw: &str) -> Result<Self> {
+                raw.parse::<$t>().map_err(|e| {
+                    Error::bad_request(format!("invalid path parameter `{name}`: {e}"))
+                })
+            }
+        }
+    )*};
+}
+impl_path_param!(
+    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool, char, String,
+);
+
+impl<T: PathParam> FromRequest for Path<T> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
-        let [a, b] = take_params::<2>(ctx)?;
-        Ok(Path((parse_param(&a.0, &a.1)?, parse_param(&b.0, &b.1)?)))
+        let (name, raw) = ctx
+            .params
+            .first()
+            .ok_or_else(|| Error::internal("route has no path parameters"))?;
+        T::parse_param(name, raw).map(Path)
     }
 }
 
-impl<A, B, C> FromRequest for Path<(A, B, C)>
-where
-    A: FromStr + Send,
-    B: FromStr + Send,
-    C: FromStr + Send,
-    A::Err: std::fmt::Display,
-    B::Err: std::fmt::Display,
-    C::Err: std::fmt::Display,
-{
+impl<A: PathParam, B: PathParam> FromRequest for Path<(A, B)> {
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        let [a, b] = take_params::<2>(ctx)?;
+        Ok(Path((A::parse_param(&a.0, &a.1)?, B::parse_param(&b.0, &b.1)?)))
+    }
+}
+
+impl<A: PathParam, B: PathParam, C: PathParam> FromRequest for Path<(A, B, C)> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
         let [a, b, c] = take_params::<3>(ctx)?;
         Ok(Path((
-            parse_param(&a.0, &a.1)?,
-            parse_param(&b.0, &b.1)?,
-            parse_param(&c.0, &c.1)?,
+            A::parse_param(&a.0, &a.1)?,
+            B::parse_param(&b.0, &b.1)?,
+            C::parse_param(&c.0, &c.1)?,
         )))
     }
 }
@@ -1002,35 +1025,9 @@ fn take_params<const N: usize>(ctx: &RequestCtx) -> Result<[(String, String); N]
     }
     Ok(std::array::from_fn(|i| ctx.params[i].clone()))
 }
-
-fn parse_param<T: FromStr>(name: &str, raw: &str) -> Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    raw.parse::<T>()
-        .map_err(|e| Error::bad_request(format!("invalid path parameter `{name}`: {e}")))
-}
 ```
 
-Refactor the EXISTING single-param `Path<T>` impl to reuse `parse_param` (same messages, less duplication):
-
-```rust
-impl<T> FromRequest for Path<T>
-where
-    T: FromStr + Send,
-    T::Err: std::fmt::Display,
-{
-    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
-        let (name, raw) = ctx
-            .params
-            .first()
-            .ok_or_else(|| Error::internal("route has no path parameters"))?;
-        parse_param(name, raw).map(Path)
-    }
-}
-```
-
-(If the blanket `Path<T>` impl and the tuple impls conflict — tuples also satisfy `T: FromStr`? They do NOT (tuples don't implement FromStr), so there is no overlap; if rustc disagrees, report BLOCKED with the error.)
+Drop the old `use std::str::FromStr;` if it becomes unused. `usize`/`isize` are in the set because existing tests use `Path<usize>`. Coherence note: `PathParam` is local and tuples have no impl of it, so the blanket-vs-tuple overlap check passes (the E0119 only arises with FOREIGN bounds like `FromStr`). Update `Path`'s doc comment: param types are the sealed `PathParam` set; custom newtypes are a contract-v1 candidate.
 
 (b) questions.rs — the limit check becomes:
 
@@ -1379,6 +1376,7 @@ And extend the JC0400 row's "Produced when" to: `Bad path param / query string /
 - design-schema: structured rate-limit config (v0: rate limits ride as opaque dependency names)
 - jerrycan_check diagnostics: span (line+column ranges) — macro spans are preserved as of Phase 1b; wiring spans through diagnostics remains
 - design-schema: path parameter types (v0 generates i64; string ids need a type field on params)
+- Path param types beyond the sealed PathParam set (serde-based extraction, axum-style) for custom id newtypes
 
 ## Accepted v0 limitations
 
