@@ -12,6 +12,7 @@ pub mod mcp_dispatch;
 pub mod mounting;
 pub mod openapi;
 pub mod questions;
+pub mod sbom;
 pub mod scaffold;
 pub mod templates;
 pub mod testgen;
