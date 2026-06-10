@@ -6,6 +6,12 @@
 pub use jerrycan_core::*;
 pub use jerrycan_macros::main;
 
+#[cfg(feature = "db")]
+pub use jerrycan_db as db;
+
+#[cfg(feature = "validate")]
+pub use jerrycan_validate as validate;
+
 #[cfg(feature = "cli")]
 pub mod platform;
 

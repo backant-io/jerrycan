@@ -11,6 +11,8 @@ homepage.workspace = true
 # only). The default ON keeps `cargo install jerrycan` working for the platform.
 default = ["cli"]
 cli = ["dep:clap", "dep:serde", "dep:serde_json"]
+db = ["dep:jerrycan-db"]
+validate = ["dep:jerrycan-validate"]
 
 [[bin]]
 name = "jerrycan"
@@ -19,6 +21,8 @@ required-features = ["cli"]
 [dependencies]
 jerrycan-core.workspace = true
 jerrycan-macros.workspace = true
+jerrycan-db = { workspace = true, optional = true }
+jerrycan-validate = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

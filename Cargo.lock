@@ -766,7 +766,9 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "jerrycan-core",
+ "jerrycan-db",
  "jerrycan-macros",
+ "jerrycan-validate",
  "serde",
  "serde_json",
  "tempfile",
@@ -812,6 +814,12 @@ version = "0.0.0"
 [[package]]
 name = "jerrycan-validate"
 version = "0.0.0"
+dependencies = [
+ "jerrycan-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "lazy_static"
