@@ -16,7 +16,7 @@ mod serve;
 pub mod test_client;
 
 pub use app::{App, BuiltApp, Extension};
-pub use dep::Dep;
+pub use dep::{Dep, TaskContext};
 pub use error::{Error, Result};
 pub use extract::{FromRequest, Headers, Path, Query, RequestCtx};
 pub use handler::Handler;

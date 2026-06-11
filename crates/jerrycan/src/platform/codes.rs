@@ -118,6 +118,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs dependencies",
     },
     CodeInfo {
+        code: "JC1003",
+        title: "dependency requires an HTTP request",
+        cause: "a dependency factory used an HTTP extractor (Json/Path/Query/Headers) but was resolved in a task context (background job, startup)",
+        fix: "restructure the factory to take only Dep<T> arguments, or resolve it inside a request",
+        doc: "jerrycan docs dependencies",
+    },
+    CodeInfo {
         code: "JL0001",
         title: "leaky route crate",
         cause: "a route crate's lib.rs exports more than module()",

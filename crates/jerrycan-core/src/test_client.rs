@@ -38,6 +38,12 @@ impl TestApp {
         self
     }
 
+    /// A [`TaskContext`](crate::TaskContext) for resolving app-level dependencies
+    /// outside a request, honoring any `override_dep` fakes set on this `TestApp`.
+    pub fn task_context(&self) -> crate::TaskContext {
+        self.built.task_context()
+    }
+
     pub async fn get(&self, path: &str) -> TestResponse {
         self.request(Method::GET, path, None).await
     }

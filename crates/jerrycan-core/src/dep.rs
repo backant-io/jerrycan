@@ -115,6 +115,37 @@ fn downcast<T: Send + Sync + 'static>(v: AnyArc) -> Result<Arc<T>> {
         .map_err(|_| Error::internal("dependency type mismatch (provider/consumer disagree)"))
 }
 
+/// Resolve dependencies OUTSIDE an HTTP request — background jobs, startup
+/// wiring, CLI commands. Built from [`BuiltApp::task_context`](crate::BuiltApp::task_context).
+///
+/// Resolution semantics mirror a request (memoized per context, honors
+/// overrides and singletons), but only **app-level** providers are in scope,
+/// and any factory reaching for an HTTP extractor (`Json`/`Path`/`Query`/
+/// `Headers`) fails with `JC1003`.
+pub struct TaskContext(RequestCtx);
+
+impl TaskContext {
+    /// Wrap a resolver in a synthetic request marked as a task context. The
+    /// parts/body/params are placeholders: HTTP-coupled extractors reject a
+    /// task context before reading them, and `Dep<T>` never touches them.
+    pub(crate) fn new(deps: DepResolver) -> Self {
+        let req = http::Request::builder()
+            .uri("/")
+            .body(())
+            .expect("static request head always builds");
+        let (parts, ()) = req.into_parts();
+        let mut ctx = RequestCtx::new(parts, bytes::Bytes::new(), deps);
+        ctx.is_task = true;
+        TaskContext(ctx)
+    }
+
+    /// Resolve a dependency by type, memoized for this task context. Mirrors
+    /// [`RequestCtx::resolve`]; returns the same `Arc<T>` `Dep<T>` would carry.
+    pub async fn resolve<T: Send + Sync + 'static>(&mut self) -> Result<Arc<T>> {
+        self.0.resolve::<T>().await
+    }
+}
+
 /// A resolved dependency. Derefs to `T`; cloning is `Arc`-cheap.
 pub struct Dep<T: ?Sized>(pub(crate) Arc<T>);
 
@@ -346,5 +377,91 @@ mod tests {
 
         let user = ctx.resolve::<User>().await.unwrap();
         assert_eq!(user.name, "fake@sqlite::memory:");
+    }
+
+    // ---- Task-scoped DI (Task 5): resolve deps outside an HTTP request ----
+
+    #[tokio::test]
+    async fn deps_resolve_without_a_request() {
+        #[derive(Clone)]
+        struct Cfg(u32);
+        async fn make_cfg() -> crate::Result<Cfg> {
+            Ok(Cfg(7))
+        }
+        let built = crate::App::new().provide_dep(make_cfg).build().unwrap();
+        let mut ctx = built.task_context();
+        let cfg = ctx.resolve::<Cfg>().await.unwrap();
+        assert_eq!(cfg.0, 7);
+    }
+
+    #[tokio::test]
+    async fn task_resolution_memoizes_and_honors_singletons() {
+        // A factory with a side-effect counter must resolve at most once per
+        // task context (request-scope memoization), and a `provide()` singleton
+        // must also be reachable from the same context.
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Clone)]
+        struct Singleton(&'static str);
+        struct Counted;
+        async fn build_counted() -> crate::Result<Counted> {
+            BUILDS.fetch_add(1, Ordering::SeqCst);
+            Ok(Counted)
+        }
+
+        BUILDS.store(0, Ordering::SeqCst);
+        let built = crate::App::new()
+            .provide(Singleton("app"))
+            .provide_dep(build_counted)
+            .build()
+            .unwrap();
+
+        let mut ctx = built.task_context();
+        // Singleton resolves in a task context.
+        let s = ctx.resolve::<Singleton>().await.unwrap();
+        assert_eq!(s.0, "app");
+        // Factory runs once and is memoized across repeat resolves.
+        let a = ctx.resolve::<Counted>().await.unwrap();
+        let b = ctx.resolve::<Counted>().await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(BUILDS.load(Ordering::SeqCst), 1, "memoized within the task");
+
+        // A fresh task context resolves the factory afresh (task scope, like a request).
+        let mut ctx2 = built.task_context();
+        let _ = ctx2.resolve::<Counted>().await.unwrap();
+        assert_eq!(BUILDS.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn http_extractors_reject_task_context_with_jc1003() {
+        #[derive(Clone)]
+        struct Whoami(#[allow(dead_code)] String);
+        async fn needs_headers(h: crate::Headers) -> crate::Result<Whoami> {
+            let _ = h;
+            Ok(Whoami("x".into()))
+        }
+        let built = crate::App::new()
+            .provide_dep(needs_headers)
+            .build()
+            .unwrap();
+        let mut ctx = built.task_context();
+        let err = ctx.resolve::<Whoami>().await.err().unwrap();
+        assert_eq!(err.code(), "JC1003");
+        assert_eq!(err.status().as_u16(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_app_task_context_honors_overrides() {
+        #[derive(Clone)]
+        struct Cfg(u32);
+        async fn make_cfg() -> crate::Result<Cfg> {
+            Ok(Cfg(1)) // real provider value
+        }
+        let app = crate::App::new()
+            .provide_dep(make_cfg)
+            .into_test()
+            .override_dep(Cfg(99)); // test fake
+        let mut ctx = app.task_context();
+        let cfg = ctx.resolve::<Cfg>().await.unwrap();
+        assert_eq!(cfg.0, 99, "override wins in a task context too");
     }
 }

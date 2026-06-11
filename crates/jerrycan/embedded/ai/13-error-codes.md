@@ -21,6 +21,7 @@ the cause + fix for any of them.
 | JC0520 | Schema contract is stale — schema.json drifted from the migrations |
 | JC1001 | Missing dependency provider |
 | JC1002 | Dependency cycle |
+| JC1003 | Dependency requires an HTTP request — an HTTP extractor was used in a task context (use only `Dep<T>` args, or resolve inside a request) |
 
 ## Generation lints (`JL####`)
 | Code | Meaning |

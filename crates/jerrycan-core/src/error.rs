@@ -94,6 +94,15 @@ impl Error {
         )
     }
 
+    /// An HTTP extractor ran inside a task context (no request to read from).
+    pub fn task_context() -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "JC1003",
+            "dependency requires an HTTP request",
+        )
+    }
+
     /// Attach machine-readable detail (e.g. validation violations). Rendered
     /// as a `details` key in the response body; absent otherwise.
     pub fn with_details(mut self, details: serde_json::Value) -> Self {

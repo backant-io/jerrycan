@@ -23,6 +23,9 @@ pub struct RequestCtx {
     /// Path parameters captured by the router, in route order.
     pub(crate) params: Vec<(String, String)>,
     pub(crate) deps: DepResolver,
+    /// True only for a [`TaskContext`](crate::dep::TaskContext): resolution runs
+    /// outside an HTTP request, so HTTP-coupled extractors reject with JC1003.
+    pub(crate) is_task: bool,
 }
 
 impl RequestCtx {
@@ -32,6 +35,7 @@ impl RequestCtx {
             body: BodyLane::Buffered(body),
             params: Vec::new(),
             deps,
+            is_task: false,
         }
     }
 
@@ -129,6 +133,9 @@ impl_path_param!(
 
 impl<T: PathParam> FromRequest for Path<T> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
         // Binds the leaf-most (last) captured parameter, so a route mounted under
         // a param-carrying prefix (e.g. `/ws/{ws}` + `/leads/{id}`) addresses its
         // own `{id}` rather than the mount's `{ws}`. Tuples address all of them.
@@ -142,6 +149,9 @@ impl<T: PathParam> FromRequest for Path<T> {
 
 impl<A: PathParam, B: PathParam> FromRequest for Path<(A, B)> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
         let [a, b] = take_params::<2>(ctx)?;
         Ok(Path((
             A::parse_param(&a.0, &a.1)?,
@@ -152,6 +162,9 @@ impl<A: PathParam, B: PathParam> FromRequest for Path<(A, B)> {
 
 impl<A: PathParam, B: PathParam, C: PathParam> FromRequest for Path<(A, B, C)> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
         let [a, b, c] = take_params::<3>(ctx)?;
         Ok(Path((
             A::parse_param(&a.0, &a.1)?,
@@ -178,6 +191,9 @@ pub struct Query<T>(pub T);
 
 impl<T: DeserializeOwned + Send> FromRequest for Query<T> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
         let q = ctx.parts.uri.query().unwrap_or("");
         serde_urlencoded::from_str::<T>(q)
             .map(Query)
@@ -187,6 +203,9 @@ impl<T: DeserializeOwned + Send> FromRequest for Query<T> {
 
 impl<T: DeserializeOwned + Send> FromRequest for Json<T> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
         serde_json::from_slice::<T>(ctx.body_bytes())
             .map(Json)
             .map_err(|e| Error::unprocessable(format!("invalid JSON body: {e}")))
@@ -205,6 +224,9 @@ impl Headers {
 
 impl FromRequest for Headers {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
         Ok(Headers(ctx.headers().clone()))
     }
 }

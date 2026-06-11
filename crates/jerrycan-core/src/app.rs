@@ -140,6 +140,7 @@ impl App {
         }
         Ok(BuiltApp {
             trie,
+            app_env,
             overrides: Arc::new(HashMap::new()),
             security_headers: self.security_headers,
             handler_timeout: self.handler_timeout,
@@ -200,6 +201,10 @@ fn insert_flat(trie: &mut Trie, flat: FlatRoute) -> Result<()> {
 /// The frozen, immutable runtime form. Cheap to share across connections.
 pub struct BuiltApp {
     pub(crate) trie: Trie,
+    /// App-level providers only (those registered via `App::provide`/`provide_dep`).
+    /// Module-scoped providers live per-endpoint in the trie and are deliberately
+    /// absent here — `task_context` resolves against this app-level env alone.
+    pub(crate) app_env: Arc<DepEnv>,
     pub(crate) overrides: Arc<HashMap<TypeId, AnyArc>>,
     pub(crate) security_headers: bool,
     pub(crate) handler_timeout: std::time::Duration,
@@ -249,6 +254,20 @@ pub(crate) fn apply_security_headers(res: &mut Response) {
 }
 
 impl BuiltApp {
+    /// A [`TaskContext`](crate::dep::TaskContext) for resolving dependencies
+    /// OUTSIDE an HTTP request — background jobs, startup wiring, CLI commands.
+    ///
+    /// Only **app-level** dependencies (those registered with `App::provide` /
+    /// `App::provide_dep`) are resolvable; module-scoped providers are not in
+    /// scope here. Any factory that pulls an HTTP extractor (`Json`/`Path`/
+    /// `Query`/`Headers`) fails with `JC1003` — it needs a real request.
+    pub fn task_context(&self) -> crate::dep::TaskContext {
+        crate::dep::TaskContext::new(DepResolver::new(
+            self.app_env.clone(),
+            self.overrides.clone(),
+        ))
+    }
+
     /// Phase 1 of the two-phase read (spec §4.4): decide what to do with the
     /// request from its HEAD alone, before any body byte is read. A match
     /// yields the body limit to read up to; anything else yields a finished,
