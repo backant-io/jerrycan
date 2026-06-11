@@ -173,6 +173,13 @@ allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "ISC", "Zlib", "CDL
 private = { ignore = true }
 [advisories]
 yanked = "deny"
+ignore = [
+    # proc-macro-error2 (transitive via sea-orm-macros -> sea-bae): the SeaORM
+    # derive macros pull it in at build time; it is unmaintained (RUSTSEC-2026-0173)
+    # with no patched release. It never reaches the runtime binary. Remove this when
+    # sea-orm drops it or a maintained fork ships.
+    "RUSTSEC-2026-0173",
+]
 [bans]
 [sources]
 unknown-registry = "deny"

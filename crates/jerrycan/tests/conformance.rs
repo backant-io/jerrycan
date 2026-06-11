@@ -9,6 +9,11 @@ mod common;
 
 const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.json");
 
+/// The v2 north-star eval slice: a tenant-scoped, JWT-guarded, db-backed
+/// sales-engagement backend (workspaces/leads/api-keys/billing). This is the
+/// heavy gate proving the full SeaORM stack scaffolds, builds, and behaves.
+const KOLLI: &str = include_str!("../../../conformance/designs/kolli-slice.design.json");
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -831,6 +836,186 @@ fn golden_app_deploys_everywhere() {
             "SKIP kubectl dry-run: no reachable cluster — used structural manifest validation"
         );
     }
+}
+
+/// THE v2 north-star gate: the kolli-slice design — a tenant-scoped, JWT-guarded,
+/// db-backed multi-module backend (workspaces/leads/api-keys/billing) — scaffolds
+/// onto the full SeaORM stack, the generated workspace BUILDS, its generated
+/// acceptance + isolation tests run and fail ONLY on unimplemented stubs (JC0500),
+/// and the lighter check gates (jerrycan lints + schema-contract freshness) are
+/// clean. We deliberately skip the heaviest gates here (cargo-audit/cargo-deny are
+/// exercised by the db-mode golden test); this gate's job is to pin the SeaORM
+/// compile-tax baseline and the red-test shape on the real eval design.
+///
+/// WHY the stub-class assertion matters (Rule 9): a pre-implementation scaffold
+/// MUST go red because the handlers are unimplemented — every red is a JC0500
+/// "not implemented" stub. If a red were instead a 401/403/422, the *generator*
+/// would be wiring the wrong status (a guard misfire or a validation false-reject)
+/// onto a request the test intends to succeed — a real bug. So this gate fails
+/// loudly if any acceptance failure carries a non-500 status, while the
+/// `*_without_auth_is_401` guard tests are expected to PASS (the guard runs before
+/// the stub, so a credential-less request is correctly rejected pre-implementation).
+#[test]
+#[ignore = "heavy: kolli-slice (SeaORM) scaffolds, builds, reds-on-stubs; records cold-build baseline"]
+fn kolli_slice_scaffold_passes_check() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Scaffold the kolli-slice design wired to the LOCAL framework path dep, the
+    // same way every other heavy test wires it (env passed to the child only).
+    let design_path = tmp.path().join("design.json");
+    std::fs::write(&design_path, KOLLI).unwrap();
+    let app = tmp.path().join("kolli-slice");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .unwrap();
+    assert!(st.success(), "kolli-slice must scaffold");
+
+    // schema.json is written by the db-mode scaffold (derived from migrations).
+    assert!(
+        app.join("schema.json").exists(),
+        "db-mode scaffold must emit schema.json"
+    );
+
+    // gen-tests for every top-level module — mirrors the binary invocation the
+    // other heavy tests use. Each emits a failing acceptance suite (stubs).
+    let mut expected_failing = 0usize;
+    for module in ["workspaces", "leads", "api-keys", "billing"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+            .current_dir(&app)
+            .args(["--json", "gen-tests", "--module", module])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "gen-tests {module} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        expected_failing += payload["expected_failing"].as_u64().unwrap() as usize;
+    }
+    assert!(
+        expected_failing > 0,
+        "the design must generate failing acceptance tests"
+    );
+
+    // COLD BUILD baseline: time the generated workspace's first build. The tempdir
+    // is its own target root, so this is a genuine from-scratch SeaORM compile —
+    // print it so CI logs carry the v2 compile-tax baseline.
+    let t0 = std::time::Instant::now();
+    let build = Command::new("cargo")
+        .current_dir(&app)
+        .args(["build", "--workspace"])
+        .output()
+        .unwrap();
+    let cold_build = t0.elapsed();
+    assert!(
+        build.status.success(),
+        "kolli-slice (SeaORM) generated workspace must build:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    eprintln!("kolli-slice cold build: {cold_build:?}");
+
+    // INCREMENTAL test-build baseline: build (don't run) the route-leads test
+    // binary now that deps are warm — the tightest agent inner-loop signal. `cargo
+    // test --no-run` compiles the test target without executing it.
+    let t1 = std::time::Instant::now();
+    let leads_build = Command::new("cargo")
+        .current_dir(&app)
+        .args(["test", "-p", "route-leads", "--no-run"])
+        .output()
+        .unwrap();
+    let leads_test_build = t1.elapsed();
+    assert!(
+        leads_build.status.success(),
+        "route-leads test binary must compile:\n{}",
+        String::from_utf8_lossy(&leads_build.stderr)
+    );
+    eprintln!("kolli-slice route-leads incremental test-build: {leads_test_build:?}");
+
+    // RED on stubs: run every generated test. `--no-fail-fast` so cargo runs all
+    // test binaries (it otherwise halts at the first failing crate).
+    let out = Command::new("cargo")
+        .current_dir(&app)
+        .args(["test", "--workspace", "--no-fail-fast"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "pre-implementation stubs must fail the acceptance suite"
+    );
+    let test_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Every red MUST be a JC0500 stub. A test failure prints the asserted-against
+    // status as `  left: <code>` (the observed status) above a `right:` (the
+    // designed status). Walk every observed status from a failed assertion and
+    // require it to be 500 — a 401/403/422 here would mean the generator mis-wired
+    // a guard or a validator onto a request the test means to succeed (a REAL bug).
+    let observed: Vec<u16> = test_output
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("left: "))
+        .filter_map(|n| n.trim().parse::<u16>().ok())
+        .collect();
+    assert!(
+        !observed.is_empty(),
+        "expected failed-assertion `left:` lines in:\n{test_output}"
+    );
+    let non_stub: Vec<u16> = observed.iter().copied().filter(|s| *s != 500).collect();
+    assert!(
+        non_stub.is_empty(),
+        "acceptance failures must be ONLY JC0500 stubs (500); found non-stub \
+         observed statuses {non_stub:?} — a guard/validation false-failure is a \
+         generator bug:\n{test_output}"
+    );
+    // And the only JC#### code surfacing in any failure body is the stub code: a
+    // JC0422 (validation) in a failure body would be a false-reject of a body the
+    // generator itself built from the design fixtures.
+    assert!(
+        !test_output.contains("JC0422"),
+        "no acceptance failure may carry JC0422 (validation false-reject):\n{test_output}"
+    );
+    // The guard tests must be PRESENT and PASSING — proof the JWT guard runs ahead
+    // of the stub (a credential-less mutation is correctly 401 pre-implementation).
+    assert!(
+        test_output.contains("_without_auth_is_401 ... ok"),
+        "guard tests must pass (guard precedes the stub):\n{test_output}"
+    );
+    assert!(
+        !test_output.contains("_without_auth_is_401 ... FAILED"),
+        "a guard test must never fail — the guard precedes the stub:\n{test_output}"
+    );
+
+    // The lighter check gates, run directly (audit/deny are too heavy here and are
+    // covered by the db-mode golden test): jerrycan lints and schema-contract
+    // freshness must both be clean on the fresh scaffold.
+    let design: jerrycan::platform::design::Design = serde_json::from_str(KOLLI).unwrap();
+    let lints = jerrycan::platform::lints::run(&app, &design);
+    assert!(
+        lints.is_empty(),
+        "jerrycan lints must be clean on a fresh scaffold: {lints:?}"
+    );
+    let schema_drift = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(jerrycan::platform::schema::verify_fresh(&app, &design))
+        .expect("schema derivation must succeed");
+    assert!(
+        schema_drift.is_empty(),
+        "scaffolded schema.json must match a fresh derivation: {schema_drift:?}"
+    );
 }
 
 // Small helpers for the deploy-anywhere test (no earlier-phase equivalents exist

@@ -216,6 +216,19 @@ impl Endpoint {
     pub fn is_guarded(&self) -> bool {
         self.auth_required || !self.required_roles.is_empty()
     }
+
+    /// True when this endpoint carries its OWN request authentication via a
+    /// cryptographic signature (the Stripe-style webhook pattern): the design
+    /// declares a 4xx error case whose `when` names a signature check. Such an
+    /// endpoint is intentionally NOT JWT/session-guarded — its caller is a third
+    /// party that can't hold the app's session, so it proves itself by signing the
+    /// payload. JL0004 (the unguarded-mutation lint) treats this as guarded so it
+    /// doesn't false-positive a deliberately signature-authenticated webhook.
+    pub fn declares_signature_auth(&self) -> bool {
+        self.errors
+            .iter()
+            .any(|e| (400..500).contains(&e.status) && e.when.to_lowercase().contains("signature"))
+    }
 }
 
 impl ModuleDesign {

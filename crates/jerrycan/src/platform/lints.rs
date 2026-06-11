@@ -80,7 +80,9 @@ fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diag
 }
 
 /// JL0004: in an auth design, a mutating route (POST/PUT/PATCH/DELETE) whose
-/// design endpoint is NOT guarded (no auth_required, no required_roles).
+/// design endpoint is NOT guarded (no auth_required, no required_roles) AND does
+/// not carry its own signature authentication (the webhook exemption — see
+/// `Endpoint::declares_signature_auth`).
 fn lint_unguarded_mutations(design: &Design, out: &mut Vec<Diagnostic>) {
     if !design.wants_auth() {
         return;
@@ -91,7 +93,7 @@ fn lint_unguarded_mutations(design: &Design, out: &mut Vec<Diagnostic>) {
                 ep.method,
                 HttpMethod::POST | HttpMethod::PUT | HttpMethod::PATCH | HttpMethod::DELETE
             );
-            if mutating && !ep.is_guarded() {
+            if mutating && !ep.is_guarded() && !ep.declares_signature_auth() {
                 out.push(d(
                     "JL0004",
                     Some("design.json".into()),
@@ -294,5 +296,71 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
             .into_iter()
             .filter(|d| d.code == "JL0006")
             .collect()
+    }
+
+    /// A minimal auth design with one mutating module endpoint; the test mutates
+    /// just that endpoint's guard/error shape to probe JL0004 in isolation.
+    fn auth_design_with_endpoint(endpoint: serde_json::Value) -> Design {
+        serde_json::from_value(serde_json::json!({
+            "name": "billing-api",
+            "contract_version": 1,
+            "auth": { "model": "jwt", "roles": ["owner"] },
+            "dependencies": ["auth"],
+            "modules": [{
+                "name": "billing",
+                "endpoints": [endpoint]
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// Only JL0004 diagnostics from a full pass (other lints fire on the absent
+    /// crate files in these bare in-memory designs).
+    fn jl0004_only(design: &Design) -> Vec<Diagnostic> {
+        let tmp = tempfile::tempdir().unwrap();
+        run(tmp.path(), design)
+            .into_iter()
+            .filter(|d| d.code == "JL0004")
+            .collect()
+    }
+
+    /// JL0004 must NOT flag a signature-authenticated webhook: a POST with no JWT
+    /// guard but a declared `4xx … signature …` error carries its own auth, so the
+    /// lint treats it as guarded. WHY (Rule 9): this is the Stripe-webhook contract
+    /// — a third party signs the payload because it can't hold the app's session;
+    /// flagging it would force a JWT guard that makes the webhook unreachable.
+    #[test]
+    fn jl0004_exempts_a_signature_authenticated_webhook() {
+        let design = auth_design_with_endpoint(serde_json::json!({
+            "operation_id": "stripe_webhook",
+            "method": "POST",
+            "path": "/webhook",
+            "success": { "status": 200 },
+            "errors": [{ "status": 400, "when": "Stripe signature is missing or invalid" }]
+        }));
+        assert!(
+            jl0004_only(&design).is_empty(),
+            "a signature-authed webhook is intentionally not JWT-guarded"
+        );
+    }
+
+    /// The exemption is narrow: a plain unguarded mutation (no guard, no signature
+    /// error) still trips JL0004, so the lint stays sharp against forgotten guards.
+    #[test]
+    fn jl0004_still_flags_a_plain_unguarded_mutation() {
+        let design = auth_design_with_endpoint(serde_json::json!({
+            "operation_id": "create_charge",
+            "method": "POST",
+            "path": "/charges",
+            "success": { "status": 201 },
+            "errors": [{ "status": 400, "when": "request body is malformed" }]
+        }));
+        let hits = jl0004_only(&design);
+        assert_eq!(
+            hits.len(),
+            1,
+            "a non-signature 400 is no exemption: {hits:?}"
+        );
+        assert!(hits[0].message.contains("create_charge"), "{:?}", hits[0]);
     }
 }
