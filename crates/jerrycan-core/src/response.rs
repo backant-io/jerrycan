@@ -231,7 +231,9 @@ impl StreamBody {
 
     /// A channel-fed body for producers that push: returns the body and a
     /// sender. Dropping the sender ends the stream cleanly; `fail` aborts it.
+    /// The channel is bounded, so `send` awaits while a slow client is behind.
     pub fn channel() -> (Self, BodySender) {
+        // 16: bounded buffer — a slow client backpressures the producer instead of buffering unboundedly.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Error>>(16);
         (Self::new(ReceiverStream(rx)), BodySender(tx))
     }
@@ -245,7 +247,10 @@ impl StreamBody {
     }
 
     /// Marks the response as a download: `content-disposition: attachment` with
-    /// the given filename (quotes, backslashes, and control chars stripped — header safety).
+    /// the given filename. Quotes/backslashes are stripped (header-injection
+    /// break-out) and control chars too — stripping the latter is what makes the
+    /// following `HeaderValue::from_str` infallible for any UTF-8 input. Non-ASCII
+    /// filenames pass through verbatim (no RFC 5987 `filename*` encoding).
     pub fn attachment(mut self, filename: &str) -> Self {
         let safe: String = filename
             .chars()
@@ -518,5 +523,44 @@ mod tests {
             .await
             .expect_err("stall must error, not end cleanly");
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn channel_fail_surfaces_as_a_body_error_carrying_the_message() {
+        // The headline guarantee of the error channel: a producer that fails
+        // after some output must reach the client as a body ERROR (truncation),
+        // never a clean end. This is the test that fails if the `Err` branch of
+        // `TimedFrames::poll_frame` regresses to swallowing the error.
+        let (body, tx) = StreamBody::channel();
+        let produce = async move {
+            assert!(tx.send("first chunk").await, "client present");
+            assert!(tx.fail(Error::internal("boom")).await, "fail delivered");
+        };
+        let response = body.into_response();
+        use http_body_util::BodyExt;
+        let (_, collected) = tokio::join!(produce, response.into_body().collect());
+        let err = collected.expect_err("a failed producer must error the body, not end cleanly");
+        assert!(
+            err.to_string().contains("boom"),
+            "the propagated message must survive to the body error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_body_composes_through_a_real_handler_dispatch() {
+        use crate::prelude::*;
+        async fn export() -> Result<StreamBody> {
+            let (body, tx) = StreamBody::channel();
+            tokio::spawn(async move {
+                tx.send("id,name\n").await;
+                tx.send("1,ada\n").await;
+            });
+            Ok(body.content_type("text/csv"))
+        }
+        let t = App::new().route("/export", get(export)).into_test();
+        let r = t.get("/export").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "text/csv");
+        assert_eq!(r.text(), "id,name\n1,ada\n");
     }
 }
