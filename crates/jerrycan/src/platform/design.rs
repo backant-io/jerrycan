@@ -15,6 +15,10 @@ pub struct Design {
     /// App-scoped dependency names the generator must provide on App.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenancy: Option<Tenancy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<JobDesign>,
     pub modules: Vec<ModuleDesign>,
 }
 
@@ -57,6 +61,8 @@ pub struct ModuleDesign {
 #[serde(deny_unknown_fields)]
 pub struct Entity {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub belongs_to: Vec<BelongsTo>,
     pub fields: Vec<Field>,
 }
 
@@ -68,6 +74,12 @@ pub struct Field {
     pub field_type: FieldType,
     #[serde(default = "default_true")]
     pub required: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unique: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub index: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {
@@ -98,6 +110,41 @@ impl FieldType {
             FieldType::Json => "serde_json::Value",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BelongsTo {
+    pub entity: String,
+    #[serde(default)]
+    pub on_delete: OnDelete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDelete {
+    Cascade,
+    SetNull,
+    #[default]
+    Restrict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tenancy {
+    pub entity: String,
+    #[serde(default)]
+    pub member_roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobDesign {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +279,41 @@ impl Design {
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         serde_json::from_str(&raw).map_err(|e| format!("invalid design.json: {e}"))
     }
+
+    /// Entities owned by the tenant: any entity (in any module or subroute)
+    /// with a belongs_to aimed at tenancy.entity. (module_name, entity_name) pairs.
+    pub fn tenant_owned(&self) -> Vec<(&str, &str)> {
+        let Some(tenancy) = self.tenancy.as_ref() else {
+            return Vec::new();
+        };
+        let mut owned = Vec::new();
+        for module in &self.modules {
+            collect_tenant_owned(module, &tenancy.entity, &mut owned);
+        }
+        owned
+    }
+
+    /// The fk column a belongs_to derives: snake_case(target) + "_id".
+    pub fn fk_column(target: &str) -> String {
+        format!("{}_id", target.to_lowercase())
+    }
+}
+
+/// Walk a module and its subroutes in document order, pairing each entity
+/// that belongs_to `tenant` with the owning module/subroute name.
+fn collect_tenant_owned<'a>(
+    module: &'a ModuleDesign,
+    tenant: &str,
+    out: &mut Vec<(&'a str, &'a str)>,
+) {
+    for entity in &module.entities {
+        if entity.belongs_to.iter().any(|b| b.entity == tenant) {
+            out.push((module.name.as_str(), entity.name.as_str()));
+        }
+    }
+    for subroute in &module.subroutes {
+        collect_tenant_owned(subroute, tenant, out);
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +349,74 @@ pub(crate) mod tests {
             }]
         }]
     }"#;
+
+    pub(crate) const V1_FULL: &str = r#"{
+        "name": "kolli-mini", "contract_version": 1,
+        "auth": { "model": "jwt", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+        "jobs": [{ "name": "expire_trials", "schedule": "0 * * * *" }],
+        "modules": [
+            { "name": "workspaces",
+              "entities": [{ "name": "Workspace", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "plan", "type": "string", "values": ["trial", "pro"] }
+              ]}],
+              "endpoints": [{ "operation_id": "list_workspaces", "method": "GET",
+                  "path": "/", "success": { "status": 200, "entity": "Workspace", "list": true } }] },
+            { "name": "leads",
+              "entities": [{ "name": "Lead",
+                  "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+                  "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "phone", "type": "string", "unique": true, "index": true },
+                      { "name": "custom", "type": "json", "required": false }
+                  ]}],
+              "endpoints": [{ "operation_id": "list_leads", "method": "GET",
+                  "path": "/", "success": { "status": 200, "entity": "Lead", "list": true } }] }
+        ]
+    }"#;
+
+    #[test]
+    fn v1_design_round_trips_with_new_constructs() {
+        let d: Design = serde_json::from_str(V1_FULL).unwrap();
+        assert_eq!(d.contract_version, 1);
+        assert_eq!(d.tenancy.as_ref().unwrap().entity, "Workspace");
+        assert_eq!(d.jobs[0].name, "expire_trials");
+        let lead = &d.modules[1].entities[0];
+        assert_eq!(lead.belongs_to[0].entity, "Workspace");
+        assert_eq!(lead.belongs_to[0].on_delete, OnDelete::Cascade);
+        assert!(lead.fields[1].unique && lead.fields[1].index);
+        assert_eq!(
+            d.modules[0].entities[0].fields[1]
+                .values
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        let back = serde_json::to_string(&d).unwrap();
+        let _re: Design = serde_json::from_str(&back).unwrap();
+    }
+
+    #[test]
+    fn v0_designs_still_parse_unchanged() {
+        let d: Design = serde_json::from_str(MINIMAL).unwrap();
+        assert_eq!(d.contract_version, 0);
+        assert!(d.tenancy.is_none() && d.jobs.is_empty());
+        assert!(d.modules[0].entities[0].belongs_to.is_empty());
+    }
+
+    #[test]
+    fn tenant_owned_walks_modules_and_subroutes() {
+        let d: Design = serde_json::from_str(V1_FULL).unwrap();
+        assert_eq!(d.tenant_owned(), vec![("leads", "Lead")]);
+    }
+
+    #[test]
+    fn fk_column_is_snake_target_id() {
+        assert_eq!(Design::fk_column("Workspace"), "workspace_id");
+    }
 
     #[test]
     fn minimal_design_round_trips() {

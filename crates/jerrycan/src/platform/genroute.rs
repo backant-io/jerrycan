@@ -995,6 +995,9 @@ mod tests {
                 name: "id".into(),
                 field_type: FieldType::Integer,
                 required: true,
+                unique: false,
+                index: false,
+                values: None,
             },
         );
         let ddl = migration_ddl(&m, false).unwrap();
@@ -1027,6 +1030,9 @@ mod tests {
                 name: "id".into(),
                 field_type: FieldType::Uuid,
                 required: true,
+                unique: false,
+                index: false,
+                values: None,
             },
         );
         let ddl = migration_ddl(&m, false).unwrap();
