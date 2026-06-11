@@ -113,7 +113,7 @@ pub fn scaffold(target: &Path, design: &Design) -> Result<Vec<String>, String> {
     };
     let routes_dir = target.join("crates/routes");
     for m in &design.modules {
-        created.extend(genroute::write_module(&routes_dir, m, mode)?);
+        created.extend(genroute::write_module(&routes_dir, m, mode, design)?);
     }
     created.extend(mounting::regenerate(target, design)?);
     created.sort();

@@ -328,7 +328,7 @@ fn cmd_generate_route(module_path: &str, json_mode: bool) -> Result<(), Failure>
         db: design.wants_db(),
         auth: design.wants_auth(),
     };
-    let created = genroute::write_module(&root.join("crates/routes"), top_module, mode)
+    let created = genroute::write_module(&root.join("crates/routes"), top_module, mode, &design)
         .map_err(Failure::gate)?;
     let modified = mounting::regenerate(&root, &design).map_err(Failure::gate)?;
     let payload = serde_json::json!({
@@ -397,7 +397,8 @@ fn cmd_add(extension: &str, json_mode: bool) -> Result<(), Failure> {
         auth: design.wants_auth(),
     };
     for m in &design.modules {
-        genroute::write_module(&root.join("crates/routes"), m, mode).map_err(Failure::gate)?;
+        genroute::write_module(&root.join("crates/routes"), m, mode, &design)
+            .map_err(Failure::gate)?;
     }
     let mut modified = mounting::regenerate(&root, &design).map_err(Failure::gate)?;
     // Policy files are mode-dependent supply-chain gates; flipping the mode must

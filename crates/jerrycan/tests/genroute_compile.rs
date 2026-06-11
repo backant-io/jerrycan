@@ -69,8 +69,8 @@ fn generated_module_crate_passes_strict_clippy() {
         db: design.wants_db(),
         auth: false,
     };
-    let module = design.modules.into_iter().next().expect("todos module");
-    let created = write_module(&routes, &module, mode).expect("write_module");
+    let module = design.modules.first().expect("todos module");
+    let created = write_module(&routes, module, mode, &design).expect("write_module");
     assert!(
         created.iter().any(|p| p.ends_with("todos/src/repo.rs")),
         "the entity-bearing module must emit repo.rs (the dead-code case): {created:?}"

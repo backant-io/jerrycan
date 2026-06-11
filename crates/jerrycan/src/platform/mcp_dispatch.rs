@@ -199,11 +199,15 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                         db: design.wants_db(),
                         auth: design.wants_auth(),
                     };
-                    let created =
-                        match genroute::write_module(&root.join("crates/routes"), top, mode) {
-                            Ok(c) => c,
-                            Err(e) => return err_payload(e),
-                        };
+                    let created = match genroute::write_module(
+                        &root.join("crates/routes"),
+                        top,
+                        mode,
+                        &design,
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => return err_payload(e),
+                    };
                     let modified = match mounting::regenerate(&root, &design) {
                         Ok(m) => m,
                         Err(e) => return err_payload(e),

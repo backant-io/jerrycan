@@ -294,18 +294,42 @@ impl Design {
     }
 
     /// The fk column a belongs_to derives: snake_case(target) + "_id".
-    /// Entity names are validated `^[A-Z][A-Za-z0-9]*$`, so each uppercase
-    /// letter (past the first char) starts a new word: "ApiKey" -> "api_key".
     pub fn fk_column(target: &str) -> String {
-        let mut snake = String::with_capacity(target.len() + 4);
-        for (i, ch) in target.char_indices() {
+        format!("{}_id", Self::to_snake(target))
+    }
+
+    /// snake_case a validated PascalCase entity name. Entity names are validated
+    /// `^[A-Z][A-Za-z0-9]*$`, so each uppercase letter (past the first char)
+    /// starts a new word: "ApiKey" -> "api_key".
+    pub fn to_snake(name: &str) -> String {
+        let mut snake = String::with_capacity(name.len() + 2);
+        for (i, ch) in name.char_indices() {
             if i > 0 && ch.is_ascii_uppercase() {
                 snake.push('_');
             }
             snake.push(ch.to_ascii_lowercase());
         }
-        snake.push_str("_id");
         snake
+    }
+
+    /// The Rust key type a belongs_to target keys on: the target entity's declared
+    /// `id` field type, `i64` for a synthetic or integer pk. Mirrors genroute's
+    /// `key_rust_type` but resolves the entity by name across the whole design tree
+    /// (a fk may point at an entity in any module or subroute). Falls back to `i64`
+    /// when the target is unknown (validation guarantees it exists in practice).
+    pub fn target_key_rust_type(&self, target: &str) -> &'static str {
+        fn find<'a>(m: &'a ModuleDesign, target: &str) -> Option<&'a Entity> {
+            m.entities
+                .iter()
+                .find(|e| e.name == target)
+                .or_else(|| m.subroutes.iter().find_map(|s| find(s, target)))
+        }
+        self.modules
+            .iter()
+            .find_map(|m| find(m, target))
+            .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
+            .map(|f| f.field_type.rust_type())
+            .unwrap_or("i64")
     }
 }
 
@@ -442,6 +466,18 @@ pub(crate) mod tests {
     fn fk_column_is_snake_target_id() {
         assert_eq!(Design::fk_column("Workspace"), "workspace_id");
         assert_eq!(Design::fk_column("ApiKey"), "api_key_id");
+        // fk_column derives from the shared to_snake (DRY); both must agree.
+        assert_eq!(Design::to_snake("ApiKey"), "api_key");
+        assert_eq!(Design::to_snake("Lead"), "lead");
+    }
+
+    #[test]
+    fn target_key_rust_type_resolves_pk_across_the_tree() {
+        let d: Design = serde_json::from_str(V1_FULL).unwrap();
+        // Workspace declares an integer id → i64 key (the fk column type a
+        // belongs_to: Workspace must use). An unknown target falls back to i64.
+        assert_eq!(d.target_key_rust_type("Workspace"), "i64");
+        assert_eq!(d.target_key_rust_type("Nonexistent"), "i64");
     }
 
     #[test]

@@ -194,6 +194,125 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
     Some(out)
 }
 
+/// PascalCase a snake_case column name for SeaORM's `Column` variants:
+/// `workspace_id` -> `WorkspaceId` (each underscore-separated word capitalized).
+fn col_pascal(snake: &str) -> String {
+    let mut out = String::with_capacity(snake.len());
+    for word in snake.split('_') {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
+/// db-mode model.rs: one SeaORM entity module per entity. Plain serde structs
+/// (`model_rs`) are memory-mode only; db mode emits `DeriveEntityModel` over the
+/// jerrycan facade — generated apps carry NO direct sea-orm dep, so each module
+/// aliases `use jerrycan::db::sea_orm;` (the derive macros emit bare `sea_orm::`
+/// paths; see docs/ai/08-database.md). `design` resolves fk target key types and
+/// whether a belongs_to target lives in the same module (intra-module relation).
+pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design) -> Option<String> {
+    if m.entities.is_empty() {
+        return None;
+    }
+    let local: std::collections::HashSet<&str> =
+        m.entities.iter().map(|e| e.name.as_str()).collect();
+    let mut out = String::from(
+        "//! Entities and DTOs for this module (db mode: SeaORM entities).\n//! Agent-owned: edit freely.\n\n",
+    );
+    for e in &m.entities {
+        let snake = Design::to_snake(&e.name);
+        let table = table_name(&e.name);
+        let key = key_rust_type(e);
+        // The synthetic pk surfaces as a visible `id` field so POST bodies may
+        // omit it (`#[serde(default)]`); a declared id has no default.
+        let id_default = if declared_id(e).is_some() {
+            ""
+        } else {
+            "        #[serde(default)]\n"
+        };
+
+        let mut fields = String::new();
+        // fk columns, in belongs_to order, before declared fields.
+        for b in &e.belongs_to {
+            let col = Design::fk_column(&b.entity);
+            let ty = design.target_key_rust_type(&b.entity);
+            if b.on_delete == OnDelete::SetNull {
+                fields.push_str("        #[serde(default)]\n");
+                fields.push_str(&format!("        pub {col}: Option<{ty}>,\n"));
+            } else {
+                fields.push_str(&format!("        pub {col}: {ty},\n"));
+            }
+        }
+        // declared fields (the declared id is the pk, emitted above; skip it).
+        for f in e.fields.iter().filter(|f| f.name != "id") {
+            let base = match f.field_type {
+                FieldType::Json => "Json",
+                FieldType::Boolean => "bool",
+                _ => f.field_type.rust_type(),
+            };
+            if f.required {
+                fields.push_str(&format!("        pub {}: {base},\n", f.name));
+            } else {
+                fields.push_str("        #[serde(default)]\n");
+                fields.push_str(&format!("        pub {}: Option<{base}>,\n", f.name));
+            }
+        }
+
+        // Intra-module belongs_to → Relation arm + Related impl; cross-module
+        // targets stay decoupled (fk field only, no relation).
+        let mut relation_arms = String::new();
+        let mut related_impls = String::new();
+        for b in &e.belongs_to {
+            if !local.contains(b.entity.as_str()) {
+                continue;
+            }
+            let target_snake = Design::to_snake(&b.entity);
+            let fk_pascal = col_pascal(&Design::fk_column(&b.entity));
+            let target_pascal = &b.entity;
+            relation_arms.push_str(&format!(
+                "        #[sea_orm(belongs_to = \"super::{target_snake}::Entity\", from = \"Column::{fk_pascal}\", to = \"super::{target_snake}::Column::Id\")]\n        {target_pascal},\n"
+            ));
+            related_impls.push_str(&format!(
+                "\n    impl Related<super::{target_snake}::Entity> for Entity {{\n        fn to() -> RelationDef {{\n            Relation::{target_pascal}.def()\n        }}\n    }}\n"
+            ));
+        }
+        // Empty enum on one line (matches docs/ai/08-database.md); arms get a body.
+        let relation = if relation_arms.is_empty() {
+            "    pub enum Relation {}\n".to_string()
+        } else {
+            format!("    pub enum Relation {{\n{relation_arms}    }}\n")
+        };
+
+        out.push_str(&format!(
+            r#"pub mod {snake} {{
+    use jerrycan::db::sea_orm;
+    use jerrycan::db::sea_orm::entity::prelude::*;
+    use serde::{{Deserialize, Serialize}};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "{table}")]
+    pub struct Model {{
+        #[sea_orm(primary_key)]
+{id_default}        pub id: {key},
+{fields}    }}
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+{relation}{related_impls}
+    impl ActiveModelBehavior for ActiveModel {{}}
+}}
+pub use {snake}::Model as {entity};
+
+"#,
+            entity = e.name,
+        ));
+    }
+    Some(out)
+}
+
 fn memory_repo_rs(m: &ModuleDesign) -> String {
     let mut out = String::from(
         "//! In-memory data access (Phase 1; jerrycan-db replaces this in Phase 2).\nuse super::model::*;\nuse std::collections::BTreeMap;\nuse std::sync::Mutex;\nuse std::sync::atomic::{AtomicI64, Ordering};\n\n",
@@ -700,6 +819,7 @@ pub fn write_module(
     routes_dir: &Path,
     m: &ModuleDesign,
     mode: GenMode,
+    design: &Design,
 ) -> Result<Vec<String>, String> {
     let root = routes_dir
         .ancestors()
@@ -713,8 +833,8 @@ pub fn write_module(
     let cargo = render(ROUTE_CARGO, &[("name", &m.name)])?;
     write_tool_owned(&crate_dir.join("Cargo.toml"), &cargo, &mut created, &root)?;
     write_tool_owned(&src.join("lib.rs"), &lib_rs(m, mode), &mut created, &root)?;
-    write_unit_files(&src, m, mode, &mut created, &root)?;
-    write_subroutes(&src, m, mode, &mut created, &root)?;
+    write_unit_files(&src, m, mode, design, &mut created, &root)?;
+    write_subroutes(&src, m, mode, design, &mut created, &root)?;
     // db mode: agent-owned create-once migrations for this crate (module + subroutes).
     if mode.db {
         write_module_migrations(&crate_dir, m, &mut created, &root)?;
@@ -727,6 +847,7 @@ fn write_unit_files(
     dir: &Path,
     m: &ModuleDesign,
     mode: GenMode,
+    design: &Design,
     created: &mut Vec<String>,
     root: &Path,
 ) -> Result<(), String> {
@@ -737,7 +858,13 @@ fn write_unit_files(
         root,
     )?;
     write_agent_owned(&dir.join("deps.rs"), &deps_rs(m), created, root)?;
-    if let Some(model) = model_rs(m) {
+    // db mode emits SeaORM entities; memory mode keeps plain serde structs.
+    let model = if mode.db {
+        model_rs_db(m, design)
+    } else {
+        model_rs(m)
+    };
+    if let Some(model) = model {
         write_agent_owned(&dir.join("model.rs"), &model, created, root)?;
     }
     if let Some(repo) = repo_rs(m, mode) {
@@ -750,6 +877,7 @@ fn write_subroutes(
     src: &Path,
     m: &ModuleDesign,
     mode: GenMode,
+    design: &Design,
     created: &mut Vec<String>,
     root: &Path,
 ) -> Result<(), String> {
@@ -770,8 +898,8 @@ fn write_subroutes(
             created,
             root,
         )?;
-        write_unit_files(&dir, sub, mode, created, root)?;
-        write_subroutes(&dir, sub, mode, created, root)?; // arbitrary depth
+        write_unit_files(&dir, sub, mode, design, created, root)?;
+        write_subroutes(&dir, sub, mode, design, created, root)?; // arbitrary depth
     }
     Ok(())
 }
@@ -843,9 +971,83 @@ mod tests {
     use super::*;
     use crate::platform::design::tests::MINIMAL;
 
+    fn demo() -> Design {
+        serde_json::from_str(MINIMAL).unwrap()
+    }
+
     fn todos() -> ModuleDesign {
-        let d: Design = serde_json::from_str(MINIMAL).unwrap();
-        d.modules.into_iter().next().unwrap()
+        demo().modules.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn db_mode_models_are_sea_orm_entities() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let m = &d.modules[1];
+        let src = model_rs_db(m, &d).unwrap();
+        assert!(src.contains("pub mod lead {"), "{src}");
+        // Cross-module belongs_to stays decoupled: fk field, NO relation arm.
+        assert!(src.contains("pub enum Relation {}"), "{src}");
+        assert!(
+            src.contains("use jerrycan::db::sea_orm;"),
+            "facade alias, no direct dep: {src}"
+        );
+        assert!(src.contains("#[sea_orm(table_name = \"leads\")]"), "{src}");
+        assert!(src.contains("#[sea_orm(primary_key)]"), "{src}");
+        assert!(
+            src.contains("pub workspace_id: i64"),
+            "fk column from belongs_to: {src}"
+        );
+        assert!(
+            src.contains("pub custom: Option<Json>"),
+            "json + optional: {src}"
+        );
+        assert!(src.contains("pub use lead::Model as Lead;"), "{src}");
+        assert!(
+            src.contains("impl ActiveModelBehavior for ActiveModel {}"),
+            "{src}"
+        );
+    }
+
+    /// Intra-module belongs_to wires a Relation arm + Related impl (cross-module
+    /// stays a bare fk for decoupling); a synthetic pk gets `#[serde(default)]`
+    /// so POST bodies may omit `id`; SetNull makes the fk `Option<_>` + default.
+    #[test]
+    fn intra_module_relation_synthetic_pk_and_set_null_fk() {
+        let mut d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        // Add a second entity to the workspaces module that belongs_to Workspace
+        // (same module) with on_delete: set_null and NO declared id (synthetic pk).
+        let member: Entity = serde_json::from_str(
+            r#"{
+                "name": "Member",
+                "belongs_to": [{ "entity": "Workspace", "on_delete": "set_null" }],
+                "fields": [{ "name": "email", "type": "string" }]
+            }"#,
+        )
+        .unwrap();
+        d.modules[0].entities.push(member);
+        let src = model_rs_db(&d.modules[0], &d).unwrap();
+        // Synthetic pk → visible id field with serde(default) so POST may omit it.
+        assert!(
+            src.contains(
+                "#[sea_orm(primary_key)]\n        #[serde(default)]\n        pub id: i64,"
+            ),
+            "{src}"
+        );
+        // SetNull fk → nullable + default.
+        assert!(
+            src.contains("#[serde(default)]\n        pub workspace_id: Option<i64>,"),
+            "{src}"
+        );
+        // Intra-module target → Relation arm keyed on the PascalCase fk column.
+        assert!(
+            src.contains("#[sea_orm(belongs_to = \"super::workspace::Entity\", from = \"Column::WorkspaceId\", to = \"super::workspace::Column::Id\")]"),
+            "{src}"
+        );
+        assert!(src.contains("Relation::Workspace.def()"), "{src}");
+        assert!(
+            src.contains("impl Related<super::workspace::Entity> for Entity"),
+            "{src}"
+        );
     }
 
     #[test]
@@ -953,9 +1155,10 @@ mod tests {
     fn write_module_respects_the_ownership_rule() {
         let tmp = tempfile::tempdir().unwrap();
         let routes = tmp.path().join("crates/routes");
-        let m = todos();
+        let d = demo();
+        let m = &d.modules[0];
 
-        let created = write_module(&routes, &m, GenMode::default()).unwrap();
+        let created = write_module(&routes, m, GenMode::default(), &d).unwrap();
         assert!(created.iter().any(|p| p.ends_with("todos/src/lib.rs")));
         assert!(
             created
@@ -969,7 +1172,7 @@ mod tests {
         let lib = routes.join("todos/src/lib.rs");
         fs::write(&lib, "// hand edit\n").unwrap();
 
-        write_module(&routes, &m, GenMode::default()).unwrap();
+        write_module(&routes, m, GenMode::default(), &d).unwrap();
         assert_eq!(
             fs::read_to_string(&handlers).unwrap(),
             "// AGENT CODE\n",
