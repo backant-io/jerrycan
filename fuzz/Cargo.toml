@@ -40,3 +40,9 @@ name = "design_parse"
 path = "fuzz_targets/design_parse.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "multipart_parse"
+path = "fuzz_targets/multipart_parse.rs"
+test = false
+doc = false

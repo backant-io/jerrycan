@@ -25,6 +25,25 @@ impl Rng {
         }
         s
     }
+    /// A messy multipart-ish byte string: boundary fragments, CRLFs, header
+    /// punctuation, padding, control bytes — the alphabet a real `multipart/
+    /// form-data` body draws from, shuffled adversarially.
+    fn messy_multipart(&mut self) -> Vec<u8> {
+        // Includes the literal boundary token "B" plus the bytes that compose
+        // delimiters, headers, padding, and closing markers, so the PRNG can
+        // straddle boundaries and partial delimiters.
+        let alphabet: &[&[u8]] = &[
+            b"\r\n", b"--", b"B", b" ", b"\t", b"content-disposition:", b" form-data;",
+            b" name=\"", b"\"", b" filename=\"", b"content-type: text/plain", b"x", b"\0",
+            b"\xff", b";", b"=", b"\r", b"\n",
+        ];
+        let len = (self.next() % 60) as usize;
+        let mut b = Vec::new();
+        for _ in 0..len {
+            b.extend_from_slice(alphabet[(self.next() as usize) % alphabet.len()]);
+        }
+        b
+    }
 }
 
 #[test]
@@ -62,4 +81,22 @@ fn router_matching_never_panics_on_adversarial_paths() {
         }
     });
     let _ = Method::GET; // import anchor
+}
+
+#[test]
+fn multipart_parser_never_panics_on_adversarial_bodies() {
+    // The incremental multipart parser is fed adversarial bodies at every
+    // chunk straddle and boundary fragment; the contract is "no panic, no
+    // hang" — `fuzz_drive`'s linear-time budget assert catches a livelock,
+    // any parser panic surfaces here. Mirrors the deep fuzz/ target on a
+    // fixed seed so a regression reproduces deterministically.
+    let mut rng = Rng(0xD1B54A32D192ED03);
+    for _ in 0..20_000 {
+        let body = rng.messy_multipart();
+        // Sweep a few chunk sizes so the same body exercises different feed
+        // straddles; chunk=1 is the worst case for the termination budget.
+        for &chunk in &[1usize, 3, 7, body.len().max(1)] {
+            jerrycan_core::multipart::fuzz_drive("B", &body, chunk);
+        }
+    }
 }

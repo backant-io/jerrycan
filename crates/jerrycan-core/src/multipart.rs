@@ -534,6 +534,40 @@ fn boundary_from_content_type(value: &str) -> Option<String> {
     None
 }
 
+/// Fuzzing hook: drives the parser over `input` split at `chunk` bytes until
+/// completion or error. Hidden — the fuzz crate is its only consumer.
+#[doc(hidden)]
+pub fn fuzz_drive(boundary: &str, input: &[u8], chunk: usize) {
+    let chunk = chunk.max(1);
+    let mut parser = Parser::new(boundary);
+    let mut feeds = input.chunks(chunk);
+    // The parser must terminate in events linear in the input size: every
+    // event either consumes bytes or is the terminal Done/Err. The budget
+    // asserts that — a fuzz-discovered livelock fails loudly here.
+    //
+    // Bound: worst case is chunk=1. Per fed byte the driver does at most two
+    // loop turns — an Ok(None) requesting the feed, then one Ok(Some(_)) that
+    // consumes >=1 byte (Data is holdback-bounded to >=1 byte; PartHeaders/
+    // EndOfPart consume their boundary/header bytes). Ok(None) turns total
+    // input.len()+1 (one per chunk + one finish); event turns total
+    // <=input.len() (each consumes >=1 byte). So ~3*input.len()+O(1) turns;
+    // input.len()*4 + 64 holds with margin and never underflows on empty input.
+    let mut budget = input.len() * 4 + 64;
+    loop {
+        match parser.next_event() {
+            Err(_) => return,
+            Ok(Some(Event::Done)) => return,
+            Ok(Some(_)) => {}
+            Ok(None) => match feeds.next() {
+                Some(c) => parser.feed(c),
+                None => parser.finish(),
+            },
+        }
+        budget -= 1;
+        assert!(budget > 0, "parser did not terminate in linear time");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
