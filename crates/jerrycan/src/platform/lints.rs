@@ -80,9 +80,10 @@ fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diag
 }
 
 /// JL0004: in an auth design, a mutating route (POST/PUT/PATCH/DELETE) whose
-/// design endpoint is NOT guarded (no auth_required, no required_roles) AND does
-/// not carry its own signature authentication (the webhook exemption — see
-/// `Endpoint::declares_signature_auth`).
+/// design endpoint is NOT guarded (no auth_required, no required_roles), is not
+/// marked `public` (the credential-issuing carve-out — login/register can't hold
+/// a session yet), AND does not carry its own signature authentication (the
+/// webhook exemption — see `Endpoint::declares_signature_auth`).
 fn lint_unguarded_mutations(design: &Design, out: &mut Vec<Diagnostic>) {
     if !design.wants_auth() {
         return;
@@ -93,7 +94,7 @@ fn lint_unguarded_mutations(design: &Design, out: &mut Vec<Diagnostic>) {
                 ep.method,
                 HttpMethod::POST | HttpMethod::PUT | HttpMethod::PATCH | HttpMethod::DELETE
             );
-            if mutating && !ep.is_guarded() && !ep.declares_signature_auth() {
+            if mutating && !ep.is_guarded() && !ep.public && !ep.declares_signature_auth() {
                 out.push(d(
                     "JL0004",
                     Some("design.json".into()),
@@ -342,6 +343,48 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
             jl0004_only(&design).is_empty(),
             "a signature-authed webhook is intentionally not JWT-guarded"
         );
+    }
+
+    /// JL0004 must NOT flag a PUBLIC mutating route: a credential-issuing login/
+    /// register POST is genuinely unauthenticated (it has no session yet to guard
+    /// by), so `public: true` is its carve-out. WHY (Rule 9): this is fix F1 — an
+    /// auth design could not declare its own login/register without JL0004 firing
+    /// with no escape; the flag lets a public route declare itself unguarded ON
+    /// PURPOSE while the lint stays sharp on everything else.
+    #[test]
+    fn jl0004_exempts_a_public_credential_issuing_route() {
+        let design = auth_design_with_endpoint(serde_json::json!({
+            "operation_id": "register",
+            "method": "POST",
+            "path": "/register",
+            "public": true,
+            "success": { "status": 201 },
+            "errors": [{ "status": 422, "when": "request body fails validation" }]
+        }));
+        assert!(
+            jl0004_only(&design).is_empty(),
+            "a public credential-issuing route is intentionally unguarded"
+        );
+    }
+
+    /// The same endpoint WITHOUT `public` trips JL0004 — the exemption is the flag,
+    /// nothing else (pairs with the public test above, like the signature-auth pair).
+    #[test]
+    fn jl0004_flags_the_same_route_without_public() {
+        let design = auth_design_with_endpoint(serde_json::json!({
+            "operation_id": "register",
+            "method": "POST",
+            "path": "/register",
+            "success": { "status": 201 },
+            "errors": [{ "status": 422, "when": "request body fails validation" }]
+        }));
+        let hits = jl0004_only(&design);
+        assert_eq!(
+            hits.len(),
+            1,
+            "without public, an unguarded mutation still trips JL0004: {hits:?}"
+        );
+        assert!(hits[0].message.contains("register"), "{:?}", hits[0]);
     }
 
     /// The exemption is narrow: a plain unguarded mutation (no guard, no signature

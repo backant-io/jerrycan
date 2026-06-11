@@ -11,6 +11,31 @@
   ],
   "modules": [
     {
+      "name": "users",
+      "entities": [
+        { "name": "User", "fields": [
+          { "name": "id", "type": "integer" },
+          { "name": "email", "type": "string", "unique": true },
+          { "name": "password", "type": "string" },
+          { "name": "role", "type": "string", "values": ["admin", "user"] }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "register", "method": "POST", "path": "/register",
+          "public": true,
+          "request_body": { "entity": "User" },
+          "success": { "status": 201, "entity": "User" },
+          "errors": [
+            { "status": 409, "when": "email already registered" },
+            { "status": 422, "when": "request body fails validation" }
+          ] },
+        { "operation_id": "login", "method": "POST", "path": "/login",
+          "public": true,
+          "success": { "status": 200 },
+          "errors": [{ "status": 401, "when": "invalid email or password" }] }
+      ]
+    },
+    {
       "name": "workspaces",
       "entities": [
         { "name": "Workspace", "fields": [

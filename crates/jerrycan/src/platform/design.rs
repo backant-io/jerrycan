@@ -157,6 +157,11 @@ pub struct Endpoint {
     pub auth_required: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_roles: Vec<String>,
+    /// Genuinely public route (credential-issuing login/register, public
+    /// webhooks): exempt from JL0004 (unguarded-mutation) and from generated 401
+    /// tests. Validation forbids combining it with auth_required/required_roles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub public: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body: Option<RequestBody>,
     pub success: Success,
@@ -519,6 +524,35 @@ pub(crate) mod tests {
     fn method_enum_rejects_options() {
         let bad = MINIMAL.replace("\"GET\"", "\"OPTIONS\"");
         assert!(serde_json::from_str::<Design>(&bad).is_err());
+    }
+
+    #[test]
+    fn public_endpoint_flag_round_trips_defaults_false_and_skips_when_false() {
+        // A credential-issuing route declares itself public; the flag must
+        // survive a round trip (Task 9: JL0004 carve-out for login/register).
+        let pub_ep: Endpoint = serde_json::from_str(
+            r#"{ "operation_id": "register", "method": "POST", "path": "/register",
+                 "public": true, "success": { "status": 201 } }"#,
+        )
+        .unwrap();
+        assert!(pub_ep.public, "public: true must deserialize");
+        let back = serde_json::to_value(&pub_ep).unwrap();
+        assert_eq!(back["public"], serde_json::json!(true), "round trips");
+
+        // Default false when absent.
+        let plain: Endpoint = serde_json::from_str(
+            r#"{ "operation_id": "list", "method": "GET", "path": "/",
+                 "success": { "status": 200 } }"#,
+        )
+        .unwrap();
+        assert!(!plain.public, "absent public defaults to false");
+        // false is skipped on serialize (mirrors unique/index), so a non-public
+        // endpoint emits no `public` key.
+        let back = serde_json::to_value(&plain).unwrap();
+        assert!(
+            back.get("public").is_none(),
+            "public: false must be skipped on serialize: {back}"
+        );
     }
 
     #[test]

@@ -289,6 +289,11 @@
           },
           "description": "Roles (subset of auth.roles) required to call this endpoint. Non-empty implies auth_required."
         },
+        "public": {
+          "type": "boolean",
+          "default": false,
+          "description": "Genuinely public endpoints (credential-issuing login/register, public webhooks): exempt from the unguarded-mutation lint (JL0004) and generated 401 tests. Cannot combine with auth_required or required_roles."
+        },
         "request_body": {
           "type": "object",
           "additionalProperties": false,

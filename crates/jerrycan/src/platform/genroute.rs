@@ -1500,6 +1500,7 @@ mod tests {
             path: "/{id}/position/{slot}".into(),
             auth_required: false,
             required_roles: vec![],
+            public: false,
             request_body: None,
             success: Success {
                 status: 204,

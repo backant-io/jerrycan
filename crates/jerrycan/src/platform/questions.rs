@@ -496,6 +496,26 @@ fn validate_module(
                 ));
             }
         }
+        // `public` marks a genuinely unauthenticated route (login/register); it
+        // contradicts any guard. Flag the combination so a design can't claim both.
+        if ep.public && ep.auth_required {
+            qs.push(q(
+                eptr.clone(),
+                format!(
+                    "Endpoint `{}` is marked public but also auth_required — a public route is unauthenticated by design; drop one.",
+                    ep.operation_id
+                ),
+            ));
+        }
+        if ep.public && !ep.required_roles.is_empty() {
+            qs.push(q(
+                eptr.clone(),
+                format!(
+                    "Endpoint `{}` is marked public but declares required_roles — a public route is unauthenticated by design; drop the roles or the public flag.",
+                    ep.operation_id
+                ),
+            ));
+        }
     }
 
     for (i, sub) in m.subroutes.iter().enumerate() {
@@ -780,6 +800,41 @@ mod tests {
                 .any(|q| q.id.ends_with("/fields/3") && q.question.contains("derived")),
             "{:?}",
             validate(&d)
+        );
+    }
+
+    #[test]
+    fn public_endpoint_cannot_also_be_auth_required() {
+        // A public endpoint that also demands auth contradicts itself: `public`
+        // is the JL0004 carve-out for genuinely unauthenticated routes (login/
+        // register), so combining it with a guard is a design error. WHY (Rule 9):
+        // the flag exists to mark a route as needing NO credential — a guarded
+        // public route would silently re-trip the very lint it claims exemption from.
+        let mut v: serde_json::Value = serde_json::from_str(MINIMAL).unwrap();
+        v["modules"][0]["endpoints"][1]["public"] = serde_json::json!(true);
+        v["modules"][0]["endpoints"][1]["auth_required"] = serde_json::json!(true);
+        let d: Design = serde_json::from_value(v).unwrap();
+        let qs = validate(&d);
+        assert!(
+            qs.iter().any(|q| q.id == "/modules/0/endpoints/1"
+                && q.question.contains("public")
+                && q.question.contains("auth_required")),
+            "{qs:?}"
+        );
+    }
+
+    #[test]
+    fn public_endpoint_cannot_require_roles() {
+        let mut v: serde_json::Value = serde_json::from_str(MINIMAL).unwrap();
+        v["modules"][0]["endpoints"][2]["public"] = serde_json::json!(true);
+        // endpoints[2] (delete_todo) already declares required_roles: ["admin"].
+        let d: Design = serde_json::from_value(v).unwrap();
+        let qs = validate(&d);
+        assert!(
+            qs.iter().any(|q| q.id == "/modules/0/endpoints/2"
+                && q.question.contains("public")
+                && q.question.contains("required_roles")),
+            "{qs:?}"
         );
     }
 

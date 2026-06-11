@@ -888,7 +888,7 @@ fn kolli_slice_scaffold_passes_check() {
     // gen-tests for every top-level module — mirrors the binary invocation the
     // other heavy tests use. Each emits a failing acceptance suite (stubs).
     let mut expected_failing = 0usize;
-    for module in ["workspaces", "leads", "api-keys", "billing"] {
+    for module in ["users", "workspaces", "leads", "api-keys", "billing"] {
         let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
             .current_dir(&app)
             .args(["--json", "gen-tests", "--module", module])

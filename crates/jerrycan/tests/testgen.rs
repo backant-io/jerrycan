@@ -91,6 +91,70 @@ fn unsupported_error_cases_become_an_agent_todo_comment() {
     );
 }
 
+/// A PUBLIC endpoint in an auth design gets a success test but NO
+/// `_without_auth_is_401` test, and its request carries no session cookie. WHY
+/// (Rule 9): `public: true` marks a credential-issuing route (login/register)
+/// that is unauthenticated BY DESIGN — generating a 401 test or threading a
+/// cookie would assert the opposite of the contract (fix F1).
+#[test]
+fn public_endpoints_get_no_401_test_and_no_cookie() {
+    // An auth design (so guarded endpoints would normally get cookies + 401
+    // tests) with one PUBLIC register POST and one ordinary guarded POST.
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "auth-api",
+        "contract_version": 1,
+        "auth": { "model": "jwt", "roles": ["admin"] },
+        "dependencies": ["auth"],
+        "modules": [{
+            "name": "accounts",
+            "entities": [{ "name": "User", "fields": [
+                { "name": "email", "type": "string" },
+                { "name": "password", "type": "string" }
+            ]}],
+            "endpoints": [
+                { "operation_id": "register", "method": "POST", "path": "/register",
+                  "public": true,
+                  "request_body": { "entity": "User" },
+                  "success": { "status": 201, "entity": "User" } },
+                { "operation_id": "create_account", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "User" },
+                  "success": { "status": 201, "entity": "User" } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let module = &design.modules[0];
+    let generated = testgen::acceptance_rs(&design, module);
+
+    // The public register route still gets its success test...
+    assert!(
+        generated.contains("async fn register_returns_201"),
+        "public route still gets a success test: {generated}"
+    );
+    // ...but NO 401 test (it is unauthenticated by design)...
+    assert!(
+        !generated.contains("register_without_auth_is_401"),
+        "public route must NOT get a 401 test: {generated}"
+    );
+    // ...and its request uses the plain (cookie-less) verb.
+    assert!(
+        generated.contains("t.post_json(\"/accounts/register\""),
+        "public route request must carry no cookie: {generated}"
+    );
+
+    // The ordinary guarded endpoint still gets BOTH a cookied success request
+    // and a 401 test — the carve-out is narrow to public routes.
+    assert!(
+        generated.contains("create_account_without_auth_is_401"),
+        "a guarded route still gets its 401 test: {generated}"
+    );
+    assert!(
+        generated.contains("t.post_json_with(\"/accounts/\""),
+        "a guarded route still threads the cookie: {generated}"
+    );
+}
+
 /// A tenant-owned module's guarded handlers take `Dep<Tenant>`; the generated
 /// test app must register the `tenant` factory and SEED a membership row, or the
 /// guard 403s every guarded request (a false stub-test failure). WHY this matters:
