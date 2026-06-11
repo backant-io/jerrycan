@@ -12,7 +12,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 homepage = "https://jerrycan.cc"
@@ -21,12 +21,12 @@ authors = ["Pavel Hegler"]
 rust-version = "1.85"
 
 [workspace.dependencies]
-jerrycan-core = { path = "crates/jerrycan-core", version = "0.1.0" }
-jerrycan-macros = { path = "crates/jerrycan-macros", version = "0.1.0" }
-jerrycan-db = { path = "crates/jerrycan-db", version = "0.1.0" }
-jerrycan-validate = { path = "crates/jerrycan-validate", version = "0.1.0" }
-jerrycan-auth = { path = "crates/jerrycan-auth", version = "0.1.0" }
-jerrycan-observe = { path = "crates/jerrycan-observe", version = "0.1.0" }
+jerrycan-core = { path = "crates/jerrycan-core", version = "0.2.0" }
+jerrycan-macros = { path = "crates/jerrycan-macros", version = "0.2.0" }
+jerrycan-db = { path = "crates/jerrycan-db", version = "0.2.0" }
+jerrycan-validate = { path = "crates/jerrycan-validate", version = "0.2.0" }
+jerrycan-auth = { path = "crates/jerrycan-auth", version = "0.2.0" }
+jerrycan-observe = { path = "crates/jerrycan-observe", version = "0.2.0" }
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 hmac = "0.12"

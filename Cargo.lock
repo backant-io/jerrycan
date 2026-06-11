@@ -1001,7 +1001,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jerrycan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "jerrycan-auth",
@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "jerrycan-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "base64",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "jerrycan-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "jerrycan-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jerrycan-core",
  "sea-query",
@@ -1063,11 +1063,11 @@ dependencies = [
 
 [[package]]
 name = "jerrycan-macros"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "jerrycan-observe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jerrycan-core",
  "tokio",
@@ -1077,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "jerrycan-validate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jerrycan-core",
  "serde",

@@ -24,7 +24,10 @@ pub fn jerrycan_dep_spec(features: &[&str]) -> String {
 
 pub(crate) fn jerrycan_dep_spec_from(env: Option<String>) -> String {
     env.unwrap_or_else(|| {
-        "jerrycan = { version = \"0.1.0\", default-features = false }".to_string()
+        format!(
+            "jerrycan = {{ version = \"{}\", default-features = false }}",
+            env!("CARGO_PKG_VERSION")
+        )
     })
 }
 
@@ -215,7 +218,10 @@ mod tests {
         let default = jerrycan_dep_spec_from(None);
         assert_eq!(
             default,
-            "jerrycan = { version = \"0.1.0\", default-features = false }"
+            format!(
+                "jerrycan = {{ version = \"{}\", default-features = false }}",
+                env!("CARGO_PKG_VERSION")
+            )
         );
         let local = jerrycan_dep_spec_from(Some(
             "jerrycan = { path = \"/x\", default-features = false }".into(),
