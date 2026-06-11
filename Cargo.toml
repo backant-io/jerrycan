@@ -34,7 +34,7 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres"] }
-sea-orm = { version = "1", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "macros"] }
+sea-orm = { version = "1", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "macros", "with-json"] }
 sea-query = { version = "0.32", default-features = false, features = ["backend-sqlite", "backend-postgres"] }
 sea-query-binder = { version = "0.7", default-features = false, features = ["sqlx-any"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }

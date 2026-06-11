@@ -580,7 +580,7 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool) -> Option<String> {
             FieldType::String | FieldType::Datetime | FieldType::Uuid => c.text(),
             FieldType::Integer | FieldType::Boolean => c.big_integer(),
             FieldType::Float => c.double(),
-            FieldType::Json => c.text(), // unreachable: validated out in db mode
+            FieldType::Json => c.text(), // json is stored as a text column on both backends
         }
     }
     let mut out = String::new();
@@ -737,7 +737,7 @@ fn module_body(m: &ModuleDesign, indent: &str, mode: GenMode) -> String {
         if mode.db {
             body.push_str(&format!(
                 "{indent}    .provide_dep(repo::{}_repo)\n",
-                e.name.to_lowercase()
+                Design::to_snake(&e.name)
             ));
         } else {
             body.push_str(&format!(
@@ -1189,6 +1189,36 @@ mod tests {
             "agent hook must wrap the module: {lib}"
         );
         assert!(lib.contains("#![forbid(unsafe_code)]"));
+    }
+
+    /// A multi-word entity name (`ApiKey`) must wire the same snake_case repo
+    /// factory in lib.rs that repo.rs actually defines. The repo factory is named
+    /// `{to_snake(name)}_repo` (`api_key_repo`); lib.rs's `.provide_dep` must point
+    /// at that exact path. A `to_lowercase` here would emit `apikey_repo`, which
+    /// resolves to nothing → E0425 at compile. (WHY: db DI is by-path, so the
+    /// reference and the definition must agree letter-for-letter.)
+    #[test]
+    fn db_repo_factory_name_matches_for_multi_word_entities() {
+        let mut d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let api_key: Entity = serde_json::from_str(
+            r#"{ "name": "ApiKey", "fields": [{ "name": "token", "type": "string" }] }"#,
+        )
+        .unwrap();
+        d.modules[1].entities.push(api_key);
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let lib = lib_rs(&d.modules[1], mode);
+        assert!(
+            lib.contains(".provide_dep(repo::api_key_repo)"),
+            "lib.rs must reference the snake_case repo factory: {lib}"
+        );
+        let repo = repo_rs(&d.modules[1], mode, &d).unwrap();
+        assert!(
+            repo.contains("pub(crate) async fn api_key_repo("),
+            "repo.rs must define the snake_case repo factory: {repo}"
+        );
     }
 
     #[test]
