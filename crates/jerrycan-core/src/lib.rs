@@ -30,7 +30,7 @@ pub use response::{
     BodyError, BodySender, Created, IntoResponse, JcBody, Json, NoContent, Response, StreamBody,
 };
 pub use router::{MethodRouter, delete, get, patch, post, put};
-pub use test_client::{TestApp, TestResponse};
+pub use test_client::{TestApp, TestPart, TestResponse};
 
 /// Re-exported so apps and tests never add `http` to their own Cargo.toml.
 pub use http;
@@ -40,6 +40,6 @@ pub mod prelude {
     pub use crate::{
         App, Clock, Created, Dep, Error, Extension, Headers, IntoResponse, Json, Middleware,
         MiddlewareFuture, Module, Multipart, Next, NoContent, Path, Query, RawBody, RequestCtx,
-        Result, StreamBody, TestApp, delete, get, patch, post, put,
+        Result, StreamBody, TestApp, TestPart, delete, get, patch, post, put,
     };
 }

@@ -293,6 +293,9 @@ pub(crate) const DEFAULT_PART_CAP: usize = 8 * 1024 * 1024;
 /// any unread remainder of the previous part. Requires
 /// `content-type: multipart/form-data` with a valid boundary — anything else is
 /// `415 JC0415`.
+///
+/// Single-consumer: the extractor takes ownership of the body, so extracting it
+/// twice in one handler is a programming error (500 on stream routes).
 pub struct Multipart {
     parser: Parser,
     source: Option<StreamLane>,
