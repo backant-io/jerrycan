@@ -481,4 +481,35 @@ mod tests {
         let err = c.drain_body().await.err().unwrap();
         assert_eq!(err.code(), "JC0413");
     }
+
+    #[tokio::test]
+    async fn limit_trips_through_the_timed_recv_wrapper_still_map_to_413() {
+        // The serve-time lane wraps `Limited` in `TimedRecvBody` (the per-frame
+        // read-deadline guard); only the unwrapped `Limited` is covered above.
+        // If `TimedRecvBody`'s `map_err(Into::into)` ever double-boxed the
+        // error, `downcast_ref::<LengthLimitError>()` in `map_stream_error`
+        // would miss it and 413s would silently degrade to 400s. Build the
+        // exact serve.rs lane shape and assert the cap still maps to 413.
+        use crate::serve::TimedRecvBody;
+        use http_body_util::BodyExt;
+        use http_body_util::combinators::UnsyncBoxBody;
+        use std::time::Duration;
+
+        let req = http::Request::builder().uri("/up").body(()).unwrap();
+        let (parts, ()) = req.into_parts();
+        let over_limit_body = http_body_util::Full::<Bytes>::new(Bytes::from_static(&[b'x'; 200]))
+            .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} });
+        let lane: StreamLane = UnsyncBoxBody::new(TimedRecvBody::new(
+            http_body_util::Limited::new(over_limit_body, 64),
+            Duration::from_secs(5),
+        ));
+        let mut c = RequestCtx::with_lane(
+            parts,
+            BodyLane::Stream(Some(lane)),
+            DepResolver::new(Arc::new(DepEnv::default()), Default::default()),
+        );
+        let err = c.drain_body().await.err().unwrap();
+        assert_eq!(err.code(), "JC0413");
+        assert_eq!(err.status().as_u16(), 413);
+    }
 }
