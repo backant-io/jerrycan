@@ -74,6 +74,33 @@ fn mcp_lists_ten_tools_including_schema() {
     assert!(r.contains("jerrycan_schema"), "{r}");
 }
 
+#[test]
+fn oversized_line_gets_minus_32600_and_server_keeps_serving() {
+    // A single 17 MiB line exceeds the 16 MiB stdio cap. The server must answer
+    // with a JSON-RPC -32600 error and then keep serving the next request,
+    // rather than silently truncating or exiting (the 0.1.0 audit finding).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut c = McpClient::start_in(tmp.path());
+
+    let oversized = "x".repeat(17 * 1024 * 1024);
+    writeln!(c.stdin, "{oversized}").unwrap();
+
+    let mut line = String::new();
+    c.stdout.read_line(&mut line).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["error"]["code"], -32600, "{v}");
+    assert!(v["id"].is_null(), "oversized error carries a null id: {v}");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("16 MiB"),
+        "{v}"
+    );
+
+    // Server survived: a normal request still works.
+    let pong = c.request("ping", serde_json::json!({}));
+    assert!(pong.as_object().unwrap().is_empty());
+    c.shutdown();
+}
+
 const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.json");
 
 #[test]

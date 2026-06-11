@@ -10,11 +10,99 @@ pub const CONTRACTS: &str = include_str!("../../embedded/contracts/mcp-tools.jso
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Hard cap on a single MCP stdio line. A 16 MiB request is already absurd for
+/// JSON-RPC; anything larger is treated as hostile/buggy input, not a payload.
+pub(crate) const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The fixed JSON-RPC reply for an oversized line. Hand-written rather than
+/// built via serde so it stays a single allocation-free literal.
+const OVERSIZED_RESPONSE: &str = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"request too large (line exceeds 16 MiB)"}}"#;
+
+/// Read one newline-terminated message with a hard size cap, layering the four
+/// outcomes so the caller can branch on each:
+///
+/// * `None` — EOF, no more messages.
+/// * `Some(Err(_))` — I/O error from the underlying reader.
+/// * `Some(Ok(Err(())))` — the line exceeded `max`; it has already been drained
+///   up to (and including) its terminating newline, so the stream stays aligned
+///   for the next call.
+/// * `Some(Ok(Ok(line)))` — a complete line (newline stripped), decoded lossily
+///   so invalid UTF-8 lands in `handle_message` as a -32700 parse error rather
+///   than aborting the loop.
+pub(crate) fn read_message(
+    reader: &mut impl BufRead,
+    max: usize,
+) -> Option<std::io::Result<Result<String, ()>>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    let mut saw_any = false;
+
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Some(Err(e)),
+        };
+        if available.is_empty() {
+            // True EOF: nothing buffered and no bytes seen at all this call.
+            if !saw_any {
+                return None;
+            }
+            // EOF with a trailing, unterminated final line. Honor it like
+            // `lines()` does: return what we have (or the overflow marker).
+            break;
+        }
+        saw_any = true;
+
+        match available.iter().position(|&b| b == b'\n') {
+            Some(nl) => {
+                if !overflowed {
+                    if buf.len() + nl > max {
+                        overflowed = true;
+                    } else {
+                        buf.extend_from_slice(&available[..nl]);
+                    }
+                }
+                reader.consume(nl + 1); // include the newline
+                break;
+            }
+            None => {
+                let len = available.len();
+                if !overflowed {
+                    if buf.len() + len > max {
+                        // Stop storing; keep draining until the newline so the
+                        // stream realigns for the next read.
+                        overflowed = true;
+                    } else {
+                        buf.extend_from_slice(available);
+                    }
+                }
+                reader.consume(len);
+            }
+        }
+    }
+
+    if overflowed {
+        return Some(Ok(Err(())));
+    }
+    Some(Ok(Ok(String::from_utf8_lossy(&buf).into_owned())))
+}
+
 pub fn serve_stdio() -> Result<(), String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|e| e.to_string())?;
+    let mut reader = stdin.lock();
+    while let Some(outcome) = read_message(&mut reader, MAX_LINE_BYTES) {
+        let line = match outcome.map_err(|e| e.to_string())? {
+            Ok(line) => line,
+            Err(()) => {
+                // Fail loud but keep serving: emit a JSON-RPC error and read on.
+                let mut out = stdout.lock();
+                writeln!(out, "{OVERSIZED_RESPONSE}").map_err(|e| e.to_string())?;
+                out.flush().map_err(|e| e.to_string())?;
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -104,4 +192,66 @@ pub fn handle_message(line: &str) -> Option<String> {
         }
     };
     Some(rpc_result(id, result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn reads_a_normal_small_line() {
+        let mut r = Cursor::new(b"hello world\n".to_vec());
+        let got = read_message(&mut r, MAX_LINE_BYTES)
+            .expect("not EOF")
+            .expect("no io error")
+            .expect("not oversized");
+        assert_eq!(got, "hello world");
+    }
+
+    #[test]
+    fn oversized_line_is_marked_then_stream_realigns() {
+        // A 17 MiB line (over the 16 MiB cap) followed by a normal one. The
+        // first read must report oversized; the second must yield the normal
+        // line intact, proving the oversized line was drained to its newline.
+        let big = vec![b'x'; 17 * 1024 * 1024];
+        let mut bytes = big;
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"after\n");
+        let mut r = Cursor::new(bytes);
+
+        let first = read_message(&mut r, MAX_LINE_BYTES)
+            .expect("not EOF")
+            .expect("no io error");
+        assert_eq!(first, Err(()), "oversized line is marked, not stored");
+
+        let second = read_message(&mut r, MAX_LINE_BYTES)
+            .expect("not EOF")
+            .expect("no io error")
+            .expect("not oversized");
+        assert_eq!(second, "after", "stream realigned past the oversized line");
+    }
+
+    #[test]
+    fn eof_yields_none() {
+        let mut r = Cursor::new(Vec::<u8>::new());
+        assert!(read_message(&mut r, MAX_LINE_BYTES).is_none());
+    }
+
+    #[test]
+    fn line_exactly_at_cap_is_accepted() {
+        // Boundary: a line of exactly `max` content bytes must NOT be rejected.
+        let max = 8;
+        let mut r = Cursor::new(b"01234567\nok\n".to_vec());
+        let first = read_message(&mut r, max)
+            .expect("not EOF")
+            .expect("no io error")
+            .expect("a line exactly at the cap is allowed");
+        assert_eq!(first, "01234567");
+        let second = read_message(&mut r, max)
+            .expect("not EOF")
+            .expect("no io error")
+            .expect("not oversized");
+        assert_eq!(second, "ok");
+    }
 }
