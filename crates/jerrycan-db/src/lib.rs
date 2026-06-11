@@ -411,6 +411,39 @@ mod tests {
         assert!(applied.is_empty());
     }
 
+    /// The transaction idiom is the framework's atomicity guarantee: a closure
+    /// returning `Err` must roll back EVERY statement it issued, leaving no
+    /// partial writes. If this fails, the sea-orm feature set is wrong — fix the
+    /// Cargo features, never weaken the test.
+    #[tokio::test]
+    async fn transactions_roll_back_on_error() {
+        use sea_orm::TransactionTrait;
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        db.conn()
+            .execute_unprepared("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let r = db
+            .conn()
+            .transaction::<_, (), sea_orm::DbErr>(|txn| {
+                Box::pin(async move {
+                    txn.execute_unprepared("INSERT INTO t VALUES (1)").await?;
+                    Err(sea_orm::DbErr::Custom("boom".into()))
+                })
+            })
+            .await;
+        assert!(r.is_err());
+        let rows = db
+            .conn()
+            .query_all(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT id FROM t",
+            ))
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "rollback must leave no rows");
+    }
+
     #[tokio::test]
     async fn a_failing_migration_surfaces_jc0510_and_is_not_recorded() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
