@@ -138,6 +138,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         fix: "set auth_required: true or required_roles on the endpoint",
         doc: "jerrycan docs auth",
     },
+    CodeInfo {
+        code: "JL0006",
+        title: "cross-tenant data access",
+        cause: "a handler for a tenant-owned entity used an unscoped repo method (all/get/remove), so it can read or delete another tenant's rows",
+        fix: "call the tenant-scoped accessor (all_for/get_for/remove_for) with the current tenant's id",
+        doc: "jerrycan docs database",
+    },
 ];
 
 /// Look up a code, case-insensitively.

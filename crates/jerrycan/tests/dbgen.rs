@@ -28,22 +28,34 @@ fn db_mode_emits_sql_repos_with_di_factories() {
         repo.contains("pub(crate) async fn todo_repo(db: Dep<Db>)"),
         "{repo}"
     );
-    // All SQL is built by sea-query (dialect rendering is library-owned):
-    // no raw SQL strings or escaped-quote templates in generated repos.
+    // Repos run on SeaORM through the jerrycan facade (NO direct sea-orm dep,
+    // NO sea-query/sqlx). The alias lets the bodies write bare `sea_orm::` paths.
     assert!(
-        repo.contains("use jerrycan::db::sea_query::{Alias, Expr, Order, Query};"),
-        "{repo}"
+        repo.contains("use jerrycan::db::sea_orm;"),
+        "facade alias resolves bare sea_orm:: paths: {repo}"
     );
+    assert!(
+        repo.contains("todo::Entity::find()") && repo.contains(".all(self.db.conn())"),
+        "reads go through SeaORM entity finders: {repo}"
+    );
+    // No raw SQL strings, no sea-query builders, no sqlx pool: the dialect work
+    // is library-owned inside SeaORM.
     assert!(
         !repo.contains("SELECT ") && !repo.contains("self.db.sql("),
         "no raw SQL strings in generated repos: {repo}"
     );
-    // One insert path for both backends: sea-query renders RETURNING; the
-    // sqlx Any driver's last_insert_id is None on sqlite, so it must never
-    // be relied on (it made creates echo id 0).
     assert!(
-        repo.contains("Query::returning().columns([Alias::new(\"id\")])"),
-        "insert uses RETURNING: {repo}"
+        !repo.contains("build_any_sqlx")
+            && !repo.contains("self.db.pool()")
+            && !repo.contains("sea_query"),
+        "repos are SeaORM now, not sea-query/sqlx: {repo}"
+    );
+    // Synthetic pk → the DB assigns the autoincrement id (NotSet on insert), and
+    // the inserted Model carries it back; never the sqlx Any last_insert_id (None
+    // on sqlite, which made creates echo id 0).
+    assert!(
+        repo.contains("id: sea_orm::ActiveValue::NotSet,"),
+        "synthetic pk is DB-assigned on insert: {repo}"
     );
     assert!(
         !repo.contains(".last_insert_id()"),
@@ -54,8 +66,8 @@ fn db_mode_emits_sql_repos_with_di_factories() {
         "PUT/PATCH handlers need a persisting update: {repo}"
     );
     assert!(
-        repo.contains("(Alias::new(\"title\"), item.title.into()), (Alias::new(\"done\"), (item.done as i64).into())"),
-        "update sets every non-pk field: {repo}"
+        repo.contains("title: Set(item.title),") && repo.contains("done: Set(item.done),"),
+        "update sets every non-pk field via the ActiveModel: {repo}"
     );
     assert!(repo.contains("map_err(db_error)"), "{repo}");
     let lib = fs::read_to_string(root.join("crates/routes/todos/src/lib.rs")).unwrap();

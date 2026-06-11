@@ -374,80 +374,102 @@ fn table_name(entity: &str) -> String {
     format!("{}s", entity.to_lowercase())
 }
 
-/// `Alias::new("col"), …` for the generated repo's column list — sea-query
-/// owns identifier quoting per dialect, so no escaped-quote SQL templates.
-fn alias_cols(e: &Entity) -> String {
-    e.fields
-        .iter()
-        .map(|f| format!("Alias::new(\"{}\")", f.name))
-        .collect::<Vec<_>>()
-        .join(", ")
+/// The Model field names in struct order — the order `model_rs_db` emits and
+/// the order an ActiveModel literal must set them: pk `id`, then fk columns (in
+/// belongs_to order), then the declared non-id fields. Used to build the
+/// `field: Set(item.field)` lists so they stay in lockstep with the model.
+fn model_field_names(e: &Entity) -> Vec<String> {
+    let mut names = vec!["id".to_string()];
+    for b in &e.belongs_to {
+        names.push(Design::fk_column(&b.entity));
+    }
+    for f in e.fields.iter().filter(|f| f.name != "id") {
+        names.push(f.name.clone());
+    }
+    names
 }
 
-fn row_constructor(e: &Entity) -> String {
-    let fields = e
-        .fields
-        .iter()
-        .map(|f| {
-            // Booleans are stored as integers (see `column_type`): sqlx `Any`
-            // can't decode a SQLite `bool`, so read the i64 column and compare.
-            if f.field_type == FieldType::Boolean {
-                format!("{name}: row.get::<i64, _>(\"{name}\") != 0", name = f.name)
-            } else {
-                format!("{name}: row.get(\"{name}\")", name = f.name)
+/// ActiveModel field assignments, one per line. `item` is consumed, so values
+/// move in (no clones). A synthetic pk (no declared `id`) is `NotSet` so the
+/// DB assigns the autoincrement id; a declared pk is `Set` from the item.
+/// `with_id == false` omits the id line (the update path sets it explicitly).
+fn active_sets(e: &Entity, with_id: bool) -> String {
+    let indent = "            ";
+    let mut out = String::new();
+    for name in model_field_names(e) {
+        if name == "id" {
+            if !with_id {
+                continue;
             }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{} {{ {fields} }}", e.name)
-}
-
-/// One `SimpleExpr` per field for INSERT values, in column order. Booleans
-/// ride as i64 (sqlx `Any` binds a Rust `bool` with SQLite's `Bool` type
-/// info, which it then can't read back).
-fn value_exprs(e: &Entity) -> String {
-    e.fields
-        .iter()
-        .map(|f| {
-            if f.field_type == FieldType::Boolean {
-                format!("(item.{} as i64).into()", f.name)
+            if declared_id(e).is_some() {
+                out.push_str(&format!("{indent}id: Set(item.id),\n"));
             } else {
-                format!("item.{}.into()", f.name)
+                out.push_str(&format!("{indent}id: sea_orm::ActiveValue::NotSet,\n"));
             }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+        } else {
+            out.push_str(&format!("{indent}{name}: Set(item.{name}),\n"));
+        }
+    }
+    out
 }
 
-/// `(Alias, SimpleExpr)` pairs for UPDATE SET — every field except the pk.
-fn update_pairs(e: &Entity) -> String {
-    e.fields
-        .iter()
-        .filter(|f| f.name != "id")
-        .map(|f| {
-            if f.field_type == FieldType::Boolean {
-                format!(
-                    "(Alias::new(\"{n}\"), (item.{n} as i64).into())",
-                    n = f.name
-                )
-            } else {
-                format!("(Alias::new(\"{n}\"), item.{n}.into())", n = f.name)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn sql_repo(e: &Entity) -> String {
+/// Tenant-scoped accessors for an entity that belongs_to the design's tenancy
+/// entity (empty otherwise). Keyed on the fk column so a tenant can only reach
+/// its own rows: `all_for` filters the fk, `get_for` adds the id, `remove_for`
+/// deletes on both. Param name = fk column; param type = the tenant pk type.
+fn scoped_methods(e: &Entity, design: &Design) -> String {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return String::new();
+    };
+    if !e.belongs_to.iter().any(|b| b.entity == tenancy.entity) {
+        return String::new();
+    }
     let entity = &e.name;
-    let snake = entity.to_lowercase();
-    let table = table_name(entity);
-    let n_cols = e.fields.len();
-    let cols = alias_cols(e);
-    let values = value_exprs(e);
-    let set_pairs = update_pairs(e);
-    let ctor = row_constructor(e);
+    let snake = Design::to_snake(entity);
+    let fk_col = Design::fk_column(&tenancy.entity);
+    let fk_pascal = col_pascal(&fk_col);
+    let fk_ty = design.target_key_rust_type(&tenancy.entity);
     let key = key_rust_type(e);
+    format!(
+        r#"
+    // Tenant-scoped accessors — handlers must use these for tenant-owned data (JL0006).
+    pub async fn all_for(&self, {fk_col}: {fk_ty}) -> Result<Vec<{entity}>> {{
+        {snake}::Entity::find()
+            .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
+            .order_by_asc({snake}::Column::Id)
+            .all(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}
+
+    pub async fn get_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<Option<{entity}>> {{
+        {snake}::Entity::find_by_id(id)
+            .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}
+
+    pub async fn remove_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<bool> {{
+        let r = {snake}::Entity::delete_many()
+            .filter({snake}::Column::Id.eq(id))
+            .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
+            .exec(self.db.conn())
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected > 0)
+    }}
+"#
+    )
+}
+
+fn sql_repo(e: &Entity, design: &Design) -> String {
+    let entity = &e.name;
+    let snake = Design::to_snake(entity);
+    let key = key_rust_type(e);
+    let insert_sets = active_sets(e, true);
+    let update_sets = active_sets(e, false);
+    let scoped = scoped_methods(e, design);
     format!(
         r#"pub struct {entity}Repo {{
     db: Db,
@@ -461,98 +483,82 @@ pub(crate) async fn {snake}_repo(db: Dep<Db>) -> Result<{entity}Repo> {{
 // Stub handlers don't call the repo yet; remove this allow as you implement them.
 #[allow(dead_code)]
 impl {entity}Repo {{
-    fn table() -> Alias {{
-        Alias::new("{table}")
-    }}
-
-    fn cols() -> [Alias; {n_cols}] {{
-        [{cols}]
-    }}
-
     pub async fn all(&self) -> Result<Vec<{entity}>> {{
-        let (sql, values) = Query::select()
-            .columns(Self::cols())
-            .from(Self::table())
-            .order_by(Alias::new("id"), Order::Asc)
-            .build_any_sqlx(self.db.query_builder());
-        let rows = jerrycan::db::sqlx::query_with(&sql, values)
-            .fetch_all(self.db.pool())
+        {snake}::Entity::find()
+            .order_by_asc({snake}::Column::Id)
+            .all(self.db.conn())
             .await
-            .map_err(db_error)?;
-        Ok(rows.into_iter().map(|row| {ctor}).collect())
+            .map_err(db_error)
     }}
 
     pub async fn get(&self, id: {key}) -> Result<Option<{entity}>> {{
-        let (sql, values) = Query::select()
-            .columns(Self::cols())
-            .from(Self::table())
-            .and_where(Expr::col(Alias::new("id")).eq(id))
-            .build_any_sqlx(self.db.query_builder());
-        let row = jerrycan::db::sqlx::query_with(&sql, values)
-            .fetch_optional(self.db.pool())
+        {snake}::Entity::find_by_id(id)
+            .one(self.db.conn())
             .await
-            .map_err(db_error)?;
-        Ok(row.map(|row| {ctor}))
+            .map_err(db_error)
     }}
 
     pub async fn insert(&self, item: {entity}) -> Result<{key}> {{
-        // sea-query renders RETURNING for both backends; never last_insert_id
-        // (the sqlx `Any` driver returns None for it on sqlite).
-        let (sql, values) = Query::insert()
-            .into_table(Self::table())
-            .columns(Self::cols())
-            .values_panic([{values}])
-            .returning(Query::returning().columns([Alias::new("id")]))
-            .build_any_sqlx(self.db.query_builder());
-        let row = jerrycan::db::sqlx::query_with(&sql, values)
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db_error)?;
-        Ok(row.get("id"))
+        let row = {snake}::ActiveModel {{
+{insert_sets}        }}
+        .insert(self.db.conn())
+        .await
+        .map_err(db_error)?;
+        Ok(row.id)
     }}
 
     pub async fn remove(&self, id: {key}) -> Result<bool> {{
-        let (sql, values) = Query::delete()
-            .from_table(Self::table())
-            .and_where(Expr::col(Alias::new("id")).eq(id))
-            .build_any_sqlx(self.db.query_builder());
-        let result = jerrycan::db::sqlx::query_with(&sql, values)
-            .execute(self.db.pool())
+        let r = {snake}::Entity::delete_by_id(id)
+            .exec(self.db.conn())
             .await
             .map_err(db_error)?;
-        Ok(result.rows_affected() > 0)
+        Ok(r.rows_affected > 0)
     }}
 
     pub async fn update(&self, id: {key}, item: {entity}) -> Result<bool> {{
-        let (sql, values) = Query::update()
-            .table(Self::table())
-            .values([{set_pairs}])
-            .and_where(Expr::col(Alias::new("id")).eq(id))
-            .build_any_sqlx(self.db.query_builder());
-        let result = jerrycan::db::sqlx::query_with(&sql, values)
-            .execute(self.db.pool())
-            .await
-            .map_err(db_error)?;
-        Ok(result.rows_affected() > 0)
+        let m = {snake}::ActiveModel {{
+            id: Set(id),
+{update_sets}        }};
+        match m.update(self.db.conn()).await {{
+            Ok(_) => Ok(true),
+            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
+            Err(e) => Err(db_error(e)),
+        }}
     }}
-}}
+{scoped}}}
 
 "#,
     )
 }
 
-pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode) -> Option<String> {
+pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Option<String> {
     if m.entities.is_empty() {
         return None;
     }
     if !mode.db {
         return Some(memory_repo_rs(m));
     }
-    let mut out = String::from(
-        "//! Data access — sea-query builders over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sea_query::{Alias, Expr, Order, Query};\nuse jerrycan::db::sea_query_binder::SqlxBinder;\nuse jerrycan::db::sqlx::Row;\nuse jerrycan::db::{db_error, Db};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
+    // `ColumnTrait`/`QueryFilter` back the `.filter(Column::Fk.eq(..))` calls in
+    // the tenant-scoped accessors only; a module with no tenant-owned entity must
+    // not import them or it trips `-D warnings` on otherwise-untouched generated
+    // code. Everything else (find/insert/update + order_by) is always used.
+    let has_scoped = m
+        .entities
+        .iter()
+        .any(|e| !scoped_methods(e, design).is_empty());
+    let filter_imports = if has_scoped {
+        "ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder"
+    } else {
+        "ActiveModelTrait, ActiveValue::Set, EntityTrait, QueryOrder"
+    };
+    // The `use jerrycan::db::sea_orm;` alias resolves the bare `sea_orm::` paths
+    // the repo writes (DbErr, ActiveValue::NotSet); the trait imports come through
+    // the same facade so generated crates carry NO direct sea-orm dependency.
+    let mut out = format!(
+        "//! Data access — SeaORM over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sea_orm;\nuse jerrycan::db::sea_orm::{{{filter_imports}}};\nuse jerrycan::db::{{db_error, Db}};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
     );
     for e in &m.entities {
-        out.push_str(&sql_repo(e));
+        out.push_str(&sql_repo(e, design));
     }
     Some(out)
 }
@@ -867,7 +873,7 @@ fn write_unit_files(
     if let Some(model) = model {
         write_agent_owned(&dir.join("model.rs"), &model, created, root)?;
     }
-    if let Some(repo) = repo_rs(m, mode) {
+    if let Some(repo) = repo_rs(m, mode, design) {
         write_agent_owned(&dir.join("repo.rs"), &repo, created, root)?;
     }
     Ok(())
@@ -1050,6 +1056,67 @@ mod tests {
         );
     }
 
+    /// db-mode repos run on SeaORM (entity finders + ActiveModel) over the
+    /// jerrycan::db facade — never sea-query/sqlx and never `self.db.pool()`
+    /// (that handle no longer exists). The insert returns the generated key.
+    #[test]
+    fn db_repos_query_via_sea_orm() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let src = repo_rs(
+            &d.modules[1],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(src.contains("lead::Entity::find()"), "{src}");
+        assert!(src.contains(".all(self.db.conn())"), "{src}");
+        assert!(
+            src.contains("pub async fn insert(&self, item: Lead) -> Result<i64>"),
+            "{src}"
+        );
+        assert!(!src.contains("self.db.pool()"), "{src}");
+        assert!(
+            !src.contains("build_any_sqlx"),
+            "repos are SeaORM now: {src}"
+        );
+    }
+
+    /// An entity that belongs_to the design's tenancy entity gains tenant-scoped
+    /// accessors keyed on the fk column — handlers must use these so a tenant
+    /// can never read or delete another tenant's rows (JL0006).
+    #[test]
+    fn tenant_owned_entities_get_scoped_methods() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let src = repo_rs(
+            &d.modules[1],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains("pub async fn all_for(&self, workspace_id: i64)"),
+            "{src}"
+        );
+        assert!(
+            src.contains("pub async fn get_for(&self, workspace_id: i64, id: i64)"),
+            "{src}"
+        );
+        assert!(
+            src.contains("pub async fn remove_for(&self, workspace_id: i64, id: i64)"),
+            "{src}"
+        );
+        assert!(
+            src.contains("Column::WorkspaceId.eq(workspace_id)"),
+            "{src}"
+        );
+    }
+
     #[test]
     fn handler_signatures_follow_the_mapping_rules() {
         let m = todos();
@@ -1134,7 +1201,7 @@ mod tests {
             model.contains("#[serde(default)]\n    pub done: bool"),
             "{model}"
         );
-        let repo = repo_rs(&m, GenMode::default()).unwrap();
+        let repo = repo_rs(&m, GenMode::default(), &demo()).unwrap();
         assert!(repo.contains("pub struct TodoRepo"));
         assert!(
             repo.contains("#[allow(dead_code)]"),
@@ -1253,6 +1320,7 @@ mod tests {
                 db: true,
                 ..GenMode::default()
             },
+            &demo(),
         )
         .unwrap();
         assert!(
@@ -1274,7 +1342,7 @@ mod tests {
         let m = todos();
         let sub = &m.subroutes[0];
         assert!(model_rs(sub).is_none());
-        assert!(repo_rs(sub, GenMode::default()).is_none());
+        assert!(repo_rs(sub, GenMode::default(), &demo()).is_none());
         let h = handlers_rs(sub, GenMode::default());
         assert!(
             h.contains("pub(crate) async fn list_comments() -> Result<Json<serde_json::Value>>"),
