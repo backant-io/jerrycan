@@ -214,7 +214,16 @@ impl TestApp {
         headers: &[(&str, &str)],
     ) -> TestResponse {
         let mut builder = http::Request::builder().method(method).uri(path);
-        if let Some(ct) = content_type {
+        // Apply the helper's default content-type only when the explicit headers
+        // don't already set one — otherwise an explicit `content-type` (e.g. a
+        // `multipart/form-data` boundary) would be shadowed by the default, since
+        // `HeaderMap::get` returns the first value inserted.
+        let explicit_ct = headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+        if let Some(ct) = content_type
+            && !explicit_ct
+        {
             builder = builder.header(header::CONTENT_TYPE, ct);
         }
         for (name, value) in headers {

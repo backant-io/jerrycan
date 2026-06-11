@@ -25,6 +25,7 @@ pub use extract::{FromRequest, Headers, Path, Query, RawBody, RequestCtx};
 pub use handler::Handler;
 pub use middleware::{Middleware, MiddlewareFuture, Next};
 pub use module::Module;
+pub use multipart::Multipart;
 pub use response::{
     BodyError, BodySender, Created, IntoResponse, JcBody, Json, NoContent, Response, StreamBody,
 };
@@ -38,7 +39,7 @@ pub use http;
 pub mod prelude {
     pub use crate::{
         App, Clock, Created, Dep, Error, Extension, Headers, IntoResponse, Json, Middleware,
-        MiddlewareFuture, Module, Next, NoContent, Path, Query, RawBody, RequestCtx, Result,
-        StreamBody, TestApp, delete, get, patch, post, put,
+        MiddlewareFuture, Module, Multipart, Next, NoContent, Path, Query, RawBody, RequestCtx,
+        Result, StreamBody, TestApp, delete, get, patch, post, put,
     };
 }

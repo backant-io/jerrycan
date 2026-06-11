@@ -1,7 +1,7 @@
 //! Live-socket protocol proofs: behaviors only a real connection can show
 //! (write stalls, chunked transfer, mid-stream aborts).
 
-use jerrycan_core::{App, Json, Result, StreamBody, get, post};
+use jerrycan_core::{App, Json, Multipart, Result, StreamBody, get, post};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -186,6 +186,68 @@ async fn streamed_request_body_drains_over_a_real_socket_when_written_in_dribble
     let echoed: serde_json::Value =
         serde_json::from_str(resp_body.trim()).expect("echoed JSON body");
     assert_eq!(echoed, serde_json::json!({"hello": "streamed world"}));
+
+    server.abort();
+}
+
+/// Collects `(name, text)` pairs from a streamed multipart body. The whole
+/// point: the parser reassembles parts off frames the client dribbles 5 bytes
+/// at a time, with no part ever arriving whole in a single frame.
+async fn upload(mut mp: Multipart) -> Result<Json<Vec<(String, String)>>> {
+    let mut out = Vec::new();
+    while let Some(part) = mp.next_part().await? {
+        let name = part.name().to_string();
+        let text = part.text().await?;
+        out.push((name, text));
+    }
+    Ok(Json(out))
+}
+
+#[tokio::test]
+async fn chunked_multipart_upload_over_a_live_socket() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = App::new().route("/upload", post(upload).stream_body().body_limit(4096));
+    let server = tokio::spawn(async move { app.serve_with(listener).await });
+
+    // A two-field multipart body with boundary `B`. Dribbled 5 bytes at a time,
+    // every boundary/header/data straddle crosses a frame edge off the wire.
+    let body =
+        "--B\r\ncontent-disposition: form-data; name=\"a\"\r\n\r\nhello\r\n--B--\r\n".to_string();
+
+    let exchange = async {
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /upload HTTP/1.1\r\nHost: l\r\nContent-Type: multipart/form-data; boundary=B\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
+        for chunk in body.as_bytes().chunks(5) {
+            // Dribble: 5 bytes, flush, pause well under the per-frame read
+            // deadline so the parser must reassemble across frames.
+            s.write_all(chunk).await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    let raw = tokio::time::timeout(Duration::from_secs(10), exchange)
+        .await
+        .expect("the dribbled multipart body must be parsed and echoed, not hang");
+
+    assert!(
+        raw.starts_with("HTTP/1.1 200"),
+        "got: {}",
+        &raw[..raw.len().min(80)]
+    );
+    let resp_body = raw.split_once("\r\n\r\n").expect("response has headers").1;
+    let echoed: Vec<(String, String)> =
+        serde_json::from_str(resp_body.trim()).expect("echoed pairs");
+    assert_eq!(echoed, vec![("a".to_string(), "hello".to_string())]);
 
     server.abort();
 }
