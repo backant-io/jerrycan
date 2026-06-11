@@ -133,7 +133,7 @@ pub enum OnDelete {
 #[serde(deny_unknown_fields)]
 pub struct Tenancy {
     pub entity: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_roles: Vec<String>,
 }
 
@@ -419,8 +419,23 @@ pub(crate) mod tests {
 
     #[test]
     fn tenant_owned_walks_modules_and_subroutes() {
-        let d: Design = serde_json::from_str(V1_FULL).unwrap();
-        assert_eq!(d.tenant_owned(), vec![("leads", "Lead")]);
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        // V1_FULL has no subroutes, so graft one carrying a tenant-owned
+        // entity onto modules[1] to exercise the recursion in
+        // collect_tenant_owned (deleting that recursion must fail this test).
+        let sub: ModuleDesign = serde_json::from_str(
+            r#"{
+                "name": "notes",
+                "entities": [{ "name": "Note",
+                    "belongs_to": [{ "entity": "Workspace" }],
+                    "fields": [{ "name": "body", "type": "string" }] }],
+                "endpoints": [{ "operation_id": "list_notes", "method": "GET", "path": "/",
+                    "success": { "status": 200 } }]
+            }"#,
+        )
+        .unwrap();
+        d.modules[1].subroutes.push(sub);
+        assert_eq!(d.tenant_owned(), vec![("leads", "Lead"), ("notes", "Note")]);
     }
 
     #[test]
