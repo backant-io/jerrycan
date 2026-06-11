@@ -294,8 +294,18 @@ impl Design {
     }
 
     /// The fk column a belongs_to derives: snake_case(target) + "_id".
+    /// Entity names are validated `^[A-Z][A-Za-z0-9]*$`, so each uppercase
+    /// letter (past the first char) starts a new word: "ApiKey" -> "api_key".
     pub fn fk_column(target: &str) -> String {
-        format!("{}_id", target.to_lowercase())
+        let mut snake = String::with_capacity(target.len() + 4);
+        for (i, ch) in target.char_indices() {
+            if i > 0 && ch.is_ascii_uppercase() {
+                snake.push('_');
+            }
+            snake.push(ch.to_ascii_lowercase());
+        }
+        snake.push_str("_id");
+        snake
     }
 }
 
@@ -416,6 +426,7 @@ pub(crate) mod tests {
     #[test]
     fn fk_column_is_snake_target_id() {
         assert_eq!(Design::fk_column("Workspace"), "workspace_id");
+        assert_eq!(Design::fk_column("ApiKey"), "api_key_id");
     }
 
     #[test]
