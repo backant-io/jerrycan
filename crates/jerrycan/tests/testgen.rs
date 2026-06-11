@@ -90,3 +90,67 @@ fn unsupported_error_cases_become_an_agent_todo_comment() {
         "{generated}"
     );
 }
+
+/// A tenant-owned module's guarded handlers take `Dep<Tenant>`; the generated
+/// test app must register the `tenant` factory and SEED a membership row, or the
+/// guard 403s every guarded request (a false stub-test failure). WHY this matters:
+/// the seed is what keeps these acceptance tests failing for the RIGHT reason
+/// (stub-500), not an unseeded-membership 403. It must (a) migrate the tenant
+/// module's tables (the `{tenant}_members` table the guard queries lives there),
+/// (b) insert a tenant row whose enum column uses a DECLARED value so the CHECK
+/// passes, and (c) insert the membership row, then provide the `tenant` factory.
+#[test]
+fn tenancy_module_tests_seed_membership_and_provide_the_guard() {
+    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let design: Design = serde_json::from_str(s).unwrap();
+    let leads = design
+        .modules
+        .iter()
+        .find(|m| m.name == "leads")
+        .expect("leads module");
+    let generated = testgen::acceptance_rs(&design, leads);
+
+    // The Tenant factory is registered app-wide for the guard to resolve.
+    assert!(
+        generated.contains(".provide_dep(shared::tenant)"),
+        "{generated}"
+    );
+    // The tenant module's migration is pulled in (cross-crate) so the membership
+    // table exists in this module's test database.
+    assert!(
+        generated.contains(
+            "include_str!(\"../../workspaces/migrations/sqlite/0001_create_tables.sql\")"
+        ),
+        "tenant migration cross-included: {generated}"
+    );
+    // Seeds: a tenant row (enum `plan` uses a declared value, not 'test-value', so
+    // the CHECK passes) and the membership row for user 1.
+    assert!(
+        generated.contains("INSERT INTO \\\"workspaces\\\"") && generated.contains("'trial'"),
+        "tenant row seeded with a valid enum value: {generated}"
+    );
+    assert!(
+        generated.contains(
+            "INSERT INTO \\\"workspace_members\\\" (user_id, workspace_id, role) VALUES (1, 1, 'owner')"
+        ),
+        "membership row seeded for user 1: {generated}"
+    );
+    // The raw-SQL seed needs ConnectionTrait in scope.
+    assert!(
+        generated.contains("use jerrycan::db::sea_orm::ConnectionTrait;"),
+        "{generated}"
+    );
+
+    // The tenant module ITSELF (workspaces) owns no tenant-owned entity, so its
+    // test neither seeds nor provides the guard (no false coupling).
+    let workspaces = design
+        .modules
+        .iter()
+        .find(|m| m.name == "workspaces")
+        .expect("workspaces module");
+    let ws_gen = testgen::acceptance_rs(&design, workspaces);
+    assert!(
+        !ws_gen.contains(".provide_dep(shared::tenant)") && !ws_gen.contains("workspace_members"),
+        "non-tenant-owned module needs no seed: {ws_gen}"
+    );
+}

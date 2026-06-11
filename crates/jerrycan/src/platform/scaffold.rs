@@ -14,6 +14,71 @@ fn shared_auth_types() -> &'static str {
     "\n/// The session payload (app-wide). Generated because the design declares auth.\n#[derive(serde::Serialize, serde::Deserialize, Clone)]\npub struct SessionUser {\n    pub id: i64,\n    pub role: String,\n}\n\n/// The guard extractor handlers use: a decrypted session.\npub type CurrentUser = jerrycan::auth::Session<SessionUser>;\n"
 }
 
+/// The membership-checked `Tenant` guard appended to shared/src/lib.rs when the
+/// design declares tenancy (validation guarantees an active auth model). The
+/// `tenant` factory is registered app-wide in main.rs; tenant-owned guarded
+/// handlers take `Dep<Tenant>` instead of `CurrentUser`, so the membership
+/// lookup (401 from a missing session, 403 from no membership row) runs before
+/// the handler. The fk column / membership table match Task 10's DDL; the id
+/// type follows the tenant pk (`target_key_rust_type`).
+fn shared_tenancy_types(design: &Design) -> String {
+    let tenant = &design.tenancy.as_ref().expect("tenancy present").entity;
+    let fk_col = Design::fk_column(tenant);
+    let tenant_snake = Design::to_snake(tenant);
+    let id_ty = design.target_key_rust_type(tenant);
+    // A text (String) pk must clone out of `&self`; a Copy integer pk returns by
+    // value (a `.clone()` there would trip clippy::clone_on_copy under -D warnings).
+    let id_body = if id_ty == "String" {
+        "self.id.clone()"
+    } else {
+        "self.id"
+    };
+    format!(
+        r#"
+/// The authenticated tenant context: membership-checked {tenant} + role.
+#[derive(Clone, Debug)]
+pub struct Tenant {{
+    pub id: {id_ty},
+    pub role: String,
+}}
+
+impl Tenant {{
+    pub fn id(&self) -> {id_ty} {{
+        {id_body}
+    }}
+    pub fn require_role(&self, role: &str) -> jerrycan::Result<()> {{
+        jerrycan::auth::require_role(&self.role, role)
+    }}
+}}
+
+/// DI guard factory — registered app-wide; handlers take `Dep<Tenant>`.
+/// Resolves the caller's membership or rejects 403 before the handler runs.
+pub async fn tenant(
+    user: CurrentUser,
+    db: jerrycan::Dep<jerrycan::db::Db>,
+) -> jerrycan::Result<Tenant> {{
+    use jerrycan::db::sea_orm::{{ConnectionTrait, Statement}};
+    let row = db
+        .conn()
+        .query_one(Statement::from_sql_and_values(
+            db.conn().get_database_backend(),
+            db.sql("SELECT {fk_col}, role FROM {tenant_snake}_members WHERE user_id = ?"),
+            [user.0.id.into()],
+        ))
+        .await
+        .map_err(jerrycan::db::db_error)?;
+    let Some(row) = row else {{
+        return Err(jerrycan::Error::forbidden());
+    }};
+    Ok(Tenant {{
+        id: row.try_get("", "{fk_col}").map_err(jerrycan::db::db_error)?,
+        role: row.try_get("", "role").map_err(jerrycan::db::db_error)?,
+    }})
+}}
+"#
+    )
+}
+
 /// Canonical on-disk form of design.json (pretty, trailing newline) — both
 /// scaffold and the MCP design tool write exactly this, so diffs stay clean.
 pub fn canonical_design_json(design: &Design) -> String {
@@ -95,10 +160,15 @@ pub fn scaffold(target: &Path, design: &Design) -> Result<Vec<String>, String> {
     // session-user type + CurrentUser alias all guards across modules agree on.
     if design.wants_auth() {
         write("crates/shared/Cargo.toml", SHARED_CARGO_AUTH)?;
-        write(
-            "crates/shared/src/lib.rs",
-            &format!("{SHARED_LIB}{}", shared_auth_types()),
-        )?;
+        // Tenancy adds the membership-checked Tenant guard after the auth types
+        // (validation guarantees an active auth model alongside tenancy). The
+        // shared crate inherits the workspace `jerrycan` features (incl. `db`)
+        // via `jerrycan.workspace = true`, so `jerrycan::db::Db` resolves here.
+        let mut lib = format!("{SHARED_LIB}{}", shared_auth_types());
+        if design.tenancy.is_some() {
+            lib.push_str(&shared_tenancy_types(design));
+        }
+        write("crates/shared/src/lib.rs", &lib)?;
     } else {
         write("crates/shared/Cargo.toml", SHARED_CARGO)?;
         write("crates/shared/src/lib.rs", SHARED_LIB)?;

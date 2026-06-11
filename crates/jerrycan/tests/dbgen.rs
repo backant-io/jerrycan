@@ -171,6 +171,30 @@ fn sql_identifiers_are_quoted_so_reserved_words_survive() {
 }
 
 #[test]
+fn tenancy_generates_the_tenant_guard_in_shared() {
+    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let d: jerrycan::platform::design::Design = serde_json::from_str(s).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    jerrycan::platform::scaffold::scaffold(&root, &d).unwrap();
+    let shared = std::fs::read_to_string(root.join("crates/shared/src/lib.rs")).unwrap();
+    assert!(shared.contains("pub struct Tenant"), "{shared}");
+    assert!(
+        shared.contains("pub async fn tenant("),
+        "guard factory: {shared}"
+    );
+    assert!(
+        shared.contains("workspace_members"),
+        "membership check: {shared}"
+    );
+    let main_rs = std::fs::read_to_string(root.join("crates/app/src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains(".provide_dep(shared::tenant)"),
+        "{main_rs}"
+    );
+}
+
+#[test]
 fn kolli_slice_design_is_valid_contract_v1() {
     let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
     let d: jerrycan::platform::design::Design = serde_json::from_str(s).unwrap();

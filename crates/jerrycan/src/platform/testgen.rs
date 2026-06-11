@@ -246,6 +246,113 @@ fn auth_preamble_login() -> String {
     )
 }
 
+/// The module owning the design's tenancy entity (the `{tenant}_members` table
+/// lives in its migration). None when the design has no tenancy.
+fn tenant_module(design: &Design) -> Option<&ModuleDesign> {
+    let tenancy = design.tenancy.as_ref()?;
+    design
+        .modules
+        .iter()
+        .find(|m| m.entities.iter().any(|e| e.name == tenancy.entity))
+}
+
+/// True when this module holds an entity that belongs_to the tenancy entity —
+/// so its guarded handlers take `Dep<Tenant>` and the test app must register the
+/// `tenant` factory + seed a membership row.
+fn module_needs_tenant(design: &Design, module: &ModuleDesign) -> bool {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return false;
+    };
+    fn walk(m: &ModuleDesign, tenant: &str) -> bool {
+        m.entities
+            .iter()
+            .any(|e| e.belongs_to.iter().any(|b| b.entity == tenant))
+            || m.subroutes.iter().any(|s| walk(s, tenant))
+    }
+    walk(module, &tenancy.entity)
+}
+
+/// A `migrate` entry for the tenant module's tables, referenced from THIS test
+/// crate (cross-crate relative include) so the `{tenant}_members` table the
+/// `tenant` guard queries exists. Empty if the tenant module IS this module
+/// (its own migration is already included) or there is no tenancy.
+fn tenant_migration_item(design: &Design, module: &ModuleDesign) -> String {
+    let Some(t) = tenant_module(design) else {
+        return String::new();
+    };
+    if t.name == module.name || t.entities.is_empty() {
+        return String::new();
+    }
+    let t_snake = t.name.replace('-', "_");
+    format!(
+        "        jerrycan::db::Migration {{\n            name: \"{t_snake}_0001_create_tables\",\n            sqlite: include_str!(\"../../{t}/migrations/sqlite/0001_create_tables.sql\"),\n            postgres: include_str!(\"../../{t}/migrations/postgres/0001_create_tables.sql\"),\n        }},\n",
+        t = t.name,
+    )
+}
+
+/// The seed statements that put the test user (id 1) into a tenant: insert one
+/// tenant row (id 1, required fields = fixtures, enum fields = first allowed
+/// value so CHECKs pass) then one membership row (user_id 1, fk 1, first member
+/// role). Run on the raw connection before `.into_test()` so the `tenant` guard
+/// resolves a membership for every guarded request. Empty when not needed.
+fn tenant_seed(design: &Design, module: &ModuleDesign) -> String {
+    if !module_needs_tenant(design, module) {
+        return String::new();
+    }
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return String::new();
+    };
+    let Some(t) = tenant_module(design) else {
+        return String::new();
+    };
+    let Some(entity) = t.entities.iter().find(|e| e.name == tenancy.entity) else {
+        return String::new();
+    };
+    let table = format!("{}s", tenancy.entity.to_lowercase());
+    let members = format!("{}_members", Design::to_snake(&tenancy.entity));
+    let fk = Design::fk_column(&tenancy.entity);
+    let role = tenancy
+        .member_roles
+        .first()
+        .map(String::as_str)
+        .unwrap_or("owner");
+
+    // Columns + values for the tenant row: id = 1 (so the fk resolves), then each
+    // declared non-id field with a seed-safe fixture (enum fields use a declared
+    // value to satisfy the CHECK constraint). Column identifiers are double-quoted
+    // in the SQL; since the whole statement is a Rust string literal, those quotes
+    // are escaped (`\\\"`) so the generated source stays valid.
+    let mut cols = vec!["id".to_string()];
+    let mut vals = vec!["1".to_string()];
+    for f in entity.fields.iter().filter(|f| f.name != "id") {
+        cols.push(format!("\\\"{}\\\"", f.name));
+        vals.push(seed_sql_value(f));
+    }
+    let cols = cols.join(", ");
+    let vals = vals.join(", ");
+    format!(
+        "    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant row\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (1, 1, '{role}')\")\n        .await\n        .expect(\"seed membership\");\n"
+    )
+}
+
+/// A SQL literal for seeding a tenant-row column. Enum fields use their first
+/// declared value (so a CHECK constraint passes); other fields use a type-shaped
+/// literal. String/text literals are single-quoted for inline DDL execution.
+fn seed_sql_value(f: &Field) -> String {
+    if let Some(values) = &f.values {
+        if let Some(first) = values.first() {
+            return format!("'{first}'");
+        }
+    }
+    match f.field_type {
+        FieldType::String | FieldType::Datetime | FieldType::Uuid => "'test-value'".to_string(),
+        FieldType::Integer => "1".to_string(),
+        FieldType::Float => "1.0".to_string(),
+        FieldType::Boolean => "false".to_string(),
+        FieldType::Json => "'{}'".to_string(),
+    }
+}
+
 fn preamble(design: &Design, module: &ModuleDesign) -> String {
     let mount = module.effective_mount();
     let auth_login = if design.wants_auth() {
@@ -263,8 +370,27 @@ fn preamble(design: &Design, module: &ModuleDesign) -> String {
     if design.wants_db() {
         let mut migration_items = String::new();
         collect_migration_items(module, &mut migration_items);
+        // Tenancy: the guarded handlers of a tenant-owned module take
+        // `Dep<Tenant>`. The test app must (a) migrate the tenant module's tables
+        // (the `{tenant}_members` table the guard queries), (b) seed a membership
+        // row so the guard resolves a tenant (not 403), and (c) register the
+        // `tenant` factory app-wide so `Dep<Tenant>` resolves at all.
+        migration_items.push_str(&tenant_migration_item(design, module));
+        let seed = tenant_seed(design, module);
+        let tenant_dep = if module_needs_tenant(design, module) {
+            ".provide_dep(shared::tenant)"
+        } else {
+            ""
+        };
+        // The seed runs raw SQL on the connection, which needs `ConnectionTrait`
+        // in scope; only import it when there's a seed (else `-D warnings` trips).
+        let seed_use = if seed.is_empty() {
+            String::new()
+        } else {
+            "use jerrycan::db::sea_orm::ConnectionTrait;\n\n".to_string()
+        };
         format!(
-            "{auth_login}async fn app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n    App::new(){auth_extend}.extend(db).mount(\"{mount}\", module()).into_test()\n}}\n"
+            "{seed_use}{auth_login}async fn app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n{seed}    App::new(){auth_extend}.extend(db){tenant_dep}.mount(\"{mount}\", module()).into_test()\n}}\n"
         )
     } else {
         format!(

@@ -73,14 +73,38 @@ fn path_params(ep: &Endpoint) -> Vec<String> {
     out
 }
 
-fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode) -> String {
+/// True when this endpoint operates on a tenant-owned entity (its repo entity
+/// belongs_to the design's tenancy entity). Such guarded endpoints take the
+/// membership-checked `Dep<shared::Tenant>` instead of a bare `CurrentUser`.
+fn endpoint_is_tenant_owned(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> bool {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return false;
+    };
+    let Some(entity) = endpoint_repo_entity(m, ep) else {
+        return false;
+    };
+    m.entities
+        .iter()
+        .find(|e| e.name == entity)
+        .is_some_and(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity))
+}
+
+fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> String {
     let mut params = Vec::new();
     if let Some(e) = endpoint_repo_entity(m, ep) {
         params.push(format!("_repo: Dep<{e}Repo>"));
     }
-    // Guard param (order: repo, user, path, body): an authenticated session.
+    // Guard param (order: repo, guard, path, body). A guarded endpoint on a
+    // tenant-owned entity takes the membership-checked `Dep<shared::Tenant>` (the
+    // Tenant factory consumes CurrentUser, so auth is still enforced: 401 from a
+    // missing session, 403 from no membership); other guarded endpoints take the
+    // bare authenticated session.
     if mode.auth && ep.is_guarded() {
-        params.push("_user: CurrentUser".to_string());
+        if endpoint_is_tenant_owned(m, ep, design) {
+            params.push("_tenant: Dep<Tenant>".to_string());
+        } else {
+            params.push("_user: CurrentUser".to_string());
+        }
     }
     let params_in_path = path_params(ep);
     // A param named `id` keys the endpoint's entity, so it takes that entity's
@@ -113,22 +137,28 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode) -> String {
     params.join(", ")
 }
 
-/// A leading comment for role-guarded endpoints, reminding the agent to add the
-/// `require_role` import and call it before proceeding (empty for unguarded /
-/// no-role endpoints). The stub itself imports only `CurrentUser` (the param
-/// type it uses); the agent adds `require_role` when implementing the guard.
-fn guard_comment(ep: &Endpoint) -> String {
+/// A leading comment for role-guarded endpoints, reminding the agent how to
+/// enforce the role before proceeding (empty for unguarded / no-role endpoints).
+/// A tenant-owned endpoint carries `_tenant: Dep<Tenant>` and checks the role on
+/// the membership (`_tenant.require_role(...)?`); other endpoints take a bare
+/// `CurrentUser` and call `require_role(&_user.0.role, ...)` directly.
+fn guard_comment(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
     if ep.required_roles.is_empty() {
-        String::new()
+        return String::new();
+    }
+    let roles = ep.required_roles.join("\", \"");
+    if endpoint_is_tenant_owned(m, ep, design) {
+        format!(
+            "    // guard: requires role \"{roles}\" — call _tenant.require_role(\"{roles}\")? before proceeding\n"
+        )
     } else {
-        let roles = ep.required_roles.join("\", \"");
         format!(
             "    // guard: requires role \"{roles}\" — add `use jerrycan::auth::require_role;` and call require_role(&_user.0.role, \"{roles}\")? before proceeding\n"
         )
     }
 }
 
-pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode) -> String {
+pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     let mut uses = String::from("use jerrycan::prelude::*;\n");
     let mentions_entities = m
         .endpoints
@@ -140,13 +170,25 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode) -> String {
     if !m.entities.is_empty() {
         uses.push_str("use super::repo::*;\n");
     }
-    // Auth mode: a guarded endpoint takes a `_user: CurrentUser` param, so the
-    // stub imports ONLY that alias (which it uses). It does NOT import
-    // `require_role` — a raw stub doesn't call it, so the import would be unused
-    // and fail `-D warnings`; the agent adds the import (see guard_comment) when
-    // implementing the role check.
-    if mode.auth && m.endpoints.iter().any(|ep| ep.is_guarded()) {
-        uses.push_str("use shared::CurrentUser;\n");
+    // Auth mode: a guarded endpoint takes either `_tenant: Dep<Tenant>` (tenant-
+    // owned) or `_user: CurrentUser` (everything else). Import ONLY the alias(es)
+    // a param actually uses, or `-D warnings` trips on an unused import. The agent
+    // adds `require_role` itself (see guard_comment); a raw stub never calls it.
+    if mode.auth {
+        let needs_tenant = m
+            .endpoints
+            .iter()
+            .any(|ep| ep.is_guarded() && endpoint_is_tenant_owned(m, ep, design));
+        let needs_user = m
+            .endpoints
+            .iter()
+            .any(|ep| ep.is_guarded() && !endpoint_is_tenant_owned(m, ep, design));
+        if needs_tenant {
+            uses.push_str("use shared::Tenant;\n");
+        }
+        if needs_user {
+            uses.push_str("use shared::CurrentUser;\n");
+        }
     }
     let mut out = format!(
         "//! Handlers for `{}` — thin: extract → call → respond.\n//! Generated stubs return 500 until implemented.\n{uses}\n",
@@ -154,14 +196,14 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode) -> String {
     );
     for ep in &m.endpoints {
         let guard = if mode.auth {
-            guard_comment(ep)
+            guard_comment(m, ep, design)
         } else {
             String::new()
         };
         out.push_str(&format!(
             "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}    Err(Error::internal(\"{op} not implemented — replace this stub\"))\n}}\n\n",
             op = ep.operation_id,
-            params = handler_params(m, ep, mode),
+            params = handler_params(m, ep, mode, design),
             ret = return_type(ep),
         ));
     }
@@ -981,7 +1023,7 @@ fn write_unit_files(
 ) -> Result<(), String> {
     write_agent_owned(
         &dir.join("handlers.rs"),
-        &handlers_rs(m, mode),
+        &handlers_rs(m, mode, design),
         created,
         root,
     )?;
@@ -1332,7 +1374,7 @@ mod tests {
     #[test]
     fn handler_signatures_follow_the_mapping_rules() {
         let m = todos();
-        let h = handlers_rs(&m, GenMode::default());
+        let h = handlers_rs(&m, GenMode::default(), &demo());
         assert!(
             h.contains(
                 "pub(crate) async fn list_todos(_repo: Dep<TodoRepo>) -> Result<Json<Vec<Todo>>>"
@@ -1371,7 +1413,7 @@ mod tests {
             },
             errors: vec![],
         });
-        let h = handlers_rs(&m, GenMode::default());
+        let h = handlers_rs(&m, GenMode::default(), &demo());
         assert!(
             h.contains("pub(crate) async fn move_todo(_repo: Dep<TodoRepo>, Path((_id, _slot)): Path<(i64, i64)>) -> Result<NoContent>"),
             "{h}"
@@ -1575,7 +1617,7 @@ mod tests {
         );
         assert!(!repo.contains(".last_insert_id()"), "{repo}");
 
-        let h = handlers_rs(&m, GenMode::default());
+        let h = handlers_rs(&m, GenMode::default(), &demo());
         assert!(h.contains("Path(_id): Path<String>"), "{h}");
     }
 
@@ -1585,7 +1627,7 @@ mod tests {
         let sub = &m.subroutes[0];
         assert!(model_rs(sub).is_none());
         assert!(repo_rs(sub, GenMode::default(), &demo()).is_none());
-        let h = handlers_rs(sub, GenMode::default());
+        let h = handlers_rs(sub, GenMode::default(), &demo());
         assert!(
             h.contains("pub(crate) async fn list_comments() -> Result<Json<serde_json::Value>>"),
             "{h}"
