@@ -1084,6 +1084,101 @@ pub fn add_dependency(design: &mut Design, module_path: &str, dep: &str) -> Resu
     Ok(())
 }
 
+/// Snake_case check for migration names (mirrors `questions::is_snake`, which is
+/// private to that module): lowercase ASCII start, then lowercase/digit/`_`.
+fn is_snake_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.starts_with(|c: char| c.is_ascii_lowercase())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// `jerrycan generate migration <name> --module <m>`: write the next numbered
+/// dual-dialect migration pair (`NNNN_<name>.sql` in both sqlite/ and postgres/)
+/// as agent-owned stubs, then re-run mounting to pick them up in the aggregated
+/// `migrations.rs`. Returns the created files plus the rewired mounting files,
+/// all relative to `root`. Numbering continues from the module's existing
+/// sqlite migrations (max 4-digit prefix + 1).
+pub fn generate_migration(root: &Path, module: &str, name: &str) -> Result<Vec<String>, String> {
+    if !is_snake_name(name) {
+        return Err(format!(
+            "migration name `{name}` is not snake_case — use lowercase words joined by `_` (e.g. add_due_index)"
+        ));
+    }
+    let crate_dir = root.join("crates/routes").join(module);
+    if !crate_dir.is_dir() {
+        let available = available_modules(root);
+        return Err(format!(
+            "module `{module}` not found under crates/routes — available: {available}"
+        ));
+    }
+    let sqlite_dir = crate_dir.join("migrations/sqlite");
+    let next = next_migration_number(&sqlite_dir);
+    let stem = format!("{next:04}_{name}");
+    let body = format!(
+        "-- {module} {name}\n-- Write your ALTER/CREATE statements here. Both dialect files must contain\n-- the equivalent change; jerrycan check applies them to a throwaway sqlite\n-- database, so a broken migration fails fast.\n"
+    );
+    let mut created = Vec::new();
+    write_agent_owned(
+        &crate_dir.join(format!("migrations/sqlite/{stem}.sql")),
+        &body,
+        &mut created,
+        root,
+    )?;
+    write_agent_owned(
+        &crate_dir.join(format!("migrations/postgres/{stem}.sql")),
+        &body,
+        &mut created,
+        root,
+    )?;
+    // Re-run mounting so the aggregated migrations.rs (and any other mounting
+    // surface) picks up the new pair — it globs each module's sqlite dir.
+    let design = Design::from_path(&root.join("design.json"))?;
+    let modified = super::mounting::regenerate(root, &design)?;
+    created.extend(modified);
+    Ok(created)
+}
+
+/// The next 4-digit migration number for a module: scan the sqlite dir for
+/// `NNNN_*.sql` stems, take the max leading 4-digit prefix, add 1 (1 if none).
+fn next_migration_number(sqlite_dir: &Path) -> u32 {
+    let mut max = 0u32;
+    if let Ok(entries) = fs::read_dir(sqlite_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "sql") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                let prefix: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = prefix.parse::<u32>() {
+                    max = max.max(n);
+                }
+            }
+        }
+    }
+    max + 1
+}
+
+/// Comma-joined list of route-crate directory names (for the not-found error).
+fn available_modules(root: &Path) -> String {
+    let routes = root.join("crates/routes");
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&routes) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// One row of the live route tree — the same shape the CLI and MCP both emit.
 #[derive(Debug, serde::Serialize)]
 pub struct RouteEntry {

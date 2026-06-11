@@ -184,6 +184,81 @@ fn generate_route_for_unknown_module_is_usage_error() {
 }
 
 #[test]
+fn generate_migration_writes_numbered_pair_and_rewires() {
+    // db mode is required for migrations: the aggregated migrations.rs only
+    // exists when the design wants db, and that file is what proves the rewire.
+    let tmp = tempfile::tempdir().unwrap();
+    let design_path = tmp.path().join("design.json");
+    let mut design: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    design["dependencies"] = serde_json::json!(["db"]);
+    std::fs::write(&design_path, serde_json::to_string_pretty(&design).unwrap()).unwrap();
+    let app_dir = tmp.path().join("todo-api");
+    assert!(
+        jerrycan()
+            .args(["new"])
+            .arg(&app_dir)
+            .arg("--design")
+            .arg(&design_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // JSON surface: created lists both dialect files; next_step points at check.
+    let out = jerrycan()
+        .current_dir(&app_dir)
+        .args([
+            "--json",
+            "generate",
+            "migration",
+            "add_due_index",
+            "--module",
+            "todos",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let created = payload["created"].as_array().unwrap();
+    assert!(
+        created.iter().any(|p| p
+            .as_str()
+            .unwrap()
+            .ends_with("migrations/sqlite/0002_add_due_index.sql")),
+        "{created:?}"
+    );
+    assert!(
+        created.iter().any(|p| p
+            .as_str()
+            .unwrap()
+            .ends_with("migrations/postgres/0002_add_due_index.sql")),
+        "{created:?}"
+    );
+    assert_eq!(
+        payload["next_step"],
+        "edit both dialect files, then run jerrycan check"
+    );
+    // The aggregated migrations.rs must now include the new sqlite file — the
+    // rewire is what makes a migration actually run, so this is the load-bearing
+    // assertion, not the file-on-disk.
+    let agg = std::fs::read_to_string(app_dir.join("crates/app/src/migrations.rs")).unwrap();
+    assert!(agg.contains("0002_add_due_index"), "{agg}");
+
+    // Human surface carries the numbered stem; a non-snake name is a usage error.
+    let bad = jerrycan()
+        .current_dir(&app_dir)
+        .args(["generate", "migration", "BadName", "--module", "todos"])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("snake_case"));
+}
+
+#[test]
 fn list_routes_walks_the_module_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let design_path = tmp.path().join("design.json");

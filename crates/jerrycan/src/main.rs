@@ -114,6 +114,12 @@ enum GenerateCmd {
         #[arg(long)]
         module: String,
     },
+    /// Next numbered dual-dialect migration pair for a module
+    Migration {
+        name: String,
+        #[arg(long)]
+        module: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -154,6 +160,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Generate { what } => match what {
             GenerateCmd::Route { path } => cmd_generate_route(&path, cli.json),
             GenerateCmd::Dep { name, module } => cmd_generate_dep(&name, &module, cli.json),
+            GenerateCmd::Migration { name, module } => {
+                cmd_generate_migration(&name, &module, cli.json)
+            }
         },
         Cmd::List {
             what: ListCmd::Routes,
@@ -371,6 +380,31 @@ fn cmd_generate_dep(name: &str, module: &str, json_mode: bool) -> Result<(), Fai
         json_mode,
         &payload,
         &format!("recorded dependency `{name}` on module `{module}`"),
+    );
+    Ok(())
+}
+
+fn cmd_generate_migration(name: &str, module: &str, json_mode: bool) -> Result<(), Failure> {
+    let root = app_root()?;
+    let created = genroute::generate_migration(&root, module, name).map_err(Failure::usage)?;
+    // The numbered stem (e.g. `0002_add_due_index`) for the human line, read off
+    // the sqlite file the generator just wrote.
+    let stem = created
+        .iter()
+        .find_map(|p| {
+            p.strip_suffix(".sql")
+                .and_then(|s| s.split_once("migrations/sqlite/"))
+                .map(|(_, stem)| stem)
+        })
+        .unwrap_or(name);
+    let payload = serde_json::json!({
+        "created": created,
+        "next_step": "edit both dialect files, then run jerrycan check",
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!("migration {stem} created (sqlite + postgres) — edit both, then jerrycan check"),
     );
     Ok(())
 }

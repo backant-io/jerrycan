@@ -205,6 +205,33 @@ fn kolli_slice_design_is_valid_contract_v1() {
 }
 
 #[test]
+fn generate_migration_emits_numbered_pair_and_rewires() {
+    let (_t, root) = scaffold_db();
+    let created =
+        jerrycan::platform::genroute::generate_migration(&root, "todos", "add_due_index").unwrap();
+    assert!(
+        created
+            .iter()
+            .any(|p| p.ends_with("migrations/sqlite/0002_add_due_index.sql")),
+        "{created:?}"
+    );
+    assert!(
+        created
+            .iter()
+            .any(|p| p.ends_with("migrations/postgres/0002_add_due_index.sql")),
+        "{created:?}"
+    );
+    let agg = std::fs::read_to_string(root.join("crates/app/src/migrations.rs")).unwrap();
+    assert!(agg.contains("0002_add_due_index"), "{agg}");
+    // numbering continues
+    let again = jerrycan::platform::genroute::generate_migration(&root, "todos", "more").unwrap();
+    assert!(
+        again.iter().any(|p| p.ends_with("0003_more.sql")),
+        "{again:?}"
+    );
+}
+
+#[test]
 fn memory_mode_is_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("todo-api");
