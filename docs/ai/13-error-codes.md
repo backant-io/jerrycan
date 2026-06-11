@@ -14,6 +14,7 @@ the cause + fix for any of them.
 | JC0408 | Request body read timeout |
 | JC0409 | Conflict — the write violates a unique key (jerrycan-db) |
 | JC0413 | Payload too large (default 1 MiB) |
+| JC0415 | Unsupported media type — content type is not what the endpoint consumes (e.g. `Multipart` needs `multipart/form-data` with a boundary) |
 | JC0422 | Unprocessable — bad JSON or validation violations |
 | JC0500 | Internal error (or handler panic) |
 | JC0503 | Handler timeout (default 30s) |

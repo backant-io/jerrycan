@@ -69,6 +69,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs app",
     },
     CodeInfo {
+        code: "JC0415",
+        title: "unsupported media type",
+        cause: "the request's content type is not what the endpoint consumes (e.g. Multipart requires multipart/form-data with a boundary)",
+        fix: "send the content type the endpoint declares; for uploads, multipart/form-data with a valid boundary parameter",
+        doc: "jerrycan docs extractors",
+    },
+    CodeInfo {
         code: "JC0422",
         title: "unprocessable entity",
         cause: "the JSON body failed to parse, or Valid<T> found violations",

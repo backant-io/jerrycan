@@ -50,6 +50,15 @@ impl Error {
     pub fn payload_too_large() -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "JC0413", "payload too large")
     }
+    /// The request's content type is not what this endpoint consumes (e.g. a
+    /// `Multipart` extractor on a non-`multipart/form-data` request).
+    pub fn unsupported_media_type() -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "JC0415",
+            "unsupported media type",
+        )
+    }
     pub fn unprocessable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "JC0422", message)
     }
@@ -144,6 +153,8 @@ mod tests {
         assert_eq!(Error::method_not_allowed().code(), "JC0405");
         assert_eq!(Error::bad_request("nope").status(), StatusCode::BAD_REQUEST);
         assert_eq!(Error::payload_too_large().code(), "JC0413");
+        assert_eq!(Error::unsupported_media_type().code(), "JC0415");
+        assert_eq!(Error::unsupported_media_type().status().as_u16(), 415);
         assert_eq!(Error::unprocessable("bad field").code(), "JC0422");
         assert_eq!(
             Error::internal("boom").status(),
