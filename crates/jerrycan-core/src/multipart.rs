@@ -17,7 +17,7 @@ pub(crate) const MAX_PART_HEADER_BYTES: usize = 8 * 1024;
 /// More parts than this is rejected (413) — a part-count bomb, not a form.
 pub(crate) const MAX_PARTS: usize = 256;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PartMeta {
     pub(crate) name: String,
     pub(crate) filename: Option<String>,
@@ -53,6 +53,11 @@ pub(crate) struct Parser {
     state: State,
     parts: usize,
     eof: bool,
+    /// How far into `buf` the Headers-state `\r\n\r\n` scan has already looked.
+    /// Persisted across `next_event` calls so a header block fed one byte at a
+    /// time is scanned once (O(n)) instead of re-scanned from 0 each feed
+    /// (O(n²)). Reset to 0 on every transition into Headers and on a hit.
+    header_scan_from: usize,
 }
 
 impl Parser {
@@ -66,6 +71,7 @@ impl Parser {
             state: State::Preamble,
             parts: 0,
             eof: false,
+            header_scan_from: 0,
         }
     }
 
@@ -117,6 +123,17 @@ impl Parser {
                     while i < self.buf.len() && (self.buf[i] == b' ' || self.buf[i] == b'\t') {
                         i += 1;
                     }
+                    // Cap the padding run BEFORE any need-more-data return so the
+                    // buffer cannot grow unboundedly while an attacker streams
+                    // spaces after a boundary — the only otherwise-unbounded state
+                    // (Preamble/Data are bounded by holdback, Headers by its cap).
+                    // Real transport padding is a handful of bytes; reusing the
+                    // header cap keeps the constant set minimal.
+                    if i > MAX_PART_HEADER_BYTES {
+                        return Err(ParseError::Malformed(
+                            "excessive padding after multipart boundary",
+                        ));
+                    }
                     if self.buf.len() < i + 2 {
                         if self.eof {
                             return Err(ParseError::Malformed("truncated multipart boundary line"));
@@ -134,6 +151,9 @@ impl Parser {
                         if self.parts > MAX_PARTS {
                             return Err(ParseError::TooManyParts);
                         }
+                        // Entering Headers with a fresh buffer window: start the
+                        // incremental `\r\n\r\n` scan from the beginning.
+                        self.header_scan_from = 0;
                         self.state = State::Headers;
                         continue;
                     }
@@ -141,23 +161,39 @@ impl Parser {
                         "invalid bytes after multipart boundary",
                     ));
                 }
-                State::Headers => match find(&self.buf, b"\r\n\r\n") {
-                    Some(i) => {
-                        let block = self.buf.split_to(i + 4);
-                        let meta = parse_part_headers(&block[..i])?;
-                        self.state = State::Data;
-                        return Ok(Some(Event::PartHeaders(meta)));
-                    }
-                    None => {
-                        if self.buf.len() > MAX_PART_HEADER_BYTES {
-                            return Err(ParseError::HeadersTooLarge);
+                State::Headers => {
+                    // Resume the `\r\n\r\n` scan from where the last call stopped.
+                    // A 4-byte terminator can only newly complete within the last
+                    // 3 bytes of previously scanned input plus the freshly fed
+                    // bytes, so back up 3 from the cursor. The buffer is never
+                    // consumed while in Headers (split_to happens only on the hit
+                    // that leaves this state), so cursor positions stay valid.
+                    let start = self.header_scan_from.saturating_sub(3);
+                    match find(&self.buf[start..], b"\r\n\r\n").map(|i| i + start) {
+                        Some(i) => {
+                            let block = self.buf.split_to(i + 4);
+                            let meta = parse_part_headers(&block[..i])?;
+                            // Reset for the next part's header block.
+                            self.header_scan_from = 0;
+                            self.state = State::Data;
+                            return Ok(Some(Event::PartHeaders(meta)));
                         }
-                        if self.eof {
-                            return Err(ParseError::Malformed("truncated multipart part headers"));
+                        None => {
+                            if self.buf.len() > MAX_PART_HEADER_BYTES {
+                                return Err(ParseError::HeadersTooLarge);
+                            }
+                            if self.eof {
+                                return Err(ParseError::Malformed(
+                                    "truncated multipart part headers",
+                                ));
+                            }
+                            // Everything up to here has been scanned; next call
+                            // resumes from the new tail.
+                            self.header_scan_from = self.buf.len();
+                            return Ok(None);
                         }
-                        return Ok(None);
                     }
-                },
+                }
                 State::Data => match find(&self.buf, &self.delimiter) {
                     Some(0) => {
                         let _ = self.buf.split_to(self.delimiter.len());
@@ -310,7 +346,9 @@ mod tests {
         for chunk in 1..=input.len() {
             let (data, meta) = run(&input, chunk);
             assert_eq!(data, want_data, "chunk size {chunk}");
-            assert_eq!(meta.len(), want_meta.len(), "chunk size {chunk}");
+            // Full meta equality (name/filename/content_type), not just length —
+            // chunking must not perturb any parsed header field at any straddle.
+            assert_eq!(meta, want_meta, "chunk size {chunk}");
         }
     }
 
@@ -345,6 +383,60 @@ mod tests {
             }
             assert!(saw_err, "cut {cut} must error (truncation), not complete");
         }
+    }
+
+    /// Data-state truncation where the input ends mid-delimiter: the tail is a
+    /// PARTIAL delimiter (`\r\n--XbOuNdArY`, one byte short of the full token),
+    /// held back as a possible boundary prefix. On finish() this must surface as
+    /// truncation, never silent data loss (the held-back bytes dropped) or a hang.
+    #[test]
+    fn data_ending_mid_partial_delimiter_is_truncation() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"--XbOuNdArYx\r\n");
+        input.extend_from_slice(b"content-disposition: form-data; name=\"f\"\r\n\r\n");
+        input.extend_from_slice(b"payload");
+        // Full delimiter is "\r\n--XbOuNdArYx"; drop the final 'x' so the buffer
+        // ends one byte short of a boundary, all of it inside the holdback window.
+        input.extend_from_slice(b"\r\n--XbOuNdArY");
+        let mut p = Parser::new(BOUNDARY);
+        p.feed(&input);
+        p.finish();
+        // Drain any leading "payload" Data event, then require the truncation error.
+        let mut saw_err = None;
+        for _ in 0..1000 {
+            match p.next_event() {
+                Err(e) => {
+                    saw_err = Some(e);
+                    break;
+                }
+                Ok(Some(Event::Done)) => panic!("completed despite a truncated trailing delimiter"),
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("NeedMore after finish()"),
+            }
+        }
+        assert!(
+            matches!(
+                saw_err,
+                Some(ParseError::Malformed("truncated multipart body"))
+            ),
+            "partial trailing delimiter must be truncated multipart body, got {saw_err:?}"
+        );
+    }
+
+    /// Important 1 regression: a boundary followed by a flood of SP padding must
+    /// be rejected before the buffer can grow past the cap, even while the
+    /// 2-byte CRLF/`--` discriminator is still pending (need-more-data path).
+    #[test]
+    fn padding_after_boundary_is_capped() {
+        let mut input = b"--XbOuNdArYx".to_vec();
+        input.extend_from_slice(&vec![b' '; 9 * 1024]);
+        let mut p = Parser::new(BOUNDARY);
+        p.feed(&input);
+        // No finish(): the cap must fire on the need-more-data path, not via eof.
+        assert!(matches!(
+            drive_to_error(&mut p),
+            ParseError::Malformed("excessive padding after multipart boundary")
+        ));
     }
 
     #[test]
