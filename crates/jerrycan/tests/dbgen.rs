@@ -96,19 +96,20 @@ fn db_mode_emits_dual_dialect_migrations_from_entities() {
     assert!(sqlite.to_lowercase().contains("\"title\" text not null"));
     // Booleans are native BOOLEAN columns on both backends: the Model field is a
     // Rust `bool` under SeaORM, which round-trips it directly (no sqlx-Any i64).
+    // `done` is `required: false`, so its column is NULLABLE (it backs an
+    // `Option<bool>` Model field) — no NOT NULL, no zero-DEFAULT.
     assert!(
-        sqlite
-            .to_lowercase()
-            .contains("\"done\" boolean not null default false"),
-        "optional bool field is native boolean with a default: {sqlite}"
+        sqlite.to_lowercase().contains("\"done\" boolean")
+            && !sqlite.to_lowercase().contains("\"done\" boolean not null"),
+        "optional bool field is a nullable native boolean: {sqlite}"
     );
     assert!(postgres.to_lowercase().contains("bigserial"), "{postgres}");
     // Postgres renders the native boolean type as `bool` (SQLite as `boolean`);
-    // both are native booleans, not the old BIGINT-as-i64 storage.
+    // both are native booleans, not the old BIGINT-as-i64 storage. Still nullable.
     assert!(
-        postgres
-            .to_lowercase()
-            .contains("\"done\" bool not null default false")
+        postgres.to_lowercase().contains("\"done\" bool")
+            && !postgres.to_lowercase().contains("\"done\" bool not null"),
+        "optional bool field is a nullable native boolean: {postgres}"
     );
     // Subroute entities get their own module-owned migration:
     assert!(root.join("crates/routes/todos/migrations/sqlite").exists());

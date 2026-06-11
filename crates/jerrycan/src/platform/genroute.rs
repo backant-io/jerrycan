@@ -661,14 +661,14 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
         }
         for f in e.fields.iter().filter(|f| f.name != "id") {
             let mut col = ColumnDef::new(Alias::new(f.name.as_str()));
-            ddl_typed(&mut col, f.field_type, backend_is_pg).not_null();
-            if !f.required {
-                match f.field_type {
-                    FieldType::Integer => col.default(0i64),
-                    FieldType::Boolean => col.default(false),
-                    FieldType::Float => col.default(0.0f64),
-                    _ => col.default(""),
-                };
+            ddl_typed(&mut col, f.field_type, backend_is_pg);
+            // A `required: false` field backs an `Option<T>` Model field, so its
+            // column is NULLABLE (sea-query's default) — inserting `None` binds
+            // NULL, which a NOT NULL column would reject. Required fields are
+            // NOT NULL with no default; the old zero-DEFAULTs only existed to let
+            // NOT NULL and optional coexist, a contradiction now removed.
+            if f.required {
+                col.not_null();
             }
             if f.unique {
                 col.unique_key();
@@ -1134,6 +1134,20 @@ mod tests {
             ws.contains("check") && ws.contains("'trial'"),
             "enum check: {ws}"
         );
+    }
+
+    /// Optional design fields (`required: false`) render as NULLABLE columns,
+    /// matching the `Option<T>` Model field they back. The old `NOT NULL DEFAULT
+    /// <zero>` rendering (a v0 relic, when models were plain types) made an
+    /// inserted `None` violate NOT NULL at runtime; nullable is the fix.
+    #[test]
+    fn optional_fields_are_nullable_columns() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let ddl = migration_ddl(&d.modules[1], false, &d)
+            .unwrap()
+            .to_lowercase();
+        assert!(!ddl.contains("\"custom\" text not null"), "{ddl}");
+        assert!(!ddl.contains("default ''"), "no zero-defaults: {ddl}");
     }
 
     /// A `bool` Model field is stored in a native BOOLEAN column now (SeaORM
