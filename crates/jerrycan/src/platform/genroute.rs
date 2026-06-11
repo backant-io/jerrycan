@@ -1515,6 +1515,46 @@ mod tests {
         );
     }
 
+    /// A subroute mounted under a param-carrying prefix generates a handler whose
+    /// single Path param is emitted positionally for its OWN leaf `{id}` — NOT a
+    /// tuple covering the parent's prefix param. The generator counts only the
+    /// endpoint's own `{params}`; the leaf-binding semantics live in core
+    /// (single `Path<T>` reads the last captured param). This pins that contract
+    /// at the generation level: a leaf endpoint under `/{ws}` stays single-Path.
+    #[test]
+    fn subroute_under_param_mount_keeps_single_path_for_its_leaf() {
+        // Parent module mounts at `/ws/{ws}`; its child subroute owns `/{id}`.
+        let m: ModuleDesign = serde_json::from_str(
+            r#"{
+                "name": "ws",
+                "mount": "/ws/{ws}",
+                "endpoints": [
+                    { "operation_id": "list_ws", "method": "GET", "path": "/",
+                      "success": { "status": 200 } }
+                ],
+                "subroutes": [
+                    {
+                        "name": "leads",
+                        "mount": "/leads",
+                        "endpoints": [
+                            { "operation_id": "show_lead", "method": "GET", "path": "/{id}",
+                              "success": { "status": 200 } }
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let sub = &m.subroutes[0];
+        let h = handlers_rs(sub, GenMode::default(), &demo());
+        // The leaf param is a single Path<i64>, not a tuple over the mount param.
+        assert!(
+            h.contains("pub(crate) async fn show_lead(Path(_id): Path<i64>)"),
+            "leaf endpoint under a param mount must stay single-Path: {h}"
+        );
+        assert!(!h.contains("Path((_"), "no tuple over the mount param: {h}");
+    }
+
     #[test]
     fn lib_rs_groups_routes_by_path_and_mounts_subroutes() {
         let m = todos();

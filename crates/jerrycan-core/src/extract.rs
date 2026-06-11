@@ -60,19 +60,25 @@ pub trait FromRequest: Sized + Send {
     fn from_request(ctx: &mut RequestCtx) -> impl Future<Output = Result<Self>> + Send;
 }
 
-/// Typed path parameter: `Path<i64>` grabs the first `{param}` in the route;
-/// `Path<(A, B)>` / `Path<(A, B, C)>` grab two/three `{param}`s in route order.
-/// Param types are the sealed [`PathParam`] set (integers, `String`, `bool`,
-/// floats, `char`); custom newtypes are a contract-v1 candidate.
+/// Typed path parameter: `Path<i64>` binds the LEAF-MOST (last) captured
+/// parameter; use a tuple to address all parameters root→leaf — `Path<(A, B)>` /
+/// `Path<(A, B, C)>` grab two/three `{param}`s in route order. Param types are
+/// the sealed [`PathParam`] set (integers, `String`, `bool`, floats, `char`);
+/// custom newtypes opt in through the [`path_param!`](crate::path_param) macro.
 pub struct Path<T>(pub T);
 
-mod sealed {
+/// Crate-internal seal for [`PathParam`]. Hidden from docs, but `pub` so the
+/// [`path_param!`](crate::path_param) macro can name it from outside this module
+/// — the trait below stays the real gate, and `path_param!` is its sanctioned door.
+#[doc(hidden)]
+pub mod sealed {
     pub trait Sealed {}
 }
 
-/// Types extractable from one path segment. Sealed closed set in v0: integers,
-/// `String`, `bool`, floats, `char`. Open/custom param types (id newtypes) are a
-/// contract-v1 candidate via serde-based extraction.
+/// Types extractable from one path segment. The built-in set (integers,
+/// `String`, `bool`, floats, `char`) is sealed; custom param types (id newtypes)
+/// join it through the [`path_param!`](crate::path_param) macro, which is the
+/// only sanctioned way to implement this trait outside the crate.
 pub trait PathParam: sealed::Sealed + Sized + Send {
     fn parse_param(name: &str, raw: &str) -> Result<Self>;
 }
@@ -89,15 +95,46 @@ macro_rules! impl_path_param {
         }
     )*};
 }
+
+/// Admit a custom newtype as a [`Path`] parameter. The type must implement
+/// [`FromStr`](std::str::FromStr) with a `Display` error; a parse failure maps
+/// to the same `JC0400` invalid-path-parameter error the built-in impls produce.
+///
+/// ```
+/// # use jerrycan_core as jerrycan;
+/// #[derive(Debug)]
+/// struct LeadId(i64);
+/// impl std::str::FromStr for LeadId {
+///     type Err = std::num::ParseIntError;
+///     fn from_str(s: &str) -> Result<Self, Self::Err> { Ok(LeadId(s.parse()?)) }
+/// }
+/// jerrycan::path_param!(LeadId);
+/// ```
+#[macro_export]
+macro_rules! path_param {
+    ($($t:ty),* $(,)?) => {$(
+        impl $crate::extract::sealed::Sealed for $t {}
+        impl $crate::extract::PathParam for $t {
+            fn parse_param(name: &str, raw: &str) -> $crate::Result<Self> {
+                raw.parse::<$t>().map_err(|e| {
+                    $crate::Error::bad_request(format!("invalid path parameter `{name}`: {e}"))
+                })
+            }
+        }
+    )*};
+}
 impl_path_param!(
     i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool, char, String,
 );
 
 impl<T: PathParam> FromRequest for Path<T> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        // Binds the leaf-most (last) captured parameter, so a route mounted under
+        // a param-carrying prefix (e.g. `/ws/{ws}` + `/leads/{id}`) addresses its
+        // own `{id}` rather than the mount's `{ws}`. Tuples address all of them.
         let (name, raw) = ctx
             .params
-            .first()
+            .last()
             .ok_or_else(|| Error::internal("route has no path parameters"))?;
         T::parse_param(name, raw).map(Path)
     }
@@ -227,6 +264,59 @@ mod tests {
         let mut c = ctx("/todos?limit=10&offset=20", "");
         let Query(p): Query<Page> = Query::from_request(&mut c).await.unwrap();
         assert_eq!((p.limit, p.offset), (10, 20));
+    }
+
+    #[tokio::test]
+    async fn single_path_param_binds_the_leaf_segment() {
+        use crate::prelude::*;
+        async fn show(Path(id): Path<i64>) -> Result<Json<i64>> {
+            Ok(Json(id))
+        }
+        let t = App::new()
+            .mount(
+                "/ws/{ws}",
+                Module::new("leads").route("/leads/{id}", get(show)),
+            )
+            .into_test();
+        assert_eq!(
+            t.get("/ws/7/leads/42").await.json::<i64>(),
+            42,
+            "leaf param, not mount param"
+        );
+    }
+
+    #[tokio::test]
+    async fn tuples_still_read_root_to_leaf() {
+        use crate::prelude::*;
+        async fn pair(Path((ws, id)): Path<(i64, i64)>) -> Result<Json<(i64, i64)>> {
+            Ok(Json((ws, id)))
+        }
+        let t = App::new()
+            .mount(
+                "/ws/{ws}",
+                Module::new("leads").route("/leads/{id}", get(pair)),
+            )
+            .into_test();
+        assert_eq!(t.get("/ws/7/leads/42").await.json::<(i64, i64)>(), (7, 42));
+    }
+
+    #[tokio::test]
+    async fn path_param_macro_admits_custom_newtypes() {
+        use crate::prelude::*;
+        #[derive(Debug)]
+        struct LeadId(i64);
+        impl std::str::FromStr for LeadId {
+            type Err = std::num::ParseIntError;
+            fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+                Ok(LeadId(s.parse()?))
+            }
+        }
+        crate::path_param!(LeadId);
+        async fn show(Path(id): Path<LeadId>) -> Result<Json<i64>> {
+            Ok(Json(id.0))
+        }
+        let t = App::new().route("/leads/{id}", get(show)).into_test();
+        assert_eq!(t.get("/leads/42").await.json::<i64>(), 42);
     }
 
     #[tokio::test]

@@ -617,6 +617,19 @@ mod tests {
                 .iter()
                 .any(|q| q.id.contains("/mount") && q.question.contains("start with '/'"))
         );
+
+        // A path parameter in a mount prefix is now fully supported: a handler's
+        // single Path<T> binds the leaf-most param, tuples address all root→leaf.
+        // The validator must NOT discourage it (only the syntax rules apply).
+        let d3 = design(&MINIMAL.replace(
+            "\"name\": \"comments\",",
+            "\"name\": \"comments\", \"mount\": \"/{comment_id}\",",
+        ));
+        assert!(
+            !validate(&d3).iter().any(|q| q.id.contains("/mount")),
+            "a param-carrying mount prefix must raise no mount question now: {:?}",
+            validate(&d3)
+        );
     }
 
     #[test]

@@ -3,6 +3,9 @@
 //! The CLI/MCP binary joins this package in Phase 1 behind a `cli` feature.
 #![forbid(unsafe_code)]
 
+/// `#[macro_export]` lands `path_param!` at the `jerrycan_core` crate root; this
+/// re-export makes `jerrycan::path_param!` resolve through the facade.
+pub use jerrycan_core::path_param;
 pub use jerrycan_core::*;
 pub use jerrycan_macros::main;
 

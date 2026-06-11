@@ -127,7 +127,7 @@
         "mount": {
           "type": "string",
           "pattern": "^/",
-          "description": "Mount prefix for this module (under the app for top-level modules, under the parent for subroutes). Defaults to '/' + name. v0 limitation: path parameters in mount prefixes interact with single-param Path extraction \u2014 prefer parameter-free mounts until multi-param Path lands."
+          "description": "Mount prefix for this module (under the app for top-level modules, under the parent for subroutes). Defaults to '/' + name. Path parameters in mount prefixes are fully supported: a handler's single Path<T> binds the leaf-most parameter, and tuples address all parameters root\u2192leaf."
         },
         "description": {
           "type": "string"
