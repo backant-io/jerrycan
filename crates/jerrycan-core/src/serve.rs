@@ -8,16 +8,30 @@ use std::sync::Arc;
 /// The serve engine: build the app, accept until `shutdown` resolves, then stop
 /// accepting, drain in-flight connections (10s cap), and return.
 pub(crate) async fn run_with_shutdown(
-    app: App,
+    mut app: App,
     listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<()> {
     const DRAIN_CAP: std::time::Duration = std::time::Duration::from_secs(10);
     const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+    // Lift background tasks off the builder before `build()` consumes it — they
+    // are FnOnce and serve-time-only, so they never enter the shared BuiltApp.
+    let background = app.take_background();
     let built = Arc::new(app.build()?);
     let mut connections = tokio::task::JoinSet::new();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Launch background tasks into the SAME JoinSet as connections, so they are
+    // governed by the identical drain cap. `_name` is retained for future
+    // observability (core has no tracing yet). A task that panics yields
+    // `Some(Err(JoinError))` from `join_next` — the drain loop still advances,
+    // so a panicking task cannot stall graceful shutdown.
+    for (_name, factory) in background {
+        let fut = factory(built.task_context(), shutdown_rx.clone());
+        connections.spawn(fut);
+    }
+
     tokio::pin!(shutdown);
 
     loop {

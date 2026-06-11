@@ -1,7 +1,7 @@
 //! `App` (spec §4.1): assembles mounted modules + app-level routes, validates
 //! the route table at build time (fail loud), and dispatches requests.
 
-use crate::dep::{AnyArc, DepEnv, DepFactory, DepResolver};
+use crate::dep::{AnyArc, DepEnv, DepFactory, DepResolver, TaskContext};
 use crate::error::{Error, Result};
 use crate::extract::RequestCtx;
 use crate::handler::BoxHandlerFn;
@@ -15,7 +15,20 @@ use crate::serve::is_transient_accept_error;
 use bytes::Bytes;
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+
+/// A serve-time background task: given a [`TaskContext`] (app-level deps) and a
+/// shutdown watch, runs until the future completes. Boxed `FnOnce` because each
+/// task is launched exactly once when serving starts.
+pub(crate) type BackgroundFactory = Box<
+    dyn FnOnce(
+            TaskContext,
+            tokio::sync::watch::Receiver<bool>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send,
+>;
 
 /// The application builder. Generated `app/src/main.rs` is exactly this:
 /// provide app-level deps, mount modules, serve.
@@ -27,6 +40,9 @@ pub struct App {
     security_headers: bool,
     handler_timeout: std::time::Duration,
     body_read_timeout: std::time::Duration,
+    /// Serve-time-only background tasks (spec: `on_serve`). They are taken off
+    /// the builder by the serve engine before `build()`; `into_test` drops them.
+    background: Vec<(&'static str, BackgroundFactory)>,
 }
 
 impl Default for App {
@@ -39,6 +55,7 @@ impl Default for App {
             security_headers: true,
             handler_timeout: std::time::Duration::from_secs(30),
             body_read_timeout: std::time::Duration::from_secs(30),
+            background: Vec::new(),
         }
     }
 }
@@ -111,6 +128,35 @@ impl App {
     pub fn middleware<M: Middleware>(mut self, mw: M) -> Self {
         self.middleware.push(Arc::new(mw));
         self
+    }
+
+    /// Register a background task that runs for the lifetime of `serve`.
+    ///
+    /// The task is launched once when serving starts, receives a
+    /// [`TaskContext`] (resolving app-level deps registered via
+    /// `provide`/`provide_dep`) and a `watch::Receiver<bool>` that flips to
+    /// `true` when shutdown begins. It runs under the same drain governance as
+    /// connections: shutdown gives it the 10s drain cap to finish before the
+    /// server aborts remaining work.
+    ///
+    /// Background tasks run ONLY under `serve` — `into_test` ignores them, so
+    /// drive the task's logic directly in tests rather than relying on it
+    /// firing. The `name` is retained for future observability.
+    pub fn on_serve<F, Fut>(mut self, name: &'static str, f: F) -> App
+    where
+        F: FnOnce(TaskContext, tokio::sync::watch::Receiver<bool>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let factory: BackgroundFactory = Box::new(move |ctx, shutdown| Box::pin(f(ctx, shutdown)));
+        self.background.push((name, factory));
+        self
+    }
+
+    /// Serve engine hook: lift the registered background tasks off the builder
+    /// before `build()` consumes it. They are FnOnce and serve-time-only, so
+    /// they deliberately do not travel into the `Arc`-shared `BuiltApp`.
+    pub(crate) fn take_background(&mut self) -> Vec<(&'static str, BackgroundFactory)> {
+        std::mem::take(&mut self.background)
     }
 
     /// Flatten modules, validate the route table, freeze the dispatch trie.
