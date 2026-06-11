@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod module;
 pub mod response;
 pub mod router;
+mod serve;
 pub mod test_client;
 
 pub use app::{App, BuiltApp, Extension};
