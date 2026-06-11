@@ -20,7 +20,7 @@ pub use app::{App, BuiltApp, Extension};
 pub use clock::Clock;
 pub use dep::{Dep, TaskContext};
 pub use error::{Error, Result};
-pub use extract::{FromRequest, Headers, Path, Query, RequestCtx};
+pub use extract::{FromRequest, Headers, Path, Query, RawBody, RequestCtx};
 pub use handler::Handler;
 pub use middleware::{Middleware, MiddlewareFuture, Next};
 pub use module::Module;
@@ -37,7 +37,7 @@ pub use http;
 pub mod prelude {
     pub use crate::{
         App, Clock, Created, Dep, Error, Extension, Headers, IntoResponse, Json, Middleware,
-        MiddlewareFuture, Module, Next, NoContent, Path, Query, RequestCtx, Result, StreamBody,
-        TestApp, delete, get, patch, post, put,
+        MiddlewareFuture, Module, Next, NoContent, Path, Query, RawBody, RequestCtx, Result,
+        StreamBody, TestApp, delete, get, patch, post, put,
     };
 }

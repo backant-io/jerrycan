@@ -201,9 +201,10 @@ impl TestApp {
 
     /// The single test request path: build the head, run the SAME two-phase
     /// policy the live server runs (route before body, per-route limit), then
-    /// dispatch. There is no streaming in tests, so the body limit is a length
-    /// check on the already-buffered bytes — the equivalent of `Limited` over
-    /// a socket. This keeps 404-before-read and per-route 413 honest in tests.
+    /// dispatch. Stream routes get a real framed lane with the route's `Limited`
+    /// cap inside it (the equivalent of `Limited` over a socket); buffered routes
+    /// keep the upfront length check on the already-buffered bytes. Either way
+    /// this keeps 404-before-read and per-route 413 honest in tests.
     async fn send(
         &self,
         method: Method,

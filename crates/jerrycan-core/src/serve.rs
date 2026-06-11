@@ -304,6 +304,8 @@ pub(crate) struct RecvTimeout;
 
 impl std::fmt::Display for RecvTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Internal-only text: the client-facing 408 message is minted in
+        // `map_stream_error` to match the buffered read path.
         f.write_str("timed out waiting for the next request-body frame")
     }
 }

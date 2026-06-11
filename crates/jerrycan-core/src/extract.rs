@@ -67,6 +67,9 @@ impl RequestCtx {
         match &mut self.body {
             BodyLane::Buffered(bytes) => Ok(bytes.clone()),
             BodyLane::Stream(slot) => {
+                // A `None` slot means a streaming consumer (Multipart, Task 7) took the
+                // lane and left it empty; a later drain on the same request lands here.
+                // This 500 is the intended post-Multipart contract, not dead code.
                 let stream = slot
                     .take()
                     .ok_or_else(|| Error::internal("request body was already consumed"))?;
@@ -283,6 +286,21 @@ impl FromRequest for Headers {
     }
 }
 
+/// The request body as EXACT bytes — the extractor for webhook signature
+/// verification, where the digest must cover the wire bytes, not a re-serialized
+/// value. Works on buffered routes (cheap clone) and `stream_body()` routes
+/// (drains and caches). See the auth docs for the Stripe/Twilio recipes.
+pub struct RawBody(pub Bytes);
+
+impl FromRequest for RawBody {
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
+        Ok(RawBody(ctx.drain_body().await?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +409,33 @@ mod tests {
         }
         let t = App::new().route("/leads/{id}", get(show)).into_test();
         assert_eq!(t.get("/leads/42").await.json::<i64>(), 42);
+    }
+
+    #[tokio::test]
+    async fn raw_body_yields_exact_bytes_and_coexists_with_headers() {
+        use crate::prelude::*;
+        async fn verify(headers: Headers, body: RawBody) -> Result<Json<(usize, bool)>> {
+            let signed = headers.get("x-signature").is_some();
+            Ok(Json((body.0.len(), signed)))
+        }
+        let t = App::new().route("/hook", post(verify)).into_test();
+        let res = t
+            .post_bytes_with("/hook", b"{\"raw\": 1}", &[("x-signature", "abc")])
+            .await;
+        assert_eq!(res.status().as_u16(), 200);
+        assert_eq!(res.json::<(usize, bool)>(), (10, true));
+    }
+
+    #[tokio::test]
+    async fn raw_body_drains_a_stream_route_transparently() {
+        use crate::prelude::*;
+        async fn len(body: RawBody) -> Result<Json<usize>> {
+            Ok(Json(body.0.len()))
+        }
+        let t = App::new().route("/up", post(len).stream_body()).into_test();
+        let payload = vec![b'x'; 100]; // > one 13-byte test frame
+        let res = t.post_bytes("/up", &payload).await;
+        assert_eq!(res.json::<usize>(), 100);
     }
 
     #[tokio::test]
