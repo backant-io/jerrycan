@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.2.0 — unreleased
+
+The v2 data foundation: a single contract bump that lands relations, constraints,
+and first-class multi-tenancy, and moves the data layer onto SeaORM.
+
+### Design contract (contract_version 1, additive)
+- `belongs_to` relations with `on_delete: cascade | set_null | restrict`
+  (`has_many` implied); field flags `unique` / `index` plus entity-level
+  composite uniques; `json` fields (`serde_json::Value`, TEXT/JSONB storage);
+  string enums via `values: [...]` (CHECK constraint + `Valid<T>`).
+- **Tenancy**: a top-level `tenancy` block generates the M2M membership table, a
+  membership-checked `Tenant` guard (`Dep<Tenant>`, `id()`/`require_role()`),
+  tenant-scoped repo methods (`all_for`/`get_for`/`remove_for`) on every entity
+  that `belongs_to` the tenant, and cross-tenant isolation acceptance tests.
+- **Jobs**: the `jobs` object *shape* is defined now (contract breaks once); the
+  engine arrives in a later v2 phase.
+
+### Data layer (jerrycan-db on SeaORM)
+- `Db` wraps `sea_orm::DatabaseConnection`; generated `model.rs` is SeaORM
+  entities, `repo.rs` stays the agent-owned query seam. JC0409/JC0510 preserved.
+- `jerrycan generate migration <name> --module <m>` emits numbered dual-dialect
+  pairs and rewires `migrations.rs`.
+
+### Schema contract
+- `schema.json` (beside `design.json`) — tables, columns, foreign keys, uniques,
+  indexes, enums — derived by introspecting the applied migrations. Surfaced
+  three ways from one payload: the committed file, `jerrycan schema --json`, and
+  the new MCP tool `jerrycan_schema` (mcp-tools.json grows 9 → 10, additive).
+- `jerrycan check` regenerates and fails `JC0520` if the committed file is stale.
+
+### Isolation & lints
+- Generated cross-tenant isolation tests (tenant A must not read tenant B).
+- `JL0006` flags unscoped repo queries on tenant-owned tables.
+
+### Invariants
+- Determinism: the same `design.json` produces byte-identical generated output
+  (golden-output corpus in CI).
+- Compatibility: every contract_version 0 design validates and generates under
+  v1 (compat suite).
+
+### Breaking
+- `Db::pool()` is removed — use `Db::conn()` (a `sea_orm::DatabaseConnection`).
+- Generated apps must regenerate tool-owned files (`model.rs`, `lib.rs`,
+  migrations runner, tests) to pick up the SeaORM layer and tenancy wiring.
+
 ## 0.1.0 — first release
 
 The first public release of jerrycan — the AI-native Rust backend platform.

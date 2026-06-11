@@ -54,4 +54,6 @@ mod doc_tests {
         "../../../docs/ai/11-observability.md"
     );
     doc_page!(page_12_packaging, "../../../docs/ai/12-packaging.md");
+    #[cfg(all(feature = "db", feature = "auth"))]
+    doc_page!(page_14_tenancy, "../../../docs/ai/14-tenancy.md");
 }

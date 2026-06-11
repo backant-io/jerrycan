@@ -26,7 +26,7 @@ jerrycan is two inseparable halves:
 
 **Humans don't write the code — agents do**, guided by documentation where every example is a compiling, *running* doc-test, and by machine-readable contracts for every tool.
 
-> **Status: 0.1.0, first release.** Phases 0 (core API + frozen contracts), 1 (CLI + MCP core loop), 2 (data & test-first generation), 3 (auth, observability, `jerrycan package`), and 4 (fuzzing, agent evals, diagnostics polish) are complete and fully tested. This is the first usable release — crates are at `0.1.0` (publish-pending; the maintainer runs `scripts/publish.sh`). Early but real; expect rough edges as it grows.
+> **Status: 0.1.0 released; 0.2.0 in development on `main`.** Phases 0 (core API + frozen contracts), 1 (CLI + MCP core loop), 2 (data & test-first generation), 3 (auth, observability, `jerrycan package`), and 4 (fuzzing, agent evals, diagnostics polish) are complete and fully tested. The crates are published at `0.1.0` on [crates.io](https://crates.io/crates/jerrycan). Work toward `0.2.0` — the v2 data foundation (relations, constraints, first-class tenancy, SeaORM) — is landing on `main`; see the [v2 design spec](docs/superpowers/specs/2026-06-11-jerrycan-v2-design.md). Early but real; expect rough edges as it grows.
 
 ## A taste
 
@@ -118,13 +118,20 @@ jerrycan_package  → hardened artifacts + SBOM, only when everything is green
 | **2 — Data & TDD** | jerrycan-db, jerrycan-validate + OpenAPI, per-module test generation | ✅ complete |
 | **3 — Production** | jerrycan-auth, jerrycan-observe, `jerrycan package` (Docker/k8s/binary/systemd) | ✅ complete |
 | **4 — Hardening** | Fuzzing, agent evals, diagnostics polish → v0.1.0 | ✅ complete |
-| **v0.1.0** | First release (publish-pending: maintainer runs `scripts/publish.sh`) | 🚀 |
+| **v0.1.0** | First release — crates published on [crates.io](https://crates.io/crates/jerrycan) | 🚀 released |
+| **v2.0 — Data foundation** | Contract v1 (relations + `on_delete`, unique/index, enums, json, **tenancy**, jobs shape), SeaORM data layer, `schema.json` contract + `jerrycan_schema` tool, generated isolation tests | ✅ complete |
+| **v2.0b — Core readiness** | Dual-lane body + per-route limits, param-carrying mounts, task-scoped DI, extension lifecycle, mockable `Clock` | 🔜 planned |
+| **v2.1 — Protocol surface** | `Multipart` / `RawBody` (webhook signatures) / `StreamBody` extractors | 🔜 planned |
+| **v2.2 — Middleware kit** | CORS in core; rate limiting as an extension (`429 JC0429`) | 🔜 planned |
+| **v2.3 — jerrycan-jobs** | `JobStore` (Postgres / Redis), retries + dead-letter, named queues, cron, idempotency, `run_at` | 🔜 planned |
+| **v2.4 — Auth expansion** | OAuth2 client, encrypted token storage + key rotation, scoped API keys, mock IdP harness | 🔜 planned |
+| **v2.5 — Eval gate → v0.2.0** | Agent rebuilds the Kolli slice via MCP, docs-only; permanent release gate | 🔜 planned |
 
-The full plan lives in the [design spec](docs/superpowers/specs/2026-06-09-jerrycan-design.md); deferred items are tracked in the [backlog](docs/phase1-backlog.md).
+The original plan lives in the [v1 design spec](docs/superpowers/specs/2026-06-09-jerrycan-design.md); the v2 roadmap is in the [v2 design spec](docs/superpowers/specs/2026-06-11-jerrycan-v2-design.md); deferred items are tracked in the [backlog](docs/phase1-backlog.md).
 
 ## Install
 
-> These work once 0.1.0 is published (publish is maintainer-pending).
+> `0.1.0` is live on crates.io — these work today.
 
 ```bash
 # In an app — the framework facade with the extensions you need:

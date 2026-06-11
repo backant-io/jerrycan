@@ -69,6 +69,26 @@ let m = Module::new("items")
 # let _ = App::new().mount("/items", m).into_test();
 ```
 
+## Relations
+An entity declares a parent with `belongs_to` (in db mode); the inverse
+`has_many` is implied. The generator derives a foreign-key column and a SeaORM
+relation from it:
+```json
+{
+  "name": "Lead",
+  "fields": [{ "name": "name", "type": "string" }],
+  "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }]
+}
+```
+Derivation rules:
+- **fk column**: `belongs_to.entity` snake-cased + `_id` (`Workspace` → a
+  `workspace_id` column, typed as the parent's pk).
+- **on_delete**: `cascade` | `set_null` | `restrict` — emitted on the foreign-key
+  constraint in the migration (so a deleted parent's children follow the rule).
+- **scoped methods**: when the parent is the design's tenancy entity, the child's
+  repo also gains `all_for`/`get_for`/`remove_for`, filtering by the fk so a
+  handler only ever reaches the caller's rows. See `jerrycan docs tenancy`.
+
 ## Errors you'll hit
 - Mounting two routes onto the same final path → build-time conflict error
   naming the path. Rename one route or move the mount prefix.

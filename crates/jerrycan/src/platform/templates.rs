@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn jerrycan_dep_spec_defaults_and_honors_env_override() {
+    fn default_dep_spec_tracks_the_crate_version() {
         // NB: env mutation — run serially-safe by using a unique var read at call time.
         let default = jerrycan_dep_spec_from(None);
         assert_eq!(
