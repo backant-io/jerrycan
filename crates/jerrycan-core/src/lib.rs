@@ -11,6 +11,7 @@ pub mod extract;
 pub mod handler;
 pub mod middleware;
 pub mod module;
+pub mod multipart;
 pub mod response;
 pub mod router;
 mod serve;
