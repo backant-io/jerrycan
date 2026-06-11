@@ -14,7 +14,11 @@ fn load(rel: &str) -> Value {
 fn mcp_tools_contract_holds_its_invariants() {
     let doc = load("mcp-tools.json");
     let tools = doc["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 9, "spec §7.2 defines exactly 9 tools");
+    assert_eq!(
+        tools.len(),
+        10,
+        "spec §7.2 + the contract-v1 schema tool define exactly 10 tools"
+    );
 
     let mut names = std::collections::HashSet::new();
     let workflow = [

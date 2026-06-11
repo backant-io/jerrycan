@@ -97,6 +97,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs database",
     },
     CodeInfo {
+        code: "JC0520",
+        title: "schema contract is stale",
+        cause: "schema.json does not match the schema derived from the module migrations",
+        fix: "run jerrycan schema --write and commit the result",
+        doc: "jerrycan docs database",
+    },
+    CodeInfo {
         code: "JC1001",
         title: "missing dependency",
         cause: "a handler asked for a Dep<T> with no registered provider",

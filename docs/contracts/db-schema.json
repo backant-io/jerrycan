@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jerrycan.cc/schemas/db-schema-v1.json",
+  "title": "jerrycan schema.json",
+  "description": "The derived data contract: the shape of an app's data layer, obtained by applying every module migration to a throwaway SQLite, introspecting the result, and overlaying the design's declared field types. Produced by `jerrycan schema` / the jerrycan_schema MCP tool; never hand-written. The check gate (JC0520) fails when the committed schema.json drifts from this derivation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "tables"],
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Schema-contract format version. Bumped when the shape below changes."
+    },
+    "tables": {
+      "type": "array",
+      "description": "Every user table, sorted by name (deterministic).",
+      "items": { "$ref": "#/$defs/table" }
+    }
+  },
+  "$defs": {
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "module", "columns", "foreign_keys", "unique", "indexes"],
+      "properties": {
+        "name": { "type": "string", "description": "SQL table name." },
+        "module": { "type": "string", "description": "Owning route module (the crate holding the migration)." },
+        "columns": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/column" }
+        },
+        "foreign_keys": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/foreign_key" }
+        },
+        "unique": {
+          "type": "array",
+          "description": "Unique constraints/indexes, each a column set.",
+          "items": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "indexes": {
+          "type": "array",
+          "description": "Plain (non-unique) created indexes, by name.",
+          "items": { "type": "string" }
+        },
+        "enums": {
+          "type": "object",
+          "description": "Design-declared CHECK value sets, keyed by column. Omitted when empty.",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "nullable", "pk"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": {
+          "type": "string",
+          "description": "The design-declared field type (string|integer|float|boolean|datetime|uuid|json), or a SQLite fallback for tables the design does not own."
+        },
+        "nullable": { "type": "boolean" },
+        "pk": { "type": "boolean" }
+      }
+    },
+    "foreign_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column", "references", "on_delete"],
+      "properties": {
+        "column": { "type": "string" },
+        "references": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["table", "column"],
+          "properties": {
+            "table": { "type": "string" },
+            "column": { "type": "string" }
+          }
+        },
+        "on_delete": {
+          "enum": ["cascade", "set_null", "restrict", "no_action"]
+        }
+      }
+    }
+  }
+}

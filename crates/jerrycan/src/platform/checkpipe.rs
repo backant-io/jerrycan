@@ -227,6 +227,21 @@ pub fn run_deny(root: &Path) -> Result<ToolStep, String> {
     external_tool(root, "deny", &["check"], "DENY0001", "cargo-deny")
 }
 
+/// Sync bridge for the async schema-drift check: derive the contract on a
+/// throwaway runtime (as `jerrycan db migrate` does) and compare it to the
+/// committed schema.json. An Err here is an environment problem (the derivation
+/// couldn't run), surfaced as a gate-stopping environment failure.
+fn verify_schema(
+    root: &Path,
+    design: &crate::platform::design::Design,
+) -> Result<Vec<Diagnostic>, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(crate::platform::schema::verify_fresh(root, design))
+}
+
 /// The whole gate. Err(String) = environment problem (missing tool), not a gate failure.
 ///
 /// audit/deny are workspace-global supply-chain gates; module scope is for fast
@@ -266,6 +281,10 @@ pub fn run_all(
         "jerrycan lints",
         Box::new(|| Ok(super::lints::run(root, design))),
     ));
+    // schema.json drift is a db-only gate: it only exists once migrations do.
+    if module.is_none() && design.wants_db() {
+        steps.push(("schema contract", Box::new(|| verify_schema(root, design))));
+    }
 
     for (name, step) in steps {
         let ds = step()?;

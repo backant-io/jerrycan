@@ -427,6 +427,49 @@ fn db_migrate_applies_module_migrations() {
 }
 
 #[test]
+fn schema_json_prints_the_derived_contract() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut design: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    design["dependencies"] = serde_json::json!(["db"]);
+    let design_path = tmp.path().join("design.json");
+    std::fs::write(&design_path, serde_json::to_string_pretty(&design).unwrap()).unwrap();
+    let app_dir = tmp.path().join("todo-api");
+    assert!(
+        jerrycan()
+            .args(["new"])
+            .arg(&app_dir)
+            .arg("--design")
+            .arg(&design_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // scaffold writes schema.json for a db app.
+    assert!(
+        app_dir.join("schema.json").exists(),
+        "scaffold wrote schema.json"
+    );
+
+    let out = jerrycan()
+        .current_dir(&app_dir)
+        .args(["--json", "schema"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let tables = payload["tables"].as_array().expect("tables array");
+    assert!(
+        tables.iter().any(|t| t["name"] == "todos"),
+        "contract names the todos table: {payload}"
+    );
+    assert_eq!(payload["schema_version"], 1);
+}
+
+#[test]
 fn docs_command_prints_pages_and_searches() {
     let out = jerrycan().args(["docs", "dependencies"]).output().unwrap();
     assert!(out.status.success());

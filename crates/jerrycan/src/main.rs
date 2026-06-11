@@ -76,6 +76,12 @@ enum Cmd {
         #[command(subcommand)]
         what: DbCmd,
     },
+    /// Show (or rewrite) the derived schema.json data contract
+    Schema {
+        /// Rewrite schema.json from the current migrations and print its path
+        #[arg(long)]
+        write: bool,
+    },
     /// Emit hardened deployment artifacts + SBOM after a green check
     Package {
         /// Emit a hardened multi-stage Dockerfile
@@ -177,6 +183,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Db {
             what: DbCmd::Migrate { url },
         } => cmd_db_migrate(url.as_deref(), cli.json),
+        Cmd::Schema { write } => cmd_schema(write, cli.json),
         Cmd::Package {
             docker,
             binary,
@@ -287,7 +294,13 @@ fn require_complete(design: &Design, json_mode: bool) -> Result<(), Failure> {
 fn cmd_new(target: &str, design_path: &str, json_mode: bool) -> Result<(), Failure> {
     let design = load_design(Path::new(design_path))?;
     require_complete(&design, json_mode)?;
-    let created = scaffold::scaffold(Path::new(target), &design).map_err(Failure::gate)?;
+    let mut created = scaffold::scaffold(Path::new(target), &design).map_err(Failure::gate)?;
+    // db apps ship a derived schema.json contract (memory mode has no migrations).
+    if let Some(rel) = jerrycan::platform::schema::write_schema(Path::new(target), &design)
+        .map_err(Failure::gate)?
+    {
+        created.push(rel);
+    }
     let payload = serde_json::json!({
         "created": created,
         "next_step": format!("cd {target} && jerrycan check — then implement the handler stubs"),
@@ -493,6 +506,64 @@ fn cmd_db_migrate(url: Option<&str>, json_mode: bool) -> Result<(), Failure> {
             payload["applied"].as_array().map(Vec::len).unwrap_or(0)
         ),
     );
+    Ok(())
+}
+
+fn cmd_schema(write: bool, json_mode: bool) -> Result<(), Failure> {
+    use jerrycan::platform::schema;
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+    if !design.wants_db() {
+        return Err(Failure::usage(
+            "this app has no `db` dependency — there is no schema contract to derive (run `jerrycan add db` first)",
+        ));
+    }
+
+    if write {
+        let rel = schema::write_schema(&root, &design)
+            .map_err(Failure::gate)?
+            .expect("write_schema returns a path in db mode");
+        let path = root.join(&rel);
+        let payload = serde_json::json!({
+            "path": rel,
+            "next_step": "commit schema.json — it is the reviewable data contract",
+        });
+        emit(json_mode, &payload, &format!("wrote {}", path.display()));
+        return Ok(());
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Failure::environment(e.to_string()))?;
+    let contract = runtime
+        .block_on(schema::derive_schema(&root, &design))
+        .map_err(Failure::gate)?;
+
+    if json_mode {
+        // --json: the contract verbatim, identical to the MCP tool payload.
+        print!("{}", schema::render(&contract));
+    } else {
+        for table in &contract.tables {
+            println!("{} ({})", table.name, table.module);
+            let width = table
+                .columns
+                .iter()
+                .map(|c| c.name.len())
+                .max()
+                .unwrap_or(0);
+            for col in &table.columns {
+                let flags = if col.pk {
+                    " pk"
+                } else if col.nullable {
+                    " null"
+                } else {
+                    ""
+                };
+                println!("  {:width$}  {}{}", col.name, col.r#type, flags);
+            }
+        }
+    }
     Ok(())
 }
 

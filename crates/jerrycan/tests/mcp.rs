@@ -17,7 +17,7 @@ fn initialize_list_and_unknown_method() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 9, "all 9 contract tools served");
+    assert_eq!(names.len(), 10, "all 10 contract tools served");
     assert!(names.contains(&"jerrycan_design") && names.contains(&"jerrycan_check"));
     // Every tool forwards its outputSchema (the contract defines one for each).
     for t in tools["tools"].as_array().unwrap() {
@@ -65,6 +65,13 @@ fn docs_tools_work_through_mcp() {
     assert!(!err);
     assert!(payload["markdown"].as_str().unwrap().contains("JC0404"));
     c.shutdown();
+}
+
+#[test]
+fn mcp_lists_ten_tools_including_schema() {
+    use jerrycan::platform::mcp::handle_message;
+    let r = handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+    assert!(r.contains("jerrycan_schema"), "{r}");
 }
 
 const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.json");

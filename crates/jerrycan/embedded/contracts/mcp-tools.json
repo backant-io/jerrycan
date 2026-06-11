@@ -220,6 +220,20 @@
         },
         "required": ["routes"]
       }
+    },
+    {
+      "name": "jerrycan_schema",
+      "description": "Derive the data contract from the app's module migrations: the schema.json shape (tables, columns, foreign keys, unique constraints, indexes, enums) with design-declared field types overlaid. The reviewable, never-hand-written source of truth for the data layer. Governed by https://jerrycan.cc/schemas/db-schema-v1.json.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "$ref": "https://jerrycan.cc/schemas/db-schema-v1.json"
+      }
     }
   ]
 }

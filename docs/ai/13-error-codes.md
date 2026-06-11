@@ -18,6 +18,7 @@ the cause + fix for any of them.
 | JC0500 | Internal error (or handler panic) |
 | JC0503 | Handler timeout (default 30s) |
 | JC0510 | Database error (jerrycan-db) |
+| JC0520 | Schema contract is stale — schema.json drifted from the migrations |
 | JC1001 | Missing dependency provider |
 | JC1002 | Dependency cycle |
 

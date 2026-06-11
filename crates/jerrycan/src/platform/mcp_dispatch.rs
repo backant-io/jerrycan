@@ -115,13 +115,21 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                 );
             }
             match scaffold::scaffold(Path::new(directory), &design) {
-                Ok(created) => (
-                    false,
-                    json!({
-                        "created": created,
-                        "next_step": "implement the handler stubs (see jerrycan_list_routes), then jerrycan_check",
-                    }),
-                ),
+                Ok(mut created) => {
+                    // db apps ship a derived schema.json contract.
+                    match super::schema::write_schema(Path::new(directory), &design) {
+                        Ok(Some(rel)) => created.push(rel),
+                        Ok(None) => {}
+                        Err(e) => return err_payload(e),
+                    }
+                    (
+                        false,
+                        json!({
+                            "created": created,
+                            "next_step": "implement the handler stubs (see jerrycan_list_routes), then jerrycan_check",
+                        }),
+                    )
+                }
                 Err(e) => err_payload(e),
             }
         }
@@ -326,6 +334,35 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                         "sbom": sbom,
                         "next_step": "deploy with your own tooling (kubectl apply -f deploy/k8s.yaml, docker build, scp the binary + systemd unit)",
                     }),
+                ),
+                Err(e) => err_payload(e),
+            }
+        }
+
+        "jerrycan_schema" => {
+            let root = root_from(args);
+            let design = match Design::from_path(&root.join("design.json")) {
+                Ok(d) => d,
+                Err(e) => return err_payload(e),
+            };
+            if !design.wants_db() {
+                return err_payload(
+                    "this app has no `db` dependency — there is no schema contract to derive",
+                );
+            }
+            // Derive on a throwaway runtime (dispatch is sync), as `db migrate` does.
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => return err_payload(e.to_string()),
+            };
+            match runtime.block_on(super::schema::derive_schema(&root, &design)) {
+                // Return the contract JSON directly as the structured payload.
+                Ok(contract) => (
+                    false,
+                    serde_json::to_value(&contract).expect("contract serializes"),
                 ),
                 Err(e) => err_payload(e),
             }

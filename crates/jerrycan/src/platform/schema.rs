@@ -398,6 +398,47 @@ pub fn render(contract: &SchemaContract) -> String {
     s
 }
 
+/// Derive and write `schema.json` into an app root (db mode only — the contract
+/// is derived from migrations, which only exist when the design wants a db).
+/// Returns the written relative path (`schema.json`), or `None` for memory mode.
+/// Runs the async derivation on a throwaway runtime, as `jerrycan db migrate` does.
+pub fn write_schema(root: &Path, design: &Design) -> Result<Option<String>, String> {
+    if !design.wants_db() {
+        return Ok(None);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let contract = runtime.block_on(derive_schema(root, design))?;
+    std::fs::write(root.join("schema.json"), render(&contract))
+        .map_err(|e| format!("write schema.json: {e}"))?;
+    Ok(Some("schema.json".to_string()))
+}
+
+/// Compare the committed `schema.json` against a fresh derivation. An empty
+/// Vec means the contract is in sync; a single JC0520 diagnostic means the file
+/// is missing or stale (drifted from the module migrations). Err means the
+/// derivation itself failed (an environment/migration problem, not drift).
+pub async fn verify_fresh(
+    root: &Path,
+    design: &Design,
+) -> Result<Vec<super::checkpipe::Diagnostic>, String> {
+    let derived = render(&derive_schema(root, design).await?);
+    let committed = std::fs::read_to_string(root.join("schema.json")).unwrap_or_default();
+    if committed == derived {
+        return Ok(Vec::new());
+    }
+    Ok(vec![super::checkpipe::Diagnostic {
+        code: "JC0520".into(),
+        file: Some("schema.json".into()),
+        line: Some(1),
+        message: "schema.json does not match the schema derived from the module migrations".into(),
+        suggestion: Some("run jerrycan schema --write".into()),
+        doc_url: Some("jerrycan docs database".into()),
+    }])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +481,28 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn published_schema_pins_the_contract_shape() {
+        // The published JSON Schema is the durable contract; spot-check that it
+        // parses and pins the version this code emits (no full validator here).
+        let s = include_str!("../../../../docs/contracts/db-schema.json");
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert_eq!(v["$id"], "https://jerrycan.cc/schemas/db-schema-v1.json");
+        assert_eq!(
+            v["properties"]["schema_version"]["const"]
+                .as_u64()
+                .expect("schema_version const"),
+            u64::from(SCHEMA_VERSION),
+        );
+        // The contract's required keys mirror the SchemaContract fields.
+        let required: Vec<&str> = v["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert_eq!(required, ["schema_version", "tables"]);
     }
 }

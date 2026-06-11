@@ -231,6 +231,44 @@ fn generate_migration_emits_numbered_pair_and_rewires() {
     );
 }
 
+#[tokio::test]
+async fn schema_verify_flags_staleness_with_jc0520() {
+    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let d: jerrycan::platform::design::Design = serde_json::from_str(s).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    jerrycan::platform::scaffold::scaffold(&root, &d).unwrap();
+    // fresh derivation written → verify passes
+    let c = jerrycan::platform::schema::derive_schema(&root, &d)
+        .await
+        .unwrap();
+    std::fs::write(
+        root.join("schema.json"),
+        jerrycan::platform::schema::render(&c),
+    )
+    .unwrap();
+    assert!(
+        jerrycan::platform::schema::verify_fresh(&root, &d)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // stale file → JC0520 diagnostic
+    std::fs::write(root.join("schema.json"), "{}").unwrap();
+    let diags = jerrycan::platform::schema::verify_fresh(&root, &d)
+        .await
+        .unwrap();
+    assert!(diags.iter().any(|x| x.code == "JC0520"), "{diags:?}");
+    // missing file → also JC0520
+    std::fs::remove_file(root.join("schema.json")).unwrap();
+    assert!(
+        !jerrycan::platform::schema::verify_fresh(&root, &d)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn memory_mode_is_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
