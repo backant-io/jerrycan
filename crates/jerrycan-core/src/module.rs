@@ -74,6 +74,8 @@ pub(crate) struct FlatRoute {
     pub(crate) methods: MethodRouter,
     pub(crate) env: Arc<DepEnv>,
     pub(crate) middleware: Arc<[Arc<dyn Middleware>]>,
+    /// Per-route body cap carried from the `MethodRouter` to the `Endpoint`.
+    pub(crate) body_limit: Option<usize>,
 }
 
 pub(crate) fn join_paths(prefix: &str, rel: &str) -> String {
@@ -107,11 +109,13 @@ impl Module {
 
         let mut out = Vec::new();
         for (path, methods) in self.routes {
+            let body_limit = methods.body_limit;
             out.push(FlatRoute {
                 path: join_paths(prefix, &path),
                 methods,
                 env: env.clone(),
                 middleware: mw_arc.clone(),
+                body_limit,
             });
         }
         for (sub_prefix, child) in self.mounts {

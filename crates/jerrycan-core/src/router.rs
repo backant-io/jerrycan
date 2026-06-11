@@ -14,6 +14,9 @@ use std::sync::Arc;
 /// Per-path method table: `get(list).post(create)` (spec §4.1).
 pub struct MethodRouter {
     pub(crate) handlers: Vec<(Method, BoxHandlerFn)>,
+    /// Per-route request-body cap in bytes. `None` defers to the app default
+    /// (1 MiB, spec §4.4). Applies to ALL methods on the route, not per-method.
+    pub(crate) body_limit: Option<usize>,
 }
 
 pub fn get<H: Handler<A>, A>(h: H) -> MethodRouter {
@@ -36,11 +39,21 @@ impl MethodRouter {
     fn new() -> Self {
         Self {
             handlers: Vec::new(),
+            body_limit: None,
         }
     }
 
     pub fn on<H: Handler<A>, A>(mut self, method: Method, h: H) -> Self {
         self.handlers.push((method, h.into_handler_fn()));
+        self
+    }
+
+    /// Cap the request body for THIS route at `bytes`, overriding the app's
+    /// 1 MiB default (spec §4.4). The cap is per-route — it applies to every
+    /// method registered here, not per-method. Bodies over the cap are
+    /// rejected with 413 before the handler runs.
+    pub fn body_limit(mut self, bytes: usize) -> Self {
+        self.body_limit = Some(bytes);
         self
     }
     pub fn get<H: Handler<A>, A>(self, h: H) -> Self {
@@ -66,6 +79,9 @@ pub(crate) struct Endpoint {
     pub(crate) methods: HashMap<Method, BoxHandlerFn>,
     pub(crate) env: Arc<DepEnv>,
     pub(crate) middleware: Arc<[Arc<dyn Middleware>]>,
+    /// Per-route body cap (bytes); `None` = the app default. Read pre-dispatch
+    /// by `route_policy` to size the body read for this route (spec §4.4).
+    pub(crate) body_limit: Option<usize>,
 }
 
 #[derive(Default)]
@@ -237,6 +253,7 @@ mod tests {
             methods: map,
             env: Arc::new(DepEnv::default()),
             middleware: Arc::from(vec![]),
+            body_limit: None,
         }
     }
 

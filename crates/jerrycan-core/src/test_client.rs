@@ -3,8 +3,10 @@
 //!
 //! Panics in handlers propagate in tests by design — the serve path converts them to 500 JC0500.
 
-use crate::app::{App, BuiltApp};
-use crate::response::Response;
+use crate::App;
+use crate::app::{BuiltApp, Policy};
+use crate::error::Error;
+use crate::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::{Method, StatusCode, header};
 use http_body_util::BodyExt;
@@ -63,6 +65,29 @@ impl TestApp {
             Method::PATCH,
             path,
             Some(serde_json::to_vec(body).expect("serialize")),
+        )
+        .await
+    }
+
+    /// POST a raw byte body (content-type `application/octet-stream`). Routes
+    /// and per-route body limits apply exactly as they do over a socket.
+    pub async fn post_bytes(&self, path: &str, bytes: &[u8]) -> TestResponse {
+        self.post_bytes_with(path, bytes, &[]).await
+    }
+
+    /// POST a raw byte body with explicit request headers.
+    pub async fn post_bytes_with(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        headers: &[(&str, &str)],
+    ) -> TestResponse {
+        self.send(
+            Method::POST,
+            path,
+            Some(Bytes::copy_from_slice(bytes)),
+            Some("application/octet-stream"),
+            headers,
         )
         .await
     }
@@ -136,16 +161,48 @@ impl TestApp {
         json: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> TestResponse {
+        let content_type = json.as_ref().map(|_| "application/json");
+        self.send(method, path, json.map(Bytes::from), content_type, headers)
+            .await
+    }
+
+    /// The single test request path: build the head, run the SAME two-phase
+    /// policy the live server runs (route before body, per-route limit), then
+    /// dispatch. There is no streaming in tests, so the body limit is a length
+    /// check on the already-buffered bytes — the equivalent of `Limited` over
+    /// a socket. This keeps 404-before-read and per-route 413 honest in tests.
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Bytes>,
+        content_type: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> TestResponse {
         let mut builder = http::Request::builder().method(method).uri(path);
-        if json.is_some() {
-            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        if let Some(ct) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, ct);
         }
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
         let req = builder.body(()).expect("test request build");
         let (parts, ()) = req.into_parts();
-        let body = Bytes::from(json.unwrap_or_default());
+        let body = body.unwrap_or_default();
+
+        // Phase 1: route on the head alone — a reject answers without reading the body.
+        let limit = match self.built.route_policy(&parts) {
+            Policy::Reject(response) => return TestResponse::collect(response).await,
+            Policy::Route { limit } => limit,
+        };
+        // Phase 2 (no streaming in tests): the per-route limit is a length check.
+        if body.len() > limit {
+            let mut response = Error::payload_too_large().into_response();
+            if self.built.security_headers {
+                crate::app::apply_security_headers(&mut response);
+            }
+            return TestResponse::collect(response).await;
+        }
         TestResponse::collect(self.built.dispatch(parts, body).await).await
     }
 }

@@ -8,11 +8,18 @@ use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use std::future::Future;
 
+/// How the request body reaches the context. One variant TODAY — the enum
+/// exists so v2.1's streaming body lands without touching every `ctx.body`
+/// reader; buffered consumers go through [`RequestCtx::body_bytes`].
+pub(crate) enum BodyLane {
+    Buffered(Bytes),
+}
+
 /// The mutable view of one in-flight request. Handlers receive extractors,
 /// not this type; middleware and the DI resolver work through it.
 pub struct RequestCtx {
     pub(crate) parts: http::request::Parts,
-    pub(crate) body: Bytes,
+    pub(crate) body: BodyLane,
     /// Path parameters captured by the router, in route order.
     pub(crate) params: Vec<(String, String)>,
     pub(crate) deps: DepResolver,
@@ -22,9 +29,17 @@ impl RequestCtx {
     pub(crate) fn new(parts: http::request::Parts, body: Bytes, deps: DepResolver) -> Self {
         Self {
             parts,
-            body,
+            body: BodyLane::Buffered(body),
             params: Vec::new(),
             deps,
+        }
+    }
+
+    /// The fully-buffered request body. The only body lane today; streaming
+    /// (v2.1) will add a fallible accessor without disturbing this one.
+    pub(crate) fn body_bytes(&self) -> &Bytes {
+        match &self.body {
+            BodyLane::Buffered(bytes) => bytes,
         }
     }
 
@@ -135,7 +150,7 @@ impl<T: DeserializeOwned + Send> FromRequest for Query<T> {
 
 impl<T: DeserializeOwned + Send> FromRequest for Json<T> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
-        serde_json::from_slice::<T>(&ctx.body)
+        serde_json::from_slice::<T>(ctx.body_bytes())
             .map(Json)
             .map_err(|e| Error::unprocessable(format!("invalid JSON body: {e}")))
     }

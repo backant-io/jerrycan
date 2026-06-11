@@ -121,6 +121,7 @@ impl App {
         let app_mw: Arc<[Arc<dyn Middleware>]> = Arc::from(self.middleware.clone());
 
         for (path, methods) in self.routes {
+            let body_limit = methods.body_limit;
             insert_flat(
                 &mut trie,
                 FlatRoute {
@@ -128,6 +129,7 @@ impl App {
                     methods,
                     env: app_env.clone(),
                     middleware: app_mw.clone(),
+                    body_limit,
                 },
             )?;
         }
@@ -190,6 +192,7 @@ fn insert_flat(trie: &mut Trie, flat: FlatRoute) -> Result<()> {
             methods,
             env: flat.env,
             middleware: flat.middleware,
+            body_limit: flat.body_limit,
         },
     )
 }
@@ -211,6 +214,22 @@ impl std::fmt::Debug for BuiltApp {
     }
 }
 
+/// The global request-body cap (spec §4.4). A route's `.body_limit` overrides
+/// it; absent that, this is the ceiling. Single source of truth for serve.rs
+/// and `route_policy`.
+pub(crate) const BODY_LIMIT: usize = 1024 * 1024; // 1 MiB
+
+/// The pre-read routing decision (spec §4.4 two-phase read). Computed from the
+/// request head ALONE — before a single body byte is read — so an unmatched
+/// path, wrong method, or malformed path never forces the body to be drained.
+pub(crate) enum Policy {
+    /// The route exists: read its body up to `limit`, then dispatch.
+    Route { limit: usize },
+    /// The request is answered from the head alone (404 / 405 / 400). The body
+    /// is never read. The response already carries security headers.
+    Reject(Response),
+}
+
 /// Defaults chosen for API-only services; handler-set values always win.
 pub(crate) fn apply_security_headers(res: &mut Response) {
     const DEFAULTS: [(&str, &str); 5] = [
@@ -230,6 +249,38 @@ pub(crate) fn apply_security_headers(res: &mut Response) {
 }
 
 impl BuiltApp {
+    /// Phase 1 of the two-phase read (spec §4.4): decide what to do with the
+    /// request from its HEAD alone, before any body byte is read. A match
+    /// yields the body limit to read up to; anything else yields a finished,
+    /// security-headered response so the caller can answer without draining
+    /// the body (routing wins over the body cap).
+    ///
+    /// Cost note: this walks the trie, and `dispatch` walks it again in phase
+    /// 2 (~650ns each). Threading the matched `&Endpoint` through would mean
+    /// holding a non-`'static` borrow across serve.rs's `tokio::spawn` panic
+    /// boundary — not possible without `Arc`-ing endpoints and rippling the
+    /// trie. The walk is cheap; we eat the double walk for v2.0b.
+    pub(crate) fn route_policy(&self, parts: &http::request::Parts) -> Policy {
+        let path = parts.uri.path();
+        let reject = |response: Response| -> Policy {
+            let mut response = response;
+            if self.security_headers {
+                apply_security_headers(&mut response);
+            }
+            Policy::Reject(response)
+        };
+        match self.trie.find(path, &parts.method) {
+            RouteMatch::Found { endpoint, .. } => Policy::Route {
+                limit: endpoint.body_limit.unwrap_or(BODY_LIMIT),
+            },
+            RouteMatch::NotFound => reject(Error::not_found().into_response()),
+            RouteMatch::MethodMissing => reject(Error::method_not_allowed().into_response()),
+            RouteMatch::Malformed => {
+                reject(Error::bad_request("malformed percent-encoding in path").into_response())
+            }
+        }
+    }
+
     /// Route + run middleware chain + handler for one request, then apply
     /// secure-by-default headers at the single dispatch exit (spec §4.4).
     pub(crate) async fn dispatch(&self, parts: http::request::Parts, body: Bytes) -> Response {

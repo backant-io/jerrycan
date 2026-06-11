@@ -1,6 +1,6 @@
 //! The hyper serve engine — accept loop, body read, graceful drain.
 
-use crate::app::{App, apply_security_headers};
+use crate::app::{App, Policy, apply_security_headers};
 use crate::error::{Error, Result};
 use crate::response::IntoResponse;
 use std::sync::Arc;
@@ -12,7 +12,6 @@ pub(crate) async fn run_with_shutdown(
     listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<()> {
-    const BODY_LIMIT: usize = 1024 * 1024; // 1 MiB — spec §4.4
     const DRAIN_CAP: std::time::Duration = std::time::Duration::from_secs(10);
     const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -42,8 +41,17 @@ pub(crate) async fn run_with_shutdown(
                         let app = app.clone();
                         async move {
                             let (parts, body) = req.into_parts();
+                            // Phase 1: route on the head ALONE. A reject (404/405/400)
+                            // answers here — the body is dropped, never read.
+                            let limit = match app.route_policy(&parts) {
+                                Policy::Reject(response) => {
+                                    return Ok::<_, std::convert::Infallible>(response);
+                                }
+                                Policy::Route { limit } => limit,
+                            };
+                            // Phase 2: read the body up to THIS route's limit, then dispatch.
                             use http_body_util::BodyExt;
-                            let limited = http_body_util::Limited::new(body, BODY_LIMIT);
+                            let limited = http_body_util::Limited::new(body, limit);
                             let collected =
                                 tokio::time::timeout(app.body_read_timeout, limited.collect()).await;
                             let response = match collected {
