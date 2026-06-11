@@ -82,6 +82,9 @@ validated design.
 - **Jobs cron shape**: a present job schedule must be cron-shaped, and job
   names must be unique (`questions.rs`; full cron parsing is deferred to the
   job engine).
+- **Public-on-tenant-owned rejection**: an endpoint marked `public` whose repo
+  entity is tenant-owned is rejected, because a public route bypasses the Tenant
+  guard and would expose one tenant's rows to anyone (`questions.rs`).
 - **Determinism**: the same `design.json` produces byte-identical output —
   enforced as a test invariant (`crates/jerrycan/tests/determinism.rs`), so
   agents can diff regenerations and the schema gate (§4) stays meaningful.

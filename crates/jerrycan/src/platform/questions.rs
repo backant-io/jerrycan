@@ -46,6 +46,22 @@ fn is_pascal(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// The entity an endpoint's repo operates on (mirrors genroute's resolution):
+/// the request_body entity, else the success entity, else the module's first
+/// entity. `None` when the module declares no entities. Kept in lockstep with
+/// `genroute::endpoint_repo_entity` so design-time checks reason about the same
+/// entity the generator wires.
+fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a str> {
+    if m.entities.is_empty() {
+        return None;
+    }
+    ep.request_body
+        .as_ref()
+        .map(|rb| rb.entity.as_str())
+        .or(ep.success.entity.as_deref())
+        .or_else(|| m.entities.first().map(|e| e.name.as_str()))
+}
+
 /// Validate a parsed design. Empty result == complete (status: "complete").
 pub fn validate(d: &Design) -> Vec<Question> {
     let mut qs = Vec::new();
@@ -261,6 +277,39 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 "/tenancy",
                 "Tenancy is declared but the design has no active auth model — the Tenant guard needs an authenticated user; set auth.model to `session` or `jwt` first.",
             ));
+        }
+
+        // A `public` endpoint bypasses every guard — including the Tenant guard
+        // that scopes a tenant-owned entity to its owner. If such an endpoint's
+        // repo entity belongs_to the tenancy root, marking it public would expose
+        // one tenant's rows to anyone. Flag the contradiction.
+        fn check_public_on_tenant_owned(
+            m: &ModuleDesign,
+            ptr: &str,
+            tenant: &str,
+            qs: &mut Vec<Question>,
+        ) {
+            for (i, ep) in m.endpoints.iter().enumerate() {
+                if ep.public
+                    && endpoint_repo_entity(m, ep).is_some_and(|name| {
+                        m.entities
+                            .iter()
+                            .find(|e| e.name == name)
+                            .is_some_and(|e| e.belongs_to.iter().any(|b| b.entity == tenant))
+                    })
+                {
+                    qs.push(q(
+                        format!("{ptr}/endpoints/{i}"),
+                        "endpoint is public but its entity is tenant-owned — public endpoints bypass the Tenant guard; remove public or move the endpoint off the tenant-owned entity".to_string(),
+                    ));
+                }
+            }
+            for (i, sub) in m.subroutes.iter().enumerate() {
+                check_public_on_tenant_owned(sub, &format!("{ptr}/subroutes/{i}"), tenant, qs);
+            }
+        }
+        for (i, m) in d.modules.iter().enumerate() {
+            check_public_on_tenant_owned(m, &format!("/modules/{i}"), &tenancy.entity, &mut qs);
         }
     }
 
@@ -842,5 +891,39 @@ mod tests {
     fn kolli_shaped_v1_design_is_question_free() {
         let d: Design = serde_json::from_str(V1_FULL).unwrap();
         assert!(validate(&d).is_empty(), "{:?}", validate(&d));
+    }
+
+    #[test]
+    fn public_endpoint_on_tenant_owned_entity_is_rejected() {
+        // A public endpoint skips every guard — including the Tenant guard that
+        // scopes a tenant-owned entity to its owner. WHY (Rule 9): marking such an
+        // endpoint public would expose one tenant's rows to anyone, silently
+        // defeating tenancy; the design must not be able to claim that exemption
+        // on an entity that belongs_to the tenancy root.
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        // V1_FULL module[1] is `leads`; its `Lead` entity belongs_to Workspace
+        // (the tenancy entity), and list_leads resolves to Lead via success.entity.
+        d.modules[1].endpoints[0].public = true;
+        let qs = validate(&d);
+        assert!(
+            qs.iter().any(|q| q.id == "/modules/1/endpoints/0"
+                && q.question.contains("public")
+                && q.question.contains("tenant-owned")),
+            "{qs:?}"
+        );
+    }
+
+    #[test]
+    fn public_endpoints_on_non_tenant_owned_entities_do_not_false_positive() {
+        // The kolli-slice north-star design has public register/login in the
+        // `users` module; User is NOT tenant-owned, so the resolution (request_body
+        // entity for register, first-entity fallback for login) must not flag them.
+        let kolli = include_str!("../../../../conformance/designs/kolli-slice.design.json");
+        let d: Design = serde_json::from_str(kolli).unwrap();
+        let qs = validate(&d);
+        assert!(
+            qs.is_empty(),
+            "kolli-slice must validate question-free; public users endpoints must not false-positive: {qs:?}"
+        );
     }
 }

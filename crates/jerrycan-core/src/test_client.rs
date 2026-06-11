@@ -63,6 +63,10 @@ impl TestApp {
 
     /// A [`TaskContext`](crate::TaskContext) for resolving app-level dependencies
     /// outside a request, honoring any `override_dep` fakes set on this `TestApp`.
+    ///
+    /// Only **app-level** dependencies (those registered with `App::provide` /
+    /// `App::provide_dep`) are resolvable; module-scoped providers are not in
+    /// scope here.
     pub fn task_context(&self) -> crate::TaskContext {
         self.built.task_context()
     }

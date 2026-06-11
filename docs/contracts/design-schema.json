@@ -174,7 +174,7 @@
         },
         "belongs_to": {
           "type": "array",
-          "description": "Foreign-key relations to other entities. Each produces a NOT NULL fk column 'snake_case(entity) + \"_id\"' referencing the target's pk (nullable instead when on_delete is set_null), plus a DDL foreign key with the given on_delete policy.",
+          "description": "Foreign-key relations to other entities. Each produces a NOT NULL fk column 'snake_case(entity) + \"_id\"' referencing the target's pk (nullable instead when on_delete is set_null). For a target in the SAME module the column carries a real DDL FOREIGN KEY with the given on_delete policy; for a cross-module target the column is emitted unenforced and indexed (no DDL constraint — the relation is reported in schema.json with \"enforced\": false, and referential integrity is enforced in handlers).",
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -194,7 +194,7 @@
                   "restrict"
                 ],
                 "default": "restrict",
-                "description": "DDL ON DELETE policy. 'set_null' makes the fk column nullable; 'cascade' deletes dependents; 'restrict' (default) blocks deletion while dependents exist."
+                "description": "ON DELETE policy. 'set_null' makes the fk column nullable; 'cascade' deletes dependents; 'restrict' (default) blocks deletion while dependents exist. The policy is emitted as a real DDL ON DELETE clause only for a SAME-module target; for a cross-module target the column is unenforced (reported in schema.json with \"enforced\": false) and the policy is upheld in handlers rather than by the database."
               }
             }
           }
@@ -292,7 +292,7 @@
         "public": {
           "type": "boolean",
           "default": false,
-          "description": "Genuinely public endpoints (credential-issuing login/register, public webhooks): exempt from the unguarded-mutation lint (JL0004) and generated 401 tests. Cannot combine with auth_required or required_roles."
+          "description": "Genuinely public endpoints (credential-issuing login/register, public webhooks): exempt from the unguarded-mutation lint (JL0004) and generated 401 tests. Cannot combine with auth_required or required_roles, and rejected on endpoints whose entity is tenant-owned (a public route bypasses the Tenant guard)."
         },
         "request_body": {
           "type": "object",
