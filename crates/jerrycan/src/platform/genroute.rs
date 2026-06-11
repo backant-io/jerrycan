@@ -653,6 +653,16 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
     // Standalone `CREATE INDEX` statements appended after their table (sea-query
     // emits indexes separately from the table, on both dialects).
     let mut indexes = String::new();
+    // SQL comments documenting cross-module relations the migration no longer
+    // enforces (appended right after the table, ahead of its indexes).
+    let mut comments = String::new();
+    // A belongs_to target in THIS module is a real, enforceable FK (the parent
+    // table is created by the same migration). A cross-module target becomes an
+    // unenforced relation column — the SAME intra-module predicate `model_rs_db`
+    // uses to decide which relations to wire (F2: per-module gen-tests migrate only
+    // one module, so a real FK to another module's table 500s with "no such table").
+    let local: std::collections::HashSet<&str> =
+        m.entities.iter().map(|e| e.name.as_str()).collect();
     for e in &m.entities {
         let tbl = table_name(&e.name);
         let mut table = Table::create();
@@ -674,8 +684,10 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
         table.col(&mut pk);
         // fk columns, in belongs_to order, BEFORE declared fields — lockstep with
         // the Model (`model_rs_db`/`model_field_names`). NOT NULL unless SetNull
-        // (the column must drop to NULL when the parent dies), plus a foreign-key
-        // constraint carrying the declared on_delete policy.
+        // (the column must drop to NULL when the parent dies). An intra-module
+        // target also gets a real foreign-key constraint carrying the declared
+        // on_delete policy; a cross-module target stays an unenforced relation:
+        // bare column + an index + a documenting comment (no FK constraint).
         for b in &e.belongs_to {
             let col = Design::fk_column(&b.entity);
             let target_table = table_name(&b.entity);
@@ -688,18 +700,39 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
                 fk_col.not_null();
             }
             table.col(&mut fk_col);
-            let action = match b.on_delete {
-                OnDelete::Cascade => ForeignKeyAction::Cascade,
-                OnDelete::SetNull => ForeignKeyAction::SetNull,
-                OnDelete::Restrict => ForeignKeyAction::Restrict,
-            };
-            table.foreign_key(
-                ForeignKey::create()
-                    .name(format!("fk_{tbl}_{col}"))
-                    .from(Alias::new(tbl.clone()), Alias::new(col.clone()))
-                    .to(Alias::new(target_table), Alias::new("id"))
-                    .on_delete(action),
-            );
+            if local.contains(b.entity.as_str()) {
+                let action = match b.on_delete {
+                    OnDelete::Cascade => ForeignKeyAction::Cascade,
+                    OnDelete::SetNull => ForeignKeyAction::SetNull,
+                    OnDelete::Restrict => ForeignKeyAction::Restrict,
+                };
+                table.foreign_key(
+                    ForeignKey::create()
+                        .name(format!("fk_{tbl}_{col}"))
+                        .from(Alias::new(tbl.clone()), Alias::new(col.clone()))
+                        .to(Alias::new(target_table), Alias::new("id"))
+                        .on_delete(action),
+                );
+            } else {
+                // Cross-module: no DB constraint, but an unconstrained fk should
+                // still be indexed for lookups/joins. Dedupe with a declared
+                // `index: true` field of the same name (none today, but cheap to
+                // guard) so we never emit two identically-named indexes.
+                let idx_name = format!("idx_{tbl}_{col}");
+                if e.fields.iter().any(|f| f.name == col && f.index) {
+                    // already produced by the declared-field index pass
+                } else {
+                    let mut idx = Index::create();
+                    idx.name(idx_name)
+                        .table(Alias::new(tbl.clone()))
+                        .col(Alias::new(col.clone()));
+                    indexes.push_str(&schema_sql(&idx, backend_is_pg));
+                    indexes.push_str(";\n\n");
+                }
+                comments.push_str(&format!(
+                    "-- {col}: references {target_table}.id (cross-module; enforced by handlers, see schema.json)\n"
+                ));
+            }
         }
         for f in e.fields.iter().filter(|f| f.name != "id") {
             let mut col = ColumnDef::new(Alias::new(f.name.as_str()));
@@ -733,6 +766,8 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
         }
         out.push_str(&schema_sql(&table, backend_is_pg));
         out.push_str(";\n\n");
+        out.push_str(&comments);
+        comments.clear();
         out.push_str(&indexes);
         indexes.clear();
     }
@@ -1246,30 +1281,77 @@ mod tests {
 
     /// The DDL must declare the fk columns the Model derives from belongs_to (the
     /// repo filters on them); without them every scoped insert/query hits "no such
-    /// column". A foreign-key constraint with the declared on_delete policy ties
-    /// the column to its target table. Enum `values` become a CHECK; unique/index
+    /// column". A CROSS-module belongs_to (Lead→Workspace, different module) is an
+    /// UNENFORCED relation: just the column + an index, NO `FOREIGN KEY`/`REFERENCES`
+    /// clause (per-module gen-tests migrate only one module, so a real FK to another
+    /// module's table would 500 with "no such table" — fix F2). A documenting SQL
+    /// comment records the relation. Enum `values` become a CHECK; unique/index
     /// fields gain their constraint/standalone index.
     #[test]
-    fn ddl_emits_fks_constraints_and_enum_checks() {
+    fn cross_module_fk_is_an_unenforced_indexed_column() {
         let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
-        let ddl = migration_ddl(&d.modules[1], false, &d)
-            .unwrap()
-            .to_lowercase();
+        let ddl = migration_ddl(&d.modules[1], false, &d).unwrap();
+        let lower = ddl.to_lowercase();
         assert!(
-            ddl.contains("\"workspace_id\""),
+            lower.contains("\"workspace_id\""),
             "fk column from belongs_to: {ddl}"
         );
-        assert!(ddl.contains("foreign key"), "{ddl}");
-        assert!(ddl.contains("references \"workspaces\""), "{ddl}");
-        assert!(ddl.contains("on delete cascade"), "{ddl}");
-        assert!(ddl.contains("unique"), "phone unique: {ddl}");
-        assert!(ddl.contains("create index"), "phone index: {ddl}");
+        // No database FK constraint to a table this module's migration never creates.
+        assert!(
+            !lower.contains("foreign key") && !lower.contains("references \"workspaces\""),
+            "cross-module belongs_to must not emit a FK constraint: {ddl}"
+        );
+        // The unconstrained fk is still indexed so lookups/joins stay fast.
+        assert!(
+            lower.contains("create index") && lower.contains("idx_leads_workspace_id"),
+            "cross-module fk column must be indexed: {ddl}"
+        );
+        // The migration documents the relation it no longer enforces.
+        assert!(
+            ddl.contains(
+                "-- workspace_id: references workspaces.id (cross-module; enforced by handlers, see schema.json)"
+            ),
+            "documenting comment: {ddl}"
+        );
+        assert!(lower.contains("unique"), "phone unique: {ddl}");
         let ws = migration_ddl(&d.modules[0], false, &d)
             .unwrap()
             .to_lowercase();
         assert!(
             ws.contains("check") && ws.contains("'trial'"),
             "enum check: {ws}"
+        );
+    }
+
+    /// An INTRA-module belongs_to (parent and child in the same ModuleDesign) keeps
+    /// its real database FOREIGN KEY constraint + on_delete policy — the parent table
+    /// is created by the same migration, so SQLite FK enforcement resolves fine. This
+    /// is the case the cross-module carve-out must NOT weaken.
+    #[test]
+    fn intra_module_fk_keeps_its_constraint_and_policy() {
+        let mut d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        // Add a second entity to the workspaces module that belongs_to Workspace
+        // (SAME module) with on_delete: cascade.
+        let member: Entity = serde_json::from_str(
+            r#"{
+                "name": "Member",
+                "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+                "fields": [{ "name": "email", "type": "string" }]
+            }"#,
+        )
+        .unwrap();
+        d.modules[0].entities.push(member);
+        let ddl = migration_ddl(&d.modules[0], false, &d)
+            .unwrap()
+            .to_lowercase();
+        assert!(ddl.contains("\"workspace_id\""), "fk column: {ddl}");
+        assert!(
+            ddl.contains("foreign key") && ddl.contains("references \"workspaces\""),
+            "intra-module belongs_to keeps a real FK constraint: {ddl}"
+        );
+        assert!(
+            ddl.contains("on delete cascade"),
+            "intra-module fk keeps its policy: {ddl}"
         );
     }
 
@@ -1290,7 +1372,8 @@ mod tests {
     /// A `bool` Model field is stored in a native BOOLEAN column now (SeaORM
     /// round-trips it directly — the old sqlx-Any "bool as i64" lore is dead). A
     /// SetNull belongs_to makes the fk column nullable (it must drop to NULL when
-    /// the parent dies, so it can't be NOT NULL) with `on delete set null`.
+    /// the parent dies, so it can't be NOT NULL) — this holds even cross-module,
+    /// where only the FK constraint is dropped, not the column's shape.
     #[test]
     fn ddl_booleans_are_native_and_set_null_fks_nullable() {
         let mut d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
@@ -1311,7 +1394,29 @@ mod tests {
             !ddl.contains("\"workspace_id\" bigint not null"),
             "set_null fk must be nullable: {ddl}"
         );
-        assert!(ddl.contains("on delete set null"), "{ddl}");
+    }
+
+    /// A SetNull belongs_to within ONE module keeps its real `on delete set null`
+    /// FK constraint (the parent table exists in the same migration). The cross-
+    /// module carve-out (which drops the constraint) must not steal this from an
+    /// intra-module relation.
+    #[test]
+    fn intra_module_set_null_fk_keeps_its_policy() {
+        let mut d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let member: Entity = serde_json::from_str(
+            r#"{
+                "name": "Member",
+                "belongs_to": [{ "entity": "Workspace", "on_delete": "set_null" }],
+                "fields": [{ "name": "email", "type": "string" }]
+            }"#,
+        )
+        .unwrap();
+        d.modules[0].entities.push(member);
+        let ddl = migration_ddl(&d.modules[0], false, &d)
+            .unwrap()
+            .to_lowercase();
+        assert!(ddl.contains("foreign key"), "intra-module FK kept: {ddl}");
+        assert!(ddl.contains("on delete set null"), "policy kept: {ddl}");
     }
 
     /// The tenant module also owns the membership table that records who belongs

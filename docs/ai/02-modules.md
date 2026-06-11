@@ -71,8 +71,7 @@ let m = Module::new("items")
 
 ## Relations
 An entity declares a parent with `belongs_to` (in db mode); the inverse
-`has_many` is implied. The generator derives a foreign-key column and a SeaORM
-relation from it:
+`has_many` is implied. The generator derives a foreign-key column from it:
 ```json
 {
   "name": "Lead",
@@ -83,8 +82,18 @@ relation from it:
 Derivation rules:
 - **fk column**: `belongs_to.entity` snake-cased + `_id` (`Workspace` → a
   `workspace_id` column, typed as the parent's pk).
-- **on_delete**: `cascade` | `set_null` | `restrict` — emitted on the foreign-key
-  constraint in the migration (so a deleted parent's children follow the rule).
+- **same-module parent**: when parent and child live in the **same** module, the
+  migration emits a real database `FOREIGN KEY` constraint with the declared
+  `on_delete` policy (`cascade` | `set_null` | `restrict`) and a SeaORM relation.
+- **cross-module parent**: when the parent lives in **another** module, the fk is
+  an *unenforced relation* — the column (indexed) but **no** database constraint.
+  Per-module acceptance tests migrate only their own module's tables, so a real
+  FK into another module's table would fail at apply/insert time ("no such
+  table"). The relationship is enforced by the handlers instead; the migration
+  records it as a comment, and `schema.json` marks it `"enforced": false`.
+- **on_delete**: the declared policy is honored as a DB constraint only for a
+  same-module parent; for a cross-module parent it is documentation (handlers
+  apply it), surfaced in `schema.json` alongside `"enforced": false`.
 - **scoped methods**: when the parent is the design's tenancy entity, the child's
   repo also gains `all_for`/`get_for`/`remove_for`, filtering by the fk so a
   handler only ever reaches the caller's rows. See `jerrycan docs tenancy`.

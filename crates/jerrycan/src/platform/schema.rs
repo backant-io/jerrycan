@@ -4,7 +4,7 @@
 //! `json`, not the `TEXT` SQLite stores it in). The contract is the durable,
 //! reviewable shape of the data layer — derived, never hand-written.
 
-use super::design::{Design, Entity, FieldType, ModuleDesign};
+use super::design::{Design, Entity, FieldType, ModuleDesign, OnDelete};
 use super::mounting;
 use crate::db::Db;
 use crate::db::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
@@ -46,6 +46,11 @@ pub struct ForeignKeyRef {
     pub column: String,
     pub references: TableColumn,
     pub on_delete: String,
+    /// `true` when a database FOREIGN KEY constraint backs this relation
+    /// (introspected from the migration); `false` for a design-declared,
+    /// application-enforced cross-module relation (no DB constraint exists, so
+    /// per-module gen-tests don't trip on a parent table they never created).
+    pub enforced: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -195,6 +200,18 @@ fn fallback_type(sqlite_decl: &str) -> String {
     .to_string()
 }
 
+/// The contract token for a design-declared on_delete policy (mirrors the
+/// `OnDelete` serde rename) — used for cross-module relations the migration
+/// doesn't enforce, so there's no SQLite spelling to normalize.
+fn on_delete_token(policy: OnDelete) -> String {
+    match policy {
+        OnDelete::Cascade => "cascade",
+        OnDelete::SetNull => "set_null",
+        OnDelete::Restrict => "restrict",
+    }
+    .to_string()
+}
+
 /// Normalize SQLite's on_delete spelling to snake_case contract tokens.
 fn normalize_on_delete(raw: &str) -> String {
     match raw.to_ascii_uppercase().as_str() {
@@ -308,7 +325,29 @@ async fn introspect_table(db: &Db, index: &DesignIndex<'_>, table: &str) -> Resu
                 column: ref_column,
             },
             on_delete: normalize_on_delete(&on_delete),
+            enforced: true, // introspected from a real DB FOREIGN KEY constraint
         });
+    }
+    // Overlay design-declared cross-module relations that have NO DB constraint:
+    // each belongs_to whose fk column isn't already an introspected FK becomes an
+    // application-enforced (enforced:false) relation, so the contract still records
+    // the relationship the handlers uphold.
+    if let Some((_, entity)) = index.entities.get(table) {
+        for b in &entity.belongs_to {
+            let col = Design::fk_column(&b.entity);
+            if foreign_keys.iter().any(|f| f.column == col) {
+                continue; // a real FK already covers it (intra-module)
+            }
+            foreign_keys.push(ForeignKeyRef {
+                column: col,
+                references: TableColumn {
+                    table: table_name(&b.entity),
+                    column: "id".to_string(),
+                },
+                on_delete: on_delete_token(b.on_delete),
+                enforced: false,
+            });
+        }
     }
     foreign_keys.sort_by(|a, b| a.column.cmp(&b.column));
 
@@ -459,9 +498,22 @@ mod tests {
         let custom = leads.columns.iter().find(|c| c.name == "custom").unwrap();
         assert_eq!(custom.r#type, "json");
         assert!(custom.nullable);
-        assert!(leads.foreign_keys.iter().any(|f| f.column == "workspace_id"
-            && f.references.table == "workspaces"
-            && f.on_delete == "cascade"));
+        // Lead belongs_to Workspace is CROSS-module (leads vs workspaces): the
+        // migration has no DB FK constraint, so it never introspects. The design
+        // overlay records it as an enforced:false relation (column + target + the
+        // declared on_delete), distinguishing it from a real database FK (F2).
+        let ws_fk = leads
+            .foreign_keys
+            .iter()
+            .find(|f| f.column == "workspace_id")
+            .unwrap();
+        assert_eq!(ws_fk.references.table, "workspaces");
+        assert_eq!(ws_fk.on_delete, "cascade");
+        assert!(
+            !ws_fk.enforced,
+            "cross-module relation is application-enforced, not a DB FK"
+        );
+        assert!(leads.indexes.iter().any(|i| i.contains("workspace_id")));
         assert!(leads.unique.iter().any(|u| u == &vec!["phone".to_string()]));
         assert!(leads.indexes.iter().any(|i| i.contains("phone")));
         let members = contract
@@ -470,11 +522,16 @@ mod tests {
             .find(|t| t.name == "workspace_members")
             .unwrap();
         assert_eq!(members.module, "workspaces");
+        // The membership table's fk to workspaces IS a real DB FK (same module as
+        // the tenant) — introspected from the migration, so enforced:true.
+        let member_fk = members
+            .foreign_keys
+            .iter()
+            .find(|f| f.on_delete == "cascade")
+            .unwrap();
         assert!(
-            members
-                .foreign_keys
-                .iter()
-                .any(|f| f.on_delete == "cascade")
+            member_fk.enforced,
+            "the membership table keeps a real, introspected FK constraint"
         );
         // determinism: tables sorted by name, stable across runs
         let names: Vec<_> = contract.tables.iter().map(|t| t.name.clone()).collect();

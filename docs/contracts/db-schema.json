@@ -73,7 +73,7 @@
     "foreign_key": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["column", "references", "on_delete"],
+      "required": ["column", "references", "on_delete", "enforced"],
       "properties": {
         "column": { "type": "string" },
         "references": {
@@ -87,6 +87,10 @@
         },
         "on_delete": {
           "enum": ["cascade", "set_null", "restrict", "no_action"]
+        },
+        "enforced": {
+          "type": "boolean",
+          "description": "true = a database FOREIGN KEY constraint; false = a design-declared relation enforced at the application layer (cross-module)."
         }
       }
     }

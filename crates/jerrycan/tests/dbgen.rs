@@ -269,6 +269,71 @@ async fn schema_verify_flags_staleness_with_jc0520() {
     );
 }
 
+/// F2 regression probe (the eval finding): per-module acceptance tests migrate
+/// ONLY their own module, but Lead belongs_to Workspace lives in a DIFFERENT
+/// module. Under SQLite FK enforcement, a real `FOREIGN KEY ... REFERENCES
+/// "workspaces"` on the leads table makes every insert 500 with "no such table:
+/// workspaces" (the leads migration never creates it). The fix: the cross-module
+/// relation is an UNENFORCED column, so applying the leads migration ALONE — with
+/// foreign_keys=ON — and inserting a lead with workspace_id=1 must succeed.
+#[tokio::test]
+async fn cross_module_fk_lets_per_module_migration_insert_under_fk_enforcement() {
+    use jerrycan::db::sea_orm::ConnectionTrait;
+
+    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let d: Design = serde_json::from_str(s).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    scaffold::scaffold(&root, &d).unwrap();
+
+    // Only the leads module's migrations — exactly what `gen-tests --module leads`
+    // applies. The workspaces table is deliberately absent.
+    let all = jerrycan::platform::mounting::collect_migrations(&root).unwrap();
+    let leads_only: Vec<_> = all
+        .into_iter()
+        .filter(|m| m.name.starts_with("leads_"))
+        .collect();
+    assert!(
+        !leads_only.is_empty(),
+        "leads module must own a migration file"
+    );
+
+    let db = jerrycan::db::Db::connect("sqlite::memory:").await.unwrap();
+    // FK enforcement ON — without it the bug would be masked (sqlite ignores FKs
+    // by default). This is the exact enforcement the eval's gen-tests run under.
+    db.conn()
+        .execute_unprepared("PRAGMA foreign_keys=ON")
+        .await
+        .unwrap();
+    db.migrate_owned(&leads_only).await.unwrap();
+
+    // Insert a lead whose workspace_id points at a workspace row that does NOT
+    // (and cannot) exist in this single-module database. A real FK would reject
+    // this (or the migration itself would have failed on "no such table"); the
+    // unenforced relation lets it through, which is the whole point of F2.
+    db.conn()
+        .execute_unprepared(
+            "INSERT INTO leads (workspace_id, phone, name, status) VALUES (1, '555', 'A', 'new')",
+        )
+        .await
+        .expect("cross-module fk is unenforced: insert with a dangling workspace_id must succeed");
+
+    let count = db
+        .conn()
+        .query_one(jerrycan::db::sea_orm::Statement::from_string(
+            jerrycan::db::sea_orm::DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM leads".to_string(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let n: i64 = count
+        .try_get::<i64>("", "n")
+        .or_else(|_| count.try_get::<i32>("", "n").map(i64::from))
+        .unwrap();
+    assert_eq!(n, 1, "the lead row persisted");
+}
+
 #[test]
 fn memory_mode_is_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
