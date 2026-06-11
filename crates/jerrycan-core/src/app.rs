@@ -3,7 +3,7 @@
 
 use crate::dep::{AnyArc, DepEnv, DepFactory, DepResolver, TaskContext};
 use crate::error::{Error, Result};
-use crate::extract::RequestCtx;
+use crate::extract::{BodyLane, RequestCtx};
 use crate::handler::BoxHandlerFn;
 use crate::middleware::{Middleware, Next};
 use crate::module::{FlatRoute, Module};
@@ -12,6 +12,7 @@ use crate::router::{Endpoint, MethodRouter, RouteMatch, Trie};
 use crate::serve;
 #[cfg(test)]
 use crate::serve::is_transient_accept_error;
+#[cfg(test)]
 use bytes::Bytes;
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -241,6 +242,7 @@ impl App {
 }
 
 fn insert_flat(trie: &mut Trie, flat: FlatRoute) -> Result<()> {
+    let stream_body = flat.methods.stream_body;
     let mut methods = HashMap::new();
     for (m, h) in flat.methods.handlers {
         if methods.insert(m.clone(), h).is_some() {
@@ -257,6 +259,7 @@ fn insert_flat(trie: &mut Trie, flat: FlatRoute) -> Result<()> {
             env: flat.env,
             middleware: flat.middleware,
             body_limit: flat.body_limit,
+            stream_body,
         },
     )
 }
@@ -292,8 +295,10 @@ pub(crate) const BODY_LIMIT: usize = 1024 * 1024; // 1 MiB
 /// request head ALONE — before a single body byte is read — so an unmatched
 /// path, wrong method, or malformed path never forces the body to be drained.
 pub(crate) enum Policy {
-    /// The route exists: read its body up to `limit`, then dispatch.
-    Route { limit: usize },
+    /// The route exists: read its body up to `limit`, then dispatch. When
+    /// `stream` is set the body is NOT collected upfront — serve hands the live
+    /// stream lane (`Limited` cap + per-frame deadline inside) to dispatch.
+    Route { limit: usize, stream: bool },
     /// The request is answered from the head alone (404 / 405 / 400). The body
     /// is never read. The response already carries security headers.
     Reject(Response),
@@ -355,6 +360,7 @@ impl BuiltApp {
         match self.trie.find(path, &parts.method) {
             RouteMatch::Found { endpoint, .. } => Policy::Route {
                 limit: endpoint.body_limit.unwrap_or(BODY_LIMIT),
+                stream: endpoint.stream_body,
             },
             RouteMatch::NotFound => reject(Error::not_found().into_response()),
             RouteMatch::MethodMissing => reject(Error::method_not_allowed().into_response()),
@@ -365,16 +371,18 @@ impl BuiltApp {
     }
 
     /// Route + run middleware chain + handler for one request, then apply
-    /// secure-by-default headers at the single dispatch exit (spec §4.4).
-    pub(crate) async fn dispatch(&self, parts: http::request::Parts, body: Bytes) -> Response {
-        let mut response = self.dispatch_inner(parts, body).await;
+    /// secure-by-default headers at the single dispatch exit (spec §4.4). The
+    /// body arrives as a [`BodyLane`]: `Buffered` for the upfront-read path,
+    /// `Stream` for `.stream_body()` routes.
+    pub(crate) async fn dispatch(&self, parts: http::request::Parts, lane: BodyLane) -> Response {
+        let mut response = self.dispatch_inner(parts, lane).await;
         if self.security_headers {
             apply_security_headers(&mut response);
         }
         response
     }
 
-    async fn dispatch_inner(&self, parts: http::request::Parts, body: Bytes) -> Response {
+    async fn dispatch_inner(&self, parts: http::request::Parts, lane: BodyLane) -> Response {
         let method = parts.method.clone();
         let path = parts.uri.path().to_string();
         match self.trie.find(&path, &method) {
@@ -384,9 +392,9 @@ impl BuiltApp {
                 Error::bad_request("malformed percent-encoding in path").into_response()
             }
             RouteMatch::Found { endpoint, params } => {
-                let mut ctx = RequestCtx::new(
+                let mut ctx = RequestCtx::with_lane(
                     parts,
-                    body,
+                    lane,
                     DepResolver::new(endpoint.env.clone(), self.overrides.clone()),
                 );
                 ctx.params = params;
@@ -458,7 +466,9 @@ mod tests {
             .body(())
             .unwrap();
         let (parts, ()) = req.into_parts();
-        built.dispatch(parts, Bytes::from(body.to_string())).await
+        built
+            .dispatch(parts, BodyLane::Buffered(Bytes::from(body.to_string())))
+            .await
     }
 
     #[tokio::test]

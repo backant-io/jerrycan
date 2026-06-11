@@ -1,7 +1,7 @@
 //! Live-socket protocol proofs: behaviors only a real connection can show
 //! (write stalls, chunked transfer, mid-stream aborts).
 
-use jerrycan_core::{App, StreamBody, get};
+use jerrycan_core::{App, Json, Result, StreamBody, get, post};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -130,6 +130,62 @@ async fn prompt_reader_gets_the_full_stream_and_is_not_disconnected() {
         3 * 1024,
         "the full streamed payload must arrive"
     );
+
+    server.abort();
+}
+
+/// Echoes a JSON body on a `.stream_body()` route: `Json` drains the live
+/// stream lane (hyper Incoming → Limited → TimedRecvBody → drain) transparently.
+async fn echo(Json(v): Json<serde_json::Value>) -> Result<Json<serde_json::Value>> {
+    Ok(Json(v))
+}
+
+#[tokio::test]
+async fn streamed_request_body_drains_over_a_real_socket_when_written_in_dribbles() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = App::new().route("/up", post(echo).stream_body().body_limit(1024));
+    let server = tokio::spawn(async move { app.serve_with(listener).await });
+
+    // The whole JSON body, written across 3 separate flushed writes with small
+    // gaps — the server must reassemble the frames off the wire and echo it.
+    let body = br#"{"hello":"streamed world"}"#;
+    let (a, rest) = body.split_at(8);
+    let (b, c) = rest.split_at(9);
+
+    let exchange = async {
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /up HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
+        for chunk in [a, b, c] {
+            // Dribble: write a slice, flush, pause well under the 30s per-frame
+            // read deadline so TimedRecvBody resets instead of firing.
+            s.write_all(chunk).await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    let raw = tokio::time::timeout(Duration::from_secs(10), exchange)
+        .await
+        .expect("the dribbled streamed body must be drained and echoed, not hang");
+
+    assert!(
+        raw.starts_with("HTTP/1.1 200"),
+        "got: {}",
+        &raw[..raw.len().min(80)]
+    );
+    let resp_body = raw.split_once("\r\n\r\n").expect("response has headers").1;
+    let echoed: serde_json::Value =
+        serde_json::from_str(resp_body.trim()).expect("echoed JSON body");
+    assert_eq!(echoed, serde_json::json!({"hello": "streamed world"}));
 
     server.abort();
 }

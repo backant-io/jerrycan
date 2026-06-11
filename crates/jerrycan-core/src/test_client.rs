@@ -224,20 +224,51 @@ impl TestApp {
         let body = body.unwrap_or_default();
 
         // Phase 1: route on the head alone — a reject answers without reading the body.
-        let limit = match self.built.route_policy(&parts) {
+        let (limit, stream) = match self.built.route_policy(&parts) {
             Policy::Reject(response) => return TestResponse::collect(response).await,
-            Policy::Route { limit } => limit,
+            Policy::Route { limit, stream } => (limit, stream),
         };
-        // Phase 2 (no streaming in tests): the per-route limit is a length check.
-        if body.len() > limit {
-            let mut response = Error::payload_too_large().into_response();
-            if self.built.security_headers {
-                crate::app::apply_security_headers(&mut response);
+        // Phase 2: stream routes get a REAL stream lane — frames + the route's
+        // `Limited` cap inside it, exactly like the live socket path, so the
+        // cumulative cap (and frame straddling) are honest in tests too. The
+        // buffered path keeps its upfront length check.
+        let lane = if stream {
+            crate::extract::BodyLane::Stream(Some(test_stream_lane(body, limit)))
+        } else {
+            if body.len() > limit {
+                let mut response = Error::payload_too_large().into_response();
+                if self.built.security_headers {
+                    crate::app::apply_security_headers(&mut response);
+                }
+                return TestResponse::collect(response).await;
             }
-            return TestResponse::collect(response).await;
-        }
-        TestResponse::collect(self.built.dispatch(parts, body).await).await
+            crate::extract::BodyLane::Buffered(body)
+        };
+        TestResponse::collect(self.built.dispatch(parts, lane).await).await
     }
+}
+
+/// A test-only stream lane: chop the buffered body into 13-byte frames so every
+/// test on a stream route exercises frame straddling for free, then wrap in the
+/// route's `Limited` cap so the cumulative cap trips in-process exactly as it
+/// does over a socket.
+fn test_stream_lane(body: Bytes, limit: usize) -> crate::extract::StreamLane {
+    struct Frames(std::collections::VecDeque<Bytes>);
+    impl http_body::Body for Frames {
+        type Data = Bytes;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            std::task::Poll::Ready(self.0.pop_front().map(|b| Ok(http_body::Frame::data(b))))
+        }
+    }
+    let frames = body.chunks(13).map(Bytes::copy_from_slice).collect();
+    // `Limited<Frames>::Error` is already `Box<dyn Error + Send + Sync>` (Frames'
+    // error type), so the cap maps straight into the lane's error channel.
+    let limited = http_body_util::Limited::new(Frames(frames), limit);
+    http_body_util::combinators::UnsyncBoxBody::new(limited)
 }
 
 pub struct TestResponse {

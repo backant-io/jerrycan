@@ -2,7 +2,9 @@
 
 use crate::app::{App, Policy, apply_security_headers};
 use crate::error::{Error, Result};
+use crate::extract::BodyLane;
 use crate::response::IntoResponse;
+use bytes::Bytes;
 use std::sync::Arc;
 
 /// The serve engine: build the app, accept until `shutdown` resolves, then stop
@@ -58,51 +60,46 @@ pub(crate) async fn run_with_shutdown(
                             let (parts, body) = req.into_parts();
                             // Phase 1: route on the head ALONE. A reject (404/405/400)
                             // answers here — the body is dropped, never read.
-                            let limit = match app.route_policy(&parts) {
+                            let (limit, stream) = match app.route_policy(&parts) {
                                 Policy::Reject(response) => {
                                     return Ok::<_, std::convert::Infallible>(response);
                                 }
-                                Policy::Route { limit } => limit,
+                                Policy::Route { limit, stream } => (limit, stream),
                             };
-                            // Phase 2: read the body up to THIS route's limit, then dispatch.
-                            use http_body_util::BodyExt;
-                            let limited = http_body_util::Limited::new(body, limit);
-                            let collected =
-                                tokio::time::timeout(app.body_read_timeout, limited.collect()).await;
-                            let response = match collected {
-                                Ok(Ok(collected)) => {
-                                    let body = collected.to_bytes();
-                                    let app2 = app.clone();
-                                    match tokio::spawn(async move { app2.dispatch(parts, body).await }).await {
-                                        Ok(response) => response,
-                                        Err(_join_error) => {
-                                            let mut response =
-                                                Error::internal("handler panicked").into_response();
-                                            if app.security_headers {
-                                                apply_security_headers(&mut response);
-                                            }
-                                            response
-                                        }
+                            // Phase 2 splits on the route's streaming marker.
+                            let response = if stream {
+                                // Stream lane: NO upfront read. The cumulative cap and the
+                                // per-frame read deadline ride INSIDE the lane; the handler's
+                                // extractors do the reading (and map their own errors).
+                                use http_body_util::combinators::UnsyncBoxBody;
+                                let lane = BodyLane::Stream(Some(UnsyncBoxBody::new(TimedRecvBody::new(
+                                    http_body_util::Limited::new(body, limit),
+                                    app.body_read_timeout,
+                                ))));
+                                dispatch_isolated(&app, parts, lane).await
+                            } else {
+                                // Buffered path: read the body up to THIS route's limit upfront,
+                                // then dispatch. Byte-for-byte unchanged from v2.0b.
+                                use http_body_util::BodyExt;
+                                let limited = http_body_util::Limited::new(body, limit);
+                                let collected =
+                                    tokio::time::timeout(app.body_read_timeout, limited.collect()).await;
+                                match collected {
+                                    Ok(Ok(collected)) => {
+                                        let lane = BodyLane::Buffered(collected.to_bytes());
+                                        dispatch_isolated(&app, parts, lane).await
                                     }
-                                }
-                                Ok(Err(_)) => {
-                                    let mut response = Error::payload_too_large().into_response();
-                                    if app.security_headers {
-                                        apply_security_headers(&mut response);
+                                    Ok(Err(_)) => {
+                                        finish_error(&app, Error::payload_too_large())
                                     }
-                                    response
-                                }
-                                Err(_) => {
-                                    let mut response = Error::new(
-                                        http::StatusCode::REQUEST_TIMEOUT,
-                                        "JC0408",
-                                        "timed out reading the request body",
-                                    )
-                                    .into_response();
-                                    if app.security_headers {
-                                        apply_security_headers(&mut response);
-                                    }
-                                    response
+                                    Err(_) => finish_error(
+                                        &app,
+                                        Error::new(
+                                            http::StatusCode::REQUEST_TIMEOUT,
+                                            "JC0408",
+                                            "timed out reading the request body",
+                                        ),
+                                    ),
                                 }
                             };
                             Ok::<_, std::convert::Infallible>(response)
@@ -139,6 +136,30 @@ pub(crate) async fn run_with_shutdown(
         connections.abort_all();
     }
     Ok(())
+}
+
+/// Apply the secure-by-default headers (when enabled) to a head-only error
+/// response — the body-read failure paths that answer without dispatching.
+fn finish_error(app: &Arc<crate::app::BuiltApp>, error: Error) -> crate::response::Response {
+    let mut response = error.into_response();
+    if app.security_headers {
+        apply_security_headers(&mut response);
+    }
+    response
+}
+
+/// Dispatch in a panic-isolating `tokio::spawn` (the in-flight handler cannot
+/// take down the connection task). A panic surfaces as a security-headered 500.
+async fn dispatch_isolated(
+    app: &Arc<crate::app::BuiltApp>,
+    parts: http::request::Parts,
+    lane: BodyLane,
+) -> crate::response::Response {
+    let app2 = app.clone();
+    match tokio::spawn(async move { app2.dispatch(parts, lane).await }).await {
+        Ok(response) => response,
+        Err(_join_error) => finish_error(app, Error::internal("handler panicked")),
+    }
 }
 
 /// Resolves on Ctrl-C (SIGINT) or, on Unix, SIGTERM — the signals containers
@@ -273,5 +294,85 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for TimedIo<T> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Marker error: a request-body frame did not arrive within the read deadline.
+/// extract::map_stream_error downcasts to this to answer 408.
+#[derive(Debug)]
+pub(crate) struct RecvTimeout;
+
+impl std::fmt::Display for RecvTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("timed out waiting for the next request-body frame")
+    }
+}
+
+impl std::error::Error for RecvTimeout {}
+
+/// Per-frame read deadline over a streamed request body. Arms on Pending,
+/// resets on every frame — the analogue of `body_read_timeout` for bodies
+/// consumed incrementally instead of collected upfront.
+pub(crate) struct TimedRecvBody<B> {
+    inner: B,
+    timeout: std::time::Duration,
+    sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<B> TimedRecvBody<B> {
+    pub(crate) fn new(inner: B, timeout: std::time::Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            sleep: None,
+        }
+    }
+}
+
+impl<B> http_body::Body for TimedRecvBody<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Bytes>, Self::Error>>> {
+        use std::future::Future;
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                // A frame arrived: the deadline resets for the next one.
+                self.sleep = None;
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.sleep = None;
+                Poll::Ready(Some(Err(e.into())))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                // The inner body registered its waker; arm/poll the deadline so
+                // ITS waker is live too — same pattern as TimedFrames/TimedIo.
+                let timeout = self.timeout;
+                let sleep = self
+                    .sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+                match sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        self.sleep = None;
+                        Poll::Ready(Some(Err(Box::new(RecvTimeout))))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }

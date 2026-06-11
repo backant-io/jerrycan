@@ -8,11 +8,19 @@ use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use std::future::Future;
 
-/// How the request body reaches the context. One variant TODAY — the enum
-/// exists so v2.1's streaming body lands without touching every `ctx.body`
-/// reader; buffered consumers go through [`RequestCtx::body_bytes`].
+/// A live, incrementally-arriving request body: hyper's stream, pre-wrapped in
+/// the route's cumulative `Limited` cap and the per-frame read deadline.
+/// Unsync (hyper's body is not Sync); the lane lives inside one dispatch task.
+pub(crate) type StreamLane =
+    http_body_util::combinators::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+
+/// How the request body reaches the context. Buffered routes collect the body
+/// upfront (the v2.0b two-phase read); `.stream_body()` routes hand the live
+/// hyper stream straight through as a [`BodyLane::Stream`].
 pub(crate) enum BodyLane {
     Buffered(Bytes),
+    /// `None` after a streaming consumer (Multipart, Task 7) took ownership.
+    Stream(Option<StreamLane>),
 }
 
 /// The mutable view of one in-flight request. Handlers receive extractors,
@@ -29,21 +37,45 @@ pub struct RequestCtx {
 }
 
 impl RequestCtx {
+    /// Buffered-lane constructor: the body is already fully collected. The
+    /// convenience path used by the buffered dispatch route and every test
+    /// helper that hands over pre-read bytes.
     pub(crate) fn new(parts: http::request::Parts, body: Bytes, deps: DepResolver) -> Self {
+        Self::with_lane(parts, BodyLane::Buffered(body), deps)
+    }
+
+    /// Lane-taking constructor: the streaming dispatch route hands the live
+    /// hyper stream lane straight through without buffering it upfront.
+    pub(crate) fn with_lane(
+        parts: http::request::Parts,
+        body: BodyLane,
+        deps: DepResolver,
+    ) -> Self {
         Self {
             parts,
-            body: BodyLane::Buffered(body),
+            body,
             params: Vec::new(),
             deps,
             is_task: false,
         }
     }
 
-    /// The fully-buffered request body. The only body lane today; streaming
-    /// (v2.1) will add a fallible accessor without disturbing this one.
-    pub(crate) fn body_bytes(&self) -> &Bytes {
-        match &self.body {
-            BodyLane::Buffered(bytes) => bytes,
+    /// The complete request body. Buffered lane: a cheap clone. Stream lane:
+    /// drains the stream (the route's `Limited` cap and per-frame deadline are
+    /// inside it) and CACHES the bytes, so repeated extractors keep working.
+    pub(crate) async fn drain_body(&mut self) -> Result<Bytes> {
+        match &mut self.body {
+            BodyLane::Buffered(bytes) => Ok(bytes.clone()),
+            BodyLane::Stream(slot) => {
+                let stream = slot
+                    .take()
+                    .ok_or_else(|| Error::internal("request body was already consumed"))?;
+                use http_body_util::BodyExt;
+                let collected = stream.collect().await.map_err(map_stream_error)?;
+                let bytes = collected.to_bytes();
+                self.body = BodyLane::Buffered(bytes.clone());
+                Ok(bytes)
+            }
         }
     }
 
@@ -56,6 +88,25 @@ impl RequestCtx {
     pub fn headers(&self) -> &http::HeaderMap {
         &self.parts.headers
     }
+}
+
+/// Map a stream-lane read failure onto the stable codes: the route's
+/// cumulative cap → 413, a frame that never arrived → 408 (same code the
+/// buffered read path uses), anything else (client vanished mid-upload) → 400.
+pub(crate) fn map_stream_error(e: Box<dyn std::error::Error + Send + Sync>) -> Error {
+    if e.downcast_ref::<http_body_util::LengthLimitError>()
+        .is_some()
+    {
+        return Error::payload_too_large();
+    }
+    if e.downcast_ref::<crate::serve::RecvTimeout>().is_some() {
+        return Error::new(
+            http::StatusCode::REQUEST_TIMEOUT,
+            "JC0408",
+            "timed out reading the request body",
+        );
+    }
+    Error::bad_request("request body failed mid-read")
 }
 
 /// Types that can be produced from the request. Implemented by all extractors
@@ -206,7 +257,8 @@ impl<T: DeserializeOwned + Send> FromRequest for Json<T> {
         if ctx.is_task {
             return Err(Error::task_context());
         }
-        serde_json::from_slice::<T>(ctx.body_bytes())
+        let body = ctx.drain_body().await?;
+        serde_json::from_slice::<T>(&body)
             .map(Json)
             .map_err(|e| Error::unprocessable(format!("invalid JSON body: {e}")))
     }
@@ -354,5 +406,79 @@ mod tests {
         let mut bad = ctx("/todos", r#"{"title":"#);
         let err = Json::<NewTodo>::from_request(&mut bad).await.err().unwrap();
         assert_eq!(err.code(), "JC0422");
+    }
+
+    /// Build a stream-lane RequestCtx directly, optionally capping it with
+    /// `Limited` — the in-process analogue of the serve-time stream lane,
+    /// without a socket. Frames the body in one chunk; that is enough for the
+    /// caching/limit unit tests (frame straddling is exercised by TestApp).
+    fn stream_ctx(body: &[u8], limit: Option<usize>) -> RequestCtx {
+        use http_body_util::BodyExt;
+        use http_body_util::combinators::UnsyncBoxBody;
+        let req = http::Request::builder().uri("/up").body(()).unwrap();
+        let (parts, ()) = req.into_parts();
+        let bytes = Bytes::copy_from_slice(body);
+        let lane: StreamLane = match limit {
+            Some(limit) => {
+                let limited = http_body_util::Limited::new(
+                    http_body_util::Full::<Bytes>::new(bytes).map_err(
+                        |never| -> Box<dyn std::error::Error + Send + Sync> { match never {} },
+                    ),
+                    limit,
+                );
+                UnsyncBoxBody::new(limited.map_err(Into::into))
+            }
+            None => {
+                let full = http_body_util::Full::<Bytes>::new(bytes);
+                UnsyncBoxBody::new(full.map_err(
+                    |never| -> Box<dyn std::error::Error + Send + Sync> { match never {} },
+                ))
+            }
+        };
+        RequestCtx::with_lane(
+            parts,
+            BodyLane::Stream(Some(lane)),
+            DepResolver::new(Arc::new(DepEnv::default()), Default::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn stream_routes_deliver_the_body_and_enforce_the_limit() {
+        use crate::prelude::*;
+        async fn echo(Json(v): Json<serde_json::Value>) -> Result<Json<serde_json::Value>> {
+            Ok(Json(v))
+        }
+        let t = App::new()
+            .route("/up", post(echo).stream_body().body_limit(64))
+            .into_test();
+        // Json over a STREAM lane drains transparently.
+        let res = t.post_json("/up", &serde_json::json!({"k": "v"})).await;
+        assert_eq!(res.status().as_u16(), 200);
+        // Cumulative limit still applies on the stream lane: oversize → 413.
+        let big = serde_json::json!({"k": "x".repeat(200)});
+        let res = t.post_json("/up", &big).await;
+        assert_eq!(res.status().as_u16(), 413, "body: {}", res.text());
+    }
+
+    #[tokio::test]
+    async fn drain_body_twice_caches_the_stream_bytes() {
+        // The caching contract: a stream lane is drained once and cached back
+        // into Buffered, so a SECOND extractor on the same request keeps working
+        // instead of seeing an already-consumed stream.
+        use bytes::Bytes;
+        let mut c = stream_ctx(br#"{"k":"v"}"#, None);
+        let first = c.drain_body().await.unwrap();
+        assert_eq!(first, Bytes::from_static(br#"{"k":"v"}"#));
+        let second = c.drain_body().await.unwrap();
+        assert_eq!(second, first, "second drain returns the cached bytes");
+    }
+
+    #[tokio::test]
+    async fn stream_lane_over_limit_maps_to_413() {
+        // A stream lane whose Limited cap trips mid-drain surfaces as 413,
+        // exactly like the buffered read path.
+        let mut c = stream_ctx(&[b'x'; 200], Some(64));
+        let err = c.drain_body().await.err().unwrap();
+        assert_eq!(err.code(), "JC0413");
     }
 }

@@ -17,6 +17,9 @@ pub struct MethodRouter {
     /// Per-route request-body cap in bytes. `None` defers to the app default
     /// (1 MiB, spec §4.4). Applies to ALL methods on the route, not per-method.
     pub(crate) body_limit: Option<usize>,
+    /// When true, the body is NOT buffered before dispatch — extractors read
+    /// the live stream lane. Applies to ALL methods on the route.
+    pub(crate) stream_body: bool,
 }
 
 pub fn get<H: Handler<A>, A>(h: H) -> MethodRouter {
@@ -40,6 +43,7 @@ impl MethodRouter {
         Self {
             handlers: Vec::new(),
             body_limit: None,
+            stream_body: false,
         }
     }
 
@@ -54,6 +58,14 @@ impl MethodRouter {
     /// rejected with 413 before the handler runs.
     pub fn body_limit(mut self, bytes: usize) -> Self {
         self.body_limit = Some(bytes);
+        self
+    }
+
+    /// Marks every method on this route as STREAMING: the body is not buffered
+    /// before dispatch; extractors read it incrementally (Multipart) or drain it
+    /// on demand (Json/RawBody). `body_limit` still caps cumulative bytes.
+    pub fn stream_body(mut self) -> Self {
+        self.stream_body = true;
         self
     }
     pub fn get<H: Handler<A>, A>(self, h: H) -> Self {
@@ -82,6 +94,9 @@ pub(crate) struct Endpoint {
     /// Per-route body cap (bytes); `None` = the app default. Read pre-dispatch
     /// by `route_policy` to size the body read for this route (spec §4.4).
     pub(crate) body_limit: Option<usize>,
+    /// When true, the body is streamed (not collected upfront) — `route_policy`
+    /// reports it so serve hands the live stream lane to dispatch (v2.1).
+    pub(crate) stream_body: bool,
 }
 
 #[derive(Default)]
@@ -254,6 +269,7 @@ mod tests {
             env: Arc::new(DepEnv::default()),
             middleware: Arc::from(vec![]),
             body_limit: None,
+            stream_body: false,
         }
     }
 
