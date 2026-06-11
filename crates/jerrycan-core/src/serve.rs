@@ -48,9 +48,10 @@ pub(crate) async fn run_with_shutdown(
                     Err(e) => return Err(Error::internal(format!("accept failed fatally: {e}"))),
                 };
                 let app = built.clone();
+                let write_stall_timeout = built.write_stall_timeout;
                 let mut shutdown_rx = shutdown_rx.clone();
                 connections.spawn(async move {
-                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let io = hyper_util::rt::TokioIo::new(TimedIo::new(stream, write_stall_timeout));
                     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                         let app = app.clone();
                         async move {
@@ -170,4 +171,107 @@ pub(crate) fn is_transient_accept_error(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::Interrupted
             | std::io::ErrorKind::WouldBlock
     ) || matches!(e.raw_os_error(), Some(23) | Some(24))
+}
+
+/// Socket wrapper that bounds WRITE stalls. Reads pass through untouched
+/// (idle keep-alives legitimately sit in read; hyper's header_read_timeout
+/// governs them). The deadline arms when a write/flush returns Pending and
+/// resets on progress, so slow-but-moving clients are fine; stalls are not.
+pub(crate) struct TimedIo<T> {
+    inner: T,
+    cap: std::time::Duration,
+    stall: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> TimedIo<T> {
+    pub(crate) fn new(inner: T, cap: std::time::Duration) -> Self {
+        Self {
+            inner,
+            cap,
+            stall: None,
+        }
+    }
+
+    /// Shared Pending arm for `poll_write`/`poll_flush`: the inner write already
+    /// registered its waker (it returned Pending), so we also poll the stall
+    /// timer to register ITS waker — both wakers live, exactly like
+    /// `TimedFrames` in response.rs. The timer firing means the write made no
+    /// progress within `cap`: surface a TimedOut error so hyper drops the conn.
+    fn poll_stall(
+        stall: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+        cap: std::time::Duration,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::future::Future;
+        use std::task::Poll;
+        let sleep = stall.get_or_insert_with(|| Box::pin(tokio::time::sleep(cap)));
+        match sleep.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                *stall = None;
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connection write stalled past the cap",
+                )))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for TimedIo<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for TimedIo<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(r) => {
+                self.stall = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => {
+                let cap = self.cap;
+                match Self::poll_stall(&mut self.stall, cap, cx) {
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => unreachable!("poll_stall never returns Ready(Ok)"),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(r) => {
+                self.stall = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => {
+                let cap = self.cap;
+                Self::poll_stall(&mut self.stall, cap, cx)
+            }
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }

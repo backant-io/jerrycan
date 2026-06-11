@@ -40,6 +40,7 @@ pub struct App {
     security_headers: bool,
     handler_timeout: std::time::Duration,
     body_read_timeout: std::time::Duration,
+    write_stall_timeout: std::time::Duration,
     /// Serve-time-only background tasks (spec: `on_serve`). They are taken off
     /// the builder by the serve engine before `build()`; `into_test` drops them.
     background: Vec<(&'static str, BackgroundFactory)>,
@@ -61,6 +62,7 @@ impl Default for App {
             security_headers: true,
             handler_timeout: std::time::Duration::from_secs(30),
             body_read_timeout: std::time::Duration::from_secs(30),
+            write_stall_timeout: std::time::Duration::from_secs(30),
             background: Vec::new(),
         }
     }
@@ -99,6 +101,14 @@ impl App {
     /// Time budget for reading a request body (default 30s — spec §4.4).
     pub fn body_read_timeout(mut self, budget: std::time::Duration) -> Self {
         self.body_read_timeout = budget;
+        self
+    }
+
+    /// Maximum time a connection's socket write may stall (client not reading)
+    /// before the connection is dropped. Protects streaming downloads — and all
+    /// responses — from slow-reader clients. Default 30s.
+    pub fn write_stall_timeout(mut self, budget: std::time::Duration) -> Self {
+        self.write_stall_timeout = budget;
         self
     }
 
@@ -197,6 +207,7 @@ impl App {
             security_headers: self.security_headers,
             handler_timeout: self.handler_timeout,
             body_read_timeout: self.body_read_timeout,
+            write_stall_timeout: self.write_stall_timeout,
         })
     }
 
@@ -261,6 +272,7 @@ pub struct BuiltApp {
     pub(crate) security_headers: bool,
     pub(crate) handler_timeout: std::time::Duration,
     pub(crate) body_read_timeout: std::time::Duration,
+    pub(crate) write_stall_timeout: std::time::Duration,
 }
 
 // The trie holds type-erased handler fns and overrides are `dyn Any`, so the
