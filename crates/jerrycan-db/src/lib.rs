@@ -1,37 +1,38 @@
-//! Database extension: one URL-driven `Db` over SQLite and Postgres (sqlx Any),
-//! module-owned dual-dialect migrations, and a deterministic `?`→`$n` translator
-//! (sqlx's Any driver does NOT translate placeholders; ours is quote-blind and
-//! safe because generated SQL never embeds string literals).
+//! Database extension: one URL-driven `Db` over SQLite and Postgres
+//! (sea-orm's `DatabaseConnection`), module-owned dual-dialect migrations, and a
+//! deterministic `?`→`$n` translator (placeholders are library-owned; ours is
+//! quote-blind and safe because generated SQL never embeds string literals).
 #![forbid(unsafe_code)]
 
 use jerrycan_core::{App, Error, Extension, Result};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 
-// Generated repos build ALL SQL through sea-query (dialect rendering is
-// library-owned: placeholders, RETURNING, quoting). Re-exported so generated
-// crates depend on `jerrycan` alone.
+// Connections are driven by sea-orm; generated repos build ALL SQL through
+// sea-query (dialect rendering is library-owned: placeholders, RETURNING,
+// quoting). Re-exported so generated crates depend on `jerrycan` alone.
+pub use sea_orm;
 pub use sea_query;
 pub use sea_query_binder;
 
-/// Which engine the pool speaks. Generated code branches on this for the few
-/// statements that genuinely differ (insert-id strategies, DDL).
+/// Which engine the connection speaks. Generated code branches on this for the
+/// few statements that genuinely differ (insert-id strategies, DDL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Sqlite,
     Postgres,
 }
 
-/// The database dependency: a cloneable pool handle. Register app-wide with
-/// `App::new().extend(db)` (or `.provide(db)` — `extend` is the §6 seam).
+/// The database dependency: a cloneable connection handle. Register app-wide
+/// with `App::new().extend(db)` (or `.provide(db)` — `extend` is the §6 seam).
 #[derive(Clone)]
 pub struct Db {
-    pool: sqlx::AnyPool,
+    conn: DatabaseConnection,
     backend: Backend,
 }
 
 impl Db {
     /// Connect by URL: `sqlite::memory:`, `sqlite://path.db`, `postgres://…`.
     pub async fn connect(url: &str) -> Result<Self> {
-        sqlx::any::install_default_drivers(); // idempotent
         let backend = if url.starts_with("postgres") {
             Backend::Postgres
         } else if url.starts_with("sqlite") {
@@ -47,12 +48,10 @@ impl Db {
             Backend::Sqlite => 1,
             Backend::Postgres => 5,
         };
-        let pool = sqlx::any::AnyPoolOptions::new()
-            .max_connections(max)
-            .connect(url)
-            .await
-            .map_err(db_error)?;
-        Ok(Self { pool, backend })
+        let mut opts = sea_orm::ConnectOptions::new(url.to_string());
+        opts.max_connections(max);
+        let conn = Database::connect(opts).await.map_err(db_error)?;
+        Ok(Self { conn, backend })
     }
 
     /// `JERRYCAN_DATABASE_URL`, defaulting to `sqlite::memory:` for dev.
@@ -62,8 +61,10 @@ impl Db {
         Self::connect(&url).await
     }
 
-    pub fn pool(&self) -> &sqlx::AnyPool {
-        &self.pool
+    /// The underlying sea-orm connection. Generated repos and migrations execute
+    /// through this handle (`execute_unprepared`, `query_one`, …).
+    pub fn conn(&self) -> &DatabaseConnection {
+        &self.conn
     }
 
     pub fn backend(&self) -> Backend {
@@ -75,13 +76,22 @@ impl Db {
         translate_placeholders(query, self.backend)
     }
 
-    /// The sea-query builder matching this pool's dialect. Generated repos
-    /// pass it to `build_any_sqlx` so one builder call renders correct SQL
+    /// The sea-query builder matching this connection's dialect. Generated repos
+    /// pass it to `build_any` so one builder call renders correct SQL
     /// (placeholders, RETURNING, quoting) for whichever engine is connected.
     pub fn query_builder(&self) -> &'static dyn sea_query::QueryBuilder {
         match self.backend {
             Backend::Sqlite => &sea_query::SqliteQueryBuilder,
             Backend::Postgres => &sea_query::PostgresQueryBuilder,
+        }
+    }
+
+    /// The sea-orm backend tag for this connection — selects the dialect when
+    /// constructing a [`Statement`] from raw SQL and bound values.
+    fn backend_db(&self) -> sea_orm::DatabaseBackend {
+        match self.backend {
+            Backend::Sqlite => sea_orm::DatabaseBackend::Sqlite,
+            Backend::Postgres => sea_orm::DatabaseBackend::Postgres,
         }
     }
 }
@@ -129,21 +139,24 @@ impl Db {
         &self,
         items: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
     ) -> Result<Vec<String>> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS _jerrycan_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_error)?;
+        self.conn
+            .execute_unprepared(
+                "CREATE TABLE IF NOT EXISTS _jerrycan_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)",
+            )
+            .await
+            .map_err(db_error)?;
 
         let mut applied = Vec::new();
         for (name, sqlite, postgres) in items {
-            let seen =
-                sqlx::query(&self.sql("SELECT name FROM _jerrycan_migrations WHERE name = ?"))
-                    .bind(name)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(db_error)?;
+            let seen = self
+                .conn
+                .query_one(Statement::from_sql_and_values(
+                    self.backend_db(),
+                    self.sql("SELECT name FROM _jerrycan_migrations WHERE name = ?"),
+                    [name.into()],
+                ))
+                .await
+                .map_err(db_error)?;
             if seen.is_some() {
                 continue;
             }
@@ -151,21 +164,18 @@ impl Db {
                 Backend::Sqlite => sqlite,
                 Backend::Postgres => postgres,
             };
-            sqlx::query(statement)
-                .execute(&self.pool)
+            self.conn.execute_unprepared(statement).await.map_err(|e| {
+                eprintln!("jerrycan-db: migration `{name}` failed");
+                db_error(e)
+            })?;
+            self.conn
+                .execute(Statement::from_sql_and_values(
+                    self.backend_db(),
+                    self.sql("INSERT INTO _jerrycan_migrations (name, applied_at) VALUES (?, ?)"),
+                    [name.into(), chrono_free_timestamp().into()],
+                ))
                 .await
-                .map_err(|e| {
-                    eprintln!("jerrycan-db: migration `{name}` failed");
-                    db_error(e)
-                })?;
-            sqlx::query(
-                &self.sql("INSERT INTO _jerrycan_migrations (name, applied_at) VALUES (?, ?)"),
-            )
-            .bind(name)
-            .bind(chrono_free_timestamp())
-            .execute(&self.pool)
-            .await
-            .map_err(db_error)?;
+                .map_err(db_error)?;
             applied.push(name.to_string());
         }
         Ok(applied)
@@ -203,15 +213,16 @@ pub fn translate_placeholders(query: &str, backend: Backend) -> String {
     }
 }
 
-/// Map any sqlx error to a stable JC code without leaking internals; the
+/// Map any sea-orm error to a stable JC code without leaking internals; the
 /// underlying detail goes to stderr for the operator. Unique-key violations
 /// are the client's fault (a re-POSTed id), not a server fault — they map to
 /// 409 JC0409 so duplicate writes can't pollute 5xx alerting.
-pub fn db_error(e: sqlx::Error) -> Error {
+pub fn db_error(e: sea_orm::DbErr) -> Error {
     eprintln!("jerrycan-db: {e}");
-    if let sqlx::Error::Database(ref db) = e
-        && db.is_unique_violation()
-    {
+    if matches!(
+        e.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+    ) {
         return Error::conflict("conflict: a row with this key already exists");
     }
     Error::new(
@@ -227,36 +238,24 @@ impl Extension for Db {
     }
 }
 
-/// Re-exported for generated code: `jerrycan::db::sqlx::{query, Row}` — route
-/// crates never declare sqlx themselves.
+/// Re-exported for generated code that still reaches for sqlx types directly;
+/// route crates never declare sqlx themselves.
 pub use sqlx;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::Row;
 
     #[tokio::test]
-    async fn sqlite_memory_is_one_database_across_queries() {
-        // Decision #4: sqlite pools are single-connection — otherwise every
+    async fn connects_and_executes_via_sea_orm() {
+        // Decision #4: sqlite connections are single-connection — otherwise every
         // pooled connection of sqlite::memory: is its OWN empty database.
         let db = Db::connect("sqlite::memory:").await.unwrap();
         assert_eq!(db.backend(), Backend::Sqlite);
-        sqlx::query("CREATE TABLE t (x BIGINT)")
-            .execute(db.pool())
+        db.conn()
+            .execute_unprepared("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             .await
             .unwrap();
-        sqlx::query("INSERT INTO t (x) VALUES (?)")
-            .bind(7i64)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let row = sqlx::query("SELECT x FROM t")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        let x: i64 = row.get("x");
-        assert_eq!(x, 7, "second pooled query must see the first one's table");
     }
 
     #[test]
@@ -280,23 +279,21 @@ mod tests {
 
     #[test]
     fn db_errors_are_jc0510_and_leak_nothing() {
-        let e = db_error(sqlx::Error::RowNotFound);
+        let e = db_error(sea_orm::DbErr::Custom("boom".into()));
         assert_eq!(e.code(), "JC0510");
         assert_eq!(e.message(), "database error");
     }
 
     /// The whole generated-repo chain in one place: sea-query renders the SQL
-    /// and binds the values; sqlx is only the executor. If this breaks, every
-    /// generated repo breaks with it.
+    /// and binds the values; the connection is only the executor. If this
+    /// breaks, every generated repo breaks with it.
     #[tokio::test]
-    async fn sea_query_builds_and_executes_via_the_any_pool() {
+    async fn sea_query_builds_and_executes_via_the_connection() {
         use sea_query::{Alias, Expr, Query};
-        use sea_query_binder::SqlxBinder;
-        use sqlx::Row;
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE sq (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
-            .execute(db.pool())
+        db.conn()
+            .execute_unprepared("CREATE TABLE sq (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
             .await
             .unwrap();
 
@@ -305,23 +302,31 @@ mod tests {
             .columns([Alias::new("id"), Alias::new("title")])
             .values_panic([7.into(), "hello".into()])
             .returning(Query::returning().columns([Alias::new("id")]))
-            .build_any_sqlx(db.query_builder());
-        let row = sqlx::query_with(&sql, values)
-            .fetch_one(db.pool())
+            .build_any(db.query_builder());
+        let row = db
+            .conn()
+            .query_one(Statement::from_sql_and_values(db.backend_db(), sql, values))
             .await
-            .unwrap();
-        assert_eq!(row.get::<i64, _>("id"), 7, "RETURNING id round-trips");
+            .unwrap()
+            .expect("RETURNING id row");
+        assert_eq!(
+            row.try_get::<i64>("", "id").unwrap(),
+            7,
+            "RETURNING id round-trips"
+        );
 
         let (sql, values) = Query::select()
             .columns([Alias::new("id"), Alias::new("title")])
             .from(Alias::new("sq"))
             .and_where(Expr::col(Alias::new("id")).eq(7))
-            .build_any_sqlx(db.query_builder());
-        let row = sqlx::query_with(&sql, values)
-            .fetch_one(db.pool())
+            .build_any(db.query_builder());
+        let row = db
+            .conn()
+            .query_one(Statement::from_sql_and_values(db.backend_db(), sql, values))
             .await
-            .unwrap();
-        assert_eq!(row.get::<String, _>("title"), "hello");
+            .unwrap()
+            .expect("select row");
+        assert_eq!(row.try_get::<String>("", "title").unwrap(), "hello");
     }
 
     /// A duplicate key is the CLIENT's fault: it must surface as 409 JC0409,
@@ -329,16 +334,17 @@ mod tests {
     #[tokio::test]
     async fn unique_violations_map_to_409_conflict() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE u (id INTEGER PRIMARY KEY, t TEXT)")
-            .execute(db.pool())
+        db.conn()
+            .execute_unprepared("CREATE TABLE u (id INTEGER PRIMARY KEY, t TEXT)")
             .await
             .unwrap();
-        sqlx::query("INSERT INTO u (id, t) VALUES (1, 'a')")
-            .execute(db.pool())
+        db.conn()
+            .execute_unprepared("INSERT INTO u VALUES (1, 'a')")
             .await
             .unwrap();
-        let dup = sqlx::query("INSERT INTO u (id, t) VALUES (1, 'b')")
-            .execute(db.pool())
+        let dup = db
+            .conn()
+            .execute_unprepared("INSERT INTO u VALUES (1, 'b')")
             .await
             .expect_err("duplicate pk must fail");
         let e = db_error(dup);
@@ -374,10 +380,8 @@ mod tests {
         assert!(applied.is_empty());
 
         // The schema is genuinely there.
-        sqlx::query("INSERT INTO todos (title, done) VALUES (?, ?)")
-            .bind("x")
-            .bind(true)
-            .execute(db.pool())
+        db.conn()
+            .execute_unprepared("INSERT INTO todos (title, done) VALUES ('x', 1)")
             .await
             .unwrap();
     }

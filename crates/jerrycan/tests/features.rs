@@ -7,11 +7,12 @@
 #[cfg(feature = "db")]
 #[tokio::test]
 async fn db_reexport_is_usable() {
+    use jerrycan::db::sea_orm::ConnectionTrait;
     let db = jerrycan::db::Db::connect("sqlite::memory:").await.unwrap();
     assert_eq!(db.backend(), jerrycan::db::Backend::Sqlite);
-    // The sqlx re-export rides along for generated repos:
-    jerrycan::db::sqlx::query("CREATE TABLE t (x BIGINT)")
-        .execute(db.pool())
+    // The sea-orm connection rides along for generated repos:
+    db.conn()
+        .execute_unprepared("CREATE TABLE t (x BIGINT)")
         .await
         .unwrap();
 }

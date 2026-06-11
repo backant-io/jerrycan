@@ -27,9 +27,8 @@ let app = App::new().extend(db);                            // Db is an Extensio
 ```rust
 # use jerrycan::prelude::*;
 # fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+use jerrycan::db::sea_orm::{ConnectionTrait, Statement};
 use jerrycan::db::sea_query::{Alias, Expr, Query};
-use jerrycan::db::sea_query_binder::SqlxBinder;
-use jerrycan::db::sqlx::Row;
 use jerrycan::db::{db_error, Db};
 
 async fn count(db: Dep<Db>) -> Result<Json<i64>> {
@@ -37,12 +36,18 @@ async fn count(db: Dep<Db>) -> Result<Json<i64>> {
     let (sql, values) = Query::select()
         .expr_as(Expr::col(Alias::new("id")).count(), Alias::new("n"))
         .from(Alias::new("notes"))
-        .build_any_sqlx(db.query_builder());
-    let row = jerrycan::db::sqlx::query_with(&sql, values)
-        .fetch_one(db.pool())
+        .build_any(db.query_builder());
+    let row = db
+        .conn()
+        .query_one(Statement::from_sql_and_values(
+            db.conn().get_database_backend(),
+            sql,
+            values,
+        ))
         .await
-        .map_err(db_error)?;
-    Ok(Json(row.get("n")))
+        .map_err(db_error)?
+        .expect("COUNT(*) always returns a row");
+    Ok(Json(row.try_get("", "n").map_err(db_error)?))
 }
 
 let db = Db::connect("sqlite::memory:").await.unwrap();
@@ -59,7 +64,7 @@ assert_eq!(t.get("/count").await.json::<i64>(), 0);
 
 ## Variations
 - All query SQL is built with `jerrycan::db::sea_query` (re-exported) and bound
-  with `build_any_sqlx(db.query_builder())` — placeholders, quoting, and
+  with `build_any(db.query_builder())` — placeholders, quoting, and
   `RETURNING` render correctly for whichever engine is connected. Values always
   travel as binds, never inside the SQL string.
 - Generated repos take `Dep<Db>` through a factory: `.provide_dep(repo::todo_repo)`
