@@ -59,10 +59,10 @@ pub fn validate(d: &Design) -> Vec<Question> {
             ),
         ));
     }
-    if d.contract_version != 0 {
+    if d.contract_version > 1 {
         qs.push(q(
             "/contract_version",
-            "contract_version must be 0 for this platform version.",
+            "contract_version must be 0 or 1 for this platform version.",
         ));
     }
     if d.modules.is_empty() {
@@ -124,10 +124,13 @@ pub fn validate(d: &Design) -> Vec<Question> {
     }
 
     if d.wants_db() {
-        fn check_json_fields(m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+        // contract v1 stores json as a real column (Json); v0 has no json columns,
+        // so a json field there is still an unsupported request.
+        let json_ok = d.contract_version >= 1;
+        fn check_db_fields(m: &ModuleDesign, ptr: &str, json_ok: bool, qs: &mut Vec<Question>) {
             for (i, e) in m.entities.iter().enumerate() {
                 for (j, f) in e.fields.iter().enumerate() {
-                    if matches!(f.field_type, FieldType::Json) {
+                    if !json_ok && matches!(f.field_type, FieldType::Json) {
                         qs.push(q(
                             format!("{ptr}/entities/{i}/fields/{j}/type"),
                             format!("Field `{}` has type json — json fields are not yet supported in db mode (store as string, or drop the db dependency; structured json columns are a contract-v1 candidate).", f.name),
@@ -145,13 +148,160 @@ pub fn validate(d: &Design) -> Vec<Question> {
                         ));
                     }
                 }
+                // The fk column a belongs_to derives is generated; an explicit field
+                // of the same name would collide with the derived column.
+                for b in &e.belongs_to {
+                    let derived = Design::fk_column(&b.entity);
+                    if let Some(j) = e.fields.iter().position(|f| f.name == derived) {
+                        qs.push(q(
+                            format!("{ptr}/entities/{i}/fields/{j}"),
+                            format!(
+                                "Field `{derived}` collides with the fk column derived from belongs_to `{}` — the fk column is derived from belongs_to; remove the explicit field or the belongs_to.",
+                                b.entity
+                            ),
+                        ));
+                    }
+                }
             }
             for (i, sub) in m.subroutes.iter().enumerate() {
-                check_json_fields(sub, &format!("{ptr}/subroutes/{i}"), qs);
+                check_db_fields(sub, &format!("{ptr}/subroutes/{i}"), json_ok, qs);
             }
         }
         for (i, m) in d.modules.iter().enumerate() {
-            check_json_fields(m, &format!("/modules/{i}"), &mut qs);
+            check_db_fields(m, &format!("/modules/{i}"), json_ok, &mut qs);
+        }
+    }
+
+    // Contract v1 constructs: belongs_to targets and enum-value placement.
+    // Collect every declared entity name (modules + subroutes) so a belongs_to
+    // may target any entity anywhere in the design.
+    let mut entity_names = std::collections::HashSet::new();
+    fn collect_entity_names<'a>(m: &'a ModuleDesign, out: &mut std::collections::HashSet<&'a str>) {
+        for e in &m.entities {
+            out.insert(e.name.as_str());
+        }
+        for sub in &m.subroutes {
+            collect_entity_names(sub, out);
+        }
+    }
+    for m in &d.modules {
+        collect_entity_names(m, &mut entity_names);
+    }
+
+    fn check_relations_and_enums(
+        m: &ModuleDesign,
+        ptr: &str,
+        entity_names: &std::collections::HashSet<&str>,
+        qs: &mut Vec<Question>,
+    ) {
+        for (i, e) in m.entities.iter().enumerate() {
+            for (k, b) in e.belongs_to.iter().enumerate() {
+                if !entity_names.contains(b.entity.as_str()) {
+                    qs.push(q(
+                        format!("{ptr}/entities/{i}/belongs_to/{k}"),
+                        format!(
+                            "belongs_to target `{}` is not a declared entity anywhere in the design — define it or fix the reference.",
+                            b.entity
+                        ),
+                    ));
+                }
+            }
+            for (j, f) in e.fields.iter().enumerate() {
+                if let Some(ref values) = f.values {
+                    if !matches!(f.field_type, FieldType::String) {
+                        qs.push(q(
+                            format!("{ptr}/entities/{i}/fields/{j}/values"),
+                            format!(
+                                "Field `{}` declares enum `values` but its type is not string — enum values are only allowed on string fields.",
+                                f.name
+                            ),
+                        ));
+                    } else if values.is_empty() {
+                        qs.push(q(
+                            format!("{ptr}/entities/{i}/fields/{j}/values"),
+                            format!(
+                                "Field `{}` declares an empty `values` list — list at least one allowed value or drop the field.",
+                                f.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        for (i, sub) in m.subroutes.iter().enumerate() {
+            check_relations_and_enums(sub, &format!("{ptr}/subroutes/{i}"), entity_names, qs);
+        }
+    }
+    for (i, m) in d.modules.iter().enumerate() {
+        check_relations_and_enums(m, &format!("/modules/{i}"), &entity_names, &mut qs);
+    }
+
+    // Tenancy: the named entity must resolve, and the Tenant guard needs an
+    // authenticated user to scope by.
+    if let Some(ref tenancy) = d.tenancy {
+        if !entity_names.contains(tenancy.entity.as_str()) {
+            qs.push(q(
+                "/tenancy/entity",
+                format!(
+                    "Tenancy entity `{}` is not a declared entity — define it or fix the reference.",
+                    tenancy.entity
+                ),
+            ));
+        }
+        // The Tenant guard scopes by the authenticated principal, which only an
+        // active auth *model* (session/jwt) produces — the bare `auth` dependency
+        // stub does not.
+        let active_auth_model = d
+            .auth
+            .as_ref()
+            .map(|a| a.model != AuthModel::None)
+            .unwrap_or(false);
+        if !active_auth_model {
+            qs.push(q(
+                "/tenancy",
+                "Tenancy is declared but the design has no active auth model — the Tenant guard needs an authenticated user; set auth.model to `session` or `jwt` first.",
+            ));
+        }
+    }
+
+    // Jobs: snake_case unique names; a present schedule must look cron-shaped
+    // (full cron parsing arrives with the engine in v2.3).
+    let mut seen_job_names = std::collections::HashSet::new();
+    for (i, job) in d.jobs.iter().enumerate() {
+        if !is_snake(&job.name) {
+            qs.push(q(
+                format!("/jobs/{i}/name"),
+                format!(
+                    "Job name `{}` must be snake_case (^[a-z][a-z0-9_]*$).",
+                    job.name
+                ),
+            ));
+        }
+        if !seen_job_names.insert(job.name.as_str()) {
+            qs.push(q(
+                format!("/jobs/{i}/name"),
+                format!(
+                    "Job name `{}` is already used — job names must be unique.",
+                    job.name
+                ),
+            ));
+        }
+        if let Some(ref schedule) = job.schedule {
+            let fields: Vec<&str> = schedule.split_whitespace().collect();
+            let cron_shaped = fields.len() == 5
+                && fields.iter().all(|f| {
+                    !f.is_empty()
+                        && f.chars()
+                            .all(|c| c.is_ascii_digit() || matches!(c, '*' | ',' | '/' | '-'))
+                });
+            if !cron_shaped {
+                qs.push(q(
+                    format!("/jobs/{i}/schedule"),
+                    format!(
+                        "Schedule `{schedule}` is not a 5-field cron expression (minute hour day month weekday, each [0-9*,/-]).",
+                    ),
+                ));
+            }
         }
     }
 
@@ -362,7 +512,7 @@ fn validate_module(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::design::tests::MINIMAL;
+    use crate::platform::design::tests::{MINIMAL, V1_FULL};
 
     fn design(json: &str) -> Design {
         serde_json::from_str(json).unwrap()
@@ -543,5 +693,86 @@ mod tests {
                 .any(|q| q.id.contains("/mount") && q.question.contains("trailing slash")),
             "trailing-slash mount must be flagged"
         );
+    }
+
+    #[test]
+    fn belongs_to_must_target_a_declared_entity() {
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        d.modules[1].entities[0].belongs_to[0].entity = "Ghost".into();
+        let qs = validate(&d);
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/1/entities/0/belongs_to/0"
+                    && q.question.contains("Ghost")),
+            "{qs:?}"
+        );
+    }
+
+    #[test]
+    fn tenancy_entity_must_exist() {
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        d.tenancy.as_mut().unwrap().entity = "Nope".into();
+        assert!(validate(&d).iter().any(|q| q.id == "/tenancy/entity"));
+    }
+
+    #[test]
+    fn tenancy_requires_active_auth() {
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        d.auth = None;
+        assert!(validate(&d).iter().any(|q| q.id == "/tenancy"));
+    }
+
+    #[test]
+    fn jobs_validate_name_uniqueness_and_cron_shape() {
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        d.jobs[0].schedule = Some("not cron".into());
+        assert!(validate(&d).iter().any(|q| q.id == "/jobs/0/schedule"));
+        let mut d2: Design = serde_json::from_str(V1_FULL).unwrap();
+        d2.jobs.push(d2.jobs[0].clone());
+        assert!(validate(&d2).iter().any(|q| q.id == "/jobs/1/name"));
+    }
+
+    #[test]
+    fn enum_values_only_on_string_fields_and_nonempty() {
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        d.modules[0].entities[0].fields[0].values = Some(vec!["x".into()]); // id: integer
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/values")
+        );
+        let mut d2: Design = serde_json::from_str(V1_FULL).unwrap();
+        d2.modules[0].entities[0].fields[1].values = Some(vec![]); // empty
+        assert!(
+            validate(&d2)
+                .iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/1/values")
+        );
+    }
+
+    #[test]
+    fn explicit_fk_named_field_conflicts_with_belongs_to() {
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        d.modules[1].entities[0].fields.push(Field {
+            name: "workspace_id".into(),
+            field_type: FieldType::Integer,
+            required: true,
+            unique: false,
+            index: false,
+            values: None,
+        });
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id.ends_with("/fields/3") && q.question.contains("derived")),
+            "{:?}",
+            validate(&d)
+        );
+    }
+
+    #[test]
+    fn kolli_shaped_v1_design_is_question_free() {
+        let d: Design = serde_json::from_str(V1_FULL).unwrap();
+        assert!(validate(&d).is_empty(), "{:?}", validate(&d));
     }
 }
