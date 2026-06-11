@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://jerrycan.cc/schemas/design-v0.json",
+  "$id": "https://jerrycan.cc/schemas/design-v1.json",
   "title": "jerrycan design.json",
-  "description": "The validated design an app is generated from. Module-grouped with nested subroutes (spec \u00a75). Produced by jerrycan_design; consumed by scaffold/generate/gen_tests.",
+  "description": "The validated design an app is generated from. Module-grouped with nested subroutes (spec \u00a75). Produced by jerrycan_design; consumed by scaffold/generate/gen_tests. Contract v1 adds entity belongs_to (foreign keys), top-level tenancy (tenant-owned entities), top-level jobs, and field unique/index/values; v0 documents remain valid.",
   "type": "object",
   "required": [
     "name",
@@ -16,7 +16,10 @@
       "pattern": "^[a-z][a-z0-9-]*$"
     },
     "contract_version": {
-      "const": 0
+      "enum": [
+        0,
+        1
+      ]
     },
     "description": {
       "type": "string"
@@ -57,6 +60,55 @@
         "type": "string"
       },
       "description": "App-scoped dependency names. Reserved names: 'db' (SQL storage via jerrycan-db: SQL repos, migrations, Db dependency), 'validate' (OpenAPI document served at /openapi.json), 'auth' (session/JWT guards + the Auth extension; also implied by a non-'none' auth.model), and 'observe' (access-log middleware + /healthz and Prometheus /metrics). Other names are stubs the generator reminds you to provide."
+    },
+    "tenancy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entity"
+      ],
+      "description": "Declares the tenant entity. Entities with a belongs_to aimed at it become tenant-owned: scoped repositories, a Tenant guard on their endpoints, isolation tests, and a membership table '<tenant_snake>_members'.",
+      "properties": {
+        "entity": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Za-z0-9]*$",
+          "description": "The tenant entity name (must match an entity declared in some module)."
+        },
+        "member_roles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Roles a member may hold in the membership table."
+        }
+      }
+    },
+    "jobs": {
+      "type": "array",
+      "description": "Background jobs the app declares. The execution engine ships in 0.2 (v2.3); contract v1 freezes the shape so designs and generated code can reference jobs now.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Job name — becomes the generated job fn/type name."
+          },
+          "schedule": {
+            "type": "string",
+            "description": "5-field cron; engine ships in 0.2 (v2.3) — contract v1 freezes the shape."
+          },
+          "queue": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "description": "Optional queue name the job runs on."
+          }
+        }
+      }
     }
   },
   "$defs": {
@@ -120,6 +172,33 @@
           "type": "string",
           "pattern": "^[A-Z][A-Za-z0-9]*$"
         },
+        "belongs_to": {
+          "type": "array",
+          "description": "Foreign-key relations to other entities. Each produces a NOT NULL fk column 'snake_case(entity) + \"_id\"' referencing the target's pk (nullable instead when on_delete is set_null), plus a DDL foreign key with the given on_delete policy.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "entity"
+            ],
+            "properties": {
+              "entity": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Za-z0-9]*$",
+                "description": "Target entity name; the fk column is derived as snake_case(entity) + \"_id\"."
+              },
+              "on_delete": {
+                "enum": [
+                  "cascade",
+                  "set_null",
+                  "restrict"
+                ],
+                "default": "restrict",
+                "description": "DDL ON DELETE policy. 'set_null' makes the fk column nullable; 'cascade' deletes dependents; 'restrict' (default) blocks deletion while dependents exist."
+              }
+            }
+          }
+        },
         "fields": {
           "type": "array",
           "minItems": 1,
@@ -149,6 +228,22 @@
               "required": {
                 "type": "boolean",
                 "default": true
+              },
+              "unique": {
+                "type": "boolean",
+                "default": false
+              },
+              "index": {
+                "type": "boolean",
+                "default": false
+              },
+              "values": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1,
+                "description": "String enums: only valid on type \"string\"; becomes a CHECK constraint in db mode and Valid<T> validation."
               }
             }
           }

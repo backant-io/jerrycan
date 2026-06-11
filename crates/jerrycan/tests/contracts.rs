@@ -105,7 +105,7 @@ fn mcp_tools_contract_holds_its_invariants() {
 #[test]
 fn design_schema_is_module_grouped_and_recursive() {
     let doc = load("design-schema.json");
-    assert_eq!(doc["$id"], "https://jerrycan.cc/schemas/design-v0.json");
+    assert_eq!(doc["$id"], "https://jerrycan.cc/schemas/design-v1.json");
     assert_eq!(
         doc["properties"]["modules"]["items"]["$ref"],
         "#/$defs/module"

@@ -471,4 +471,24 @@ pub(crate) mod tests {
         let bad = MINIMAL.replace("\"GET\"", "\"OPTIONS\"");
         assert!(serde_json::from_str::<Design>(&bad).is_err());
     }
+
+    #[test]
+    fn published_schema_accepts_v1_constructs() {
+        // Structural spot-checks keep the published contract honest (we don't
+        // run a full JSON-Schema validator).
+        let s = include_str!("../../../../docs/contracts/design-schema.json");
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert_eq!(
+            v["properties"]["contract_version"]["enum"],
+            serde_json::json!([0, 1])
+        );
+        assert!(
+            s.contains("\"belongs_to\"")
+                && s.contains("\"tenancy\"")
+                && s.contains("\"jobs\"")
+                && s.contains("\"on_delete\"")
+                && s.contains("\"unique\"")
+                && s.contains("\"values\"")
+        );
+    }
 }
