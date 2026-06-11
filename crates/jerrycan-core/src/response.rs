@@ -7,16 +7,42 @@ use http::{HeaderValue, StatusCode, header};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use serde::Serialize;
 
-/// The response body: a fixed buffer today, a stream when a handler opts in
-/// (`StreamBody` arrives with the protocol-surface phase; the TYPE lands now so
-/// it is a feature, not a core change). Wraps a `BoxBody` so the response type
-/// is stable whether the body is a full buffer or a stream.
-pub struct JcBody(BoxBody<Bytes, std::convert::Infallible>);
+/// Mid-stream body failure. Reaching hyper as a body error aborts the
+/// connection, so the client sees a truncated (invalid) chunked stream rather
+/// than a clean end — truncation must be detectable.
+#[derive(Debug)]
+pub struct BodyError(String);
+
+impl BodyError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BodyError {}
+
+impl From<std::convert::Infallible> for BodyError {
+    fn from(e: std::convert::Infallible) -> Self {
+        match e {}
+    }
+}
+
+/// The response body: a fixed buffer for buffered handlers, or a stream when a
+/// handler returns [`StreamBody`] (downloads, exports). Wraps a `BoxBody` so the
+/// response type is stable whichever shape the body takes; its error channel is
+/// [`BodyError`], which a mid-stream failure rides to abort the connection.
+pub struct JcBody(BoxBody<Bytes, BodyError>);
 
 impl JcBody {
     /// A complete, in-memory body.
     pub fn full(bytes: impl Into<Bytes>) -> Self {
-        Self(Full::new(bytes.into()).boxed())
+        Self(Full::new(bytes.into()).map_err(BodyError::from).boxed())
     }
 
     /// An empty body (zero frames).
@@ -29,15 +55,16 @@ impl JcBody {
     /// across hyper's `Send` service future.
     pub fn stream<B>(body: B) -> Self
     where
-        B: http_body::Body<Data = Bytes, Error = std::convert::Infallible> + Send + Sync + 'static,
+        B: http_body::Body<Data = Bytes> + Send + Sync + 'static,
+        B::Error: Into<BodyError>,
     {
-        Self(BoxBody::new(body))
+        Self(body.map_err(Into::into).boxed())
     }
 }
 
 impl http_body::Body for JcBody {
     type Data = Bytes;
-    type Error = std::convert::Infallible;
+    type Error = BodyError;
 
     fn poll_frame(
         mut self: std::pin::Pin<&mut Self>,
@@ -172,6 +199,171 @@ impl<T: IntoResponse> IntoResponse for crate::Result<T> {
     }
 }
 
+/// A streaming response body: downloads, CSV exports, anything produced
+/// incrementally. Defaults: `application/octet-stream`, 200 OK, 30s frame
+/// timeout (a producer that stalls longer aborts the connection).
+pub struct StreamBody {
+    stream: std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<Bytes, Error>> + Send + Sync + 'static>,
+    >,
+    content_type: HeaderValue,
+    attachment: Option<HeaderValue>,
+    frame_timeout: std::time::Duration,
+}
+
+impl StreamBody {
+    /// Default per-frame producer deadline (see [`StreamBody::frame_timeout`]).
+    pub const DEFAULT_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Stream chunks from anything implementing `Stream` (SeaORM streaming
+    /// queries, hand-rolled producers). An `Err` item aborts the connection.
+    pub fn new<S>(stream: S) -> Self
+    where
+        S: futures_core::Stream<Item = Result<Bytes, Error>> + Send + Sync + 'static,
+    {
+        Self {
+            stream: Box::pin(stream),
+            content_type: HeaderValue::from_static("application/octet-stream"),
+            attachment: None,
+            frame_timeout: Self::DEFAULT_FRAME_TIMEOUT,
+        }
+    }
+
+    /// A channel-fed body for producers that push: returns the body and a
+    /// sender. Dropping the sender ends the stream cleanly; `fail` aborts it.
+    pub fn channel() -> (Self, BodySender) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Error>>(16);
+        (Self::new(ReceiverStream(rx)), BodySender(tx))
+    }
+
+    /// Sets the `content-type` header. Panics on a value that is not a valid
+    /// header value — that is a programming error, not request-dependent.
+    pub fn content_type(mut self, value: &str) -> Self {
+        self.content_type =
+            HeaderValue::from_str(value).expect("content_type must be a valid header value");
+        self
+    }
+
+    /// Marks the response as a download: `content-disposition: attachment` with
+    /// the given filename (quotes, backslashes, and control chars stripped — header safety).
+    pub fn attachment(mut self, filename: &str) -> Self {
+        let safe: String = filename
+            .chars()
+            .filter(|c| *c != '"' && *c != '\\' && !c.is_control())
+            .collect();
+        self.attachment = Some(
+            HeaderValue::from_str(&format!("attachment; filename=\"{safe}\""))
+                .expect("sanitized filename is a valid header value"),
+        );
+        self
+    }
+
+    /// Maximum time the producer may take between chunks before the
+    /// connection is aborted.
+    pub fn frame_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.frame_timeout = timeout;
+        self
+    }
+}
+
+/// Push side of [`StreamBody::channel`].
+pub struct BodySender(tokio::sync::mpsc::Sender<Result<Bytes, Error>>);
+
+impl BodySender {
+    /// Sends one chunk. Returns false when the client is gone (stop producing).
+    pub async fn send(&self, chunk: impl Into<Bytes>) -> bool {
+        self.0.send(Ok(chunk.into())).await.is_ok()
+    }
+    /// Aborts the response: the connection is reset so the client sees
+    /// truncation instead of a falsely-complete body.
+    pub async fn fail(self, error: Error) -> bool {
+        self.0.send(Err(error)).await.is_ok()
+    }
+}
+
+/// mpsc receiver as a Stream (hand-rolled: futures-util is not a dependency).
+struct ReceiverStream(tokio::sync::mpsc::Receiver<Result<Bytes, Error>>);
+
+impl futures_core::Stream for ReceiverStream {
+    type Item = Result<Bytes, Error>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+/// Stream → Body adapter with a per-frame producer deadline. The deadline arms
+/// when a poll returns Pending and RESETS on every yielded frame, so steady
+/// producers of any total duration are unaffected; only stalls trip it.
+struct TimedFrames {
+    stream: std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<Bytes, Error>> + Send + Sync + 'static>,
+    >,
+    timeout: std::time::Duration,
+    sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl http_body::Body for TimedFrames {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, BodyError>>> {
+        use std::future::Future;
+        use std::task::Poll;
+        match self.stream.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.sleep = None;
+                Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.sleep = None;
+                Poll::Ready(Some(Err(BodyError::new(format!(
+                    "response stream failed: {e}"
+                )))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                let timeout = self.timeout;
+                let sleep = self
+                    .sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+                match sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        self.sleep = None;
+                        Poll::Ready(Some(Err(BodyError::new(
+                            "response stream timed out producing the next chunk",
+                        ))))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+impl IntoResponse for StreamBody {
+    fn into_response(self) -> Response {
+        let body = JcBody::stream(TimedFrames {
+            stream: self.stream,
+            timeout: self.frame_timeout,
+            sleep: None,
+        });
+        let mut r = http::Response::new(body);
+        r.headers_mut()
+            .insert(header::CONTENT_TYPE, self.content_type);
+        if let Some(disposition) = self.attachment {
+            r.headers_mut()
+                .insert(header::CONTENT_DISPOSITION, disposition);
+        }
+        r
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +473,50 @@ mod tests {
         use http_body_util::BodyExt;
         let collected = body.collect().await.unwrap().to_bytes();
         assert_eq!(collected, Bytes::from("abcd"));
+    }
+
+    #[tokio::test]
+    async fn stream_body_streams_with_content_type_and_disposition() {
+        let (body, tx) = StreamBody::channel();
+        let send = async move {
+            assert!(tx.send("a,b\n").await);
+            assert!(tx.send("1,2\n").await);
+        };
+        let r = body
+            .content_type("text/csv")
+            .attachment("export.csv")
+            .into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "text/csv");
+        assert_eq!(
+            r.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"export.csv\""
+        );
+        let (_, collected) = tokio::join!(send, r.into_body().collect());
+        assert_eq!(collected.unwrap().to_bytes(), Bytes::from("a,b\n1,2\n"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_body_frame_timeout_errors_the_body() {
+        struct Never;
+        impl futures_core::Stream for Never {
+            type Item = Result<Bytes, Error>;
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+        let body = StreamBody::new(Never)
+            .frame_timeout(std::time::Duration::from_millis(100))
+            .into_response()
+            .into_body();
+        use http_body_util::BodyExt;
+        let err = body
+            .collect()
+            .await
+            .expect_err("stall must error, not end cleanly");
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 }

@@ -19,12 +19,13 @@ http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
+futures-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util", "test-util"] }
 criterion = { workspace = true }
 
 [[bench]]

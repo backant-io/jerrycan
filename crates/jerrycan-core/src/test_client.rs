@@ -251,9 +251,9 @@ impl TestResponse {
         let (parts, body) = res.into_parts();
         let body = body
             .collect()
-            // JcBody's Body::Error is Infallible — collecting cannot fail.
+            // A buffered body cannot fail; a streaming one can fail mid-stream.
             .await
-            .expect("collect response body (JcBody is infallible)")
+            .unwrap_or_else(|e| panic!("response body failed mid-stream: {e}"))
             .to_bytes();
         Self {
             status: parts.status,
