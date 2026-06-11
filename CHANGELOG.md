@@ -44,6 +44,8 @@ and first-class multi-tenancy, and moves the data layer onto SeaORM.
 - `Db::pool()` is removed — use `Db::conn()` (a `sea_orm::DatabaseConnection`).
 - Generated apps must regenerate tool-owned files (`model.rs`, `lib.rs`,
   migrations runner, tests) to pick up the SeaORM layer and tenancy wiring.
+- MSRV raised to Rust 1.88 (the SeaORM data layer pulls `time` 0.3.47, which
+  requires it; resolves RUSTSEC-2026-0009).
 
 ## 0.1.0 — first release
 

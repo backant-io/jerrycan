@@ -4,6 +4,12 @@
 allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "ISC", "Zlib", "CDLA-Permissive-2.0"]
 [advisories]
 yanked = "deny"
+ignore = [
+    # proc-macro-error2: unmaintained; transitive build-time-only dep via
+    # sea-orm-macros -> sea-bae. No fixed upstream exists; compile-time proc
+    # macro, never in the runtime artifact. Re-evaluate on sea-orm releases.
+    "RUSTSEC-2026-0173",
+]
 [bans]
 [sources]
 unknown-registry = "deny"
