@@ -40,6 +40,36 @@ and first-class multi-tenancy, and moves the data layer onto SeaORM.
 - Compatibility: every contract_version 0 design validates and generates under
   v1 (compat suite).
 
+### Core readiness (v2.0b)
+The serving core grown up to carry real apps: streaming-shaped responses,
+per-route limits, task-scoped DI, an extension lifecycle, and injectable time.
+- **Two-phase read**: routing decides BEFORE the body is read, so an unknown
+  path (`404`) or wrong method (`405`) never drains an oversized body. Each
+  route sets its own ceiling with `.body_limit(n)`; the 1 MiB cap is the default.
+- **Boxed response bodies** (`JcBody`) — responses carry a boxed body, the seam
+  streaming will plug into. The serve engine moved into its own `serve.rs`.
+- **Leaf-most path binding**: a single `Path<T>` binds the LAST captured param,
+  so a route under a param-carrying mount (`/ws/{ws}` + `/leads/{id}`) addresses
+  its own `{id}`; tuples still read root→leaf. Custom id newtypes opt in through
+  the new `jerrycan::path_param!` macro.
+- **Task-scoped DI**: `BuiltApp`/`TestApp::task_context()` resolves app-level
+  deps OUTSIDE a request — startup wiring, background jobs, CLI. HTTP extractors
+  (`Json`/`Path`/`Query`/`Headers`) reject there with `JC1003`.
+- **`App::on_serve`**: background tasks that run for the lifetime of `serve`,
+  receive a `TaskContext` + shutdown watch, and drain under the same 10s budget;
+  `into_test` deliberately does not run them.
+- **Injectable `Clock`**: handlers/tasks take `Dep<Clock>` and call `now()` for
+  domain time (rate windows, schedules, expiry); tests move it with
+  `TestApp::clock().advance(..)`/`.set(..)`. Transport timeouts stay on real time.
+- **Public endpoints**: routes can be marked `public: true` (a `JL0004` carve-out
+  for credential-issuing routes); the `kolli` users module gains `register`/`login`.
+- **Cross-module relations** are unenforced fk columns by default; `schema.json`
+  reports the enforcement state per relation.
+- **MCP stdio**: lines are capped at 16 MiB — an overlong line fails loud with
+  JSON-RPC `-32600` and the reader recovers rather than wedging.
+- **Threat model** published (`docs/threat-model.md`); `JL0007` flags handler
+  code that escapes the request boundary.
+
 ### Breaking
 - `Db::pool()` is removed — use `Db::conn()` (a `sea_orm::DatabaseConnection`).
 - Generated apps must regenerate tool-owned files (`model.rs`, `lib.rs`,

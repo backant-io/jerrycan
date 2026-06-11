@@ -85,6 +85,50 @@ assert_eq!(t.get("/grid/3/9").await.text(), "r3c9");
 # }); }
 ```
 
+### Leaf binding under a param-carrying mount
+A single `Path<T>` binds the LEAF-MOST (last) captured parameter. So a route
+mounted under a prefix that itself carries a `{param}` addresses its own param,
+not the mount's — `Path<i64>` on `/leads/{id}` under `/ws/{ws}` is the `{id}`.
+Reach the mount's param by taking the whole set as a tuple (root→leaf):
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+async fn show(Path(id): Path<i64>) -> Result<Json<i64>> { Ok(Json(id)) }        // leaf {id}
+async fn pair(Path((ws, id)): Path<(i64, i64)>) -> Result<Json<(i64, i64)>> {   // both, root→leaf
+    Ok(Json((ws, id)))
+}
+
+let t = App::new()
+    .mount("/ws/{ws}", Module::new("leads")
+        .route("/leads/{id}", get(show))
+        .route("/leads/{id}/full", get(pair)))
+    .into_test();
+assert_eq!(t.get("/ws/7/leads/42").await.json::<i64>(), 42);          // leaf, not mount
+assert_eq!(t.get("/ws/7/leads/42/full").await.json::<(i64, i64)>(), (7, 42));
+# }); }
+```
+
+Custom id newtypes become path params through `jerrycan::path_param!`: the type
+just needs `FromStr` with a `Display` error; a parse failure is the same
+`400 JC0400` the built-in impls produce:
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+#[derive(Debug)]
+struct LeadId(i64);
+impl std::str::FromStr for LeadId {
+    type Err = std::num::ParseIntError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> { Ok(LeadId(s.parse()?)) }
+}
+jerrycan::path_param!(LeadId);
+
+async fn show(Path(id): Path<LeadId>) -> Result<Json<i64>> { Ok(Json(id.0)) }
+
+let t = App::new().route("/leads/{id}", get(show)).into_test();
+assert_eq!(t.get("/leads/42").await.json::<i64>(), 42);
+# }); }
+```
+
 ## Errors you'll hit
 - `Path<T>` parse failure → `400 JC0400` ("invalid path parameter") automatically.
 - Malformed/mistyped JSON body → `422 JC0422` with the serde message.

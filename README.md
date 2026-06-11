@@ -120,7 +120,7 @@ jerrycan_package  → hardened artifacts + SBOM, only when everything is green
 | **4 — Hardening** | Fuzzing, agent evals, diagnostics polish → v0.1.0 | ✅ complete |
 | **v0.1.0** | First release — crates published on [crates.io](https://crates.io/crates/jerrycan) | 🚀 released |
 | **v2.0 — Data foundation** | Contract v1 (relations + `on_delete`, unique/index, enums, json, **tenancy**, jobs shape), SeaORM data layer, `schema.json` contract + `jerrycan_schema` tool, generated isolation tests | ✅ complete |
-| **v2.0b — Core readiness** | Dual-lane body + per-route limits, param-carrying mounts, task-scoped DI, extension lifecycle, mockable `Clock` | 🔜 planned |
+| **v2.0b — Core readiness** | Dual-lane body + per-route limits, param-carrying mounts, task-scoped DI, extension lifecycle, mockable `Clock` | ✅ complete |
 | **v2.1 — Protocol surface** | `Multipart` / `RawBody` (webhook signatures) / `StreamBody` extractors | 🔜 planned |
 | **v2.2 — Middleware kit** | CORS in core; rate limiting as an extension (`429 JC0429`) | 🔜 planned |
 | **v2.3 — jerrycan-jobs** | `JobStore` (Postgres / Redis), retries + dead-letter, named queues, cron, idempotency, `run_at` | 🔜 planned |
