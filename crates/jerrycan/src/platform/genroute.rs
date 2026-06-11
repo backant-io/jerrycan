@@ -740,47 +740,47 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
     // and in what role. Emitted right after the tenant's own table so the fk
     // resolves. UNIQUE(user_id, fk) keeps a user from joining the same tenant
     // twice — rendered as a standalone CREATE UNIQUE INDEX (cleanest on both).
-    if let Some(tenancy) = &design.tenancy {
-        if m.entities.iter().any(|e| e.name == tenancy.entity) {
-            let tenant_table = table_name(&tenancy.entity);
-            let members = format!("{}_members", Design::to_snake(&tenancy.entity));
-            let fk = Design::fk_column(&tenancy.entity);
-            let mut table = Table::create();
-            table.table(Alias::new(members.clone()));
-            let mut pk = ColumnDef::new(Alias::new("id"));
-            pk.big_integer().not_null().auto_increment().primary_key();
-            table.col(&mut pk);
-            table.col(
-                ColumnDef::new(Alias::new("user_id"))
-                    .big_integer()
-                    .not_null(),
-            );
-            let mut fk_col = ColumnDef::new(Alias::new(fk.clone()));
-            match design.target_key_rust_type(&tenancy.entity) {
-                "String" => ddl_typed(&mut fk_col, FieldType::String, backend_is_pg),
-                _ => fk_col.big_integer(),
-            };
-            fk_col.not_null();
-            table.col(&mut fk_col);
-            table.col(ColumnDef::new(Alias::new("role")).text().not_null());
-            table.foreign_key(
-                ForeignKey::create()
-                    .name(format!("fk_{members}_{fk}"))
-                    .from(Alias::new(members.clone()), Alias::new(fk.clone()))
-                    .to(Alias::new(tenant_table), Alias::new("id"))
-                    .on_delete(ForeignKeyAction::Cascade),
-            );
-            out.push_str(&schema_sql(&table, backend_is_pg));
-            out.push_str(";\n\n");
-            let mut uniq = Index::create();
-            uniq.unique()
-                .name(format!("idx_{members}_user_tenant"))
-                .table(Alias::new(members.clone()))
-                .col(Alias::new("user_id"))
-                .col(Alias::new(fk.clone()));
-            out.push_str(&schema_sql(&uniq, backend_is_pg));
-            out.push_str(";\n\n");
-        }
+    if let Some(tenancy) = &design.tenancy
+        && m.entities.iter().any(|e| e.name == tenancy.entity)
+    {
+        let tenant_table = table_name(&tenancy.entity);
+        let members = format!("{}_members", Design::to_snake(&tenancy.entity));
+        let fk = Design::fk_column(&tenancy.entity);
+        let mut table = Table::create();
+        table.table(Alias::new(members.clone()));
+        let mut pk = ColumnDef::new(Alias::new("id"));
+        pk.big_integer().not_null().auto_increment().primary_key();
+        table.col(&mut pk);
+        table.col(
+            ColumnDef::new(Alias::new("user_id"))
+                .big_integer()
+                .not_null(),
+        );
+        let mut fk_col = ColumnDef::new(Alias::new(fk.clone()));
+        match design.target_key_rust_type(&tenancy.entity) {
+            "String" => ddl_typed(&mut fk_col, FieldType::String, backend_is_pg),
+            _ => fk_col.big_integer(),
+        };
+        fk_col.not_null();
+        table.col(&mut fk_col);
+        table.col(ColumnDef::new(Alias::new("role")).text().not_null());
+        table.foreign_key(
+            ForeignKey::create()
+                .name(format!("fk_{members}_{fk}"))
+                .from(Alias::new(members.clone()), Alias::new(fk.clone()))
+                .to(Alias::new(tenant_table), Alias::new("id"))
+                .on_delete(ForeignKeyAction::Cascade),
+        );
+        out.push_str(&schema_sql(&table, backend_is_pg));
+        out.push_str(";\n\n");
+        let mut uniq = Index::create();
+        uniq.unique()
+            .name(format!("idx_{members}_user_tenant"))
+            .table(Alias::new(members.clone()))
+            .col(Alias::new("user_id"))
+            .col(Alias::new(fk.clone()));
+        out.push_str(&schema_sql(&uniq, backend_is_pg));
+        out.push_str(";\n\n");
     }
     Some(out)
 }

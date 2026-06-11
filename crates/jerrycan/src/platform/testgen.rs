@@ -527,10 +527,10 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
 /// declared value (so a CHECK constraint passes); other fields use a type-shaped
 /// literal. String/text literals are single-quoted for inline DDL execution.
 fn seed_sql_value(f: &Field) -> String {
-    if let Some(values) = &f.values {
-        if let Some(first) = values.first() {
-            return format!("'{first}'");
-        }
+    if let Some(values) = &f.values
+        && let Some(first) = values.first()
+    {
+        return format!("'{first}'");
     }
     match f.field_type {
         FieldType::String | FieldType::Datetime | FieldType::Uuid => "'test-value'".to_string(),

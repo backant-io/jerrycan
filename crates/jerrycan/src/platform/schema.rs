@@ -118,21 +118,21 @@ impl<'a> DesignIndex<'a> {
 /// membership table, handled by the caller).
 fn overlay_type(index: &DesignIndex, table: &str, column: &str) -> Option<String> {
     // Membership table: id integer, user_id integer, role string, fk per tenant key.
-    if let Some((members, _)) = &index.membership {
-        if members == table {
-            return Some(match column {
-                "id" | "user_id" => "integer".to_string(),
-                "role" => "string".to_string(),
-                _ => {
-                    // the tenant fk column
-                    if index.tenant_key_string {
-                        "string".to_string()
-                    } else {
-                        "integer".to_string()
-                    }
+    if let Some((members, _)) = &index.membership
+        && members == table
+    {
+        return Some(match column {
+            "id" | "user_id" => "integer".to_string(),
+            "role" => "string".to_string(),
+            _ => {
+                // the tenant fk column
+                if index.tenant_key_string {
+                    "string".to_string()
+                } else {
+                    "integer".to_string()
                 }
-            });
-        }
+            }
+        });
     }
     let (_, entity) = index.entities.get(table)?;
     // A declared field carries its own FieldType.
