@@ -3,10 +3,12 @@
 //! JL0002 handler names don't match design operation_ids
 //! JL0003 a generated (tool-owned) file was hand-edited
 //! JL0004 an auth design leaves a mutating route unguarded
+//! JL0006 a tenant-owned handler calls an UNSCOPED repo method (cross-tenant read)
 
 use super::checkpipe::Diagnostic;
 use super::design::{Design, HttpMethod, ModuleDesign};
 use super::mounting;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 fn d(
@@ -35,7 +37,46 @@ pub fn run(root: &Path, design: &Design) -> Vec<Diagnostic> {
     }
     lint_generated_drift(root, design, &mut out);
     lint_unguarded_mutations(design, &mut out);
+    lint_unscoped_tenant_queries(root, design, &mut out);
     out
+}
+
+/// JL0006: a handler in a module that owns tenant-owned entities calls an
+/// UNSCOPED repo method (`repo.all()`, `repo.get(`, `repo.remove(`, `repo.update(`).
+/// Those read/delete across ALL tenants, so a tenant could reach another tenant's
+/// rows. The scoped accessors (`all_for`/`get_for`/`remove_for`) are excluded by
+/// the `(` anchor (e.g. `repo.get_for(` has `_` not `(` after `get`).
+///
+/// We scan ONLY the agent-owned handlers.rs (where the call happens), never
+/// repo.rs: the generated repo's own scoped methods call `Entity::...` directly,
+/// not `self.all()`, so repo.rs never legitimately matches — and scanning it
+/// would flag the unscoped methods the scoped ones are meant to replace.
+fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diagnostic>) {
+    // The set of modules that own at least one tenant-owned entity.
+    let modules: BTreeSet<&str> = design.tenant_owned().into_iter().map(|(m, _)| m).collect();
+    // `repo.all()` takes no args; the others anchor on `(` so `*_for(` is excluded.
+    const PATTERNS: [&str; 4] = ["repo.all()", "repo.get(", "repo.remove(", "repo.update("];
+    for module in modules {
+        let rel = format!("crates/routes/{module}/src/handlers.rs");
+        let Ok(content) = std::fs::read_to_string(root.join(&rel)) else {
+            continue;
+        };
+        for (i, line) in content.lines().enumerate() {
+            let Some(hit) = PATTERNS.iter().find(|p| line.contains(**p)) else {
+                continue;
+            };
+            out.push(d(
+                "JL0006",
+                Some(rel.clone()),
+                Some(i as u64 + 1),
+                format!(
+                    "handler in module `{module}` calls the unscoped `{hit}` on a tenant-owned repo — it can read or delete another tenant's rows"
+                ),
+                "call the tenant-scoped accessor (all_for/get_for/remove_for) with the current tenant's id",
+                "jerrycan docs database",
+            ));
+        }
+    }
 }
 
 /// JL0004: in an auth design, a mutating route (POST/PUT/PATCH/DELETE) whose
@@ -164,5 +205,94 @@ fn lint_generated_drift(root: &Path, design: &Design, out: &mut Vec<Diagnostic>)
                 "jerrycan docs app#anti-patterns",
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A design with tenancy whose `leads` module owns a tenant-owned entity, so
+    /// JL0006 scans crates/routes/leads/src/handlers.rs. (Reuses the design.rs
+    /// V1_FULL fixture, where Lead belongs_to the Workspace tenancy.)
+    fn tenant_design() -> Design {
+        serde_json::from_str(super::super::design::tests::V1_FULL).unwrap()
+    }
+
+    /// JL0006 flags the UNSCOPED `repo.get(` call on a tenant-owned module's
+    /// handler, and only that line — the clean `repo.get_for(...)` accessor (which
+    /// the `(` anchor distinguishes from `get(`) must NOT be flagged. WHY: this is
+    /// the cross-tenant-read guard; a false positive on the scoped call would make
+    /// the correct fix un-passable.
+    #[test]
+    fn jl0006_flags_unscoped_repo_call_not_the_scoped_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/leads/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        // Line 3 is the offender; line 5 is the clean scoped accessor.
+        let content = "\
+use super::repo::*;
+async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
+    let leaked = repo.get(id).await?;
+    let _ = leaked;
+    let scoped = repo.get_for(tenant.id(), id).await?;
+    Ok(())
+}
+";
+        std::fs::write(&handlers, content).unwrap();
+
+        let design = tenant_design();
+        let hits = jl0006_only(root, &design);
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one unscoped call, the scoped one is clean: {hits:?}"
+        );
+        let only = &hits[0];
+        assert_eq!(only.code, "JL0006");
+        assert_eq!(only.line, Some(3), "must point at the `repo.get(` line");
+        assert!(
+            only.file
+                .as_deref()
+                .unwrap()
+                .contains("leads/src/handlers.rs"),
+            "{only:?}"
+        );
+        assert!(
+            only.suggestion
+                .as_deref()
+                .unwrap()
+                .contains("all_for/get_for/remove_for"),
+            "carries the registered fix text: {only:?}"
+        );
+    }
+
+    /// A module with no unscoped calls (only scoped accessors) produces no JL0006.
+    #[test]
+    fn jl0006_silent_when_handlers_use_scoped_accessors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/leads/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn list_leads(repo: Dep<LeadRepo>) -> Result<()> {\n    let _ = repo.all_for(tenant.id()).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let design = tenant_design();
+        assert!(
+            jl0006_only(root, &design).is_empty(),
+            "scoped-only handlers are clean"
+        );
+    }
+
+    /// Run the full lint pass and keep only JL0006 (the other lints fire on the
+    /// absent lib.rs/main.rs in this bare fixture — irrelevant to this check).
+    fn jl0006_only(root: &Path, design: &Design) -> Vec<Diagnostic> {
+        run(root, design)
+            .into_iter()
+            .filter(|d| d.code == "JL0006")
+            .collect()
     }
 }

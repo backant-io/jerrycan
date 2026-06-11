@@ -17,16 +17,36 @@ fn fixture_value(t: FieldType) -> &'static str {
     }
 }
 
-fn fixture_json(m: &ModuleDesign, entity: &str) -> String {
+/// The fixture literal for a belongs_to fk column, valued at the SEEDED tenant
+/// (id 1): "1" for an integer/synthetic key, the string fixture for a text key.
+/// Mirrors the seed in `tenant_seed` so the generated body points at a row the
+/// guard can actually resolve.
+fn fk_fixture_value(design: &Design, target: &str) -> &'static str {
+    match design.target_key_rust_type(target) {
+        "String" => "\"1\"",
+        _ => "1",
+    }
+}
+
+fn fixture_json(design: &Design, m: &ModuleDesign, entity: &str) -> String {
     let Some(e) = m.entities.iter().find(|e| e.name == entity) else {
         return "{}".to_string();
     };
-    let fields = e
+    // belongs_to fk columns first: a tenant-owned entity's body must carry the
+    // fk (NOT NULL) so the handler's Json<Entity> deserializes (else 422 before
+    // the stub), valued at the seeded tenant so a scoped query can resolve it.
+    let fks = e.belongs_to.iter().map(|b| {
+        format!(
+            "\"{}\": {}",
+            Design::fk_column(&b.entity),
+            fk_fixture_value(design, &b.entity)
+        )
+    });
+    let cols = e
         .fields
         .iter()
-        .map(|f| format!("\"{}\": {}", f.name, fixture_value(f.field_type)))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .map(|f| format!("\"{}\": {}", f.name, fixture_value(f.field_type)));
+    let fields = fks.chain(cols).collect::<Vec<_>>().join(", ");
     format!("{{{fields}}}")
 }
 
@@ -52,11 +72,17 @@ struct TestOut {
 
 /// A request expression `t.<verb>(...)`. In auth mode a guarded endpoint threads
 /// the test cookie via the `_with` helper variants; otherwise the plain verb.
-fn request_expr(unit: &ModuleDesign, ep: &Endpoint, path: &str, guarded_and_auth: bool) -> String {
+fn request_expr(
+    design: &Design,
+    unit: &ModuleDesign,
+    ep: &Endpoint,
+    path: &str,
+    guarded_and_auth: bool,
+) -> String {
     let body = || {
         ep.request_body
             .as_ref()
-            .map(|rb| fixture_json(unit, &rb.entity))
+            .map(|rb| fixture_json(design, unit, &rb.entity))
             .unwrap_or_else(|| "{}".to_string())
     };
     if guarded_and_auth {
@@ -103,7 +129,7 @@ fn request_expr(unit: &ModuleDesign, ep: &Endpoint, path: &str, guarded_and_auth
     }
 }
 
-fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
+fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOut) {
     let auth = out.auth;
     // The path-param value a seeded row answers to: the fixture id for entities
     // that declare one (text pks seed their fixture string), "1" otherwise
@@ -116,6 +142,7 @@ fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
         .unwrap_or("1");
     let seed = creator(unit).map(|ep| {
         let body = fixture_json(
+            design,
             unit,
             &ep.request_body.as_ref().expect("creator has body").entity,
         );
@@ -136,7 +163,7 @@ fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
         let guarded = auth && ep.is_guarded();
 
         if param_count(ep) == 0 {
-            let request = request_expr(unit, ep, &full_path, guarded);
+            let request = request_expr(design, unit, ep, &full_path, guarded);
             // A creator that echoes its entity must echo the id it was given —
             // catches inserts that return a backend default (0) instead.
             let id_echo = (ep.method == HttpMethod::POST)
@@ -155,18 +182,18 @@ fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
             ));
             out.count += 1;
             if guarded {
-                push_401_test(out, unit, ep, &full_path, false);
+                push_401_test(design, out, unit, ep, &full_path, false);
             }
         } else if param_count(ep) == 1 && seed.is_some() {
             let seeded_path = full_path.replacen(&regex_free_param(&ep.path), seed_id, 1);
-            let request = request_expr(unit, ep, &seeded_path, guarded);
+            let request = request_expr(design, unit, ep, &seeded_path, guarded);
             out.code.push_str(&format!(
                 "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n}}\n\n",
                 seed = seed.as_deref().unwrap_or("")
             ));
             out.count += 1;
             if guarded {
-                push_401_test(out, unit, ep, &seeded_path, seed.is_some());
+                push_401_test(design, out, unit, ep, &seeded_path, seed.is_some());
             }
         } else if param_count(ep) >= 1 {
             out.todos.push(format!(
@@ -211,15 +238,22 @@ fn unit_tests(unit: &ModuleDesign, base: &str, out: &mut TestOut) {
 
     for sub in &unit.subroutes {
         let sub_base = format!("{}{}", base, sub.effective_mount());
-        unit_tests(sub, &sub_base, out);
+        unit_tests(design, sub, &sub_base, out);
     }
 }
 
 /// A `{op}_without_auth_is_401` test: the guard extractor runs first, so a
 /// credential-less request is rejected before any handler logic — no seed needed.
-fn push_401_test(out: &mut TestOut, unit: &ModuleDesign, ep: &Endpoint, path: &str, _seeded: bool) {
+fn push_401_test(
+    design: &Design,
+    out: &mut TestOut,
+    unit: &ModuleDesign,
+    ep: &Endpoint,
+    path: &str,
+    _seeded: bool,
+) {
     let fn_base = &ep.operation_id;
-    let request = request_expr(unit, ep, path, false); // no cookie
+    let request = request_expr(design, unit, ep, path, false); // no cookie
     out.code.push_str(&format!(
         "#[tokio::test]\nasync fn {fn_base}_without_auth_is_401() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 401, \"design: {fn_base} is guarded — no cookie must 401; body: {{}}\", res.text());\n}}\n\n"
     ));
@@ -239,10 +273,12 @@ const TEST_SECRET: &str = "a-very-long-development-secret-string!!";
 
 /// In auth mode: a test-only login shim that mints a session cookie directly via
 /// the `Auth` extension (no app `/login` route needed), plus the `.extend(Auth)`
-/// the app() helper adds so the SAME secret decrypts the cookie.
+/// the app() helper adds so the SAME secret decrypts the cookie. `test_cookie_for`
+/// mints a cookie for any user id (isolation tests act as a second user);
+/// `test_cookie()` keeps minting user 1's for back-compat with the success tests.
 fn auth_preamble_login() -> String {
     format!(
-        "fn test_cookie() -> String {{\n    let auth = jerrycan::auth::Auth::with_secret(\"{TEST_SECRET}\");\n    let token = auth.sessions().encode(&shared::SessionUser {{ id: 1, role: \"admin\".into() }}).expect(\"encode\");\n    format!(\"jerrycan_session={{token}}\")\n}}\n\n"
+        "fn test_cookie_for(user_id: i64) -> String {{\n    let auth = jerrycan::auth::Auth::with_secret(\"{TEST_SECRET}\");\n    let token = auth.sessions().encode(&shared::SessionUser {{ id: user_id, role: \"admin\".into() }}).expect(\"encode\");\n    format!(\"jerrycan_session={{token}}\")\n}}\n\nfn test_cookie() -> String {{\n    test_cookie_for(1)\n}}\n\n"
     )
 }
 
@@ -322,17 +358,169 @@ fn tenant_seed(design: &Design, module: &ModuleDesign) -> String {
     // value to satisfy the CHECK constraint). Column identifiers are double-quoted
     // in the SQL; since the whole statement is a Rust string literal, those quotes
     // are escaped (`\\\"`) so the generated source stays valid.
+    let (cols, vals) = tenant_row_cols_vals(entity, "1");
+    format!(
+        "    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant row\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (1, 1, '{role}')\")\n        .await\n        .expect(\"seed membership\");\n"
+    )
+}
+
+/// The membership role to seed for the second tenant's user: the role a
+/// role-gated DELETE on this module requires (so the isolation DELETE leg clears
+/// the role check and exercises the SCOPED `remove_for` — proving cross-tenant
+/// isolation, not a 403 role rejection), falling back to the first member role.
+fn isolation_member_role<'a>(design: &'a Design, module: &'a ModuleDesign) -> &'a str {
+    module
+        .endpoints
+        .iter()
+        .find(|ep| ep.method == HttpMethod::DELETE && !ep.required_roles.is_empty())
+        .and_then(|ep| ep.required_roles.first())
+        .map(String::as_str)
+        .or_else(|| {
+            design
+                .tenancy
+                .as_ref()
+                .and_then(|t| t.member_roles.first())
+                .map(String::as_str)
+        })
+        .unwrap_or("owner")
+}
+
+/// The columns + values for a tenant row seeded at the given pk: id = the pk
+/// literal, then each declared non-id field with a seed-safe fixture (enum
+/// fields use a declared value to satisfy the CHECK). Returns (cols, vals) as
+/// the comma-joined SQL fragments. The tenant pk is an integer in practice (the
+/// kolli-slice Workspace), so the literal is numeric.
+fn tenant_row_cols_vals(entity: &Entity, pk: &str) -> (String, String) {
     let mut cols = vec!["id".to_string()];
-    let mut vals = vec!["1".to_string()];
+    let mut vals = vec![pk.to_string()];
     for f in entity.fields.iter().filter(|f| f.name != "id") {
         cols.push(format!("\\\"{}\\\"", f.name));
         vals.push(seed_sql_value(f));
     }
-    let cols = cols.join(", ");
-    let vals = vals.join(", ");
+    (cols.join(", "), vals.join(", "))
+}
+
+/// The `seed_second_tenant` helper for a tenant-owned module: inserts a SECOND
+/// tenant (id 2) and a membership for user 2 (fk 2, role from
+/// `isolation_member_role`). The isolation test acts as this user to prove a
+/// tenant cannot reach another tenant's rows. Empty for non-tenant-owned modules.
+fn seed_second_tenant_fn(design: &Design, module: &ModuleDesign) -> String {
+    if !module_needs_tenant(design, module) {
+        return String::new();
+    }
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return String::new();
+    };
+    let Some(t) = tenant_module(design) else {
+        return String::new();
+    };
+    let Some(entity) = t.entities.iter().find(|e| e.name == tenancy.entity) else {
+        return String::new();
+    };
+    let table = format!("{}s", tenancy.entity.to_lowercase());
+    let members = format!("{}_members", Design::to_snake(&tenancy.entity));
+    let fk = Design::fk_column(&tenancy.entity);
+    let role = isolation_member_role(design, module);
+    let (cols, vals) = tenant_row_cols_vals(entity, "2");
     format!(
-        "    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant row\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (1, 1, '{role}')\")\n        .await\n        .expect(\"seed membership\");\n"
+        "async fn seed_second_tenant(db: &jerrycan::db::Db) {{\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant 2 row\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (2, 2, '{role}')\")\n        .await\n        .expect(\"seed tenant 2 membership\");\n}}\n\n"
     )
+}
+
+/// The cross-tenant isolation test for a tenant-owned module: user 1 (tenant 1)
+/// creates a row; user 2 (tenant 2, seeded by app()) must not be able to read,
+/// list, or delete it. WHY this matters (Rule 9): it encodes the SECURITY
+/// contract — it fails on stubs (500), goes green only when the handler uses the
+/// SCOPED accessors (get_for/all_for/remove_for), and stays RED if the agent
+/// reaches for the unscoped all/get/remove (which would leak the foreign row).
+///
+/// Emitted only for a top-level tenant-owned entity that has a guarded creator
+/// (POST "/" with a body). With a GET "/{id}" it runs the full get/list/delete
+/// legs; without one it degrades to a list-only variant asserting the foreign row
+/// is absent from user 2's list. Empty when there's no usable creator.
+fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return String::new();
+    };
+    // The tenant-owned entity declared directly on this module (subroute-nested
+    // tenant entities are out of scope — their isolation is the agent's to test).
+    let Some(entity) = module
+        .entities
+        .iter()
+        .find(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity))
+    else {
+        return String::new();
+    };
+    // A guarded creator at "/" with a body for this entity is required to seed a
+    // tenant-1 row to probe; without it there's nothing to isolate.
+    let Some(create) = module.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::POST
+            && ep.path == "/"
+            && ep
+                .request_body
+                .as_ref()
+                .is_some_and(|rb| rb.entity == entity.name)
+    }) else {
+        return String::new();
+    };
+    let base = module.effective_mount();
+    let base = base.trim_end_matches('/');
+    let plural = module.name.replace('-', "_");
+    let body = fixture_json(design, module, &entity.name);
+    let create_path = format!("{base}/");
+
+    // user 1 (cookie 1) creates a row in tenant 1, then we read the id it echoes.
+    let mut t = String::new();
+    t.push_str(&format!(
+        "/// SECURITY: a tenant must not reach another tenant's {entity} rows. User 1\n/// creates a row in tenant 1; user 2 (tenant 2) must be denied read/list/delete.\n/// Passes only with the SCOPED repo accessors (get_for/all_for/remove_for).\n#[tokio::test]\nasync fn tenant_a_cannot_read_tenant_b_{plural}() {{\n    let t = app().await;\n",
+        entity = entity.name,
+    ));
+    t.push_str(&format!(
+        "    let created = t.post_json_with(\"{create_path}\", &serde_json::json!({body}), &[(\"cookie\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n    let id = &row[\"id\"];\n    let cookie2 = test_cookie_for(2);\n",
+        status = create.success.status,
+        entity = entity.name,
+    ));
+
+    // A GET "/{id}" lets us assert the foreign row 404s for user 2 and survives
+    // for user 1; a DELETE "/{id}" (role-gated → user 2's membership carries the
+    // role) must also 404 without destroying user 1's row.
+    let get_one = module
+        .endpoints
+        .iter()
+        .find(|ep| ep.method == HttpMethod::GET && param_count(ep) == 1);
+    let delete_one = module
+        .endpoints
+        .iter()
+        .find(|ep| ep.method == HttpMethod::DELETE && param_count(ep) == 1);
+    let list = module
+        .endpoints
+        .iter()
+        .find(|ep| ep.method == HttpMethod::GET && param_count(ep) == 0);
+
+    if let Some(_get) = get_one {
+        t.push_str(&format!(
+            "    let foreign = t.get_with(&format!(\"{base}/{{id}}\"), &[(\"cookie\", &cookie2)]).await;\n    assert_eq!(foreign.status().as_u16(), 404, \"cross-tenant get must 404 (use get_for, not get); body: {{}}\", foreign.text());\n",
+        ));
+    }
+    if list.is_some() {
+        // Always cookied: even an unguarded list is safe to call with a cookie,
+        // and a guarded one needs it. user 2 sees only tenant 2's (empty) rows.
+        t.push_str(&format!(
+            "    let listed = t.get_with(\"{base}/\", &[(\"cookie\", &cookie2)]).await;\n    assert_eq!(listed.status().as_u16(), 200, \"user 2 lists their own {plural}; body: {{}}\", listed.text());\n    let rows: serde_json::Value = serde_json::from_str(&listed.text()).expect(\"list json\");\n    let absent = rows.as_array().map(|a| a.iter().all(|r| &r[\"id\"] != id)).unwrap_or(true);\n    assert!(absent, \"cross-tenant list must NOT contain tenant 1's row (use all_for); body: {{}}\", listed.text());\n",
+        ));
+    }
+    if let Some(_del) = delete_one {
+        t.push_str(&format!(
+            "    let del = t.delete_with(&format!(\"{base}/{{id}}\"), &[(\"cookie\", &cookie2)]).await;\n    assert_eq!(del.status().as_u16(), 404, \"cross-tenant delete must 404 (use remove_for, not remove); body: {{}}\", del.text());\n",
+        ));
+        if get_one.is_some() {
+            t.push_str(&format!(
+                "    let survives = t.get_with(&format!(\"{base}/{{id}}\"), &[(\"cookie\", &test_cookie_for(1))]).await;\n    assert_eq!(survives.status().as_u16(), 200, \"tenant 1's row must survive a cross-tenant delete; body: {{}}\", survives.text());\n",
+            ));
+        }
+    }
+    t.push_str("}\n\n");
+    t
 }
 
 /// A SQL literal for seeding a tenant-row column. Enum fields use their first
@@ -382,6 +570,16 @@ fn preamble(design: &Design, module: &ModuleDesign) -> String {
         } else {
             ""
         };
+        // The second-tenant seed helper exists only for tenant-owned modules (the
+        // ones whose isolation test acts as a second user). app() always seeds it
+        // so success tests (user 1, tenant 1) are unaffected and the isolation test
+        // finds tenant 2 already present.
+        let second_seed_fn = seed_second_tenant_fn(design, module);
+        let second_seed_call = if second_seed_fn.is_empty() {
+            String::new()
+        } else {
+            "    seed_second_tenant(&db).await;\n".to_string()
+        };
         // The seed runs raw SQL on the connection, which needs `ConnectionTrait`
         // in scope; only import it when there's a seed (else `-D warnings` trips).
         let seed_use = if seed.is_empty() {
@@ -390,7 +588,7 @@ fn preamble(design: &Design, module: &ModuleDesign) -> String {
             "use jerrycan::db::sea_orm::ConnectionTrait;\n\n".to_string()
         };
         format!(
-            "{seed_use}{auth_login}async fn app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n{seed}    App::new(){auth_extend}.extend(db){tenant_dep}.mount(\"{mount}\", module()).into_test()\n}}\n"
+            "{seed_use}{auth_login}{second_seed_fn}async fn app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n{seed}{second_seed_call}    App::new(){auth_extend}.extend(db){tenant_dep}.mount(\"{mount}\", module()).into_test()\n}}\n"
         )
     } else {
         format!(
@@ -428,7 +626,13 @@ pub fn acceptance_rs(design: &Design, module: &ModuleDesign) -> String {
         count: 0,
         auth: design.wants_auth(),
     };
-    unit_tests(module, &module.effective_mount(), &mut out);
+    unit_tests(design, module, &module.effective_mount(), &mut out);
+    // Cross-tenant isolation: the security contract for tenant-owned modules.
+    // Appended after the per-endpoint tests; counts toward expected_failing
+    // (it fails on stubs like every other generated test).
+    let isolation = isolation_test(design, module);
+    out.count += isolation.matches("#[tokio::test]").count();
+    out.code.push_str(&isolation);
     let todos = if out.todos.is_empty() {
         String::new()
     } else {

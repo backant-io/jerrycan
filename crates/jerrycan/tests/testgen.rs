@@ -154,3 +154,91 @@ fn tenancy_module_tests_seed_membership_and_provide_the_guard() {
         "non-tenant-owned module needs no seed: {ws_gen}"
     );
 }
+
+/// A tenant-owned entity's create/update bodies must carry the fk column the
+/// `belongs_to` derives, valued at the SEEDED tenant (workspace 1). WHY: without
+/// it the generated request body is missing a NOT-NULL column, so the handler's
+/// `Json<Lead>` deserialization rejects it 422 — the test fails before reaching
+/// the stub, masking whether the handler is actually implemented. With the fk
+/// present the request reaches the stub (500 on stubs → green when implemented).
+#[test]
+fn tenant_owned_fixtures_carry_the_foreign_key() {
+    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let design: Design = serde_json::from_str(s).unwrap();
+    let leads = design
+        .modules
+        .iter()
+        .find(|m| m.name == "leads")
+        .expect("leads module");
+    let generated = testgen::acceptance_rs(&design, leads);
+    // create_lead (POST /) and update_lead (PUT /{id}) both send a Lead body;
+    // each must include the workspace_id fk valued at the seeded tenant (1).
+    assert!(
+        generated.contains("\"workspace_id\": 1"),
+        "Lead fixture bodies must carry workspace_id: 1: {generated}"
+    );
+
+    // A non-tenant-owned entity's body must NOT gain a phantom fk.
+    let workspaces = design
+        .modules
+        .iter()
+        .find(|m| m.name == "workspaces")
+        .expect("workspaces module");
+    let ws_gen = testgen::acceptance_rs(&design, workspaces);
+    assert!(
+        !ws_gen.contains("\"workspace_id\""),
+        "Workspace (the tenant itself) must not carry a self fk: {ws_gen}"
+    );
+}
+
+/// A tenant-owned module with a creator + GET /{id} gets a cross-tenant
+/// isolation test: user 1 creates a row in workspace 1, user 2 (workspace 2)
+/// must NOT be able to read it. This is the security contract — it fails on
+/// stubs (500) and stays red if the agent uses unscoped repo methods (which
+/// would return the foreign row), going green only with scoped get_for.
+#[test]
+fn tenant_owned_modules_get_isolation_tests() {
+    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let d: Design = serde_json::from_str(s).unwrap();
+    let leads = d
+        .modules
+        .iter()
+        .find(|m| m.name == "leads")
+        .expect("leads module");
+    let out = testgen::acceptance_rs(&d, leads);
+    assert!(
+        out.contains("async fn tenant_a_cannot_read_tenant_b_leads()"),
+        "{out}"
+    );
+    assert!(out.contains("404"), "cross-tenant get must 404: {out}");
+    // The isolation test seeds a SECOND tenant (workspace 2) + membership for
+    // user 2, and mints user 2's cookie via the generalized helper.
+    assert!(
+        out.contains("fn seed_second_tenant(") && out.contains("test_cookie_for("),
+        "isolation test needs a second-tenant seed + per-user cookie helper: {out}"
+    );
+    // test_cookie() stays back-compat (delegates to test_cookie_for(1)).
+    assert!(
+        out.contains("test_cookie_for(1)"),
+        "test_cookie() must delegate to test_cookie_for(1): {out}"
+    );
+    // The DELETE leg is role-gated (owner); user 2's membership must seed the
+    // owner role so the role check passes and the SCOPED remove_for 404s (proving
+    // isolation, not a role rejection).
+    assert!(
+        out.contains("'owner'"),
+        "second tenant membership seeds the owner role: {out}"
+    );
+
+    // The non-tenant-owned tenant module (workspaces) gets NO isolation test.
+    let workspaces = d
+        .modules
+        .iter()
+        .find(|m| m.name == "workspaces")
+        .expect("workspaces module");
+    let ws_gen = testgen::acceptance_rs(&d, workspaces);
+    assert!(
+        !ws_gen.contains("cannot_read_tenant_b"),
+        "non-tenant-owned module gets no isolation test: {ws_gen}"
+    );
+}
