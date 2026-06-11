@@ -16,6 +16,7 @@ pub mod package;
 pub mod questions;
 pub mod sbom;
 pub mod scaffold;
+pub mod schema;
 pub mod templates;
 pub mod testgen;
 
