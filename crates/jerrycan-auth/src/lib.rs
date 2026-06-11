@@ -10,6 +10,7 @@ pub mod guard;
 pub mod jwt;
 pub mod password;
 pub mod session;
+pub mod webhook;
 
 pub use guard::{Bearer, Session, require_role};
 pub use password::{hash_password, verify_password};
