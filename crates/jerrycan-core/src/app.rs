@@ -306,7 +306,7 @@ pub(crate) fn apply_security_headers(res: &mut Response) {
 }
 
 impl BuiltApp {
-    /// A [`TaskContext`](crate::dep::TaskContext) for resolving dependencies
+    /// A [`TaskContext`] for resolving dependencies
     /// OUTSIDE an HTTP request — background jobs, startup wiring, CLI commands.
     ///
     /// Only **app-level** dependencies (those registered with `App::provide` /
