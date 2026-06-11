@@ -159,6 +159,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         fix: "call the tenant-scoped accessor (all_for/get_for/remove_for) with the current tenant's id",
         doc: "jerrycan docs database",
     },
+    CodeInfo {
+        code: "JL0007",
+        title: "request-boundary escape",
+        cause: "agent-owned module code calls into process/filesystem/network APIs directly — outside the framework's request boundary and threat model",
+        fix: "use framework extensions for I/O; if genuinely intended, append `// jerrycan:allow JL0007` to the line",
+        doc: "jerrycan docs errors",
+    },
 ];
 
 /// Look up a code, case-insensitively.

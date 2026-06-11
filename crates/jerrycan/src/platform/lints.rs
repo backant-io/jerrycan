@@ -4,6 +4,7 @@
 //! JL0003 a generated (tool-owned) file was hand-edited
 //! JL0004 an auth design leaves a mutating route unguarded
 //! JL0006 a tenant-owned handler calls an UNSCOPED repo method (cross-tenant read)
+//! JL0007 agent-owned module code reaches outside the request boundary (process/fs/net)
 
 use super::checkpipe::Diagnostic;
 use super::design::{Design, HttpMethod, ModuleDesign};
@@ -38,7 +39,81 @@ pub fn run(root: &Path, design: &Design) -> Vec<Diagnostic> {
     lint_generated_drift(root, design, &mut out);
     lint_unguarded_mutations(design, &mut out);
     lint_unscoped_tenant_queries(root, design, &mut out);
+    lint_boundary_escapes(root, design, &mut out);
     out
+}
+
+/// JL0007: agent-owned module code that reaches outside the request boundary —
+/// process spawning, filesystem, or raw network. Handler code is agent-authored
+/// untrusted input (see the threat model); the framework's contract is that I/O
+/// goes through its extensions, not direct std::/tokio:: process/fs/net calls.
+///
+/// We scan the whole agent-owned file set of every module and subroute
+/// (handlers.rs, repo.rs, deps.rs, model.rs) for the needles below. A line whose
+/// trimmed start is `//` is prose, not code, and is skipped; a line ending in the
+/// allow-hatch suffix is an explicit, line-scoped opt-out and is not flagged.
+fn lint_boundary_escapes(root: &Path, design: &Design, out: &mut Vec<Diagnostic>) {
+    const NEEDLES: [&str; 6] = [
+        "std::process::",
+        "std::fs::",
+        "std::net::",
+        "tokio::process::",
+        "tokio::fs::",
+        "tokio::net::",
+    ];
+    const ALLOW: &str = "// jerrycan:allow JL0007";
+    const FILES: [&str; 4] = ["handlers.rs", "repo.rs", "deps.rs", "model.rs"];
+
+    // Every agent-owned file, relative to root, across modules and subroutes.
+    let mut rels: Vec<String> = Vec::new();
+    fn collect(src_rel: &str, m: &ModuleDesign, files: &[&str], rels: &mut Vec<String>) {
+        for f in files {
+            rels.push(format!("{src_rel}/{f}"));
+        }
+        for sub in &m.subroutes {
+            collect(
+                &format!("{src_rel}/subroutes/{}", sub.name.replace('-', "_")),
+                sub,
+                files,
+                rels,
+            );
+        }
+    }
+    for m in &design.modules {
+        collect(
+            &format!("crates/routes/{}/src", m.name),
+            m,
+            &FILES,
+            &mut rels,
+        );
+    }
+
+    for rel in rels {
+        let Ok(content) = std::fs::read_to_string(root.join(&rel)) else {
+            continue; // model.rs/repo.rs are absent in memory mode; that's fine
+        };
+        for (i, line) in content.lines().enumerate() {
+            // A whole-line comment is prose, not code.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if !NEEDLES.iter().any(|n| line.contains(n)) {
+                continue;
+            }
+            // Line-scoped escape hatch.
+            if line.trim_end().ends_with(ALLOW) {
+                continue;
+            }
+            out.push(d(
+                "JL0007",
+                Some(rel.clone()),
+                Some(i as u64 + 1),
+                "handler code reaches outside the request boundary (process/fs/net)".into(),
+                "use framework extensions for I/O; if this is genuinely intended, append `// jerrycan:allow JL0007` to the line",
+                "jerrycan docs errors",
+            ));
+        }
+    }
 }
 
 /// JL0006: a handler in a module that owns tenant-owned entities calls an
@@ -385,6 +460,149 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
             "without public, an unguarded mutation still trips JL0004: {hits:?}"
         );
         assert!(hits[0].message.contains("register"), "{:?}", hits[0]);
+    }
+
+    // ---- JL0007: handler code escaping the request boundary --------------
+
+    /// A bare design with a `leads` module that has one `audit` subroute, so the
+    /// JL0007 scan walks both `crates/routes/leads/src/{...}.rs` and
+    /// `crates/routes/leads/src/subroutes/audit/{...}.rs`.
+    fn boundary_design() -> Design {
+        serde_json::from_value(serde_json::json!({
+            "name": "leads-api",
+            "contract_version": 1,
+            "modules": [{
+                "name": "leads",
+                "endpoints": [{
+                    "operation_id": "list_leads", "method": "GET", "path": "/",
+                    "success": { "status": 200 }
+                }],
+                "subroutes": [{
+                    "name": "audit",
+                    "endpoints": [{
+                        "operation_id": "list_audit", "method": "GET", "path": "/",
+                        "success": { "status": 200 }
+                    }]
+                }]
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// Only JL0007 diagnostics from a full pass (the other lints fire on the
+    /// absent lib.rs/main.rs in these bare fixtures — irrelevant here).
+    fn jl0007_only(root: &Path, design: &Design) -> Vec<Diagnostic> {
+        run(root, design)
+            .into_iter()
+            .filter(|d| d.code == "JL0007")
+            .collect()
+    }
+
+    /// Write a file under root, creating parent dirs.
+    fn write_at(root: &Path, rel: &str, content: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+
+    /// JL0007 flags `std::process::Command` in a module's handlers.rs, with the
+    /// exact file:line. WHY (Rule 9): handler code is agent-authored untrusted
+    /// input; reaching process/fs/net escapes the framework's request boundary
+    /// and the threat model — the lint is the mechanical guard for that class.
+    #[test]
+    fn jl0007_flags_process_in_handlers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_at(
+            root,
+            "crates/routes/leads/src/handlers.rs",
+            "async fn run_it() {\n    let _ = std::process::Command::new(\"curl\");\n}\n",
+        );
+        let hits = jl0007_only(root, &boundary_design());
+        assert_eq!(hits.len(), 1, "exactly one boundary escape: {hits:?}");
+        assert_eq!(hits[0].code, "JL0007");
+        assert_eq!(hits[0].line, Some(2), "points at the std::process:: line");
+        assert!(
+            hits[0]
+                .file
+                .as_deref()
+                .unwrap()
+                .contains("leads/src/handlers.rs"),
+            "{:?}",
+            hits[0]
+        );
+    }
+
+    /// The scan covers the whole agent-owned set (repo.rs, deps.rs) and the
+    /// tokio:: needles too, not just handlers.rs/std::. A subroute's files are
+    /// scanned at their nested path.
+    #[test]
+    fn jl0007_flags_fs_net_across_the_agent_owned_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_at(
+            root,
+            "crates/routes/leads/src/repo.rs",
+            "fn load() {\n    let _ = std::fs::read_to_string(\"/etc/passwd\");\n}\n",
+        );
+        write_at(
+            root,
+            "crates/routes/leads/src/deps.rs",
+            "fn dial() {\n    let _ = std::net::TcpStream::connect(\"10.0.0.1:80\");\n}\n",
+        );
+        write_at(
+            root,
+            "crates/routes/leads/src/subroutes/audit/handlers.rs",
+            "async fn beam() {\n    let _ = tokio::fs::read(\"x\").await;\n}\n",
+        );
+        let hits = jl0007_only(root, &boundary_design());
+        assert_eq!(hits.len(), 3, "fs + net + tokio::fs: {hits:?}");
+        let files: BTreeSet<&str> = hits.iter().map(|h| h.file.as_deref().unwrap()).collect();
+        assert!(files.iter().any(|f| f.contains("repo.rs")), "{files:?}");
+        assert!(files.iter().any(|f| f.contains("deps.rs")), "{files:?}");
+        assert!(
+            files
+                .iter()
+                .any(|f| f.contains("subroutes/audit/handlers.rs")),
+            "subroute files are scanned: {files:?}"
+        );
+    }
+
+    /// The escape hatch: a line ending with `// jerrycan:allow JL0007` is NOT
+    /// flagged, but the hatch is line-scoped — the very next offending line still
+    /// flags. WHY (Rule 9): a blanket file/module suppression would let one
+    /// `allow` silence the whole file; line scope keeps every other escape sharp.
+    #[test]
+    fn jl0007_allow_hatch_is_line_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_at(
+            root,
+            "crates/routes/leads/src/handlers.rs",
+            "async fn x() {\n    let _ = std::process::Command::new(\"ok\"); // jerrycan:allow JL0007\n    let _ = std::process::Command::new(\"bad\");\n}\n",
+        );
+        let hits = jl0007_only(root, &boundary_design());
+        assert_eq!(hits.len(), 1, "only the un-allowed line flags: {hits:?}");
+        assert_eq!(hits[0].line, Some(3), "the next line still flags");
+    }
+
+    /// Legitimate code is never flagged: jerrycan::/sea_orm:: calls, `use std::fmt`,
+    /// `std::collections::HashMap`, and a comment that merely mentions std::process
+    /// in prose. The needle is `std::process::` (etc.), and a line whose trimmed
+    /// start is `//` is skipped entirely.
+    #[test]
+    fn jl0007_silent_on_legitimate_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_at(
+            root,
+            "crates/routes/leads/src/handlers.rs",
+            "use std::fmt;\nuse std::collections::HashMap;\n// we never call std::process::Command here\nasync fn x() {\n    let _ = jerrycan::prelude::Json::default();\n    let _: HashMap<u8, u8> = HashMap::new();\n    let _ = sea_orm::EntityTrait::find();\n}\n",
+        );
+        assert!(
+            jl0007_only(root, &boundary_design()).is_empty(),
+            "no boundary escape in legitimate code"
+        );
     }
 
     /// The exemption is narrow: a plain unguarded mutation (no guard, no signature

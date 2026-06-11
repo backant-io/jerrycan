@@ -31,3 +31,4 @@ the cause + fix for any of them.
 | JL0003 | Generated file drifted from the design |
 | JL0004 | Mutating route unguarded in an auth design |
 | JL0006 | Cross-tenant data access — a tenant-owned handler used an unscoped repo method (use `all_for`/`get_for`/`remove_for`) |
+| JL0007 | Request-boundary escape — agent-owned module code calls process/fs/net directly (use framework I/O; opt out per line with `// jerrycan:allow JL0007`) |
