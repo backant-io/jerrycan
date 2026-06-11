@@ -33,9 +33,24 @@ impl Rng {
         // delimiters, headers, padding, and closing markers, so the PRNG can
         // straddle boundaries and partial delimiters.
         let alphabet: &[&[u8]] = &[
-            b"\r\n", b"--", b"B", b" ", b"\t", b"content-disposition:", b" form-data;",
-            b" name=\"", b"\"", b" filename=\"", b"content-type: text/plain", b"x", b"\0",
-            b"\xff", b";", b"=", b"\r", b"\n",
+            b"\r\n",
+            b"--",
+            b"B",
+            b" ",
+            b"\t",
+            b"content-disposition:",
+            b" form-data;",
+            b" name=\"",
+            b"\"",
+            b" filename=\"",
+            b"content-type: text/plain",
+            b"x",
+            b"\0",
+            b"\xff",
+            b";",
+            b"=",
+            b"\r",
+            b"\n",
         ];
         let len = (self.next() % 60) as usize;
         let mut b = Vec::new();

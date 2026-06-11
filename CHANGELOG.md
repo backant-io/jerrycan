@@ -70,6 +70,37 @@ per-route limits, task-scoped DI, an extension lifecycle, and injectable time.
 - **Threat model** published (`docs/threat-model.md`); `JL0007` flags handler
   code that escapes the request boundary.
 
+### Protocol surface (v2.1)
+The HTTP edge grown out to real protocol work: streaming bodies in and out,
+multipart uploads, and raw-bytes webhook verification.
+- **`Multipart` extractor** — streaming `multipart/form-data`: parts in wire
+  order via `next_part()`, `chunk()` for unbuffered file reads and
+  `bytes()`/`text()` for fields, with attacker-surface caps (8 MiB per-part
+  buffer / `set_part_cap`, 256 parts, 8 KiB part headers → `413`; wrong content
+  type → `415 JC0415`; malformed → `400`).
+- **`RawBody`** — the exact request bytes on either lane (buffered or
+  `stream_body()`), the extractor webhook signing needs.
+- **`StreamBody` + `BodySender`** (plus the `JcBody` `BodyError` channel) —
+  incremental downloads/exports via `channel()`/`new()`, with `content_type`,
+  `attachment`, and a per-frame `frame_timeout` (default 30s). A mid-stream
+  failure aborts the connection so truncation is always detectable, never a
+  silently-incomplete body.
+- **`.stream_body()` route marker** — the body is not buffered before dispatch;
+  `body_limit` becomes a cumulative cap and `body_read_timeout` a per-frame
+  read deadline (`408 JC0408`).
+- **`App::write_stall_timeout`** (default 30s) — drops slow-reader clients so a
+  stalled download can't pin a connection.
+- **`JC0415`** unsupported-media-type added (e.g. `Multipart` without
+  `multipart/form-data`).
+- **`jerrycan::auth::webhook`** — constant-time `verify_sha256_hex`/
+  `sign_sha256_hex` (Stripe/GitHub) and `verify_sha1_base64`/`sign_sha1_base64`
+  (Twilio) over the raw request bytes; `serde_urlencoded` re-exported for signed
+  form bodies.
+- **Fuzzing**: a `multipart_parse` cargo-fuzz target plus a stable-toolchain
+  fuzz-smoke run in CI.
+- **TestApp**: `post_multipart`/`post_multipart_with` with `TestPart::text`/
+  `TestPart::file`, and `TestResponse::bytes()` for raw download bodies.
+
 ### Breaking
 - `Db::pool()` is removed — use `Db::conn()` (a `sea_orm::DatabaseConnection`).
 - Generated apps must regenerate tool-owned files (`model.rs`, `lib.rs`,

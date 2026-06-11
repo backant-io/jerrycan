@@ -129,6 +129,82 @@ assert_eq!(t.get("/leads/42").await.json::<i64>(), 42);
 # }); }
 ```
 
+## RawBody — the exact request bytes
+`RawBody(pub Bytes)` is the request body as the EXACT wire bytes, untouched by
+any parser. It's the extractor for webhook signature verification: the provider
+signs the bytes it sent, so the HMAC must cover those bytes — `Json<T>` would
+re-serialize the value and the digest would never match. `RawBody` works on both
+lanes: on a buffered route it's a cheap clone of the already-read body; on a
+`.stream_body()` route it drains the body and caches it. Either way the route's
+`body_limit` still caps the total. Pair it with `Headers` to read the signature
+header the provider sent:
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+async fn webhook(headers: Headers, RawBody(body): RawBody) -> Result<NoContent> {
+    let signature = headers.get("x-signature")
+        .ok_or_else(|| Error::new(jerrycan::http::StatusCode::UNAUTHORIZED, "JC0401", "missing signature"))?;
+    // `body` is the exact bytes the sender signed — verify against `signature`
+    // (see 10-auth for the Stripe/Twilio HMAC recipes).
+    let _ = (signature, &body);
+    Ok(NoContent)
+}
+
+let t = App::new().route("/hook", post(webhook)).into_test();
+let res = t.post_bytes_with("/hook", b"{\"event\":1}", &[("x-signature", "abc")]).await;
+assert_eq!(res.status().as_u16(), 204);
+# }); }
+```
+
+## Multipart — file uploads and form-data
+`Multipart` parses `multipart/form-data` bodies — file uploads and mixed
+form/file submissions. Pair it with `.stream_body()` so a large upload is never
+buffered whole before the handler runs; without the marker it still works for
+anything inside the route's `body_limit`. Parts arrive in wire order: loop
+`next_part()`, then stream a file part with `part.chunk()` (governed by the
+route's cumulative `body_limit`, not the per-part cap) and pull small fields
+with `part.text()`:
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+async fn import(mut form: Multipart) -> Result<Json<(String, usize)>> {
+    let mut dataset = String::new();
+    let mut lines = 0usize;
+    while let Some(mut part) = form.next_part().await? {
+        match part.name() {
+            "dataset" => dataset = part.text().await?,       // small field: buffer it
+            "file" => {                                       // the CSV: stream it
+                while let Some(chunk) = part.chunk().await? {
+                    lines += chunk.iter().filter(|&&b| b == b'\n').count();
+                }
+            }
+            _ => {}                                           // ignore unknown fields
+        }
+    }
+    Ok(Json((dataset, lines)))
+}
+
+let t = App::new().route("/import", post(import).stream_body()).into_test();
+let res = t.post_multipart("/import", &[
+    TestPart::text("dataset", "leads"),
+    TestPart::file("file", "rows.csv", "text/csv", b"name,email\nada,a@x\nbob,b@x\n"),
+]).await;
+assert_eq!(res.json::<(String, usize)>(), ("leads".to_string(), 3)); // header + 2 rows
+# }); }
+```
+Rules and limits:
+- Wrong content type (not `multipart/form-data` with a boundary) → `415 JC0415`.
+- `bytes()`/`text()` buffer a whole part, capped at the per-part cap (default
+  8 MiB; override per request with `form.set_part_cap(n)`) → `413 JC0413` over it.
+  `chunk()` is NOT subject to this cap — it's bounded only by the route's
+  `body_limit`, so stream big files through `chunk()`.
+- More than 256 parts, or part headers over 8 KiB → `413 JC0413` (part-count /
+  header bombs).
+- A malformed body → `400 JC0400`.
+- Parts are sequential: `next_part()` discards any unread remainder of the
+  current part before yielding the next, and the extractor is single-consumer
+  (it owns the body — extracting `Multipart` twice in one handler is an error).
+
 ## Errors you'll hit
 - `Path<T>` parse failure → `400 JC0400` ("invalid path parameter") automatically.
 - Malformed/mistyped JSON body → `422 JC0422` with the serde message.

@@ -61,6 +61,38 @@ Handled by the hyper serve engine and the core app, before any handler runs.
   message; **JC0510** is the constant `"database error"` with the underlying
   sqlx detail written to stderr for the operator, never to the client
   (`crates/jerrycan-db/src/lib.rs`).
+- **Multipart parser surface** (`crates/jerrycan-core/src/multipart.rs`). The
+  `multipart/form-data` framing is attacker-controlled, so the parser is a pure
+  incremental state machine with no IO: it is unit-tested at every chunk
+  straddle (`every_chunking_yields_identical_parts`) and fuzzed in isolation
+  (`fuzz/fuzz_targets/multipart_parse.rs`, plus a stable-toolchain
+  `fuzz_smoke` that runs in CI). Each unbounded direction has a cap before any
+  need-more-data return: 8 KiB part headers (`MAX_PART_HEADER_BYTES`), 256 parts
+  (`MAX_PARTS`), bounded boundary padding, and an 8 MiB per-part buffer cap for
+  `bytes()`/`text()` (`DEFAULT_PART_CAP`) — all over-cap conditions are
+  **JC0413**. The cumulative request `body_limit` still governs the whole body
+  (via the `Limited` wrapper on the stream lane), and on a `stream_body()` route
+  `body_read_timeout` is a per-frame deadline (**JC0408**), so neither a slow
+  feeder nor an oversized body can be unbounded. Truncated framing is **JC0400**,
+  never a hang (`truncated_input_is_malformed_not_a_hang`).
+- **Slowloris-by-download** (`crates/jerrycan-core/src/app.rs`
+  `write_stall_timeout`, default 30s). A client that opens a streaming download
+  and then stops reading would otherwise pin a connection indefinitely; the
+  socket-write stall budget drops it.
+- **Stream truncation honesty** (`crates/jerrycan-core/src/response.rs`). A
+  `StreamBody` that fails mid-stream — a producer `fail`/`Err` item, or a
+  per-frame stall past `frame_timeout` (default 30s) — reaches hyper as a body
+  ERROR, which aborts the chunked response. The client sees detectable
+  truncation, never a cleanly-ended body that is silently incomplete
+  (`channel_fail_surfaces_as_a_body_error_carrying_the_message`,
+  `stream_body_frame_timeout_errors_the_body`).
+- **Webhook verification** (`crates/jerrycan-auth/src/webhook.rs`). Signature
+  checks (`verify_sha256_hex`/`verify_sha1_base64`) compute the HMAC over the
+  EXACT request bytes (the `RawBody` extractor, not a re-serialized value) and
+  compare in constant time (`hmac`'s `verify_slice`); malformed signatures fail
+  verification rather than panicking. The Stripe recipe additionally bounds
+  timestamp staleness against the injectable `Clock` to resist replay
+  (docs/ai/10-auth.md).
 
 ## 3. Malicious `design.json`
 

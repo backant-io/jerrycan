@@ -11,9 +11,9 @@ the cause + fix for any of them.
 | JC0403 | Forbidden — role check failed |
 | JC0404 | Not found |
 | JC0405 | Method not allowed |
-| JC0408 | Request body read timeout |
+| JC0408 | Request body read timeout — on a `stream_body()` route this is the per-frame deadline (a stalled client between chunks) |
 | JC0409 | Conflict — the write violates a unique key (jerrycan-db) |
-| JC0413 | Payload too large (default 1 MiB) |
+| JC0413 | Payload too large — body over the route limit (default 1 MiB), or a multipart part over the per-part cap (8 MiB), >256 parts, or part headers over 8 KiB |
 | JC0415 | Unsupported media type — content type is not what the endpoint consumes (e.g. `Multipart` needs `multipart/form-data` with a boundary) |
 | JC0422 | Unprocessable — bad JSON or validation violations |
 | JC0500 | Internal error (or handler panic) |

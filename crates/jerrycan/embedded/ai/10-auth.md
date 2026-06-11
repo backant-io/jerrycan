@@ -55,6 +55,100 @@ assert_eq!(t.get_with("/me", &[("cookie", &cookie_pair)]).await.json::<i64>(), 4
 - Secret: `Auth::from_env()` reads `JERRYCAN_SECRET` (>= 32 bytes). In
   production (`JERRYCAN_ENV=prod`) a missing/short secret is a startup error.
 
+## Verifying webhook signatures
+A webhook is an unauthenticated POST from a third party; the only proof it's
+genuine is an HMAC the provider computes over the EXACT bytes it sent. Take the
+body with `RawBody` (see 03-extractors) — never re-parse and re-serialize it, or
+the digest won't match. `jerrycan::auth::webhook` provides constant-time
+verifiers; the secret is a per-provider value, modelled as a dependency you
+`.provide` from the environment (`std::env::var`, the same source `JERRYCAN_SECRET`
+uses).
+
+**Stripe** signs `"{timestamp}.{body}"` with HMAC-SHA256 and sends
+`Stripe-Signature: t=<unix-seconds>,v1=<hex>`. Verify the digest, and bound the
+timestamp's age (via `Dep<Clock>`) so a captured request can't be replayed:
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+use jerrycan::auth::webhook::verify_sha256_hex;
+use std::time::{Duration, UNIX_EPOCH};
+
+struct StripeSecret(String);   // .provide(StripeSecret(std::env::var("STRIPE_WEBHOOK_SECRET")?))
+
+async fn stripe(
+    headers: Headers,
+    clock: Dep<Clock>,
+    secret: Dep<StripeSecret>,
+    RawBody(body): RawBody,
+) -> Result<NoContent> {
+    let unauthorized = || Error::new(jerrycan::http::StatusCode::UNAUTHORIZED, "JC0401", "bad signature");
+    let header = headers.get("stripe-signature").ok_or_else(unauthorized)?;
+    let mut ts = None;
+    let mut v1 = None;
+    for part in header.split(',') {
+        match part.split_once('=') {
+            Some(("t", v)) => ts = v.parse::<u64>().ok(),
+            Some(("v1", v)) => v1 = Some(v),
+            _ => {}
+        }
+    }
+    let (ts, v1) = (ts.ok_or_else(unauthorized)?, v1.ok_or_else(unauthorized)?);
+
+    // Reject stale timestamps (replay) — Clock is injectable, so tests can move it.
+    let now = clock.now().duration_since(UNIX_EPOCH).map_err(|_| Error::internal("clock"))?;
+    if now.saturating_sub(Duration::from_secs(ts)) > Duration::from_secs(300) {
+        return Err(unauthorized());
+    }
+
+    let signed = format!("{ts}.{}", String::from_utf8_lossy(&body));
+    if !verify_sha256_hex(secret.0.as_bytes(), signed.as_bytes(), v1) {
+        return Err(unauthorized());
+    }
+    Ok(NoContent)   // genuine, fresh event
+}
+# let _ = stripe;
+# }); }
+```
+
+**Twilio** sends `X-Twilio-Signature`: base64 HMAC-SHA1 over the full request
+URL with the POST form params appended, sorted by key (`key+value`, no
+separators). The body is `application/x-www-form-urlencoded`, parsed with the
+re-exported `serde_urlencoded`:
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+use jerrycan::auth::webhook::verify_sha1_base64;
+
+struct TwilioToken(String);   // .provide(TwilioToken(std::env::var("TWILIO_AUTH_TOKEN")?))
+struct WebhookUrl(String);    // the publicly-reachable URL Twilio is configured to call
+
+async fn twilio(
+    headers: Headers,
+    token: Dep<TwilioToken>,
+    url: Dep<WebhookUrl>,
+    RawBody(body): RawBody,
+) -> Result<NoContent> {
+    let unauthorized = || Error::new(jerrycan::http::StatusCode::UNAUTHORIZED, "JC0401", "bad signature");
+    let signature = headers.get("x-twilio-signature").ok_or_else(unauthorized)?;
+
+    let mut params: Vec<(String, String)> = jerrycan::serde_urlencoded::from_bytes(&body)
+        .map_err(|_| Error::bad_request("malformed form body"))?;
+    params.sort_by(|a, b| a.0.cmp(&b.0));               // sort by key, then append key+value
+    let mut message = url.0.clone();
+    for (k, v) in &params {
+        message.push_str(k);
+        message.push_str(v);
+    }
+
+    if !verify_sha1_base64(token.0.as_bytes(), message.as_bytes(), signature) {
+        return Err(unauthorized());
+    }
+    Ok(NoContent)
+}
+# let _ = twilio;
+# }); }
+```
+
 ## Errors you'll hit
 - Missing/invalid session cookie or bearer token → `401 JC0401`.
 - Authenticated but wrong role (`require_role`) → `403 JC0403`.

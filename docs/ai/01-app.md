@@ -157,6 +157,54 @@ assert_eq!(t.post_bytes("/small", &two_mib).await.status().as_u16(), 413); // ov
 # }); }
 ```
 
+## Streaming
+A route marked `.stream_body()` does NOT buffer the request body before
+dispatch — extractors read it incrementally (`Multipart`) or drain it on demand
+(`Json`/`RawBody`). `body_limit` still applies as a cumulative cap, and
+`body_read_timeout` becomes a PER-FRAME deadline: a client that stalls longer
+than the budget between chunks gets `408 JC0408`. Use it for large uploads (see
+`Multipart` in 03-extractors).
+
+`StreamBody` is the response side — downloads and exports produced incrementally,
+never buffered whole. The channel form returns a body plus a `BodySender`; push
+chunks with `send` (returns `false` once the client is gone — stop producing),
+set the content type, and mark it a download with `attachment`:
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+async fn export() -> Result<StreamBody> {
+    let (body, tx) = StreamBody::channel();
+    tokio::spawn(async move {
+        tx.send("id,name\n").await;          // header row
+        for i in 1..=3 {
+            if !tx.send(format!("{i},row{i}\n")).await { break; }  // client gone: stop
+        }
+        // dropping `tx` here ends the stream cleanly
+    });
+    Ok(body.content_type("text/csv").attachment("export.csv"))
+}
+
+let t = App::new().route("/export", get(export)).into_test();
+let res = t.get("/export").await;
+assert_eq!(res.headers()["content-type"], "text/csv");
+assert_eq!(res.headers()["content-disposition"], "attachment; filename=\"export.csv\"");
+assert_eq!(res.text(), "id,name\n1,row1\n2,row2\n3,row3\n");
+# }); }
+```
+
+**Failure is honest, not silent.** A streamed body that fails mid-way ABORTS the
+connection — the client sees a truncated (invalid) chunked stream, never a
+cleanly-ended body that is actually incomplete. Two things trigger an abort: a
+producer error (`tx.fail(err)` on the channel, or an `Err` item from a
+`StreamBody::new(stream)` source), and a stalled producer — if the producer
+takes longer than the frame timeout (default 30s, change with
+`.frame_timeout(..)`) to yield the next chunk, the connection is reset. So a
+half-written export is always detectable as truncation.
+
+`write_stall_timeout` (default 30s, set with `App::write_stall_timeout(..)`) is
+the other side: a slow-READER client whose socket write stalls past the budget
+is dropped, so one slow download can't pin a connection forever.
+
 ## Errors you'll hit
 - Duplicate or ambiguous routes fail at **build/serve time**, not request time —
   `serve()` returns `Err` describing the conflicting path. Fix the route table;

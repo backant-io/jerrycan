@@ -65,6 +65,39 @@ assert_eq!(res.headers()["content-type"], "application/json");
 # }); }
 ```
 
+Post a `multipart/form-data` request with `post_multipart` — `TestPart::text`
+for fields, `TestPart::file` for uploads (it builds the boundary and wire body
+for you). `post_multipart_with` adds request headers (auth cookies, etc.).
+`TestResponse::bytes()` returns the raw response body for non-text downloads:
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+async fn upload(mut form: Multipart) -> Result<Json<Vec<String>>> {
+    let mut seen = Vec::new();
+    while let Some(part) = form.next_part().await? {
+        let label = match part.filename() {
+            Some(f) => format!("{}:{}", part.name(), f),
+            None => part.name().to_string(),
+        };
+        seen.push(format!("{label}({})", part.bytes().await?.len()));
+    }
+    Ok(Json(seen))
+}
+
+let t = App::new().route("/upload", post(upload).stream_body()).into_test();
+let res = t.post_multipart("/upload", &[
+    TestPart::text("title", "Q3 leads"),
+    TestPart::file("csv", "leads.csv", "text/csv", b"a,b\n1,2\n"),
+]).await;
+assert_eq!(res.status().as_u16(), 200);
+assert_eq!(
+    res.json::<Vec<String>>(),
+    vec!["title(8)".to_string(), "csv:leads.csv(8)".to_string()]
+);
+assert_eq!(res.bytes()[0], b'[');   // raw bytes, for binary downloads
+# }); }
+```
+
 ## Errors you'll hit
 - `panic: app failed to build` — your route table has a conflict; the message
   names the path. This is the same failure `serve()` would return.
