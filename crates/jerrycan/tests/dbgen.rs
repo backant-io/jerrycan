@@ -94,19 +94,21 @@ fn db_mode_emits_dual_dialect_migrations_from_entities() {
         "{sqlite}"
     );
     assert!(sqlite.to_lowercase().contains("\"title\" text not null"));
-    // Booleans are stored as BIGINT (0/1) on both backends: the sqlx `Any` driver
-    // can't round-trip a Rust `bool` against SQLite, so the repo binds `as i64`.
+    // Booleans are native BOOLEAN columns on both backends: the Model field is a
+    // Rust `bool` under SeaORM, which round-trips it directly (no sqlx-Any i64).
     assert!(
         sqlite
             .to_lowercase()
-            .contains("\"done\" bigint not null default 0"),
-        "optional bool field stores as integer with a default: {sqlite}"
+            .contains("\"done\" boolean not null default false"),
+        "optional bool field is native boolean with a default: {sqlite}"
     );
     assert!(postgres.to_lowercase().contains("bigserial"), "{postgres}");
+    // Postgres renders the native boolean type as `bool` (SQLite as `boolean`);
+    // both are native booleans, not the old BIGINT-as-i64 storage.
     assert!(
         postgres
             .to_lowercase()
-            .contains("\"done\" bigint not null default 0")
+            .contains("\"done\" bool not null default false")
     );
     // Subroute entities get their own module-owned migration:
     assert!(root.join("crates/routes/todos/migrations/sqlite").exists());

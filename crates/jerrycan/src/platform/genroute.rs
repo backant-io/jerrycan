@@ -563,62 +563,182 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
     Some(out)
 }
 
+/// The SchemaBuilder matching a dialect — renders both `CREATE TABLE` and the
+/// standalone `CREATE INDEX` statements consistently.
+fn schema_sql<S: sea_query::SchemaStatementBuilder>(stmt: &S, backend_is_pg: bool) -> String {
+    use sea_query::{PostgresQueryBuilder, SqliteQueryBuilder};
+    if backend_is_pg {
+        stmt.build(PostgresQueryBuilder)
+    } else {
+        stmt.build(SqliteQueryBuilder)
+    }
+}
+
+/// Map a FieldType onto a native column type. Booleans are native BOOLEAN now
+/// (the Model field is `bool` under SeaORM, which round-trips it on both
+/// backends); JSON is `jsonb` on Postgres (sea-orm's Json maps to sqlx JSON,
+/// which Postgres expects in a json/jsonb column) and TEXT on SQLite.
+fn ddl_typed(
+    c: &mut sea_query::ColumnDef,
+    t: FieldType,
+    backend_is_pg: bool,
+) -> &mut sea_query::ColumnDef {
+    match t {
+        FieldType::String | FieldType::Datetime | FieldType::Uuid => c.text(),
+        FieldType::Integer => c.big_integer(),
+        FieldType::Boolean => c.boolean(),
+        FieldType::Float => c.double(),
+        FieldType::Json => {
+            if backend_is_pg {
+                c.json_binary()
+            } else {
+                c.text()
+            }
+        }
+    }
+}
+
 /// Dual-dialect `CREATE TABLE` DDL for one module's entities (None if it has
 /// none), rendered by sea-query so dialect differences (autoincrement vs
-/// bigserial, quoting) are library-owned, never hand-rolled strings.
-fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool) -> Option<String> {
-    use sea_query::{Alias, ColumnDef, PostgresQueryBuilder, SqliteQueryBuilder, Table};
+/// bigserial, quoting) are library-owned, never hand-rolled strings. `design`
+/// resolves fk target key types/tables and the tenancy membership table.
+fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Option<String> {
+    use sea_query::{Alias, ColumnDef, Expr, ForeignKey, ForeignKeyAction, Index, Table};
     if m.entities.is_empty() {
         return None;
     }
-    // Booleans are stored as integers (0/1): the sqlx `Any` driver cannot
-    // round-trip a Rust `bool` against SQLite (it rejects the `Bool` type
-    // info on read), so the repo binds `bool as i64` and reads `i64 != 0`.
-    // big_integer round-trips identically on both backends under `Any`.
-    fn typed(c: &mut ColumnDef, t: FieldType) -> &mut ColumnDef {
-        match t {
-            FieldType::String | FieldType::Datetime | FieldType::Uuid => c.text(),
-            FieldType::Integer | FieldType::Boolean => c.big_integer(),
-            FieldType::Float => c.double(),
-            FieldType::Json => c.text(), // json is stored as a text column on both backends
-        }
-    }
     let mut out = String::new();
+    // Standalone `CREATE INDEX` statements appended after their table (sea-query
+    // emits indexes separately from the table, on both dialects).
+    let mut indexes = String::new();
     for e in &m.entities {
+        let tbl = table_name(&e.name);
         let mut table = Table::create();
-        table.table(Alias::new(table_name(&e.name)));
+        table.table(Alias::new(tbl.clone()));
         // A declared `id` field IS the pk (typed as declared); only entities
         // without one get the synthetic autoincrement pk. Emitting both would
         // be a duplicate-column error.
         let mut pk = ColumnDef::new(Alias::new("id"));
         match declared_id(e) {
             Some(t) if t != FieldType::Integer => {
-                typed(&mut pk, t).not_null().primary_key();
+                ddl_typed(&mut pk, t, backend_is_pg)
+                    .not_null()
+                    .primary_key();
             }
             _ => {
                 pk.big_integer().not_null().auto_increment().primary_key();
             }
         }
         table.col(&mut pk);
+        // fk columns, in belongs_to order, BEFORE declared fields — lockstep with
+        // the Model (`model_rs_db`/`model_field_names`). NOT NULL unless SetNull
+        // (the column must drop to NULL when the parent dies), plus a foreign-key
+        // constraint carrying the declared on_delete policy.
+        for b in &e.belongs_to {
+            let col = Design::fk_column(&b.entity);
+            let target_table = table_name(&b.entity);
+            let mut fk_col = ColumnDef::new(Alias::new(col.clone()));
+            match design.target_key_rust_type(&b.entity) {
+                "String" => ddl_typed(&mut fk_col, FieldType::String, backend_is_pg),
+                _ => fk_col.big_integer(),
+            };
+            if b.on_delete != OnDelete::SetNull {
+                fk_col.not_null();
+            }
+            table.col(&mut fk_col);
+            let action = match b.on_delete {
+                OnDelete::Cascade => ForeignKeyAction::Cascade,
+                OnDelete::SetNull => ForeignKeyAction::SetNull,
+                OnDelete::Restrict => ForeignKeyAction::Restrict,
+            };
+            table.foreign_key(
+                ForeignKey::create()
+                    .name(format!("fk_{tbl}_{col}"))
+                    .from(Alias::new(tbl.clone()), Alias::new(col.clone()))
+                    .to(Alias::new(target_table), Alias::new("id"))
+                    .on_delete(action),
+            );
+        }
         for f in e.fields.iter().filter(|f| f.name != "id") {
             let mut col = ColumnDef::new(Alias::new(f.name.as_str()));
-            typed(&mut col, f.field_type).not_null();
+            ddl_typed(&mut col, f.field_type, backend_is_pg).not_null();
             if !f.required {
                 match f.field_type {
-                    FieldType::Integer | FieldType::Boolean => col.default(0i64),
+                    FieldType::Integer => col.default(0i64),
+                    FieldType::Boolean => col.default(false),
                     FieldType::Float => col.default(0.0f64),
                     _ => col.default(""),
                 };
             }
+            if f.unique {
+                col.unique_key();
+            }
+            // Enum `values` constrain the column to that set via a CHECK.
+            if let Some(values) = &f.values {
+                col.check(Expr::col(Alias::new(f.name.as_str())).is_in(values.clone()));
+            }
             table.col(&mut col);
+            // An indexed field gets a standalone CREATE INDEX after the table.
+            if f.index {
+                let idx_name = format!("idx_{tbl}_{name}", name = f.name);
+                let mut idx = Index::create();
+                idx.name(idx_name)
+                    .table(Alias::new(tbl.clone()))
+                    .col(Alias::new(f.name.as_str()));
+                indexes.push_str(&schema_sql(&idx, backend_is_pg));
+                indexes.push_str(";\n\n");
+            }
         }
-        let sql = if backend_is_pg {
-            table.build(PostgresQueryBuilder)
-        } else {
-            table.build(SqliteQueryBuilder)
-        };
-        out.push_str(&sql);
+        out.push_str(&schema_sql(&table, backend_is_pg));
         out.push_str(";\n\n");
+        out.push_str(&indexes);
+        indexes.clear();
+    }
+    // The tenant module also owns the membership table: who belongs to the tenant
+    // and in what role. Emitted right after the tenant's own table so the fk
+    // resolves. UNIQUE(user_id, fk) keeps a user from joining the same tenant
+    // twice — rendered as a standalone CREATE UNIQUE INDEX (cleanest on both).
+    if let Some(tenancy) = &design.tenancy {
+        if m.entities.iter().any(|e| e.name == tenancy.entity) {
+            let tenant_table = table_name(&tenancy.entity);
+            let members = format!("{}_members", Design::to_snake(&tenancy.entity));
+            let fk = Design::fk_column(&tenancy.entity);
+            let mut table = Table::create();
+            table.table(Alias::new(members.clone()));
+            let mut pk = ColumnDef::new(Alias::new("id"));
+            pk.big_integer().not_null().auto_increment().primary_key();
+            table.col(&mut pk);
+            table.col(
+                ColumnDef::new(Alias::new("user_id"))
+                    .big_integer()
+                    .not_null(),
+            );
+            let mut fk_col = ColumnDef::new(Alias::new(fk.clone()));
+            match design.target_key_rust_type(&tenancy.entity) {
+                "String" => ddl_typed(&mut fk_col, FieldType::String, backend_is_pg),
+                _ => fk_col.big_integer(),
+            };
+            fk_col.not_null();
+            table.col(&mut fk_col);
+            table.col(ColumnDef::new(Alias::new("role")).text().not_null());
+            table.foreign_key(
+                ForeignKey::create()
+                    .name(format!("fk_{members}_{fk}"))
+                    .from(Alias::new(members.clone()), Alias::new(fk.clone()))
+                    .to(Alias::new(tenant_table), Alias::new("id"))
+                    .on_delete(ForeignKeyAction::Cascade),
+            );
+            out.push_str(&schema_sql(&table, backend_is_pg));
+            out.push_str(";\n\n");
+            let mut uniq = Index::create();
+            uniq.unique()
+                .name(format!("idx_{members}_user_tenant"))
+                .table(Alias::new(members.clone()))
+                .col(Alias::new("user_id"))
+                .col(Alias::new(fk.clone()));
+            out.push_str(&schema_sql(&uniq, backend_is_pg));
+            out.push_str(";\n\n");
+        }
     }
     Some(out)
 }
@@ -631,8 +751,9 @@ fn write_module_migrations(
     m: &ModuleDesign,
     created: &mut Vec<String>,
     root: &Path,
+    design: &Design,
 ) -> Result<(), String> {
-    if let Some(ddl) = migration_ddl(m, false) {
+    if let Some(ddl) = migration_ddl(m, false, design) {
         write_agent_owned(
             &crate_dir.join("migrations/sqlite/0001_create_tables.sql"),
             &ddl,
@@ -640,7 +761,7 @@ fn write_module_migrations(
             root,
         )?;
     }
-    if let Some(ddl) = migration_ddl(m, true) {
+    if let Some(ddl) = migration_ddl(m, true, design) {
         write_agent_owned(
             &crate_dir.join("migrations/postgres/0001_create_tables.sql"),
             &ddl,
@@ -648,7 +769,7 @@ fn write_module_migrations(
             root,
         )?;
     }
-    write_subtree_migrations(crate_dir, m, created, root)
+    write_subtree_migrations(crate_dir, m, created, root, design)
 }
 
 /// Subroute migrations land in the OWNING (top) crate's migrations dir, named
@@ -658,10 +779,11 @@ fn write_subtree_migrations(
     m: &ModuleDesign,
     created: &mut Vec<String>,
     root: &Path,
+    design: &Design,
 ) -> Result<(), String> {
     for sub in &m.subroutes {
         let sub_snake = sub.name.replace('-', "_");
-        if let Some(ddl) = migration_ddl(sub, false) {
+        if let Some(ddl) = migration_ddl(sub, false, design) {
             write_agent_owned(
                 &crate_dir.join(format!(
                     "migrations/sqlite/0001_create_tables_{sub_snake}.sql"
@@ -671,7 +793,7 @@ fn write_subtree_migrations(
                 root,
             )?;
         }
-        if let Some(ddl) = migration_ddl(sub, true) {
+        if let Some(ddl) = migration_ddl(sub, true, design) {
             write_agent_owned(
                 &crate_dir.join(format!(
                     "migrations/postgres/0001_create_tables_{sub_snake}.sql"
@@ -681,7 +803,7 @@ fn write_subtree_migrations(
                 root,
             )?;
         }
-        write_subtree_migrations(crate_dir, sub, created, root)?;
+        write_subtree_migrations(crate_dir, sub, created, root, design)?;
     }
     Ok(())
 }
@@ -843,7 +965,7 @@ pub fn write_module(
     write_subroutes(&src, m, mode, design, &mut created, &root)?;
     // db mode: agent-owned create-once migrations for this crate (module + subroutes).
     if mode.db {
-        write_module_migrations(&crate_dir, m, &mut created, &root)?;
+        write_module_migrations(&crate_dir, m, &mut created, &root, design)?;
     }
     Ok(created)
 }
@@ -983,6 +1105,82 @@ mod tests {
 
     fn todos() -> ModuleDesign {
         demo().modules.into_iter().next().unwrap()
+    }
+
+    /// The DDL must declare the fk columns the Model derives from belongs_to (the
+    /// repo filters on them); without them every scoped insert/query hits "no such
+    /// column". A foreign-key constraint with the declared on_delete policy ties
+    /// the column to its target table. Enum `values` become a CHECK; unique/index
+    /// fields gain their constraint/standalone index.
+    #[test]
+    fn ddl_emits_fks_constraints_and_enum_checks() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let ddl = migration_ddl(&d.modules[1], false, &d)
+            .unwrap()
+            .to_lowercase();
+        assert!(
+            ddl.contains("\"workspace_id\""),
+            "fk column from belongs_to: {ddl}"
+        );
+        assert!(ddl.contains("foreign key"), "{ddl}");
+        assert!(ddl.contains("references \"workspaces\""), "{ddl}");
+        assert!(ddl.contains("on delete cascade"), "{ddl}");
+        assert!(ddl.contains("unique"), "phone unique: {ddl}");
+        assert!(ddl.contains("create index"), "phone index: {ddl}");
+        let ws = migration_ddl(&d.modules[0], false, &d)
+            .unwrap()
+            .to_lowercase();
+        assert!(
+            ws.contains("check") && ws.contains("'trial'"),
+            "enum check: {ws}"
+        );
+    }
+
+    /// A `bool` Model field is stored in a native BOOLEAN column now (SeaORM
+    /// round-trips it directly — the old sqlx-Any "bool as i64" lore is dead). A
+    /// SetNull belongs_to makes the fk column nullable (it must drop to NULL when
+    /// the parent dies, so it can't be NOT NULL) with `on delete set null`.
+    #[test]
+    fn ddl_booleans_are_native_and_set_null_fks_nullable() {
+        let mut d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        d.modules[1].entities[0].fields.push(Field {
+            name: "active".into(),
+            field_type: FieldType::Boolean,
+            required: true,
+            unique: false,
+            index: false,
+            values: None,
+        });
+        d.modules[1].entities[0].belongs_to[0].on_delete = OnDelete::SetNull;
+        let ddl = migration_ddl(&d.modules[1], false, &d)
+            .unwrap()
+            .to_lowercase();
+        assert!(ddl.contains("\"active\" boolean not null"), "{ddl}");
+        assert!(
+            !ddl.contains("\"workspace_id\" bigint not null"),
+            "set_null fk must be nullable: {ddl}"
+        );
+        assert!(ddl.contains("on delete set null"), "{ddl}");
+    }
+
+    /// The tenant module also owns the membership table that records who belongs
+    /// to each tenant: `{tenant}_members` with user_id + the tenant fk + role,
+    /// cascading so a tenant's memberships die with it.
+    #[test]
+    fn tenancy_generates_the_membership_table_in_the_tenant_module() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let ws = migration_ddl(&d.modules[0], false, &d)
+            .unwrap()
+            .to_lowercase();
+        assert!(ws.contains("create table \"workspace_members\""), "{ws}");
+        assert!(
+            ws.contains("\"user_id\"") && ws.contains("\"role\""),
+            "{ws}"
+        );
+        assert!(
+            ws.contains("on delete cascade"),
+            "member rows die with the tenant: {ws}"
+        );
     }
 
     #[test]
@@ -1300,7 +1498,7 @@ mod tests {
                 values: None,
             },
         );
-        let ddl = migration_ddl(&m, false).unwrap();
+        let ddl = migration_ddl(&m, false, &demo()).unwrap();
         assert_eq!(
             ddl.matches("\"id\"").count(),
             1,
@@ -1310,7 +1508,7 @@ mod tests {
             ddl.contains("PRIMARY KEY AUTOINCREMENT"),
             "sqlite autoincrement pk: {ddl}"
         );
-        let pg = migration_ddl(&m, true).unwrap();
+        let pg = migration_ddl(&m, true, &demo()).unwrap();
         assert!(
             pg.to_lowercase().contains("bigserial"),
             "postgres serial pk: {pg}"
@@ -1335,7 +1533,7 @@ mod tests {
                 values: None,
             },
         );
-        let ddl = migration_ddl(&m, false).unwrap();
+        let ddl = migration_ddl(&m, false, &demo()).unwrap();
         assert!(
             ddl.to_lowercase()
                 .contains("\"id\" text not null primary key"),
