@@ -5,6 +5,7 @@
 
 use crate::App;
 use crate::app::{BuiltApp, Policy};
+use crate::clock::Clock;
 use crate::error::Error;
 use crate::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -17,15 +18,30 @@ use std::sync::Arc;
 
 impl App {
     /// Build for testing. Panics on build errors — a test should fail loudly.
+    ///
+    /// Swaps the default real [`Clock`] for a controllable [`Clock::test`] via
+    /// the override seam (overrides outrank the app's `Clock::system` singleton)
+    /// and keeps a handle on the same clock — [`TestApp::clock`] returns it, so
+    /// `advance`/`set` move the very clock handlers resolve.
     pub fn into_test(self) -> TestApp {
-        TestApp {
-            built: self.build().expect("app failed to build"),
-        }
+        let mut built = self.build().expect("app failed to build");
+        let clock = Clock::test();
+        let mut overrides = (*built.overrides).clone();
+        overrides.insert(
+            TypeId::of::<Clock>(),
+            Arc::new(clock.clone()) as crate::dep::AnyArc,
+        );
+        built.overrides = Arc::new(overrides);
+        TestApp { built, clock }
     }
 }
 
 pub struct TestApp {
     built: BuiltApp,
+    /// The test clock handed to handlers via the override above. Shares its
+    /// offset with the resolved copy (`Clock` clones share one `Arc`), so
+    /// `clock().advance(..)` is observable through real requests.
+    clock: Clock,
 }
 
 impl TestApp {
@@ -36,6 +52,13 @@ impl TestApp {
         map.insert(TypeId::of::<T>(), Arc::new(value) as crate::dep::AnyArc);
         self.built.overrides = Arc::new(map);
         self
+    }
+
+    /// The controllable [`Clock`] injected for this test. `advance`/`set` it to
+    /// move domain time (rate windows, schedules, expiry) under the app; the
+    /// change is visible to every subsequent request and task context.
+    pub fn clock(&self) -> Clock {
+        self.clock.clone()
     }
 
     /// A [`TaskContext`](crate::TaskContext) for resolving app-level dependencies
@@ -253,5 +276,27 @@ impl TestResponse {
                 self.text()
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::prelude::*;
+
+    /// `into_test` injects the SAME clock `TestApp::clock()` returns: advancing
+    /// the handle must be visible to a dep resolved through a task context —
+    /// the path background jobs use to read domain time.
+    #[tokio::test]
+    async fn test_clock_handle_drives_resolved_clock_in_task_context() {
+        let t = App::new().into_test();
+        let mut ctx = t.task_context();
+        let resolved = ctx.resolve::<Clock>().await.unwrap();
+        let before = resolved.now();
+        t.clock().advance(std::time::Duration::from_secs(60));
+        assert_eq!(
+            resolved.now().duration_since(before).unwrap(),
+            std::time::Duration::from_secs(60),
+            "TestApp::clock() and the resolved Clock share one offset",
+        );
     }
 }

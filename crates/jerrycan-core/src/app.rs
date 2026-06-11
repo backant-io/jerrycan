@@ -47,10 +47,16 @@ pub struct App {
 
 impl Default for App {
     fn default() -> Self {
+        // The real clock is a singleton provided up front so handlers can take
+        // `Dep<Clock>` without any wiring. A later `.provide(Clock::test())`
+        // (or `into_test`'s override) replaces it: `insert_value` is
+        // last-write-wins on the type, and overrides outrank singletons.
+        let mut env = DepEnv::default();
+        env.insert_value(crate::clock::Clock::system());
         Self {
             routes: Vec::new(),
             mounts: Vec::new(),
-            env: DepEnv::default(),
+            env,
             middleware: Vec::new(),
             security_headers: true,
             handler_timeout: std::time::Duration::from_secs(30),

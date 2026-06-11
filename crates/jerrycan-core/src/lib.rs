@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod clock;
 pub mod dep;
 pub mod error;
 pub mod extract;
@@ -16,6 +17,7 @@ mod serve;
 pub mod test_client;
 
 pub use app::{App, BuiltApp, Extension};
+pub use clock::Clock;
 pub use dep::{Dep, TaskContext};
 pub use error::{Error, Result};
 pub use extract::{FromRequest, Headers, Path, Query, RequestCtx};
@@ -32,7 +34,7 @@ pub use http;
 /// One import for generated code: `use jerrycan::prelude::*;`
 pub mod prelude {
     pub use crate::{
-        App, Created, Dep, Error, Extension, Headers, IntoResponse, Json, Middleware,
+        App, Clock, Created, Dep, Error, Extension, Headers, IntoResponse, Json, Middleware,
         MiddlewareFuture, Module, Next, NoContent, Path, Query, RequestCtx, Result, TestApp,
         delete, get, patch, post, put,
     };
