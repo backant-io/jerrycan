@@ -156,6 +156,16 @@ fn sql_identifiers_are_quoted_so_reserved_words_survive() {
 }
 
 #[test]
+fn kolli_slice_design_is_valid_contract_v1() {
+    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let d: jerrycan::platform::design::Design = serde_json::from_str(s).unwrap();
+    assert_eq!(d.contract_version, 1);
+    let qs = jerrycan::platform::questions::validate(&d);
+    assert!(qs.is_empty(), "{qs:?}");
+    assert_eq!(d.tenant_owned().len(), 2); // Lead, ApiKey
+}
+
+#[test]
 fn memory_mode_is_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("todo-api");
