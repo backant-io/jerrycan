@@ -38,3 +38,20 @@ fn observe_reexport_is_usable() {
     m.record(200, 0.01);
     assert!(m.render().contains("jerrycan_requests_total"));
 }
+
+// The rate-limit extension and CORS config both reach generated apps through
+// the facade: `jerrycan::ratelimit::RateLimit` (the optional sub-crate) and
+// `jerrycan::{CorsConfig, CorsOrigins}` (from core via the glob re-export).
+// This pins that `App::new().cors(..).extend(RateLimit::per_window(..))`
+// composes through the facade alone — the path generated code writes.
+#[cfg(feature = "rate-limit")]
+#[test]
+fn rate_limit_and_cors_reach_through_the_facade() {
+    use jerrycan::ratelimit::RateLimit;
+    use jerrycan::{App, CorsConfig, CorsOrigins};
+    use std::time::Duration;
+
+    let _app = App::new()
+        .cors(CorsConfig::new(CorsOrigins::any()))
+        .extend(RateLimit::per_window(100, Duration::from_secs(60)));
+}

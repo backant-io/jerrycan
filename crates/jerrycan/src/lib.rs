@@ -18,6 +18,9 @@ pub use jerrycan_validate as validate;
 #[cfg(feature = "auth")]
 pub use jerrycan_auth as auth;
 
+#[cfg(feature = "rate-limit")]
+pub use jerrycan_ratelimit as ratelimit;
+
 #[cfg(feature = "observe")]
 pub use jerrycan_observe as observe;
 

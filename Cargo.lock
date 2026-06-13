@@ -1197,6 +1197,7 @@ dependencies = [
  "jerrycan-db",
  "jerrycan-macros",
  "jerrycan-observe",
+ "jerrycan-ratelimit",
  "jerrycan-validate",
  "sea-query",
  "serde",

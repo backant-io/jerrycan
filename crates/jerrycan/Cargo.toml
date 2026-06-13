@@ -23,6 +23,8 @@ db = ["dep:jerrycan-db"]
 validate = ["dep:jerrycan-validate"]
 auth = ["dep:jerrycan-auth"]
 observe = ["dep:jerrycan-observe"]
+rate-limit = ["dep:jerrycan-ratelimit"]
+rate-limit-redis = ["rate-limit", "jerrycan-ratelimit/rate-limit-redis"]
 
 [[bin]]
 name = "jerrycan"
@@ -35,6 +37,7 @@ jerrycan-db = { workspace = true, optional = true }
 jerrycan-validate = { workspace = true, optional = true }
 jerrycan-auth = { workspace = true, optional = true }
 jerrycan-observe = { workspace = true, optional = true }
+jerrycan-ratelimit = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 sea-query = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
