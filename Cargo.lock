@@ -1193,6 +1193,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jerrycan-ratelimit"
+version = "0.2.0"
+dependencies = [
+ "http",
+ "jerrycan-core",
+ "tokio",
+]
+
+[[package]]
 name = "jerrycan-validate"
 version = "0.2.0"
 dependencies = [

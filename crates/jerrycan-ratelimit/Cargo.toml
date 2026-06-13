@@ -1,0 +1,19 @@
+[package]
+name = "jerrycan-ratelimit"
+description = "Rate-limiting extension for the jerrycan framework: fixed-window, identity-aware (api-key → user → IP), in-memory or Redis store. https://jerrycan.cc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["rate-limit", "middleware", "web", "throttle"]
+categories = ["web-programming"]
+
+[dependencies]
+jerrycan-core = { workspace = true }
+http.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
