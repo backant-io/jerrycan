@@ -21,29 +21,32 @@ use std::time::Duration;
 type UserKeyFn = Arc<dyn Fn(&RequestCtx) -> Option<String> + Send + Sync>;
 
 /// Fixed-window, identity-aware rate limiting (spec §v2.2). Install with
-/// `app.extend(RateLimit::per_window(limit, window))`. Partition key is
-/// api-key header → user-key closure → client IP; OPTIONS is exempt; over-limit
-/// requests get 429 JC0429 + Retry-After. Time comes from the injected Clock so
-/// windows are deterministic under TestApp::clock().
+/// `app.extend(RateLimit::per_window(limit, window))`. Default partition key is
+/// the user-key closure (if set) → client IP; the api-key tier is OPT-IN via
+/// `.api_key_header(name)`. OPTIONS is exempt; over-limit requests get 429
+/// JC0429 + Retry-After. Time comes from the injected Clock so windows are
+/// deterministic under TestApp::clock().
 #[derive(Clone)]
 pub struct RateLimit {
     limit: u32,
     window: Duration,
     store: Arc<dyn RateLimitStore>,
-    api_key_header: http::HeaderName,
+    api_key_header: Option<http::HeaderName>,
     user_key: Option<UserKeyFn>,
     trust_forwarded_for: bool,
 }
 
 impl RateLimit {
     /// Allow `limit` requests per `window` per partition key, using the default
-    /// in-memory store. The api-key tier reads `x-api-key`.
+    /// in-memory store. The api-key tier is OFF by default (see
+    /// [`api_key_header`](Self::api_key_header)); the default partition is the
+    /// user-key closure (if set) then the raw client IP, both unspoofable.
     pub fn per_window(limit: u32, window: Duration) -> Self {
         Self {
             limit,
             window,
             store: Arc::new(InMemoryStore::new()),
-            api_key_header: http::HeaderName::from_static("x-api-key"),
+            api_key_header: None,
             user_key: None,
             trust_forwarded_for: false,
         }
@@ -55,9 +58,14 @@ impl RateLimit {
         self
     }
 
-    /// Change the header consulted for the api-key partition tier.
+    /// Partition by an api-key header (OFF by default). The api-key tier is only
+    /// safe when the key is AUTHENTICATED upstream of the limiter — an
+    /// unvalidated, client-controlled header lets a caller mint a fresh budget per
+    /// request by rotating the value, bypassing the limit. Enable this only for
+    /// services that verify the key before the limiter runs (or accept the
+    /// tradeoff). Scoped api-key auth arrives in v2.4.
     pub fn api_key_header(mut self, name: &'static str) -> Self {
-        self.api_key_header = http::HeaderName::from_static(name);
+        self.api_key_header = Some(http::HeaderName::from_static(name));
         self
     }
 
@@ -87,8 +95,8 @@ impl RateLimit {
     pub(crate) fn store_ref(&self) -> &Arc<dyn RateLimitStore> {
         &self.store
     }
-    pub(crate) fn api_key_header_ref(&self) -> &http::HeaderName {
-        &self.api_key_header
+    pub(crate) fn api_key_header_ref(&self) -> Option<&http::HeaderName> {
+        self.api_key_header.as_ref()
     }
     pub(crate) fn user_key_ref(&self) -> Option<&UserKeyFn> {
         self.user_key.as_ref()

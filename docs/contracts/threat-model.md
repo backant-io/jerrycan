@@ -104,9 +104,22 @@ Handled by the hyper serve engine and the core app, before any handler runs.
   poisoning). The preflight `204` deliberately omits the default security headers
   (notably `cache-control: no-store`, which would fight `Access-Control-Max-Age`
   and force a preflight on every request).
-- **Rate-limit IP spoofing** (`crates/jerrycan-ratelimit/src/middleware.rs`). The
-  IP partition tier keys on the RAW socket peer (`RequestCtx::peer_addr`) by
-  default; `X-Forwarded-For` is honored ONLY when the operator opts in with
+- **Rate-limit default partition is unspoofable**
+  (`crates/jerrycan-ratelimit/src/lib.rs`,
+  `crates/jerrycan-ratelimit/src/middleware.rs`). The DEFAULT `per_window`
+  partitions by the user-key closure (if the operator set one) then the RAW socket
+  peer (`RequestCtx::peer_addr`) — both unspoofable, the peer always present over a
+  real socket. The api-key partition tier is OPT-IN (off by default, enabled via
+  `.api_key_header(name)`) precisely BECAUSE an unauthenticated, client-rotatable
+  api-key header would let a caller bypass the limit by attaching a fresh value per
+  request, hashing to a new bucket each time and minting a full budget every call.
+  Enable the tier ONLY when the key is authenticated UPSTREAM of the limiter (so a
+  rotated key is rejected before it reaches partitioning); scoped api-key auth
+  arrives in v2.4. An empty header value never partitions — it falls through to the
+  IP/user tier rather than collapsing every empty-key request into one shared
+  bucket.
+- **Rate-limit IP spoofing** (`crates/jerrycan-ratelimit/src/middleware.rs`).
+  `X-Forwarded-For` is honored for the IP tier ONLY when the operator opts in with
   `trust_forwarded_for(true)`, because that header is client-spoofable and would
   otherwise let an attacker forge a fresh partition key per request to evade the
   limit. The trusted-proxy assumption is the operator's: enable it only when a
@@ -119,10 +132,11 @@ Handled by the hyper serve engine and the core app, before any handler runs.
   api-key, no user-key, no peer) is NOT limited — fail-open is deliberate: a
   misconfigured limiter must not `500` all traffic. A STORE error, by contrast,
   fails CLOSED — it surfaces as **JC0500** rather than silently admitting the
-  request, so a broken Redis is loud, not a hole. The api-key value is hashed
-  (non-cryptographic, partitioning only) before it becomes a counter key; a rare
-  hash collision makes two keys share one counter (stricter, never a bypass), and
-  the raw key is never stored. The fixed window admits up to 2× the limit across a
+  request, so a broken Redis is loud, not a hole. When the api-key tier is enabled
+  (opt-in, see above), the api-key value is hashed (non-cryptographic,
+  partitioning only) before it becomes a counter key; a rare hash collision makes
+  two keys share one counter (stricter, never a bypass), and the raw key is never
+  stored. The fixed window admits up to 2× the limit across a
   boundary (a client spending its quota at the end of one window and the start of
   the next) — a known fixed-window property, documented in docs/ai/06-middleware.md,
   not a defect.

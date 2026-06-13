@@ -16,13 +16,17 @@ impl RateLimitMw {
         Self { cfg }
     }
 
-    /// api-key header → user-key closure → IP. First that yields a key wins; the
-    /// tier prefix prevents cross-tier collisions. None ⇒ no identity ⇒ fail open.
+    /// api-key header (opt-in) → user-key closure → IP. First that yields a key
+    /// wins; the tier prefix prevents cross-tier collisions. None ⇒ no identity ⇒
+    /// fail open. The api-key tier is gated on opt-in because an unauthenticated,
+    /// client-rotatable header would let a caller mint a fresh budget per request.
     fn partition_key(&self, ctx: &RequestCtx) -> Option<String> {
-        if let Some(v) = ctx
-            .headers()
-            .get(self.cfg.api_key_header_ref())
-            .and_then(|v| v.to_str().ok())
+        if let Some(header) = self.cfg.api_key_header_ref()
+            && let Some(v) = ctx
+                .headers()
+                .get(header)
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
         {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();

@@ -26,8 +26,35 @@ async fn ip_partition_trips_at_the_limit_then_resets_next_window() {
 }
 
 #[tokio::test]
+async fn default_per_window_does_not_partition_on_unauthenticated_api_key() {
+    // The api-key tier is OPT-IN. With the default config, a rotating x-api-key
+    // from one IP must NOT mint fresh buckets — the client stays IP-limited.
+    let t = app(1); // default per_window, no api-key tier configured
+    let ip: std::net::SocketAddr = "198.51.100.50:7000".parse().unwrap();
+    assert_eq!(
+        t.request_from(http::Method::GET, "/ping", &[("x-api-key", "rotate-1")], ip)
+            .await
+            .status()
+            .as_u16(),
+        204
+    );
+    // a DIFFERENT x-api-key, SAME ip — still limited by IP, not a fresh bucket
+    assert_eq!(
+        t.request_from(http::Method::GET, "/ping", &[("x-api-key", "rotate-2")], ip)
+            .await
+            .status()
+            .as_u16(),
+        429,
+        "rotating an unauthenticated api-key must NOT bypass the IP limit"
+    );
+}
+
+#[tokio::test]
 async fn api_key_partition_beats_ip() {
-    let t = app(1);
+    let t = App::new()
+        .extend(RateLimit::per_window(1, Duration::from_secs(60)).api_key_header("x-api-key"))
+        .route("/ping", get(|| async { NoContent }))
+        .into_test();
     let ip: std::net::SocketAddr = "203.0.113.1:9".parse().unwrap();
     assert_eq!(
         t.request_from(http::Method::GET, "/ping", &[("x-api-key", "alpha")], ip)
