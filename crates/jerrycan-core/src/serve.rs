@@ -40,7 +40,7 @@ pub(crate) async fn run_with_shutdown(
         tokio::select! {
             () = &mut shutdown => break,
             accepted = listener.accept() => {
-                let (stream, _) = match accepted {
+                let (stream, peer_addr) = match accepted {
                     Ok(pair) => pair,
                     Err(e) if is_transient_accept_error(&e) => {
                         eprintln!("jerrycan: transient accept error ({e}); backing off 50ms");
@@ -57,7 +57,11 @@ pub(crate) async fn run_with_shutdown(
                     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                         let app = app.clone();
                         async move {
-                            let (parts, body) = req.into_parts();
+                            let (mut parts, body) = req.into_parts();
+                            // Thread the raw TCP peer onto the request so route_policy
+                            // and both dispatch lanes (stream + buffered) can read it
+                            // back via RequestCtx::peer_addr (rate-limit IP tier).
+                            parts.extensions.insert(crate::extract::ClientAddr(peer_addr));
                             // Phase 1: route on the head ALONE. A reject (404/405/400)
                             // answers here — the body is dropped, never read.
                             let (limit, stream) = match app.route_policy(&parts) {

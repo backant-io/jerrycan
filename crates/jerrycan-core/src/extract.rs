@@ -23,6 +23,12 @@ pub(crate) enum BodyLane {
     Stream(Option<StreamLane>),
 }
 
+/// The connection's remote socket address, threaded from the accept loop onto
+/// `parts.extensions` so it survives into the handler. A newtype so the typemap
+/// lookup is unambiguous. `None` for synthetic requests (tasks, some tests).
+#[derive(Clone, Copy, Debug)]
+pub struct ClientAddr(pub std::net::SocketAddr);
+
 /// The mutable view of one in-flight request. Handlers receive extractors,
 /// not this type; middleware and the DI resolver work through it.
 pub struct RequestCtx {
@@ -90,6 +96,14 @@ impl RequestCtx {
     }
     pub fn headers(&self) -> &http::HeaderMap {
         &self.parts.headers
+    }
+
+    /// The remote peer's socket address, if the transport provided one. Set by the
+    /// serve loop from `accept()`; absent for task contexts and synthetic requests.
+    /// Rate limiting uses the IP here as its last-resort partition key; treat it as
+    /// the raw TCP peer (a proxy's address behind a load balancer).
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.parts.extensions.get::<ClientAddr>().map(|c| c.0)
     }
 }
 
@@ -319,6 +333,15 @@ mod tests {
             Bytes::from(body.to_string()),
             DepResolver::new(Arc::new(DepEnv::default()), Default::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn peer_addr_is_none_without_a_socket_and_readable_when_set() {
+        let mut c = ctx("/x", "");
+        assert!(c.peer_addr().is_none());
+        let addr: std::net::SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        c.parts.extensions.insert(crate::extract::ClientAddr(addr));
+        assert_eq!(c.peer_addr(), Some(addr));
     }
 
     #[tokio::test]

@@ -156,6 +156,7 @@ impl TestApp {
             Some(Bytes::copy_from_slice(bytes)),
             Some("application/octet-stream"),
             headers,
+            None,
         )
         .await
     }
@@ -210,6 +211,7 @@ impl TestApp {
             Some(Bytes::from(body)),
             Some(&content_type),
             headers,
+            None,
         )
         .await
     }
@@ -217,6 +219,25 @@ impl TestApp {
     /// GET with explicit request headers (auth tests, content negotiation).
     pub async fn get_with(&self, path: &str, headers: &[(&str, &str)]) -> TestResponse {
         self.request_with(Method::GET, path, None, headers).await
+    }
+
+    /// Like `get`, but also sets the simulated client socket address (for the
+    /// rate-limiter's IP partition tier).
+    pub async fn get_from(&self, path: &str, peer: std::net::SocketAddr) -> TestResponse {
+        self.send(Method::GET, path, None, None, &[], Some(peer))
+            .await
+    }
+
+    /// A by-method request with headers AND a simulated peer address.
+    pub async fn request_from(
+        &self,
+        method: http::Method,
+        path: &str,
+        headers: &[(&str, &str)],
+        peer: std::net::SocketAddr,
+    ) -> TestResponse {
+        self.send(method, path, None, None, headers, Some(peer))
+            .await
     }
 
     /// POST JSON with explicit request headers.
@@ -284,8 +305,15 @@ impl TestApp {
         headers: &[(&str, &str)],
     ) -> TestResponse {
         let content_type = json.as_ref().map(|_| "application/json");
-        self.send(method, path, json.map(Bytes::from), content_type, headers)
-            .await
+        self.send(
+            method,
+            path,
+            json.map(Bytes::from),
+            content_type,
+            headers,
+            None,
+        )
+        .await
     }
 
     /// The single test request path: build the head, run the SAME two-phase
@@ -301,6 +329,7 @@ impl TestApp {
         body: Option<Bytes>,
         content_type: Option<&str>,
         headers: &[(&str, &str)],
+        peer: Option<std::net::SocketAddr>,
     ) -> TestResponse {
         let mut builder = http::Request::builder().method(method).uri(path);
         // Apply the helper's default content-type only when the explicit headers
@@ -319,7 +348,12 @@ impl TestApp {
             builder = builder.header(*name, *value);
         }
         let req = builder.body(()).expect("test request build");
-        let (parts, ()) = req.into_parts();
+        let (mut parts, ()) = req.into_parts();
+        // Inject the simulated peer the same way the serve loop does, so IP-based
+        // rate-limit tests run in-memory with the address already on the request.
+        if let Some(peer) = peer {
+            parts.extensions.insert(crate::extract::ClientAddr(peer));
+        }
         let body = body.unwrap_or_default();
 
         // Phase 1: route on the head alone — a reject answers without reading the body.

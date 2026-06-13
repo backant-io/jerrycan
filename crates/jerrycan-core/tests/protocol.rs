@@ -1,7 +1,10 @@
 //! Live-socket protocol proofs: behaviors only a real connection can show
 //! (write stalls, chunked transfer, mid-stream aborts).
 
-use jerrycan_core::{App, Json, Multipart, Result, StreamBody, get, post};
+use jerrycan_core::{
+    App, Json, Middleware, MiddlewareFuture, Multipart, Next, RequestCtx, Result, StreamBody, get,
+    post,
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -248,6 +251,71 @@ async fn chunked_multipart_upload_over_a_live_socket() {
     let echoed: Vec<(String, String)> =
         serde_json::from_str(resp_body.trim()).expect("echoed pairs");
     assert_eq!(echoed, vec![("a".to_string(), "hello".to_string())]);
+
+    server.abort();
+}
+
+/// App-level middleware that stamps the connection's peer address (as threaded
+/// from the accept loop into `RequestCtx`) into an `x-peer` response header — so
+/// a live client can observe that the socket's address survived into the handler.
+struct StampPeer;
+
+impl Middleware for StampPeer {
+    fn handle<'a>(&'a self, ctx: &'a mut RequestCtx, next: Next<'a>) -> MiddlewareFuture<'a> {
+        let peer = ctx.peer_addr();
+        Box::pin(async move {
+            let mut res = next.run(ctx).await;
+            if let Some(peer) = peer
+                && let Ok(value) = http::HeaderValue::from_str(&peer.to_string())
+            {
+                res.headers_mut().insert("x-peer", value);
+            }
+            res
+        })
+    }
+}
+
+async fn ok() -> &'static str {
+    "ok"
+}
+
+#[tokio::test]
+async fn client_peer_address_flows_into_the_handler_over_a_real_socket() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = App::new().route("/whoami", get(ok)).middleware(StampPeer);
+    let server = tokio::spawn(async move { app.serve_with(listener).await });
+
+    let exchange = async {
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        s.write_all(b"GET /whoami HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    let raw = tokio::time::timeout(Duration::from_secs(10), exchange)
+        .await
+        .expect("the peer-stamping exchange must complete, not hang");
+
+    assert!(
+        raw.starts_with("HTTP/1.1 200"),
+        "got: {}",
+        &raw[..raw.len().min(64)]
+    );
+    // The header carries the raw TCP peer of THIS loopback client. Assert the
+    // address prefix, not the ephemeral source port (which the OS picks).
+    let headers = raw.split_once("\r\n\r\n").expect("response has headers").0;
+    let peer_line = headers
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("x-peer:"))
+        .expect("x-peer header present");
+    assert!(
+        peer_line.contains("127.0.0.1:"),
+        "x-peer must carry the loopback peer address, got: {peer_line}"
+    );
 
     server.abort();
 }
