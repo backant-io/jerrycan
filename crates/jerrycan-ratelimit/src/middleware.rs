@@ -28,7 +28,8 @@ impl RateLimitMw {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             v.hash(&mut h);
             // Hash so the raw secret isn't held in the window map (this is
-            // partitioning, not authentication).
+            // partitioning, not authentication — the hash is non-cryptographic
+            // and rare collisions just share a counter, never bypass the limit).
             return Some(format!("apikey:{:016x}", h.finish()));
         }
         if let Some(uk) = self.cfg.user_key_ref()
@@ -37,11 +38,15 @@ impl RateLimitMw {
             return Some(format!("user:{u}"));
         }
         let ip = if self.cfg.trusts_forwarded_for() {
+            // An empty / whitespace XFF entry must fall back to the socket peer,
+            // not collapse every such request into one shared `ip:` bucket.
             ctx.headers()
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.split(',').next())
-                .map(|s| s.trim().to_string())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
         } else {
             None
         }
