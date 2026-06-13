@@ -103,6 +103,10 @@ impl CorsConfig {
     pub(crate) fn credentials(&self) -> bool {
         self.allow_credentials
     }
+    /// Configured `expose_headers` (empty => no `Access-Control-Expose-Headers`).
+    pub(crate) fn cfg_expose(&self) -> &[String] {
+        &self.expose
+    }
 
     /// Validate at build time: `*` + credentials is forbidden by the Fetch spec
     /// and is a footgun, so it is a build error, not a runtime surprise.
@@ -179,6 +183,52 @@ pub(crate) fn preflight_response(
         h.insert(header::ACCESS_CONTROL_MAX_AGE, v);
     }
     r
+}
+
+/// Decorate an actual (non-preflight) response with CORS headers for an allowed
+/// origin. Insert-if-absent so handler-set values win; APPEND `Vary: Origin`
+/// (don't clobber a content-negotiation Vary). No-op for a same-origin request
+/// (no Origin) or a disallowed origin. `origin` is the request's Origin header
+/// value (already extracted); the matching/echo is fallible and skips on bad bytes.
+pub(crate) fn apply_cors(res: &mut Response, origin: Option<&HeaderValue>, config: &CorsConfig) {
+    let Some(origin) = origin.and_then(|v| v.to_str().ok()) else {
+        return;
+    };
+    if !config.allows_origin(origin) {
+        return;
+    }
+    let Ok(origin_val) = HeaderValue::from_str(origin) else {
+        return;
+    };
+    let h = res.headers_mut();
+    if !h.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN) {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_val);
+    }
+    if config.credentials() && !h.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS) {
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+    }
+    if !config.cfg_expose().is_empty()
+        && !h.contains_key(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        && let Ok(v) = HeaderValue::from_str(&config.cfg_expose().join(", "))
+    {
+        h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, v);
+    }
+    // Vary: Origin — append unless already present (caches must not serve a
+    // wrong-origin response). Check existing Vary values case-insensitively.
+    let has_origin_vary = h.get_all(header::VARY).iter().any(|v| {
+        v.to_str()
+            .map(|s| {
+                s.split(',')
+                    .any(|p| p.trim().eq_ignore_ascii_case("origin"))
+            })
+            .unwrap_or(false)
+    });
+    if !has_origin_vary {
+        h.append(header::VARY, HeaderValue::from_static("Origin"));
+    }
 }
 
 #[cfg(test)]

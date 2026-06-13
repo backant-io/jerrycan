@@ -402,6 +402,17 @@ impl BuiltApp {
             if self.security_headers {
                 apply_security_headers(&mut response);
             }
+            // A cross-origin request that 404/405/400s still carries the CORS
+            // headers, so the browser surfaces the real status to JS rather than
+            // hiding it behind a CORS error. The preflight branch above returns
+            // directly (its own complete response), so it is not double-decorated.
+            if let Some(config) = &self.cors {
+                crate::cors::apply_cors(
+                    &mut response,
+                    parts.headers.get(http::header::ORIGIN),
+                    config,
+                );
+            }
             Policy::Reject(response)
         };
         match self.trie.find(path, &parts.method) {
@@ -422,9 +433,16 @@ impl BuiltApp {
     /// body arrives as a [`BodyLane`]: `Buffered` for the upfront-read path,
     /// `Stream` for `.stream_body()` routes.
     pub(crate) async fn dispatch(&self, parts: http::request::Parts, lane: BodyLane) -> Response {
+        // Capture the request Origin BEFORE the ctx consumes `parts`, so the
+        // dispatch exit can decorate an actual cross-origin response with CORS
+        // headers (the other half of preflight, handled in `route_policy`).
+        let origin = parts.headers.get(http::header::ORIGIN).cloned();
         let mut response = self.dispatch_inner(parts, lane).await;
         if self.security_headers {
             apply_security_headers(&mut response);
+        }
+        if let Some(config) = &self.cors {
+            crate::cors::apply_cors(&mut response, origin.as_ref(), config);
         }
         response
     }
