@@ -14,6 +14,7 @@ categories = ["web-programming"]
 [dependencies]
 jerrycan-core = { workspace = true }
 http.workspace = true
+tokio = { workspace = true, features = ["time", "sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
