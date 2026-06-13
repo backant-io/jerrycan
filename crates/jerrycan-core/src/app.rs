@@ -220,6 +220,7 @@ impl App {
             app_env,
             overrides: Arc::new(HashMap::new()),
             security_headers: self.security_headers,
+            cors: self.cors.clone(),
             handler_timeout: self.handler_timeout,
             body_read_timeout: self.body_read_timeout,
             write_stall_timeout: self.write_stall_timeout,
@@ -287,6 +288,9 @@ pub struct BuiltApp {
     pub(crate) app_env: Arc<DepEnv>,
     pub(crate) overrides: Arc<HashMap<TypeId, AnyArc>>,
     pub(crate) security_headers: bool,
+    /// Installed CORS policy (spec §v2.2). When set, `route_policy` answers a
+    /// CORS preflight `OPTIONS` directly — before the trie's 405 path.
+    pub(crate) cors: Option<std::sync::Arc<crate::cors::CorsConfig>>,
     pub(crate) handler_timeout: std::time::Duration,
     pub(crate) body_read_timeout: std::time::Duration,
     pub(crate) write_stall_timeout: std::time::Duration,
@@ -364,6 +368,35 @@ impl BuiltApp {
     /// trie. The walk is cheap; we eat the double walk for v2.0b.
     pub(crate) fn route_policy(&self, parts: &http::request::Parts) -> Policy {
         let path = parts.uri.path();
+        // CORS preflight is answered HERE, before the trie's 405 path: an OPTIONS
+        // to a method-mismatched route would otherwise be rejected 405 before any
+        // middleware runs. The preflight 204 is returned DIRECTLY (not through the
+        // security-headering `reject` closure) — its only headers are CORS ones.
+        if let Some(config) = &self.cors
+            && crate::cors::is_preflight(parts)
+        {
+            let origin = parts
+                .headers
+                .get(http::header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if config.allows_origin(origin)
+                && let Some(methods) = self.trie.methods_for(path)
+            {
+                let acrh = parts
+                    .headers
+                    .get(http::header::ACCESS_CONTROL_REQUEST_HEADERS)
+                    .and_then(|v| v.to_str().ok());
+                return Policy::Reject(crate::cors::preflight_response(
+                    config, origin, acrh, &methods,
+                ));
+            }
+            // Disallowed origin or unknown path: bare 204 with NO CORS headers.
+            // The browser blocks the request; we leak neither a 404 nor a 405.
+            let mut r = http::Response::new(crate::response::JcBody::empty());
+            *r.status_mut() = http::StatusCode::NO_CONTENT;
+            return Policy::Reject(r);
+        }
         let reject = |response: Response| -> Policy {
             let mut response = response;
             if self.security_headers {

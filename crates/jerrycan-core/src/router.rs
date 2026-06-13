@@ -202,6 +202,34 @@ impl Trie {
         self.find_in(&segs, method)
     }
 
+    /// The HTTP methods registered for `path`, or `None` if the path is unknown.
+    /// Used by CORS preflight to reflect `Access-Control-Allow-Methods`. The walk
+    /// mirrors [`Trie::find`] (percent-decode then resolve via `find_node`) but
+    /// ignores the request method — preflight cares only whether the path exists.
+    /// Methods are sorted so the emitted header is deterministic (a framework
+    /// invariant) regardless of registration order.
+    pub(crate) fn methods_for(&self, path: &str) -> Option<Vec<Method>> {
+        let mut params: Vec<(String, String)> = Vec::new();
+        let node = if path.contains('%') {
+            let mut decoded: Vec<String> = Vec::new();
+            for raw in segments(path) {
+                decoded.push(decode_segment(raw)?);
+            }
+            let segs: Vec<&str> = decoded.iter().map(String::as_str).collect();
+            find_node(&self.root, &segs, &mut params)
+        } else {
+            let segs: Vec<&str> = segments(path).collect();
+            find_node(&self.root, &segs, &mut params)
+        }?;
+        let ep = node
+            .endpoint
+            .as_ref()
+            .expect("find_node only returns endpoint nodes");
+        let mut methods: Vec<Method> = ep.methods.keys().cloned().collect();
+        methods.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Some(methods)
+    }
+
     fn find_in<'a>(&'a self, segs: &[&str], method: &Method) -> RouteMatch<'a> {
         let mut params: Vec<(String, String)> = Vec::new();
         match find_node(&self.root, segs, &mut params) {

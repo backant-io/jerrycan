@@ -107,13 +107,13 @@ impl TestApp {
     }
 
     pub async fn get(&self, path: &str) -> TestResponse {
-        self.request(Method::GET, path, None).await
+        self.request_json(Method::GET, path, None).await
     }
     pub async fn delete(&self, path: &str) -> TestResponse {
-        self.request(Method::DELETE, path, None).await
+        self.request_json(Method::DELETE, path, None).await
     }
     pub async fn post_json<B: Serialize>(&self, path: &str, body: &B) -> TestResponse {
-        self.request(
+        self.request_json(
             Method::POST,
             path,
             Some(serde_json::to_vec(body).expect("serialize")),
@@ -121,7 +121,7 @@ impl TestApp {
         .await
     }
     pub async fn put_json<B: Serialize>(&self, path: &str, body: &B) -> TestResponse {
-        self.request(
+        self.request_json(
             Method::PUT,
             path,
             Some(serde_json::to_vec(body).expect("serialize")),
@@ -129,10 +129,37 @@ impl TestApp {
         .await
     }
     pub async fn patch_json<B: Serialize>(&self, path: &str, body: &B) -> TestResponse {
-        self.request(
+        self.request_json(
             Method::PATCH,
             path,
             Some(serde_json::to_vec(body).expect("serialize")),
+        )
+        .await
+    }
+
+    /// A CORS preflight (`OPTIONS`) request with headers.
+    pub async fn options_with(&self, path: &str, headers: &[(&str, &str)]) -> TestResponse {
+        self.request(http::Method::OPTIONS, path, headers, None)
+            .await
+    }
+
+    /// A by-method request with headers and an optional body. The generic seam the
+    /// `*_with` helpers don't cover (OPTIONS, HEAD, custom flows). No simulated
+    /// peer address — use `request_from` for the IP-partition rate-limit tier.
+    pub async fn request(
+        &self,
+        method: http::Method,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> TestResponse {
+        self.send(
+            method,
+            path,
+            body.map(Bytes::copy_from_slice),
+            None,
+            headers,
+            None,
         )
         .await
     }
@@ -293,7 +320,12 @@ impl TestApp {
         .await
     }
 
-    async fn request(&self, method: Method, path: &str, json: Option<Vec<u8>>) -> TestResponse {
+    async fn request_json(
+        &self,
+        method: Method,
+        path: &str,
+        json: Option<Vec<u8>>,
+    ) -> TestResponse {
         self.request_with(method, path, json, &[]).await
     }
 

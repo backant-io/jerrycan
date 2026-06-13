@@ -3,6 +3,8 @@
 //! any middleware runs), so CORS is a pre-routing + response-decoration concern
 //! integrated into `route_policy`/dispatch in later tasks — not a `Middleware`.
 
+use crate::response::{JcBody, Response};
+use http::{HeaderValue, Method, StatusCode, header};
 use std::time::Duration;
 
 /// Which origins may make cross-origin requests.
@@ -85,6 +87,23 @@ impl CorsConfig {
         }
     }
 
+    /// Configured `allow_methods` (empty => reflect the route's real methods).
+    pub(crate) fn cfg_methods(&self) -> &[http::Method] {
+        &self.methods
+    }
+    /// Configured `allow_headers` (empty => reflect `Access-Control-Request-Headers`).
+    pub(crate) fn cfg_headers(&self) -> &[String] {
+        &self.headers
+    }
+    /// Configured `Access-Control-Max-Age`, if set.
+    pub(crate) fn cfg_max_age(&self) -> Option<std::time::Duration> {
+        self.max_age
+    }
+    /// Whether `Access-Control-Allow-Credentials: true` is emitted.
+    pub(crate) fn credentials(&self) -> bool {
+        self.allow_credentials
+    }
+
     /// Validate at build time: `*` + credentials is forbidden by the Fetch spec
     /// and is a footgun, so it is a build error, not a runtime surprise.
     pub(crate) fn validate(&self) -> crate::Result<()> {
@@ -95,6 +114,71 @@ impl CorsConfig {
         }
         Ok(())
     }
+}
+
+/// Is this request a CORS preflight? (`OPTIONS` + `Origin` +
+/// `Access-Control-Request-Method`). All three are required by the Fetch spec;
+/// a bare `OPTIONS` (no origin/no ACRM) is a normal request, not a preflight.
+pub(crate) fn is_preflight(parts: &http::request::Parts) -> bool {
+    parts.method == Method::OPTIONS
+        && parts.headers.contains_key(header::ORIGIN)
+        && parts
+            .headers
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+}
+
+/// Build the CORS preflight `204` for an ALLOWED origin. `allowed_methods` are
+/// the route's real methods (used when the config doesn't pin `allow_methods`).
+/// Returns a bare `204` carrying ONLY CORS headers — deliberately no security
+/// headers, since `cache-control: no-store` would fight `Access-Control-Max-Age`.
+pub(crate) fn preflight_response(
+    config: &CorsConfig,
+    origin: &str,
+    request_headers: Option<&str>,
+    allowed_methods: &[Method],
+) -> Response {
+    let mut r = http::Response::new(JcBody::empty());
+    *r.status_mut() = StatusCode::NO_CONTENT;
+    let h = r.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(origin) {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        h.insert(header::VARY, HeaderValue::from_static("Origin"));
+    }
+    if config.credentials() {
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+    }
+    let methods = if config.cfg_methods().is_empty() {
+        allowed_methods
+    } else {
+        config.cfg_methods()
+    };
+    let methods_joined = methods
+        .iter()
+        .map(Method::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Ok(v) = HeaderValue::from_str(&methods_joined) {
+        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, v);
+    }
+    let allow_headers = if config.cfg_headers().is_empty() {
+        request_headers.map(str::to_string)
+    } else {
+        Some(config.cfg_headers().join(", "))
+    };
+    if let Some(hdrs) = allow_headers
+        && let Ok(v) = HeaderValue::from_str(&hdrs)
+    {
+        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
+    }
+    if let Some(age) = config.cfg_max_age()
+        && let Ok(v) = HeaderValue::from_str(&age.as_secs().to_string())
+    {
+        h.insert(header::ACCESS_CONTROL_MAX_AGE, v);
+    }
+    r
 }
 
 #[cfg(test)]
