@@ -36,6 +36,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+redis = { version = "1", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "connection-manager", "script"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres"] }
 sea-orm = { version = "1", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "macros", "with-json"] }
 sea-query = { version = "0.32", default-features = false, features = ["backend-sqlite", "backend-postgres"] }

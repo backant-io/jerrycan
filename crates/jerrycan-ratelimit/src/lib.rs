@@ -4,9 +4,14 @@
 #![forbid(unsafe_code)]
 
 mod middleware;
+#[cfg(feature = "rate-limit-redis")]
+mod redis_store;
 pub mod store;
 
 pub use store::{InMemoryStore, Outcome, RateLimitStore};
+
+#[cfg(feature = "rate-limit-redis")]
+pub use redis_store::RedisStore;
 
 use jerrycan_core::{App, Extension, RequestCtx};
 use std::sync::Arc;

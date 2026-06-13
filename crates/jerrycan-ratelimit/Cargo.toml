@@ -15,6 +15,10 @@ categories = ["web-programming"]
 jerrycan-core = { workspace = true }
 http.workspace = true
 tokio = { workspace = true, features = ["time", "sync"] }
+redis = { workspace = true, optional = true }
+
+[features]
+rate-limit-redis = ["dep:redis"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
