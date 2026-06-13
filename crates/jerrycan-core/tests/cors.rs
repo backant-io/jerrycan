@@ -129,6 +129,44 @@ async fn cross_origin_404_still_carries_allow_origin() {
 }
 
 #[tokio::test]
+async fn cross_origin_413_still_carries_allow_origin() {
+    // A cross-origin request that overflows the body limit answers 413 from the
+    // serve-level error path (finish_error), BEFORE dispatch. Without CORS
+    // decoration the browser masks the 413 behind a CORS error and JS can't tell
+    // a too-large upload from a network failure — so the Allow-Origin must ride.
+    let t = App::new()
+        .cors(CorsConfig::new(CorsOrigins::list(["https://app.example"])))
+        .route("/upload", post(|| async { NoContent }).body_limit(8))
+        .into_test();
+    let big = vec![b'x'; 64]; // over the 8-byte cap
+    let res = t
+        .post_bytes_with("/upload", &big, &[("origin", "https://app.example")])
+        .await;
+    assert_eq!(res.status().as_u16(), 413, "body: {}", res.text());
+    assert_eq!(
+        res.headers()["access-control-allow-origin"],
+        "https://app.example",
+        "browser must see the 413, so CORS headers ride even on serve-level errors"
+    );
+}
+
+#[tokio::test]
+async fn cross_origin_413_from_disallowed_origin_gets_no_allow_origin() {
+    // The mirror of the above: a disallowed origin that 413s gets NO Allow-Origin
+    // (decoration is gated on the allowlist exactly like the dispatch/reject paths).
+    let t = App::new()
+        .cors(CorsConfig::new(CorsOrigins::list(["https://app.example"])))
+        .route("/upload", post(|| async { NoContent }).body_limit(8))
+        .into_test();
+    let big = vec![b'x'; 64];
+    let res = t
+        .post_bytes_with("/upload", &big, &[("origin", "https://evil.example")])
+        .await;
+    assert_eq!(res.status().as_u16(), 413);
+    assert!(res.headers().get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test]
 async fn disallowed_origin_gets_no_allow_origin() {
     let t = app();
     let res = t

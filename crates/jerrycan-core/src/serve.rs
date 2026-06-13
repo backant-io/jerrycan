@@ -62,6 +62,12 @@ pub(crate) async fn run_with_shutdown(
                             // and both dispatch lanes (stream + buffered) can read it
                             // back via RequestCtx::peer_addr (rate-limit IP tier).
                             parts.extensions.insert(crate::extract::ClientAddr(peer_addr));
+                            // Capture the request Origin ONCE, before `parts` is moved
+                            // into dispatch. The serve-level error paths (413/408/500)
+                            // need it to CORS-decorate their responses so a cross-origin
+                            // request sees the real status, not a browser CORS error —
+                            // the same reason route_policy decorates 404/405/400.
+                            let cors_origin = parts.headers.get(http::header::ORIGIN).cloned();
                             // Phase 1: route on the head ALONE. A reject (404/405/400)
                             // answers here — the body is dropped, never read.
                             let (limit, stream) = match app.route_policy(&parts) {
@@ -80,7 +86,7 @@ pub(crate) async fn run_with_shutdown(
                                     http_body_util::Limited::new(body, limit),
                                     app.body_read_timeout,
                                 ))));
-                                dispatch_isolated(&app, parts, lane).await
+                                dispatch_isolated(&app, parts, lane, cors_origin.as_ref()).await
                             } else {
                                 // Buffered path: read the body up to THIS route's limit upfront,
                                 // then dispatch. Byte-for-byte unchanged from v2.0b.
@@ -91,11 +97,13 @@ pub(crate) async fn run_with_shutdown(
                                 match collected {
                                     Ok(Ok(collected)) => {
                                         let lane = BodyLane::Buffered(collected.to_bytes());
-                                        dispatch_isolated(&app, parts, lane).await
+                                        dispatch_isolated(&app, parts, lane, cors_origin.as_ref()).await
                                     }
-                                    Ok(Err(_)) => {
-                                        finish_error(&app, Error::payload_too_large())
-                                    }
+                                    Ok(Err(_)) => finish_error(
+                                        &app,
+                                        Error::payload_too_large(),
+                                        cors_origin.as_ref(),
+                                    ),
                                     Err(_) => finish_error(
                                         &app,
                                         Error::new(
@@ -103,6 +111,7 @@ pub(crate) async fn run_with_shutdown(
                                             "JC0408",
                                             "timed out reading the request body",
                                         ),
+                                        cors_origin.as_ref(),
                                     ),
                                 }
                             };
@@ -144,25 +153,38 @@ pub(crate) async fn run_with_shutdown(
 
 /// Apply the secure-by-default headers (when enabled) to a head-only error
 /// response — the body-read failure paths that answer without dispatching.
-fn finish_error(app: &Arc<crate::app::BuiltApp>, error: Error) -> crate::response::Response {
+/// Also CORS-decorates for an allowed origin, so a cross-origin 413/408/500
+/// surfaces its real status to JS instead of being masked by a browser CORS
+/// error — mirroring the 404/405/400 decoration in `route_policy`.
+fn finish_error(
+    app: &Arc<crate::app::BuiltApp>,
+    error: Error,
+    cors_origin: Option<&http::HeaderValue>,
+) -> crate::response::Response {
     let mut response = error.into_response();
     if app.security_headers {
         apply_security_headers(&mut response);
+    }
+    if let Some(config) = &app.cors {
+        crate::cors::apply_cors(&mut response, cors_origin, config);
     }
     response
 }
 
 /// Dispatch in a panic-isolating `tokio::spawn` (the in-flight handler cannot
 /// take down the connection task). A panic surfaces as a security-headered 500.
+/// `cors_origin` is the request Origin captured before `parts` moved in, so the
+/// panic-500 (which can no longer reach `parts`) is still CORS-decorated.
 async fn dispatch_isolated(
     app: &Arc<crate::app::BuiltApp>,
     parts: http::request::Parts,
     lane: BodyLane,
+    cors_origin: Option<&http::HeaderValue>,
 ) -> crate::response::Response {
     let app2 = app.clone();
     match tokio::spawn(async move { app2.dispatch(parts, lane).await }).await {
         Ok(response) => response,
-        Err(_join_error) => finish_error(app, Error::internal("handler panicked")),
+        Err(_join_error) => finish_error(app, Error::internal("handler panicked"), cors_origin),
     }
 }
 

@@ -387,6 +387,10 @@ impl TestApp {
             parts.extensions.insert(crate::extract::ClientAddr(peer));
         }
         let body = body.unwrap_or_default();
+        // Capture the request Origin before `parts` is moved into dispatch, so the
+        // in-process 413 path mirrors serve.rs's `finish_error` and CORS-decorates
+        // a cross-origin over-limit response.
+        let cors_origin = parts.headers.get(http::header::ORIGIN).cloned();
 
         // Phase 1: route on the head alone — a reject answers without reading the body.
         let (limit, stream) = match self.built.route_policy(&parts) {
@@ -404,6 +408,9 @@ impl TestApp {
                 let mut response = Error::payload_too_large().into_response();
                 if self.built.security_headers {
                     crate::app::apply_security_headers(&mut response);
+                }
+                if let Some(config) = &self.built.cors {
+                    crate::cors::apply_cors(&mut response, cors_origin.as_ref(), config);
                 }
                 return TestResponse::collect(response).await;
             }

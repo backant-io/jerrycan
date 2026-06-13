@@ -2,8 +2,8 @@
 //! (write stalls, chunked transfer, mid-stream aborts).
 
 use jerrycan_core::{
-    App, Json, Middleware, MiddlewareFuture, Multipart, Next, RequestCtx, Result, StreamBody, get,
-    post,
+    App, CorsConfig, CorsOrigins, Json, Middleware, MiddlewareFuture, Multipart, Next, NoContent,
+    RequestCtx, Result, StreamBody, get, post,
 };
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -251,6 +251,60 @@ async fn chunked_multipart_upload_over_a_live_socket() {
     let echoed: Vec<(String, String)> =
         serde_json::from_str(resp_body.trim()).expect("echoed pairs");
     assert_eq!(echoed, vec![("a".to_string(), "hello".to_string())]);
+
+    server.abort();
+}
+
+async fn sink() -> NoContent {
+    NoContent
+}
+
+/// A cross-origin request that overflows the per-route body limit answers 413
+/// from the SERVE-level error path (`finish_error`), over a real socket — the
+/// path the in-process TestApp 413 can only mirror. Without CORS decoration the
+/// browser masks the 413 behind a CORS error; the `Access-Control-Allow-Origin`
+/// must ride the serve-level error response just as it does the 404/405 rejects.
+#[tokio::test]
+async fn cross_origin_413_over_a_live_socket_carries_allow_origin() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = App::new()
+        .cors(CorsConfig::new(CorsOrigins::list(["https://app.example"])))
+        .route("/upload", post(sink).body_limit(8));
+    let server = tokio::spawn(async move { app.serve_with(listener).await });
+
+    // 64 bytes over the 8-byte cap: hyper's Limited trips, serve.rs answers 413.
+    let body = vec![b'x'; 64];
+    let exchange = async {
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /upload HTTP/1.1\r\nHost: l\r\nOrigin: https://app.example\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.write_all(&body).await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    let raw = tokio::time::timeout(Duration::from_secs(10), exchange)
+        .await
+        .expect("the over-limit exchange must complete, not hang");
+
+    assert!(
+        raw.starts_with("HTTP/1.1 413"),
+        "got: {}",
+        &raw[..raw.len().min(80)]
+    );
+    let headers = raw.split_once("\r\n\r\n").expect("response has headers").0;
+    assert!(
+        headers
+            .lines()
+            .any(|l| l.eq_ignore_ascii_case("access-control-allow-origin: https://app.example")),
+        "the serve-level 413 must carry Allow-Origin so the browser surfaces it, got headers:\n{headers}"
+    );
 
     server.abort();
 }
