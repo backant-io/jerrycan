@@ -80,17 +80,77 @@ async fn api_key_partition_beats_ip() {
 }
 
 #[tokio::test]
-async fn options_is_exempt() {
-    let t = app(1);
-    let ip: std::net::SocketAddr = "203.0.113.2:9".parse().unwrap();
-    assert_eq!(t.get_from("/ping", ip).await.status().as_u16(), 204);
+async fn options_is_exempt_even_when_the_budget_is_burned() {
+    // /ping has BOTH get and an explicit OPTIONS handler, so OPTIONS resolves to
+    // RouteMatch::Found and actually reaches the middleware (not a 405-at-routing,
+    // which the old `options_is_exempt` hit before the limiter ever ran). limit=1:
+    // burn the budget with a GET, then assert OPTIONS still passes (exempt), not 429.
+    let t = App::new()
+        .extend(RateLimit::per_window(1, Duration::from_secs(60)))
+        .route(
+            "/ping",
+            get(|| async { NoContent }).on(http::Method::OPTIONS, || async { NoContent }),
+        )
+        .into_test();
+    let ip: std::net::SocketAddr = "203.0.113.20:9".parse().unwrap();
+    assert_eq!(t.get_from("/ping", ip).await.status().as_u16(), 204); // burn budget
+    assert_eq!(t.get_from("/ping", ip).await.status().as_u16(), 429); // confirm limited
+    // OPTIONS to the SAME ip, budget burned — must be exempt (the middleware
+    // returns next.run for OPTIONS instead of short-circuiting with a 429).
     let opt = t
         .request_from(http::Method::OPTIONS, "/ping", &[], ip)
         .await;
     assert_ne!(
         opt.status().as_u16(),
         429,
-        "OPTIONS must bypass rate limiting"
+        "OPTIONS must bypass rate limiting even when the budget is exhausted"
+    );
+    assert_eq!(
+        opt.status().as_u16(),
+        204,
+        "the OPTIONS handler ran (exempt, reached the handler)"
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_429_still_carries_cors_headers() {
+    // The cross-feature composition: a 429 from the rate-limit middleware must
+    // still carry CORS headers, because CORS decorates at the dispatch exit AFTER
+    // the middleware short-circuits. Without it, the browser masks the 429 behind
+    // a CORS error and JS can't surface the rate-limit to the user.
+    let t = App::new()
+        .cors(CorsConfig::new(CorsOrigins::list(["https://app.example"])))
+        .extend(RateLimit::per_window(1, Duration::from_secs(60)))
+        .route("/ping", get(|| async { NoContent }))
+        .into_test();
+    let ip: std::net::SocketAddr = "203.0.113.30:9".parse().unwrap();
+    // first cross-origin request OK
+    assert_eq!(
+        t.request_from(
+            http::Method::GET,
+            "/ping",
+            &[("origin", "https://app.example")],
+            ip
+        )
+        .await
+        .status()
+        .as_u16(),
+        204
+    );
+    // second is 429 AND must carry Access-Control-Allow-Origin (browser must see the 429)
+    let limited = t
+        .request_from(
+            http::Method::GET,
+            "/ping",
+            &[("origin", "https://app.example")],
+            ip,
+        )
+        .await;
+    assert_eq!(limited.status().as_u16(), 429);
+    assert_eq!(
+        limited.headers()["access-control-allow-origin"],
+        "https://app.example",
+        "a cross-origin 429 must carry CORS headers so the browser surfaces the rate-limit to JS"
     );
 }
 

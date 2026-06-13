@@ -50,6 +50,8 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Build benches
         run: cargo build --workspace --benches --all-features
+      - name: Build facade with no default features (generated-app config)
+        run: cargo build -p jerrycan --no-default-features
       - name: "Conformance (heavy: generated apps must build, check, serve, and pass the scripted eval)"
         run: |
           cargo test -p jerrycan --all-features --test conformance -- --include-ignored

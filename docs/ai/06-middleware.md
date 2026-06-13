@@ -71,6 +71,12 @@ behind a trusted proxy); `store(Arc::new(..))` swaps the backend — the default
 in-memory, and `RedisStore` (behind `rate-limit-redis`) shares one window across
 replicas.
 
+Failure modes split by cause: a missing identity (no peer, no api-key, no
+user-key) or a missing clock fails **open** — a misconfigured limiter must not
+break all traffic, so the request is admitted. But a **store** error (e.g. Redis
+down) fails **closed** — it surfaces as a `500`, never silently admitting traffic
+past the limit.
+
 Fixed windows are deterministic but allow a **burst across the boundary**: a client
 can spend its full quota at the end of one window and again at the start of the
 next, so up to ~2× the limit in a short span. That is the known fixed-window
