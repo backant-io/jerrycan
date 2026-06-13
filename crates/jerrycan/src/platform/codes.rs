@@ -83,6 +83,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs validation",
     },
     CodeInfo {
+        code: "JC0429",
+        title: "too many requests",
+        cause: "the client exceeded the configured rate limit for its identity (api-key → user → IP) in the current fixed window",
+        fix: "slow down and retry after the Retry-After delay; raise the limit in the rate-limit extension config if the traffic is legitimate",
+        doc: "jerrycan docs middleware",
+    },
+    CodeInfo {
         code: "JC0500",
         title: "internal error",
         cause: "an unexpected server-side failure (or a handler panicked)",

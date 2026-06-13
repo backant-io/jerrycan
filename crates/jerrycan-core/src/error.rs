@@ -62,6 +62,17 @@ impl Error {
     pub fn unprocessable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "JC0422", message)
     }
+    /// The client exceeded its configured rate limit for the current window
+    /// (the rate-limit extension; spec §v2.2). The response also carries a
+    /// `Retry-After` header, which the middleware sets — `Error` has no header
+    /// channel.
+    pub fn too_many_requests() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "JC0429",
+            "rate limit exceeded",
+        )
+    }
     /// Authentication is required or failed (spec §4.4 auth).
     pub fn unauthorized() -> Self {
         Self::new(
@@ -156,6 +167,8 @@ mod tests {
         assert_eq!(Error::unsupported_media_type().code(), "JC0415");
         assert_eq!(Error::unsupported_media_type().status().as_u16(), 415);
         assert_eq!(Error::unprocessable("bad field").code(), "JC0422");
+        assert_eq!(Error::too_many_requests().code(), "JC0429");
+        assert_eq!(Error::too_many_requests().status().as_u16(), 429);
         assert_eq!(
             Error::internal("boom").status(),
             StatusCode::INTERNAL_SERVER_ERROR
