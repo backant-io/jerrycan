@@ -93,6 +93,39 @@ Handled by the hyper serve engine and the core app, before any handler runs.
   verification rather than panicking. The Stripe recipe additionally bounds
   timestamp staleness against the injectable `Clock` to resist replay
   (docs/ai/10-auth.md).
+- **CORS credentials safety** (`crates/jerrycan-core/src/cors.rs`,
+  `crates/jerrycan-core/src/app.rs`). `CorsOrigins::any()` together with
+  `allow_credentials(true)` is refused at **build time** (`App::build`), because a
+  wildcard origin plus cookies is the classic cross-origin credential leak — the
+  combination cannot be expressed. Echoed origins are validated fallibly when
+  written back as a header value: bytes that don't form a valid `HeaderValue` are
+  skipped, never panicked on. Every decorated response carries `Vary: Origin` so a
+  shared cache can't serve one origin's allow-headers to another (cache
+  poisoning). The preflight `204` deliberately omits the default security headers
+  (notably `cache-control: no-store`, which would fight `Access-Control-Max-Age`
+  and force a preflight on every request).
+- **Rate-limit IP spoofing** (`crates/jerrycan-ratelimit/src/middleware.rs`). The
+  IP partition tier keys on the RAW socket peer (`RequestCtx::peer_addr`) by
+  default; `X-Forwarded-For` is honored ONLY when the operator opts in with
+  `trust_forwarded_for(true)`, because that header is client-spoofable and would
+  otherwise let an attacker forge a fresh partition key per request to evade the
+  limit. The trusted-proxy assumption is the operator's: enable it only when a
+  proxy you control rewrites the header. The raw peer is always present over a real
+  socket, so the IP tier is not a production bypass — it degrades only in the
+  no-peer test path (see fail-open below).
+- **Rate-limit fail-open, hashing, and burst**
+  (`crates/jerrycan-ratelimit/src/middleware.rs`,
+  `crates/jerrycan-ratelimit/src/store.rs`). A request with NO identity (no
+  api-key, no user-key, no peer) is NOT limited — fail-open is deliberate: a
+  misconfigured limiter must not `500` all traffic. A STORE error, by contrast,
+  fails CLOSED — it surfaces as **JC0500** rather than silently admitting the
+  request, so a broken Redis is loud, not a hole. The api-key value is hashed
+  (non-cryptographic, partitioning only) before it becomes a counter key; a rare
+  hash collision makes two keys share one counter (stricter, never a bypass), and
+  the raw key is never stored. The fixed window admits up to 2× the limit across a
+  boundary (a client spending its quota at the end of one window and the start of
+  the next) — a known fixed-window property, documented in docs/ai/06-middleware.md,
+  not a defect.
 
 ## 3. Malicious `design.json`
 

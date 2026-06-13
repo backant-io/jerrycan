@@ -157,6 +157,48 @@ assert_eq!(t.post_bytes("/small", &two_mib).await.status().as_u16(), 413); // ov
 # }); }
 ```
 
+## CORS
+`App::cors(config)` installs a cross-origin policy. It is pure core (always
+available) and is NOT a middleware: preflight `OPTIONS` is answered BEFORE
+routing — a browser preflight to a real path returns `204` with the route's
+reflected methods instead of the `405` a bare `OPTIONS` would get — and the
+actual response is decorated afterward. Build the config with an origin set:
+`CorsOrigins::list([..])` is an exact-match allowlist (scheme + host + optional
+port); `CorsOrigins::any()` is `*`. Chain `.allow_credentials(true)`,
+`.max_age(d)`, `.allow_headers([..])`, `.expose_headers([..])`. **`any()` with
+credentials is a BUILD ERROR** (`App::build` refuses it) — a wildcard origin and
+cookies together is the classic credential-leak, so the combination can't be
+expressed. Allowed cross-origin responses carry `Access-Control-Allow-Origin` and
+`Vary: Origin` on EVERY status — including `404`, `413`, and `500` — so the
+browser surfaces the real status to JS instead of masking a too-large upload or a
+server error behind an opaque CORS failure. A disallowed origin gets no CORS
+headers, and a same-origin request (no `Origin`) is left undecorated.
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+let t = App::new()
+    .cors(CorsConfig::new(CorsOrigins::list(["https://app.example"])))
+    .route("/todos", get(|| async { Json(vec![1, 2, 3]) }).post(|| async { NoContent }))
+    .into_test();
+
+// preflight is answered before routing: 204, not 405, with reflected methods
+let pre = t.options_with("/todos", &[
+    ("origin", "https://app.example"),
+    ("access-control-request-method", "POST"),
+]).await;
+assert_eq!(pre.status().as_u16(), 204);
+assert_eq!(pre.headers()["access-control-allow-origin"], "https://app.example");
+
+// the actual cross-origin response carries the header too
+let res = t.get_with("/todos", &[("origin", "https://app.example")]).await;
+assert_eq!(res.headers()["access-control-allow-origin"], "https://app.example");
+
+// a disallowed origin gets nothing
+let evil = t.get_with("/todos", &[("origin", "https://evil.example")]).await;
+assert!(evil.headers().get("access-control-allow-origin").is_none());
+# }); }
+```
+
 ## Streaming
 A route marked `.stream_body()` does NOT buffer the request body before
 dispatch — extractors read it incrementally (`Multipart`) or drain it on demand

@@ -101,6 +101,34 @@ multipart uploads, and raw-bytes webhook verification.
 - **TestApp**: `post_multipart`/`post_multipart_with` with `TestPart::text`/
   `TestPart::file`, and `TestResponse::bytes()` for raw download bodies.
 
+### Middleware kit (v2.2)
+The cross-origin and abuse-control edge: CORS in the core, a peer address on the
+request context, and an identity-aware rate limiter as an extension.
+- **CORS in core** (`App::cors(CorsConfig::new(CorsOrigins::list([..])))` /
+  `CorsOrigins::any()`) — an exact-match origin allowlist, `allow_credentials`
+  (with `any()`+credentials refused at build time), `max_age`, `allow_headers`,
+  `expose_headers`. Preflight `OPTIONS` is answered BEFORE routing (`204` with
+  reflected methods, not `405`), and the actual response is decorated afterward —
+  including error responses (`404`/`413`/`500`) so the browser surfaces the real
+  status. Same-origin and disallowed-origin responses are left undecorated;
+  `Vary: Origin` rides every decorated response.
+- **`RequestCtx::peer_addr()`** — the raw socket peer, the source the rate-limit
+  IP tier partitions on.
+- **`jerrycan-ratelimit`** (the `rate-limit` feature) — a fixed-window,
+  identity-aware limiter installed with
+  `app.extend(RateLimit::per_window(n, dur))`. Partition precedence is
+  api-key header → `user_key` closure → client IP; `OPTIONS` is exempt;
+  over-limit is `429 JC0429` + `Retry-After`. Builders: `api_key_header`,
+  `user_key`, `trust_forwarded_for` (off by default — `X-Forwarded-For` is
+  client-spoofable), `store`. The default store is in-memory; `RedisStore`
+  (behind `rate-limit-redis`) shares one window across replicas. Windows are
+  deterministic under `TestApp::clock().advance(..)`.
+- **`JC0429`** too-many-requests added (the rate-limit extension; carries
+  `Retry-After`).
+- **TestApp**: `options_with` (preflight), `request`/`request_from` (arbitrary
+  method + headers, with/without a peer), and `get_from`/`request_from` (drive a
+  request from a chosen socket peer for the IP tier).
+
 ### Breaking
 - `Db::pool()` is removed — use `Db::conn()` (a `sea_orm::DatabaseConnection`).
 - Generated apps must regenerate tool-owned files (`model.rs`, `lib.rs`,
