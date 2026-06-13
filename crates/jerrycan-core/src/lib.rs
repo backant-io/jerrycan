@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod clock;
+pub mod cors;
 pub mod dep;
 pub mod error;
 pub mod extract;
@@ -19,6 +20,7 @@ pub mod test_client;
 
 pub use app::{App, BuiltApp, Extension};
 pub use clock::Clock;
+pub use cors::{CorsConfig, CorsOrigins};
 pub use dep::{Dep, TaskContext};
 pub use error::{Error, Result};
 pub use extract::{FromRequest, Headers, Path, Query, RawBody, RequestCtx};
@@ -42,8 +44,8 @@ pub use serde_urlencoded;
 /// One import for generated code: `use jerrycan::prelude::*;`
 pub mod prelude {
     pub use crate::{
-        App, Clock, Created, Dep, Error, Extension, Headers, IntoResponse, Json, Middleware,
-        MiddlewareFuture, Module, Multipart, Next, NoContent, Path, Query, RawBody, RequestCtx,
-        Result, StreamBody, TestApp, TestPart, delete, get, patch, post, put,
+        App, Clock, CorsConfig, CorsOrigins, Created, Dep, Error, Extension, Headers, IntoResponse,
+        Json, Middleware, MiddlewareFuture, Module, Multipart, Next, NoContent, Path, Query,
+        RawBody, RequestCtx, Result, StreamBody, TestApp, TestPart, delete, get, patch, post, put,
     };
 }

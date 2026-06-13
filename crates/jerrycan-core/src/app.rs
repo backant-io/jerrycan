@@ -39,6 +39,7 @@ pub struct App {
     env: DepEnv,
     middleware: Vec<Arc<dyn Middleware>>,
     security_headers: bool,
+    cors: Option<std::sync::Arc<crate::cors::CorsConfig>>,
     handler_timeout: std::time::Duration,
     body_read_timeout: std::time::Duration,
     write_stall_timeout: std::time::Duration,
@@ -61,6 +62,7 @@ impl Default for App {
             env,
             middleware: Vec::new(),
             security_headers: true,
+            cors: None,
             handler_timeout: std::time::Duration::from_secs(30),
             body_read_timeout: std::time::Duration::from_secs(30),
             write_stall_timeout: std::time::Duration::from_secs(30),
@@ -89,6 +91,15 @@ impl App {
     /// must be explicit — that is the contract.
     pub fn security_headers(mut self, on: bool) -> Self {
         self.security_headers = on;
+        self
+    }
+
+    /// Install a CORS policy (spec §v2.2). Preflight `OPTIONS` is answered before
+    /// routing; actual cross-origin responses (including 404/405) are decorated
+    /// with the CORS headers. `allow_credentials(true)` with `CorsOrigins::any()`
+    /// is a build error.
+    pub fn cors(mut self, config: crate::cors::CorsConfig) -> Self {
+        self.cors = Some(std::sync::Arc::new(config));
         self
     }
 
@@ -179,6 +190,9 @@ impl App {
     /// Flatten modules, validate the route table, freeze the dispatch trie.
     /// All conflicts surface HERE — before serving (spec §4.1 "fail loud").
     pub fn build(self) -> Result<BuiltApp> {
+        if let Some(c) = &self.cors {
+            c.validate()?;
+        }
         let mut trie = Trie::default();
         let app_env = Arc::new(self.env.clone());
         let app_mw: Arc<[Arc<dyn Middleware>]> = Arc::from(self.middleware.clone());
@@ -493,6 +507,36 @@ mod tests {
             .route("/x", get(|| async { "b" }));
         let err = app.build().unwrap_err();
         assert!(err.message().contains("/x"));
+    }
+
+    #[test]
+    fn wildcard_origin_with_credentials_is_a_build_error() {
+        let err = App::new()
+            .cors(
+                crate::cors::CorsConfig::new(crate::cors::CorsOrigins::any())
+                    .allow_credentials(true),
+            )
+            .build()
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("credential"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn allowlist_origin_with_credentials_builds() {
+        assert!(
+            App::new()
+                .cors(
+                    crate::cors::CorsConfig::new(crate::cors::CorsOrigins::list([
+                        "https://app.example"
+                    ]))
+                    .allow_credentials(true)
+                )
+                .build()
+                .is_ok()
+        );
     }
 
     #[tokio::test]
