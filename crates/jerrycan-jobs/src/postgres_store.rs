@@ -437,15 +437,22 @@ impl JobStore for PostgresStore {
                 // due ids in (run_at, id) order and locks them; concurrent workers
                 // skip already-locked rows, so no job is double-claimed.
                 Backend::Postgres => {
+                    // The outer `UPDATE ... RETURNING` alone yields rows in heap
+                    // order (Postgres makes no ordering promise on RETURNING),
+                    // whereas the sqlite/in-memory stores return (run_at, id)
+                    // order. Wrap the UPDATE in a CTE and `SELECT ... ORDER BY` it
+                    // so every backend returns the SAME deterministic claim order.
                     let sql = format!(
-                        "UPDATE jerrycan_jobs SET status='leased', lease_expires_at=$1, attempts=attempts+1 \
-                         WHERE id IN ( \
-                           SELECT id FROM jerrycan_jobs \
-                           WHERE queue=$2 AND ((status='pending' AND run_at<=$3) OR (status='leased' AND lease_expires_at<$3)) \
-                           ORDER BY run_at, id \
-                           FOR UPDATE SKIP LOCKED \
-                           LIMIT $4 \
-                         ) RETURNING {JOB_COLUMNS}"
+                        "WITH claimed AS ( \
+                           UPDATE jerrycan_jobs SET status='leased', lease_expires_at=$1, attempts=attempts+1 \
+                           WHERE id IN ( \
+                             SELECT id FROM jerrycan_jobs \
+                             WHERE queue=$2 AND ((status='pending' AND run_at<=$3) OR (status='leased' AND lease_expires_at<$3)) \
+                             ORDER BY run_at, id \
+                             FOR UPDATE SKIP LOCKED \
+                             LIMIT $4 \
+                           ) RETURNING {JOB_COLUMNS} \
+                         ) SELECT {JOB_COLUMNS} FROM claimed ORDER BY run_at, id"
                     );
                     let rows = self
                         .db

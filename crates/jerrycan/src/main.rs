@@ -682,14 +682,28 @@ fn cmd_gen_tests(module: &str, json_mode: bool) -> Result<(), Failure> {
         .map_err(Failure::usage)?;
     let mut tests_created = vec![rel.clone()];
     let mut count = count;
+    // The jobs acceptance tests are written ONCE (jobs are top-level, not
+    // per-module), so `jobs_count` is added to the total exactly once.
+    let has_jobs = jobs.is_some();
     if let Some((jobs_rel, jobs_count)) = jobs {
         tests_created.push(jobs_rel);
         count += jobs_count;
     }
+    // When the design declares jobs, their acceptance tests live in package
+    // `jobs` (not `route-{module}`), so point the operator at both.
+    let next_step = if has_jobs {
+        format!(
+            "cargo test -p route-{module} && cargo test -p jobs (expect {count} failures total), implement handlers + job tasks, iterate"
+        )
+    } else {
+        format!(
+            "cargo test -p route-{module} (expect {count} failures), implement handlers, iterate"
+        )
+    };
     let payload = serde_json::json!({
         "tests_created": tests_created,
         "expected_failing": count,
-        "next_step": format!("cargo test -p route-{module} (expect {count} failures), implement handlers, iterate"),
+        "next_step": next_step,
     });
     emit(
         json_mode,

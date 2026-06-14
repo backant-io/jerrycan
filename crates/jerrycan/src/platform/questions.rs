@@ -350,6 +350,19 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 ),
             ));
         }
+        // The queue is interpolated RAW into generated Rust string literals
+        // (`.queue("{q}", ...)` / `.cron(..., "{queue}")` in jobsgen.rs), so a
+        // queue with a `"` (or any non-identifier char) breaks the generated
+        // crate at build time, far from the design. Validate it like every other
+        // identifier interpolated into generated Rust (is_snake job names, etc.).
+        if let Some(ref queue) = job.queue
+            && !is_snake(queue)
+        {
+            qs.push(q(
+                format!("/jobs/{i}/queue"),
+                format!("Job queue `{queue}` must be snake_case (^[a-z][a-z0-9_]*$)."),
+            ));
+        }
         if let Some(ref schedule) = job.schedule {
             let fields: Vec<&str> = schedule.split_whitespace().collect();
             let cron_shaped = fields.len() == 5
@@ -827,6 +840,24 @@ mod tests {
         let mut d2: Design = serde_json::from_str(V1_FULL).unwrap();
         d2.jobs.push(d2.jobs[0].clone());
         assert!(validate(&d2).iter().any(|q| q.id == "/jobs/1/name"));
+    }
+
+    #[test]
+    fn jobs_validate_queue_is_snake_case() {
+        // The queue is interpolated RAW into generated Rust string literals
+        // (`.queue("{q}", ...)`); a `"` in the queue would break the generated
+        // crate at build time, far from the design. Validation must reject a
+        // non-identifier queue up front, mirroring the job-name check.
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        d.jobs[0].queue = Some("not a queue\"".into());
+        assert!(
+            validate(&d).iter().any(|q| q.id == "/jobs/0/queue"),
+            "a non-snake_case job queue must be a validation error"
+        );
+        // A valid snake_case queue passes.
+        let mut ok: Design = serde_json::from_str(V1_FULL).unwrap();
+        ok.jobs[0].queue = Some("billing".into());
+        assert!(!validate(&ok).iter().any(|q| q.id == "/jobs/0/queue"));
     }
 
     #[test]

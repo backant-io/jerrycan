@@ -344,10 +344,10 @@ fn check_range(n: u8, min: u8, max: u8, part: &str) -> Result<(), CronError> {
 /// **First-run / leader policy (see the cron leader, Task 5):** a `None`
 /// `last_fired` — e.g. a freshly inserted row whose `last_fired` is still NULL —
 /// makes this fire the most-recent tick immediately. That is the intended pure
-/// semantics and is deliberately left unchanged. Whether to *seed*
-/// `last_fired = now` on a first NULL row so a deploy does not immediately fire
-/// every cron job is a deploy-policy decision that belongs to the leader, not
-/// this pure function.
+/// semantics and is deliberately left unchanged: on deploy a cron job fires its
+/// single most-recent missed tick (not every missed tick). Seeding
+/// `last_fired = now` on a first NULL row to suppress that deploy-time fire is a
+/// possible future escape hatch — it is NOT implemented; no leader seeds today.
 pub fn due_fire(
     schedule: &CronSchedule,
     last_fired: Option<SystemTime>,

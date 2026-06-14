@@ -259,8 +259,11 @@ are below.
   `last_fired`, and each run advances `last_fired`
   (`crates/jerrycan-jobs/src/cron.rs` `due_fire`). FIRST-RUN policy: a NULL
   `last_fired` (a freshly-deployed cron row) makes `due_fire` return the
-  most-recent tick, so a cron job fires once on deploy — the leader seeds
-  `last_fired` if a deploy-time fire is unwanted (`cron.rs` `due_fire` doc).
+  most-recent tick, so a cron job fires the most-recent missed tick once on
+  deploy. Seeding `last_fired = now` on the first NULL row to suppress that
+  deploy-time fire is a possible future escape hatch — it is NOT implemented
+  today; the actual behavior is the single most-recent-tick fire described above
+  (`cron.rs` `due_fire` doc).
 
 ## 7. Residual risks / out of scope
 

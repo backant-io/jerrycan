@@ -25,10 +25,14 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-/// Worker-loop concurrency per declared queue. A sane default for the stub phase;
-/// agents tune it (or split queues) after profiling. Documented in the generated
-/// registry so the choice is visible where it bites.
-const DEFAULT_CONCURRENCY: u32 = 4;
+/// Worker-loop concurrency per declared queue. Conservative by default re: the
+/// DB pool: each worker loop can hold a `Db` connection for a job's whole
+/// runtime, and `Db`'s pool is small (5 connections), shared with the cron leader
+/// and request handlers — so a high default could starve handlers under a few
+/// long jobs. `2` keeps headroom in the pool; agents raise it (and the pool)
+/// after profiling. Documented in the generated registry so the choice is
+/// visible where it bites.
+const DEFAULT_CONCURRENCY: u32 = 2;
 
 /// The queue a job runs on: its declared `queue`, or `"default"` when absent.
 /// A cron job runs on its named queue just like a queue job.
@@ -101,7 +105,7 @@ pub fn registry_rs(design: &Design) -> String {
                 // in the agent-owned `mod {name}`, not at the crate root).
                 let payload = format!("{name}::{}Payload", pascal(name));
                 format!(
-                    "        .register(\n            \"{name}\",\n            std::sync::Arc::new(|ctx: jerrycan::TaskContext, payload: serde_json::Value| -> jerrycan::jobs::JobFuture<'static, ()> {{\n                Box::pin(async move {{\n                    let p: {payload} = serde_json::from_value(payload)\n                        .map_err(|e| jerrycan::Error::unprocessable(format!(\"bad job payload: {{e}}\")))?;\n                    {name}::{name}(ctx, p).await\n                }})\n            }}),\n        )\n"
+                    "        .register(\n            \"{name}\",\n            std::sync::Arc::new(|ctx: jerrycan::TaskContext, payload: serde_json::Value| -> jerrycan::jobs::JobFuture<'static, ()> {{\n                Box::pin(async move {{\n                    // A no-payload enqueue carries `Value::Null` (NewJob's default);\n                    // `from_value(Null)` into a struct fails, so treat null as the\n                    // default payload (the struct derives Default) rather than\n                    // erroring → retries → dead-letter.\n                    let p: {payload} = if payload.is_null() {{\n                        Default::default()\n                    }} else {{\n                        serde_json::from_value(payload)\n                            .map_err(|e| jerrycan::Error::unprocessable(format!(\"bad job payload: {{e}}\")))?\n                    }};\n                    {name}::{name}(ctx, p).await\n                }})\n            }}),\n        )\n"
                 )
             }
         })
@@ -375,10 +379,19 @@ mod tests {
         d.jobs.push(queue_job());
         let r = registry_rs(&d);
         assert!(
-            r.contains(
-                "let p: send_welcome_email::SendWelcomeEmailPayload = serde_json::from_value(payload)"
-            ),
-            "queue closure deserializes into the module-qualified payload struct: {r}"
+            r.contains("let p: send_welcome_email::SendWelcomeEmailPayload = if payload.is_null()"),
+            "queue closure binds the module-qualified payload struct, handling null: {r}"
+        );
+        assert!(
+            r.contains("serde_json::from_value(payload)"),
+            "queue closure deserializes a non-null payload: {r}"
+        );
+        // A no-payload enqueue carries Value::Null; from_value(Null) into a struct
+        // fails, so the closure must fall back to Default rather than erroring →
+        // retries → dead-letter.
+        assert!(
+            r.contains("if payload.is_null()") && r.contains("Default::default()"),
+            "queue closure treats a null payload as the default (no-payload enqueue): {r}"
         );
         assert!(
             r.contains("send_welcome_email::send_welcome_email(ctx, p).await"),

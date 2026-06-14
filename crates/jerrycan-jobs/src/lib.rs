@@ -1,6 +1,7 @@
 //! Background job engine for jerrycan (spec §v2.3): at-least-once queues with
 //! retries + dead-letter, cron with skip-missed semantics, run_at delayed jobs,
-//! over a Postgres (default) or Redis store. <https://jerrycan.cc>
+//! over a Postgres (default) or in-memory store (a Redis store arrives in
+//! v2.3b). <https://jerrycan.cc>
 #![forbid(unsafe_code)]
 
 pub mod cron;
@@ -167,18 +168,38 @@ impl Jobs {
 
         // Phase 2: enqueue each due job (await, lock NOT held). The idempotency
         // key makes a duplicate enqueue a store no-op, so a double-tick is safe.
+        // Matches the Postgres leader exactly: `run_at = fire` (the job is due at
+        // the tick instant, not `now`), only an `Inserted` counts toward
+        // `enqueued` (a `Duplicate` means the tick already fired), and we record
+        // which jobs to advance — only those whose enqueue SUCCEEDED, so a
+        // transient store error (a fallible store, e.g. v2.3b Redis) leaves
+        // `last_fired` unadvanced and the tick retries on the next poll.
         let mut enqueued = 0;
+        let mut advanced: Vec<&Due> = Vec::with_capacity(due.len());
         for d in &due {
-            let job = NewJob::new(&d.job, &d.queue).idempotency_key(&d.key);
-            if self.store.enqueue(job, now).await.is_ok() {
-                enqueued += 1;
+            let job = NewJob::new(&d.job, &d.queue)
+                .idempotency_key(&d.key)
+                .run_at(d.fire);
+            match self.store.enqueue(job, now).await {
+                Ok(EnqueueOutcome::Inserted(_)) => {
+                    enqueued += 1;
+                    advanced.push(d);
+                }
+                // A Duplicate means this tick already fired (idempotent no-op);
+                // advancing is still correct, but it does NOT count as a new
+                // enqueue (matching the Postgres rows-returned semantics).
+                Ok(EnqueueOutcome::Duplicate(_)) => advanced.push(d),
+                // An Err must NOT advance last_fired: a transient failure retries
+                // next poll.
+                Err(_) => {}
             }
         }
 
-        // Phase 3: re-lock and advance last_fired for everything we evaluated.
-        if !due.is_empty() {
+        // Phase 3: re-lock and advance last_fired only for the jobs whose enqueue
+        // succeeded (Inserted or Duplicate).
+        if !advanced.is_empty() {
             let mut state = self.cron_state.lock().expect("cron state mutex poisoned");
-            for d in &due {
+            for d in &advanced {
                 state.insert(d.job.clone(), d.fire);
             }
         }
@@ -259,7 +280,15 @@ impl Extension for Jobs {
                                     // poll: `ctx.fork()` is a transient `&self`
                                     // borrow, so no `&TaskContext` crosses the
                                     // await and the loop future stays `Send`.
-                                    let _ = worker.tick(&q, clock.now(), ctx.fork()).await;
+                                    // Log a tick failure (e.g. a DB outage in
+                                    // `store.lease`) for operator visibility, but
+                                    // keep looping — a transient blip must not kill
+                                    // the worker.
+                                    if let Err(e) = worker.tick(&q, clock.now(), ctx.fork()).await {
+                                        eprintln!(
+                                            "jerrycan-jobs: worker tick on queue '{q}' failed: {e}"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -286,14 +315,22 @@ impl Extension for Jobs {
                         match tokio::time::timeout(interval, shutdown.changed()).await {
                             Ok(_) => break, // shutdown fired
                             Err(_) => {
+                                // Log a cron tick failure (e.g. a DB outage in the
+                                // advisory-lock leader) for operator visibility, but
+                                // keep polling — a transient blip must not kill the
+                                // cron loop. The in-memory leader is infallible
+                                // (returns a plain count), so only the Postgres
+                                // leader can surface an error here.
                                 if let Some(pg) = &jobs.pg_leader {
                                     // Advisory-lock leader: the lock + enqueue +
                                     // last_fired all live in one transaction.
-                                    let _ = pg.cron_tick(&jobs.crons, clock.now()).await;
+                                    if let Err(e) = pg.cron_tick(&jobs.crons, clock.now()).await {
+                                        eprintln!("jerrycan-jobs: cron tick failed: {e}");
+                                    }
                                 } else {
                                     // The mutex is never held across this await:
                                     // cron_tick_once locks → drops → enqueues → re-locks.
-                                    let _ = jobs.cron_tick_once(clock.now()).await;
+                                    jobs.cron_tick_once(clock.now()).await;
                                 }
                             }
                         }

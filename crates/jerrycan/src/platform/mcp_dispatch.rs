@@ -304,16 +304,31 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                         Ok(jobs) => {
                             let mut tests_created = vec![rel];
                             let mut count = count;
+                            // Jobs are top-level (not per-module): their acceptance
+                            // tests are written ONCE, so `jobs_count` is added to the
+                            // total exactly once.
+                            let has_jobs = jobs.is_some();
                             if let Some((jobs_rel, jobs_count)) = jobs {
                                 tests_created.push(jobs_rel);
                                 count += jobs_count;
                             }
+                            // With jobs, the jobs acceptance tests live in package
+                            // `jobs`; point the operator at them too.
+                            let next_step = if has_jobs {
+                                format!(
+                                    "run the tests to see them fail, implement crates/routes/{module}/src/handlers.rs and crates/jobs/src/*.rs job tasks, iterate until green (jerrycan test --module {module} && cargo test -p jobs)"
+                                )
+                            } else {
+                                format!(
+                                    "run the tests to see them fail, implement crates/routes/{module}/src/handlers.rs, iterate until green (jerrycan test --module {module})"
+                                )
+                            };
                             (
                                 false,
                                 json!({
                                     "tests_created": tests_created,
                                     "expected_failing": count,
-                                    "next_step": format!("run the tests to see them fail, implement crates/routes/{module}/src/handlers.rs, iterate until green (jerrycan test --module {module})"),
+                                    "next_step": next_step,
                                 }),
                             )
                         }
