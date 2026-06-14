@@ -160,6 +160,41 @@ impl CronSchedule {
         never()
     }
 
+    /// The most recent scheduled instant at **or before** `at` (UTC,
+    /// minute-aligned at second 0), or `None` if no tick matches within the
+    /// bounded search window. The mirror image of [`CronSchedule::next_after`]:
+    /// it truncates `at` to its minute and steps minute-by-minute **backward**,
+    /// decomposing each candidate with the same `Civil::from_unix_secs` and
+    /// testing it with the same `CronSchedule::matches`, so the two directions
+    /// share one field-match implementation and cannot diverge. `None` means
+    /// either an impossible schedule (e.g. `0 0 30 2 *` — Feb 30) or that `at`
+    /// precedes the schedule's first-ever tick; the scan stops at minute 0 so it
+    /// never underflows below the epoch. The loop is capped at
+    /// `SEARCH_BOUND_MINUTES`, so it is always bounded.
+    pub fn prev_at_or_before(&self, at: SystemTime) -> Option<SystemTime> {
+        let at_secs = at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Truncate to the minute: an exact fire minute is itself a candidate, so
+        // an at-or-before query on a matching minute returns that minute.
+        let start_minute = at_secs / SECS_PER_MINUTE;
+
+        for step in 0..SEARCH_BOUND_MINUTES {
+            // Stop at the epoch: there is no minute before 0 to scan.
+            let candidate_minute = match start_minute.checked_sub(step) {
+                Some(m) => m,
+                None => break,
+            };
+            let secs = (candidate_minute * SECS_PER_MINUTE) as i64;
+            let civil = Civil::from_unix_secs(secs);
+            if self.matches(&civil) {
+                return Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64));
+            }
+        }
+        None
+    }
+
     /// Whether a civil instant matches every field. Day-of-month vs
     /// day-of-week follows standard cron: when **both** are restricted the day
     /// matches if **either** does (OR); when one is `*` only the other
@@ -294,34 +329,34 @@ fn check_range(n: u8, min: u8, max: u8, part: &str) -> Result<(), CronError> {
     Ok(())
 }
 
-/// The single tick to fire now, with **skip-missed** semantics: after downtime
-/// only the **most recent** due tick fires once (the worker advances
-/// `last_fired` to it), so missed ticks collapse rather than replay. Returns
-/// `None` when nothing is yet due.
+/// The single tick to fire now, with **skip-missed** semantics: the **most
+/// recent** scheduled tick at-or-before `now` that has not already fired (i.e.
+/// is strictly after `last_fired`). A backlog after downtime collapses to one
+/// fire — each later run re-evaluates from the advanced `last_fired`, so no tick
+/// is lost or double-fired. Returns `None` when nothing new is due.
 ///
-/// `last_fired` is the instant the schedule last fired (the store's
-/// bookkeeping); `None` means it has never fired, so the search starts from the
-/// epoch. We walk scheduled ticks strictly after `last_fired` and keep the last
-/// one that is `<= now`: the first tick is due iff `<= now`, and if the worker
-/// was down across several ticks they collapse to that latest one (each later
-/// run re-evaluates from the advanced `last_fired`, so no tick is lost or
-/// double-fired). The walk is bounded by [`CronSchedule::next_after`]'s own cap
-/// and by `now`, so it always terminates.
+/// This computes the answer directly via [`CronSchedule::prev_at_or_before`] (a
+/// bounded backward scan) rather than walking scheduled ticks forward from
+/// `last_fired`. It is therefore O(minutes back to the most recent match) —
+/// independent of how old `last_fired` is, and crucially it does **not** walk
+/// ~30M ticks from the epoch when `last_fired == None`.
+///
+/// **First-run / leader policy (see the cron leader, Task 5):** a `None`
+/// `last_fired` — e.g. a freshly inserted row whose `last_fired` is still NULL —
+/// makes this fire the most-recent tick immediately. That is the intended pure
+/// semantics and is deliberately left unchanged. Whether to *seed*
+/// `last_fired = now` on a first NULL row so a deploy does not immediately fire
+/// every cron job is a deploy-policy decision that belongs to the leader, not
+/// this pure function.
 pub fn due_fire(
     schedule: &CronSchedule,
     last_fired: Option<SystemTime>,
     now: SystemTime,
 ) -> Option<SystemTime> {
-    let mut from = last_fired.unwrap_or(SystemTime::UNIX_EPOCH);
-    let mut due: Option<SystemTime> = None;
-    loop {
-        let next = schedule.next_after(from);
-        if next <= now {
-            due = Some(next);
-            from = next; // collapse missed ticks: advance to the latest due one
-        } else {
-            return due;
-        }
+    let prev = schedule.prev_at_or_before(now)?;
+    match last_fired {
+        Some(lf) if prev <= lf => None, // the most-recent tick already fired
+        _ => Some(prev),                // due: first run, or newer than last_fired
     }
 }
 
@@ -574,6 +609,52 @@ mod tests {
         // Feb 30 never exists; next_after returns the far-future never sentinel.
         let s = CronSchedule::parse("0 0 30 2 *").unwrap();
         assert_eq!(s.next_after(at(0)), never(), "Feb 30 never fires");
+    }
+
+    #[test]
+    fn due_fire_first_run_returns_the_most_recent_tick_without_walking_from_epoch() {
+        // last_fired=None must NOT walk ~30M ticks from 1970; it returns the
+        // most recent tick <= now via the bounded backward scan.
+        let s = CronSchedule::parse("0 * * * *").unwrap();
+        let now = at(1_780_000_000); // a 2026-ish instant with leftover seconds
+        let fire = due_fire(&s, None, now).unwrap();
+        // The fire is at-or-before now and is itself the most-recent real tick.
+        assert!(fire <= now);
+        assert_eq!(s.prev_at_or_before(now), Some(fire));
+        // And it is a genuine schedule tick: the next match strictly after one
+        // second before it lands exactly on it.
+        assert_eq!(s.next_after(fire - Duration::from_secs(1)), fire);
+    }
+
+    #[test]
+    fn prev_at_or_before_is_the_mirror_of_next_after() {
+        let s = CronSchedule::parse("*/15 * * * *").unwrap();
+        // Most recent quarter-hour at/before 12:07 is 12:00.
+        assert_eq!(
+            s.prev_at_or_before(at(12 * 3600 + 7 * 60)),
+            Some(at(12 * 3600))
+        );
+        // At exactly 12:15 the at-or-before is 12:15 itself (inclusive).
+        assert_eq!(
+            s.prev_at_or_before(at(12 * 3600 + 15 * 60)),
+            Some(at(12 * 3600 + 15 * 60))
+        );
+    }
+
+    #[test]
+    fn prev_at_or_before_impossible_schedule_is_none() {
+        // Feb 30 never exists, so no tick is found within the backward bound.
+        let s = CronSchedule::parse("0 0 30 2 *").unwrap();
+        assert_eq!(s.prev_at_or_before(at(2_000_000_000)), None);
+    }
+
+    #[test]
+    fn prev_at_or_before_before_first_tick_is_none() {
+        // A schedule whose first-ever tick is after `at` has no prior tick;
+        // the scan stops at minute 0 without underflowing below the epoch.
+        let s = CronSchedule::parse("0 0 29 2 *").unwrap(); // Feb 29, first is 1972
+        // 1971-06-01 is before the first leap day; nothing at-or-before it.
+        assert_eq!(s.prev_at_or_before(at(517 * 86400)), None);
     }
 
     /// Test-only re-decompose so leap-year assertions can read back the result.
