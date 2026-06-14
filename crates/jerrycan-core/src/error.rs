@@ -73,6 +73,12 @@ impl Error {
             "rate limit exceeded",
         )
     }
+    /// A background job exhausted its retries and was dead-lettered, or failed
+    /// irrecoverably (the jobs engine; spec §v2.3). Surfaced in operator logs and
+    /// the dead-letter table, not to an HTTP client.
+    pub fn job_failed(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "JC0521", message)
+    }
     /// Authentication is required or failed (spec §4.4 auth).
     pub fn unauthorized() -> Self {
         Self::new(
@@ -169,6 +175,8 @@ mod tests {
         assert_eq!(Error::unprocessable("bad field").code(), "JC0422");
         assert_eq!(Error::too_many_requests().code(), "JC0429");
         assert_eq!(Error::too_many_requests().status().as_u16(), 429);
+        assert_eq!(Error::job_failed("boom").code(), "JC0521");
+        assert_eq!(Error::job_failed("boom").status().as_u16(), 500);
         assert_eq!(
             Error::internal("boom").status(),
             StatusCode::INTERNAL_SERVER_ERROR

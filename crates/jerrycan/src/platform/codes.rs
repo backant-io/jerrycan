@@ -118,6 +118,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs database",
     },
     CodeInfo {
+        code: "JC0521",
+        title: "job failed",
+        cause: "a background job returned an error and (after its retries) was moved to the dead-letter table, or failed irrecoverably",
+        fix: "inspect the dead-letter table and the operator logs; fix the job handler and requeue the dead-lettered job",
+        doc: "jerrycan docs jobs",
+    },
+    CodeInfo {
         code: "JC1001",
         title: "missing dependency",
         cause: "a handler asked for a Dep<T> with no registered provider",
