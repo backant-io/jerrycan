@@ -129,6 +129,37 @@ request context, and an identity-aware rate limiter as an extension.
   method + headers, with/without a peer), and `get_from`/`request_from` (drive a
   request from a chosen socket peer for the IP tier).
 
+### Job engine (v2.3)
+Background work off the request path: declared cron schedules and
+programmatically-enqueued queue jobs, generated as typed task stubs.
+- **`jerrycan-jobs`** (the `jobs` feature) — at-least-once queues over a durable
+  Postgres `SELECT … FOR UPDATE SKIP LOCKED` store (always compiled,
+  `Jobs::postgres(db)`) plus an in-memory test store (`Jobs::in_memory()`). The
+  Redis store is deferred to v2.3b. **Jobs run at LEAST once** (a crashed
+  worker's lease expires and the job re-runs), so task handlers MUST be
+  idempotent — exactly-once is impossible across crashes.
+- **Retries → dead-letter** — a failing (or timed-out) task is retried with
+  exponential backoff; after `max_attempts` (default 5) it moves to the
+  dead-letter set, inspectable (`list_dead`) and requeueable (`requeue_dead`),
+  never silently dropped.
+- **Cron** — a `schedule` (5-field cron) fires a job each tick with skip-missed
+  semantics (a downtime backlog fires the most recent tick once, no backfill)
+  under a single leader: on Postgres a `pg_advisory_xact_lock` leader (one node
+  fires each tick, lock + enqueue + last-fired in one transaction);
+  single-process deploys are the trivial leader.
+- **`run_at`** delayed jobs, **idempotency keys** (a duplicate enqueue is a
+  no-op reporting the existing id), and **per-queue worker concurrency** (one
+  worker pool per declared queue).
+- **Generation** — `design.jobs` emits a typed task stub per job
+  (`crates/jobs/src/{name}.rs`: cron `async fn name(ctx)`, queue `(ctx,
+  payload: {Name}Payload)`), a wired `Jobs` extension, and a failing acceptance
+  test (red until the task is implemented).
+- **`JobsHandle`** — app handlers resolve `Dep<JobsHandle>` and
+  `enqueue(NewJob, now)` with the clock explicit, so tests drive time
+  deterministically; **`TaskContext::fork`** gives each job a fresh
+  dependency-resolution cache (DI isolation between jobs).
+- **`JC0521`** job-failed/dead-lettered added.
+
 ### Breaking
 - `Db::pool()` is removed — use `Db::conn()` (a `sea_orm::DatabaseConnection`).
 - Generated apps must regenerate tool-owned files (`model.rs`, `lib.rs`,

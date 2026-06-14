@@ -218,7 +218,51 @@ boundary-violating code. Mitigations are mechanical.
 - **MSRV** is declared (`rust-version = "1.88"`, root `Cargo.toml`) and tested
   in CI.
 
-## 6. Residual risks / out of scope
+## 6. Background jobs
+
+The job engine (`crates/jerrycan-jobs`, the `jobs` feature) runs work off the
+request path. Its safety properties — and the one contract a caller MUST hold —
+are below.
+
+- **At-least-once ⇒ task handlers must be idempotent.** The framework guarantees
+  at-LEAST-once delivery: a worker that crashes mid-job has its lease expire
+  (`lease_expires_at < now`) and the job is re-leased and re-run
+  (`crates/jerrycan-jobs/src/store.rs` `lease`). Exactly-once is impossible
+  across crashes, so a non-idempotent task (charge, send, increment)
+  double-executes on a reclaim. The generated task stub and acceptance test both
+  carry the idempotency reminder (`crates/jerrycan/src/platform/jobsgen.rs`); the
+  worker documents it loudly (`worker.rs`). This is a CALLER obligation the
+  framework cannot enforce — it is named here so it is not forgotten.
+- **The cron leader is single-fire (Postgres-only).** Only one instance fires
+  each cron tick. On Postgres the leader takes
+  `pg_advisory_xact_lock(JOBS_CRON_ADVISORY_KEY)` and does the lock, the enqueue,
+  and the `last_fired` advance in ONE transaction, so two nodes cannot
+  double-fire and the lock auto-releases at COMMIT (drain-safe) —
+  `crates/jerrycan-jobs/src/postgres_store.rs` `cron_tick`. The advisory key is a
+  fixed, reserved jerrycan-cron magic constant —
+  `JOBS_CRON_ADVISORY_KEY = 0x6A_43_43_72_6F_6E_00_01` ("jCCron" + 0001) — so an
+  application's own `pg_advisory_xact_lock` calls MUST avoid that key. Cron
+  leadership is **Postgres-only**: an in-memory/single-process deploy is the
+  trivial leader (one process), and a Redis-only deploy has NO cron leader (out
+  of scope until the v2.3b Redis store).
+- **A poisoned job is bounded — no infinite retry, no runaway.** A task that
+  keeps failing is retried with exponential backoff and, after `max_attempts`
+  (default 5), moved to the dead-letter set (status `Dead`); it is not leased
+  again until an admin `requeue_dead`s it (`worker.rs` `fail`, `store.rs`). The
+  per-job `exec_timeout` (default 5min) bounds a runaway task — a background task
+  gets NO request `handler_timeout`, so this is its only wall-clock budget
+  (`worker.rs` `JobConfig`). A job killed at the 10s shutdown drain cap simply
+  re-runs via lease reclaim, which idempotency covers.
+- **Cron skip-missed — no thundering-herd backfill.** After downtime a cron job
+  fires the MOST RECENT missed tick exactly once, not every missed tick: the pure
+  `due_fire` returns the most-recent tick at-or-before `now` that is newer than
+  `last_fired`, and each run advances `last_fired`
+  (`crates/jerrycan-jobs/src/cron.rs` `due_fire`). FIRST-RUN policy: a NULL
+  `last_fired` (a freshly-deployed cron row) makes `due_fire` return the
+  most-recent tick, so a cron job fires once on deploy — the leader seeds
+  `last_fired` if a deploy-time fire is unwanted (`cron.rs` `due_fire` doc).
+
+## 7. Residual risks / out of scope
 
 Stated honestly; these are not defended today.
 

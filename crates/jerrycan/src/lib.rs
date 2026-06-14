@@ -65,4 +65,6 @@ mod doc_tests {
     doc_page!(page_12_packaging, "../../../docs/ai/12-packaging.md");
     #[cfg(all(feature = "db", feature = "auth"))]
     doc_page!(page_14_tenancy, "../../../docs/ai/14-tenancy.md");
+    #[cfg(feature = "jobs")]
+    doc_page!(page_15_jobs, "../../../docs/ai/15-jobs.md");
 }
