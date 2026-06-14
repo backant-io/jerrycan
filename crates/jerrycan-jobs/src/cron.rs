@@ -360,6 +360,32 @@ pub fn due_fire(
     }
 }
 
+/// Fuzzing hook: parse `input` as a cron expression and, on success, exercise
+/// the two scanning entry points (`next_after` / `prev_at_or_before`) over a
+/// handful of instants — the epoch, a far-future cap, and a 2026-ish instant.
+/// The contract is panic-freedom: a malformed expression must `Err` (never
+/// panic), and a parsed schedule's bounded scans must terminate without
+/// overflow or unwrap-on-None for any instant. Hidden — the fuzz crate is its
+/// only consumer.
+#[doc(hidden)]
+pub fn fuzz_drive(input: &str) {
+    let schedule = match CronSchedule::parse(input) {
+        Ok(s) => s,
+        Err(_) => return, // a rejected expression is the expected outcome
+    };
+    // A spread of instants: the epoch boundary (no-underflow path), a 2026-ish
+    // instant with leftover seconds (the common production path), and a far
+    // future near the `never()` sentinel. Each scan is internally bounded, so
+    // this returns; the assertions here are that nothing panics.
+    for secs in [0u64, 1_780_000_123, u64::from(u32::MAX)] {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let _ = schedule.next_after(t);
+        let _ = schedule.prev_at_or_before(t);
+        let _ = due_fire(&schedule, None, t);
+        let _ = due_fire(&schedule, Some(t), t);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

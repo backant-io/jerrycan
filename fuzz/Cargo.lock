@@ -1018,7 +1018,19 @@ dependencies = [
  "jerrycan",
  "jerrycan-auth",
  "jerrycan-core",
+ "jerrycan-jobs",
  "libfuzzer-sys",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "jerrycan-jobs"
+version = "0.2.0"
+dependencies = [
+ "jerrycan-core",
+ "jerrycan-db",
  "serde",
  "serde_json",
  "tokio",
