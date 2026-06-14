@@ -313,6 +313,21 @@ pub fn validate(d: &Design) -> Vec<Question> {
         }
     }
 
+    // Jobs require a database: the engine's default store is Postgres and the
+    // generated `jobs(db)` wiring + JOBS_MIGRATIONS run over `jerrycan::db::Db`.
+    // A jobs-without-db design can't compile, so reject it here (one error for the
+    // whole jobs list, not per-job). The shallow cron-shape check below stays as
+    // the design-time guard; the engine deep-parses each expression at serve and
+    // fails loud (`Jobs::cron` panics on a bad expression), so a malformed-but-
+    // cron-shaped schedule is caught there rather than adding a jerrycan-jobs dep
+    // to the CLI just for validation.
+    if d.wants_jobs() && !d.wants_db() {
+        qs.push(q(
+            "/jobs".to_string(),
+            "Jobs require a database dependency — add `db` to `dependencies` (background jobs run over a Postgres store).".to_string(),
+        ));
+    }
+
     // Jobs: snake_case unique names; a present schedule must look cron-shaped
     // (full cron parsing arrives with the engine in v2.3).
     let mut seen_job_names = std::collections::HashSet::new();
@@ -812,6 +827,23 @@ mod tests {
         let mut d2: Design = serde_json::from_str(V1_FULL).unwrap();
         d2.jobs.push(d2.jobs[0].clone());
         assert!(validate(&d2).iter().any(|q| q.id == "/jobs/1/name"));
+    }
+
+    #[test]
+    fn jobs_require_a_database_dependency() {
+        // Jobs run over a Postgres store; the generated `jobs(db)` wiring +
+        // JOBS_MIGRATIONS need `jerrycan::db::Db`. A jobs-without-db design can't
+        // compile, so validation rejects it before generation.
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        d.dependencies.retain(|dep| dep != "db");
+        assert!(d.wants_jobs() && !d.wants_db());
+        assert!(
+            validate(&d).iter().any(|q| q.id == "/jobs"),
+            "jobs without a db dependency must be a validation error"
+        );
+        // With db present (the unmodified fixture), no jobs-require-db error.
+        let ok: Design = serde_json::from_str(V1_FULL).unwrap();
+        assert!(!validate(&ok).iter().any(|q| q.id == "/jobs"));
     }
 
     #[test]

@@ -273,6 +273,15 @@ impl Design {
         self.dependencies.iter().any(|d| d == "observe")
     }
 
+    /// Declared background jobs switch on the generated `crates/jobs/` crate (the
+    /// typed task stubs + the dispatch registry) and the `Jobs` extension wiring
+    /// in main.rs. Jobs are top-level (not per-module), so this gates a single
+    /// top-level crate. Jobs require a database (the engine's default store is
+    /// Postgres); validation rejects jobs without a `db` dependency.
+    pub fn wants_jobs(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
     /// The facade features this design's mode requires on the `jerrycan` dep,
     /// in a stable order (scaffold and mounting must agree byte-for-byte).
     pub fn facade_features(&self) -> Vec<&'static str> {
@@ -288,6 +297,9 @@ impl Design {
         }
         if self.wants_observe() {
             features.push("observe");
+        }
+        if self.wants_jobs() {
+            features.push("jobs");
         }
         features
     }
@@ -449,6 +461,23 @@ pub(crate) mod tests {
         );
         let back = serde_json::to_string(&d).unwrap();
         let _re: Design = serde_json::from_str(&back).unwrap();
+    }
+
+    #[test]
+    fn wants_jobs_gates_on_declared_jobs_and_adds_the_facade_feature() {
+        // A design that declares a job switches on the jobs crate + the `jobs`
+        // facade feature; the kolli eval slice (V1_FULL) carries one.
+        let with_jobs: Design = serde_json::from_str(V1_FULL).unwrap();
+        assert!(with_jobs.wants_jobs(), "a declared job must set wants_jobs");
+        assert!(
+            with_jobs.facade_features().contains(&"jobs"),
+            "wants_jobs must surface the `jobs` facade feature so the app enables it: {:?}",
+            with_jobs.facade_features()
+        );
+        // No declared jobs → no jobs crate, no `jobs` feature.
+        let no_jobs: Design = serde_json::from_str(MINIMAL).unwrap();
+        assert!(!no_jobs.wants_jobs());
+        assert!(!no_jobs.facade_features().contains(&"jobs"));
     }
 
     #[test]

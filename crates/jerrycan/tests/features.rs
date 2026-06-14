@@ -39,6 +39,21 @@ fn observe_reexport_is_usable() {
     assert!(m.render().contains("jerrycan_requests_total"));
 }
 
+// The jobs engine reaches generated apps through the facade: the generated
+// `crates/jobs` crate writes `jerrycan::jobs::Jobs::postgres(db)…`,
+// `jerrycan::jobs::JOBS_MIGRATIONS`, and `jerrycan::jobs::JobFuture`. This pins
+// that those paths resolve through the facade alone (the `jobs` feature implies
+// `db`, so `jerrycan::db::Migration` is also in scope here).
+#[cfg(feature = "jobs")]
+#[test]
+fn jobs_reexport_is_usable() {
+    // The migrations constant + the builder are the surface generated registries
+    // depend on. `Jobs::in_memory` builds without a live db; the real generated
+    // wiring uses `Jobs::postgres(db)`, exercised by the genroute_compile gate.
+    let _migrations: &[jerrycan::db::Migration] = jerrycan::jobs::JOBS_MIGRATIONS;
+    let _jobs = jerrycan::jobs::Jobs::in_memory().queue("default", 4);
+}
+
 // The rate-limit extension and CORS config both reach generated apps through
 // the facade: `jerrycan::ratelimit::RateLimit` (the optional sub-crate) and
 // `jerrycan::{CorsConfig, CorsOrigins}` (from core via the glob re-export).

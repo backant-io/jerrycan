@@ -247,6 +247,119 @@ fn generated_auth_module_crate_passes_strict_clippy() {
     }
 }
 
+/// A minimal JOBS-mode design: db + two jobs — one CRON (`expire_trials`, with a
+/// schedule + a named queue) and one QUEUE-only (`send_email`, no schedule → a
+/// `{Name}Payload` struct + the 2-arg stub). This exercises BOTH generated task
+/// shapes plus the registry's cron/queue closure wiring in one crate. Jobs
+/// require a db (validation enforces it), so the design declares `db`.
+const JOBS_MINIMAL: &str = r#"{
+    "name": "jobs-api",
+    "contract_version": 1,
+    "dependencies": ["db"],
+    "jobs": [
+        { "name": "expire_trials", "schedule": "0 * * * *", "queue": "billing" },
+        { "name": "send_email" }
+    ],
+    "modules": [{
+        "name": "things",
+        "endpoints": [
+            { "operation_id": "list_things", "method": "GET", "path": "/",
+              "success": { "status": 200 } }
+        ]
+    }]
+}"#;
+
+/// THE Task 7 compile gate: the generated top-level `crates/jobs/` crate (the
+/// dispatch registry + the wired `Jobs` extension + the typed task stubs) must
+/// compile under strict clippy. Uses the REAL scaffold via the jerrycan binary
+/// (so the jobs crate gets the genuine facade dep with the `jobs` feature, the
+/// workspace member, and the app dep) and asserts the raw generated stubs — never
+/// touched by any agent — pass `-D warnings`. Exercises both job shapes: a cron
+/// 1-arg stub and a queue 2-arg stub + payload struct.
+#[test]
+#[ignore = "invokes cargo on a scaffolded jobs crate; run with --include-ignored"]
+fn generated_jobs_crate_passes_strict_clippy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("jobs-app");
+
+    let design: Design = serde_json::from_str(JOBS_MINIMAL).expect("JOBS_MINIMAL parses");
+    assert!(design.wants_jobs(), "design must declare jobs");
+    assert!(design.wants_db(), "jobs require db");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, JOBS_MINIMAL);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(status.success(), "jerrycan new must scaffold the jobs app");
+
+    // The tool-owned registry wires the cron 1-arg closure and the queue 2-arg
+    // closure (with payload deserialization); the agent task modules carry the
+    // matching stub shapes.
+    let lib = fs::read_to_string(app.join("crates/jobs/src/lib.rs")).expect("read jobs lib.rs");
+    assert!(
+        lib.contains("Box::pin(expire_trials::expire_trials(ctx))"),
+        "cron closure (1-arg) must be wired:\n{lib}"
+    );
+    assert!(
+        lib.contains("send_email::send_email(ctx, p).await"),
+        "queue closure (2-arg, deserialized payload) must be wired:\n{lib}"
+    );
+    let cron = fs::read_to_string(app.join("crates/jobs/src/expire_trials.rs")).expect("cron stub");
+    assert!(
+        cron.contains("pub async fn expire_trials(mut _ctx: TaskContext)"),
+        "cron stub is 1-arg owned ctx:\n{cron}"
+    );
+    let queue = fs::read_to_string(app.join("crates/jobs/src/send_email.rs")).expect("queue stub");
+    assert!(
+        queue.contains("pub struct SendEmailPayload {}")
+            && queue.contains(
+                "pub async fn send_email(mut _ctx: TaskContext, _payload: SendEmailPayload)"
+            ),
+        "queue stub has payload struct + 2-arg fn:\n{queue}"
+    );
+    // The app wires the extension + runs JOBS_MIGRATIONS.
+    let main = fs::read_to_string(app.join("crates/app/src/main.rs")).expect("main.rs");
+    assert!(
+        main.contains(".extend(jobs::jobs(db.clone()))")
+            && main.contains("db.migrate(jerrycan::jobs::JOBS_MIGRATIONS)"),
+        "main.rs must wire the jobs extension + migrations:\n{main}"
+    );
+
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // The gate: strict clippy over the generated jobs crate.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "jobs",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo clippy");
+
+    if !output.status.success() {
+        panic!(
+            "generated jobs crate failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");

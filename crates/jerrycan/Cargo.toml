@@ -23,6 +23,9 @@ db = ["dep:jerrycan-db"]
 validate = ["dep:jerrycan-validate"]
 auth = ["dep:jerrycan-auth"]
 observe = ["dep:jerrycan-observe"]
+# Jobs require a database: the engine's default store is Postgres and the
+# generated `jobs(db)` wiring takes a `jerrycan::db::Db`, so `jobs` implies `db`.
+jobs = ["dep:jerrycan-jobs", "db"]
 rate-limit = ["dep:jerrycan-ratelimit"]
 rate-limit-redis = ["rate-limit", "jerrycan-ratelimit/rate-limit-redis"]
 
@@ -37,6 +40,7 @@ jerrycan-db = { workspace = true, optional = true }
 jerrycan-validate = { workspace = true, optional = true }
 jerrycan-auth = { workspace = true, optional = true }
 jerrycan-observe = { workspace = true, optional = true }
+jerrycan-jobs = { workspace = true, optional = true }
 jerrycan-ratelimit = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 sea-query = { workspace = true, optional = true }

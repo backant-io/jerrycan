@@ -24,6 +24,9 @@ pub use jerrycan_ratelimit as ratelimit;
 #[cfg(feature = "observe")]
 pub use jerrycan_observe as observe;
 
+#[cfg(feature = "jobs")]
+pub use jerrycan_jobs as jobs;
+
 #[cfg(feature = "cli")]
 pub mod platform;
 

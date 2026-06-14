@@ -1195,6 +1195,7 @@ dependencies = [
  "jerrycan-auth",
  "jerrycan-core",
  "jerrycan-db",
+ "jerrycan-jobs",
  "jerrycan-macros",
  "jerrycan-observe",
  "jerrycan-ratelimit",
