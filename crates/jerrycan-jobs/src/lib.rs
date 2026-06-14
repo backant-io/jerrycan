@@ -190,11 +190,15 @@ impl Jobs {
 /// enqueue with the same key, so two leader ticks landing on the same fire
 /// instant enqueue the job exactly once.
 fn cron_idempotency_key(job: &str, fire: SystemTime) -> String {
-    let secs = fire
+    // Keyed on epoch MILLIS to match the Postgres leader's encoding
+    // (postgres_store.rs), so the in-memory and durable leaders mint identical
+    // keys for the same fire instant — no divergence if a deployment ever reuses
+    // a DB across backends.
+    let millis = fire
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("cron:{job}:{secs}")
+    format!("cron:{job}:{millis}")
 }
 
 /// An enqueue handle for app handlers: resolve `Dep<JobsHandle>` and call

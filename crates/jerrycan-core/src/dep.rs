@@ -502,7 +502,10 @@ mod tests {
         let sa = a.resolve::<Singleton>().await.unwrap();
         let sb = b.resolve::<Singleton>().await.unwrap();
         assert!(Arc::ptr_eq(&sa, &sb), "forks share the singleton provider");
-        assert_eq!(sa.0, "app", "the shared singleton carries the provided value");
+        assert_eq!(
+            sa.0, "app",
+            "the shared singleton carries the provided value"
+        );
 
         // ...but each fork has an independent cache: the factory runs once per
         // fork, not once total, so two forks => two builds.
