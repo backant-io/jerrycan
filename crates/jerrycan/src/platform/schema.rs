@@ -240,6 +240,12 @@ async fn query(db: &Db, sql: &str) -> Result<Vec<crate::db::sea_orm::QueryResult
 
 /// Apply the design's migrations to a throwaway in-memory SQLite and introspect
 /// the resulting schema into a deterministic [`SchemaContract`].
+///
+/// `schema.json` stays DESIGN-ONLY: only the design's module migrations are
+/// applied here. The jobs engine's `jerrycan_jobs*` tables come from
+/// `jerrycan_jobs::JOBS_MIGRATIONS` (framework infrastructure run at app
+/// startup, not module migrations), so they never enter the introspected schema
+/// — keep it that way (do not fold JOBS_MIGRATIONS into the collected set).
 pub async fn derive_schema(root: &Path, design: &Design) -> Result<SchemaContract, String> {
     // 1. Collect module migrations in the same module-then-stem order the
     //    generated migrations.rs / `jerrycan db migrate` use.
