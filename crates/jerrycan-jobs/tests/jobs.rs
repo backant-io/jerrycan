@@ -78,6 +78,97 @@ async fn worker_runs_acks_retries_with_backoff_then_dead_letters() {
 }
 
 #[tokio::test]
+async fn a_still_running_job_is_not_reclaimed_before_exec_timeout() {
+    // THE lease invariant (the worker clamps the lease to >= exec_timeout): a job
+    // whose handler is still running well past `lease_duration` but before
+    // `exec_timeout` must NOT become re-leasable, or a concurrent worker loop
+    // would reclaim it and run it a second time (silent duplicated work). The
+    // worker leases with the EFFECTIVE lease `max(lease_duration, exec_timeout)`,
+    // so a 5s `lease_duration` under a 60s `exec_timeout` actually holds the lease
+    // for 60s. We drive `tick` to lease, then probe the store directly at a time
+    // past `lease_duration` (5s) but before `exec_timeout` (60s) and assert the
+    // job is still claimed (not re-leasable).
+    let store: Arc<dyn JobStore> = Arc::new(InMemoryStore::new());
+    // A handler that "runs forever" relative to this test: it parks so the job is
+    // still in-flight when we probe. The probe drives the store directly (no
+    // second worker loop), so we don't actually await this future to completion.
+    let blocking: JobFn = Arc::new(|_ctx, _p| Box::pin(std::future::pending()));
+    let mut dispatch = HashMap::new();
+    dispatch.insert("slow".to_string(), blocking);
+
+    let cfg = JobConfig {
+        backoff_base: Duration::from_secs(1),
+        backoff_cap: Duration::from_secs(60),
+        // lease_duration deliberately SHORTER than exec_timeout: without the
+        // clamp this job would be reclaimable after 5s, mid-run.
+        lease_duration: Duration::from_secs(5),
+        exec_timeout: Duration::from_secs(60),
+        poll_interval: Duration::from_secs(1),
+        batch: 10,
+    };
+    let worker = Worker::new(store.clone(), Arc::new(dispatch), cfg);
+    let t = App::new().into_test();
+    let base = t.task_context();
+
+    store
+        .enqueue(NewJob::new("slow", "default"), t0())
+        .await
+        .unwrap();
+
+    // Lease the job by ticking ONCE under a bounded timeout: the handler parks
+    // forever, so `tick` itself would hang waiting on the 60s exec_timeout. We
+    // only need it to have CLAIMED the job (the lease is written before the
+    // handler runs), so abandon the tick after a beat — the lease persists.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        worker.tick("default", t0(), base.fork()),
+    )
+    .await;
+
+    // Past `lease_duration` (5s) but BEFORE `exec_timeout` (60s): the job is still
+    // running, so its EFFECTIVE 60s lease must still hold — NOT re-leasable.
+    let probe = t0() + Duration::from_secs(6);
+    assert!(
+        store
+            .lease("default", probe, Duration::from_secs(5), 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a still-running job must NOT be reclaimed before exec_timeout: the worker \
+         leases with the effective lease max(lease_duration, exec_timeout) = 60s, \
+         not the 5s lease_duration"
+    );
+
+    // Sanity floor: past the effective lease (60s) a crashed worker's job IS
+    // reclaimable (you can't distinguish a crash from a slow job before then).
+    let after_effective = t0() + Duration::from_secs(61);
+    assert_eq!(
+        store
+            .lease("default", after_effective, Duration::from_secs(5), 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "past the effective lease the job is reclaimable (crash recovery)"
+    );
+}
+
+/// The default config is self-consistent with the lease invariant: its lease
+/// covers a job's whole `exec_timeout`, so even a never-clamped store could not
+/// reclaim a still-running job under the defaults.
+#[test]
+fn default_lease_covers_exec_timeout() {
+    let c = JobConfig::default();
+    assert!(
+        c.lease_duration >= c.exec_timeout,
+        "JobConfig::default lease_duration ({:?}) must be >= exec_timeout ({:?}) \
+         so the effective lease covers a job's max runtime",
+        c.lease_duration,
+        c.exec_timeout
+    );
+}
+
+#[tokio::test]
 async fn worker_acks_a_successful_job() {
     let store: Arc<dyn JobStore> = Arc::new(InMemoryStore::new());
     let ok: JobFn = Arc::new(|_ctx, _p| Box::pin(async { Ok(()) }));
