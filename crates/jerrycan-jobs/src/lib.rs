@@ -5,8 +5,260 @@
 
 pub mod cron;
 pub mod store;
+pub mod worker;
+
 pub use cron::{CronError, CronSchedule, due_fire};
 pub use store::{
     DEFAULT_MAX_ATTEMPTS, EnqueueOutcome, InMemoryStore, Job, JobFuture, JobStatus, JobStore,
     NewJob,
 };
+pub use worker::{JobConfig, JobFn, Worker};
+
+use cron::CronSchedule as Schedule;
+use jerrycan_core::{App, Extension};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+/// The background job extension (spec §v2.3). Install with
+/// `app.extend(Jobs::in_memory().queue("default", 4).register("send_email", f))`.
+///
+/// It provides a [`JobsHandle`] (so app handlers resolve `Dep<JobsHandle>` to
+/// enqueue), spawns `concurrency` per-queue worker `on_serve` loops, and — if
+/// any cron jobs are registered — a single cron-poller `on_serve` loop. The
+/// store defaults to the in-memory reference; swap in Postgres/Redis via
+/// [`Jobs::store`]. The cron poller is an in-memory single-process leader here;
+/// the Postgres advisory-lock leader lands in a later task.
+#[derive(Clone)]
+pub struct Jobs {
+    store: Arc<dyn JobStore>,
+    config: JobConfig,
+    /// job name → typed task fn, built via [`Jobs::register`].
+    dispatch: Arc<HashMap<String, JobFn>>,
+    /// (queue, concurrency): each spawns `concurrency` worker loops.
+    queues: Vec<(String, u32)>,
+    /// (job name, schedule, queue): the leader enqueues each due tick.
+    crons: Vec<(String, Schedule, String)>,
+    /// In-memory last-fired-per-cron (the Postgres leader uses a table later).
+    cron_state: Arc<Mutex<HashMap<String, SystemTime>>>,
+}
+
+impl Jobs {
+    /// A jobs engine over the in-memory reference store with engine defaults and
+    /// an empty dispatch/queue/cron set.
+    pub fn in_memory() -> Self {
+        Self {
+            store: Arc::new(InMemoryStore::new()),
+            config: JobConfig::default(),
+            dispatch: Arc::new(HashMap::new()),
+            queues: Vec::new(),
+            crons: Vec::new(),
+            cron_state: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Use a custom store (e.g. the Postgres or Redis store from a later task).
+    pub fn store(mut self, store: Arc<dyn JobStore>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Replace the engine config wholesale (backoff/lease/exec/poll/batch).
+    pub fn config(mut self, config: JobConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Register a typed task fn under `name`. A later registration for the same
+    /// name wins (last-write).
+    pub fn register(mut self, name: &str, f: JobFn) -> Self {
+        Arc::make_mut(&mut self.dispatch).insert(name.into(), f);
+        self
+    }
+
+    /// Run `concurrency` worker loops on `queue` (floored at 1). The store's
+    /// `lease` serializes claims, so the loops never double-run a job.
+    pub fn queue(mut self, name: &str, concurrency: u32) -> Self {
+        self.queues.push((name.into(), concurrency.max(1)));
+        self
+    }
+
+    /// Register a cron-triggered job: the leader enqueues `job` on `queue` each
+    /// due tick. The cron expression is parsed HERE — a bad expression is a
+    /// build-time configuration error, so this **panics loudly** rather than
+    /// silently dropping a schedule.
+    pub fn cron(mut self, job: &str, expr: &str, queue: &str) -> Self {
+        let schedule = Schedule::parse(expr)
+            .unwrap_or_else(|e| panic!("jerrycan-jobs: invalid cron for job '{job}': {e}"));
+        self.crons.push((job.into(), schedule, queue.into()));
+        self
+    }
+
+    /// An enqueue handle to provide for app handlers.
+    pub fn handle(&self) -> JobsHandle {
+        JobsHandle {
+            store: self.store.clone(),
+        }
+    }
+
+    /// Evaluate every registered cron once against `now` (in-memory leader): for
+    /// each cron whose most-recent tick is newly due, enqueue it on its queue
+    /// (idempotency-keyed per `(job, fire)` so a double-tick can't double-enqueue)
+    /// and advance its `last_fired`. Returns how many jobs were enqueued.
+    ///
+    /// This is the exact logic the cron-poller `on_serve` loop runs each
+    /// interval, lifted to a testable async method. It NEVER holds the
+    /// `cron_state` mutex across an `.await`: it collects the due tuples under
+    /// the lock, drops it, enqueues each, then re-locks to record `last_fired`.
+    pub async fn cron_tick_once(&self, now: SystemTime) -> usize {
+        // Phase 1: under the lock, decide what is due. No await held here.
+        struct Due {
+            job: String,
+            queue: String,
+            fire: SystemTime,
+            key: String,
+        }
+        let due: Vec<Due> = {
+            let state = self.cron_state.lock().expect("cron state mutex poisoned");
+            self.crons
+                .iter()
+                .filter_map(|(job, sched, queue)| {
+                    let last = state.get(job).copied();
+                    cron::due_fire(sched, last, now).map(|fire| Due {
+                        job: job.clone(),
+                        queue: queue.clone(),
+                        fire,
+                        key: cron_idempotency_key(job, fire),
+                    })
+                })
+                .collect()
+        };
+
+        // Phase 2: enqueue each due job (await, lock NOT held). The idempotency
+        // key makes a duplicate enqueue a store no-op, so a double-tick is safe.
+        let mut enqueued = 0;
+        for d in &due {
+            let job = NewJob::new(&d.job, &d.queue).idempotency_key(&d.key);
+            if self.store.enqueue(job, now).await.is_ok() {
+                enqueued += 1;
+            }
+        }
+
+        // Phase 3: re-lock and advance last_fired for everything we evaluated.
+        if !due.is_empty() {
+            let mut state = self.cron_state.lock().expect("cron state mutex poisoned");
+            for d in &due {
+                state.insert(d.job.clone(), d.fire);
+            }
+        }
+        enqueued
+    }
+}
+
+/// The per-`(job, fire)` cron idempotency key. The store no-ops a second
+/// enqueue with the same key, so two leader ticks landing on the same fire
+/// instant enqueue the job exactly once.
+fn cron_idempotency_key(job: &str, fire: SystemTime) -> String {
+    let secs = fire
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("cron:{job}:{secs}")
+}
+
+/// An enqueue handle for app handlers: resolve `Dep<JobsHandle>` and call
+/// [`enqueue`](JobsHandle::enqueue). `now` is the caller's `clock.now()`.
+pub struct JobsHandle {
+    store: Arc<dyn JobStore>,
+}
+
+impl JobsHandle {
+    /// Enqueue a job. A duplicate idempotency key is a no-op reporting the
+    /// existing id (see [`EnqueueOutcome`]).
+    pub async fn enqueue(
+        &self,
+        job: NewJob,
+        now: SystemTime,
+    ) -> jerrycan_core::Result<EnqueueOutcome> {
+        self.store.enqueue(job, now).await
+    }
+}
+
+impl Extension for Jobs {
+    fn register(self, app: App) -> App {
+        // App handlers resolve `Dep<JobsHandle>` to enqueue jobs.
+        let mut app = app.provide(self.handle());
+
+        // Per queue: `concurrency` worker loops. Each loop gets its own
+        // TaskContext from core and forks a fresh one per job; the store's lease
+        // serializes claims so concurrent loops never double-run a job.
+        for (queue, concurrency) in &self.queues {
+            for i in 0..*concurrency {
+                let store = self.store.clone();
+                let dispatch = self.dispatch.clone();
+                let config = self.config.clone();
+                let q = queue.clone();
+                // on_serve wants a &'static str; the queue/index are build-time
+                // config, so leaking one name per loop is bounded and fine.
+                let name: &'static str = Box::leak(format!("jobs-worker-{q}-{i}").into_boxed_str());
+                app = app.on_serve(name, move |mut ctx, mut shutdown| {
+                    let store = store.clone();
+                    let dispatch = dispatch.clone();
+                    let poll = config.poll_interval;
+                    let q = q.clone();
+                    async move {
+                        // Resolve the Clock from the SAME task context (honors
+                        // test overrides); without it, skip the loop.
+                        let clock = match ctx.resolve::<jerrycan_core::Clock>().await {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                        let worker = Worker::new(store, dispatch, config);
+                        loop {
+                            // REAL tokio time for the poll cadence; the injected
+                            // Clock supplies the `now` for due decisions.
+                            match tokio::time::timeout(poll, shutdown.changed()).await {
+                                Ok(_) => break, // shutdown fired
+                                Err(_) => {
+                                    // Pass an owned, forked (Send) context per
+                                    // poll: `ctx.fork()` is a transient `&self`
+                                    // borrow, so no `&TaskContext` crosses the
+                                    // await and the loop future stays `Send`.
+                                    let _ = worker.tick(&q, clock.now(), ctx.fork()).await;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // The cron poller (one loop): each interval, evaluate every cron and
+        // enqueue the newly-due ones. In-memory single-process leader here.
+        if !self.crons.is_empty() {
+            let jobs = self.clone();
+            let interval = self.config.poll_interval;
+            app = app.on_serve("jobs-cron", move |mut ctx, mut shutdown| {
+                let jobs = jobs.clone();
+                async move {
+                    let clock = match ctx.resolve::<jerrycan_core::Clock>().await {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    loop {
+                        match tokio::time::timeout(interval, shutdown.changed()).await {
+                            Ok(_) => break, // shutdown fired
+                            Err(_) => {
+                                // The mutex is never held across this await:
+                                // cron_tick_once locks → drops → enqueues → re-locks.
+                                let _ = jobs.cron_tick_once(clock.now()).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        app
+    }
+}

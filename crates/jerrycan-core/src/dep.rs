@@ -144,6 +144,21 @@ impl TaskContext {
     pub async fn resolve<T: Send + Sync + 'static>(&mut self) -> Result<Arc<T>> {
         self.0.resolve::<T>().await
     }
+
+    /// A sibling task context sharing the app-level providers but with a fresh
+    /// dependency-resolution cache — the job worker forks one per job so cached
+    /// deps never leak between jobs.
+    ///
+    /// The new context reuses the same `Arc<DepEnv>` (singletons + factories)
+    /// and the same `Arc` of overrides, so it resolves identical singletons; it
+    /// gets an empty cache, so request-scope factories run afresh and per-job
+    /// state is isolated.
+    pub fn fork(&self) -> TaskContext {
+        TaskContext::new(DepResolver::new(
+            self.0.deps.env.clone(),
+            self.0.deps.overrides.clone(),
+        ))
+    }
 }
 
 /// A resolved dependency. Derefs to `T`; cloning is `Arc`-cheap.
@@ -447,6 +462,57 @@ mod tests {
         let err = ctx.resolve::<Whoami>().await.err().unwrap();
         assert_eq!(err.code(), "JC1003");
         assert_eq!(err.status().as_u16(), 500);
+    }
+
+    #[test]
+    fn task_context_is_send() {
+        // The job worker holds an owned `TaskContext` across `.await`s and forks
+        // a fresh one per job; an `on_serve` future must be `Send`. An owned
+        // `TaskContext` is `Send` (its body lane is `Send` but `!Sync`) — this
+        // invariant is load-bearing for the jobs engine, so lock it in.
+        fn assert_send<T: Send>() {}
+        assert_send::<TaskContext>();
+    }
+
+    #[tokio::test]
+    async fn fork_shares_singletons_but_resets_the_resolution_cache() {
+        // A side-effect counter on a factory: each forked context must resolve
+        // the factory afresh (independent caches), while a `provide()` singleton
+        // is the same `Arc` across forks (shared app-level providers).
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Clone)]
+        struct Singleton(&'static str);
+        struct Counted;
+        async fn build_counted() -> crate::Result<Counted> {
+            BUILDS.fetch_add(1, Ordering::SeqCst);
+            Ok(Counted)
+        }
+
+        BUILDS.store(0, Ordering::SeqCst);
+        let built = crate::App::new()
+            .provide(Singleton("app"))
+            .provide_dep(build_counted)
+            .build()
+            .unwrap();
+        let base = built.task_context();
+
+        // Two forks resolve the SAME singleton Arc (shared providers)...
+        let mut a = base.fork();
+        let mut b = base.fork();
+        let sa = a.resolve::<Singleton>().await.unwrap();
+        let sb = b.resolve::<Singleton>().await.unwrap();
+        assert!(Arc::ptr_eq(&sa, &sb), "forks share the singleton provider");
+        assert_eq!(sa.0, "app", "the shared singleton carries the provided value");
+
+        // ...but each fork has an independent cache: the factory runs once per
+        // fork, not once total, so two forks => two builds.
+        let _ = a.resolve::<Counted>().await.unwrap();
+        let _ = b.resolve::<Counted>().await.unwrap();
+        assert_eq!(
+            BUILDS.load(Ordering::SeqCst),
+            2,
+            "each fork resolves the factory in its own fresh cache"
+        );
     }
 
     #[tokio::test]
