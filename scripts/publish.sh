@@ -13,7 +13,7 @@
 # Run from the repo root. Rate-limit tolerant (waits between new-crate pushes).
 set -euo pipefail
 
-CRATES=(jerrycan-core jerrycan-macros jerrycan-db jerrycan-auth jerrycan-validate jerrycan-observe jerrycan-ratelimit jerrycan)
+CRATES=(jerrycan-core jerrycan-macros jerrycan-db jerrycan-auth jerrycan-validate jerrycan-observe jerrycan-ratelimit jerrycan-jobs jerrycan)
 
 for c in "${CRATES[@]}"; do
   echo "=== publishing $c ==="
