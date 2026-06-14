@@ -1,6 +1,6 @@
 [package]
 name = "jerrycan-jobs"
-description = "Background job engine for the jerrycan framework: at-least-once queues, retries + dead-letter, cron, run_at, Postgres or Redis store. https://jerrycan.cc"
+description = "Background job engine for the jerrycan framework: at-least-once queues, retries + dead-letter, cron, run_at, over a Postgres store. https://jerrycan.cc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,10 +17,8 @@ jerrycan-db = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time", "sync", "rt"] }
-redis = { workspace = true, optional = true }
-
-[features]
-jobs-redis = ["dep:redis"]
+# A Redis Streams store ships in v2.3b as a fast-follow (its own `jobs-redis`
+# feature + optional `redis` dep land then); v2.3 ships the Postgres default.
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }

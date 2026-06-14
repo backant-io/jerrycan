@@ -1260,7 +1260,6 @@ version = "0.2.0"
 dependencies = [
  "jerrycan-core",
  "jerrycan-db",
- "redis",
  "serde",
  "serde_json",
  "tokio",
