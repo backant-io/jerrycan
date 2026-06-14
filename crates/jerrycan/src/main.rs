@@ -675,8 +675,19 @@ fn cmd_gen_tests(module: &str, json_mode: bool) -> Result<(), Failure> {
     let design = load_design(&root.join("design.json"))?;
     let (rel, count) = jerrycan::platform::testgen::write_acceptance(&root, &design, module)
         .map_err(Failure::usage)?;
+    // The declared jobs get their own tool-owned acceptance tests (direct
+    // task-fn calls), which fail on the stubs exactly like the HTTP ones — so
+    // they count toward `expected_failing` too.
+    let jobs = jerrycan::platform::jobsgen::write_jobs_acceptance(&root, &design)
+        .map_err(Failure::usage)?;
+    let mut tests_created = vec![rel.clone()];
+    let mut count = count;
+    if let Some((jobs_rel, jobs_count)) = jobs {
+        tests_created.push(jobs_rel);
+        count += jobs_count;
+    }
     let payload = serde_json::json!({
-        "tests_created": [rel],
+        "tests_created": tests_created,
         "expected_failing": count,
         "next_step": format!("cargo test -p route-{module} (expect {count} failures), implement handlers, iterate"),
     });

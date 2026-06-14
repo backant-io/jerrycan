@@ -54,10 +54,11 @@ fn pascal(snake: &str) -> String {
 /// The tool-owned `crates/jobs/Cargo.toml`. Depends on the facade `jerrycan`
 /// (workspace dep, carrying the app's `jobs` feature) for the `Jobs` builder +
 /// `JOBS_MIGRATIONS`, plus `serde_json` (queue closures deserialize payloads).
-/// No `shared` dep — jobs don't touch the cross-module DTO crate. Regenerated
-/// each run (mirrors ROUTE_CARGO's ownership).
+/// No `shared` dep — jobs don't touch the cross-module DTO crate. `tokio` is a
+/// dev-dependency so the tool-owned `tests/acceptance.rs` can use `#[tokio::test]`
+/// (mirrors ROUTE_CARGO's dev-deps). Regenerated each run.
 pub fn cargo_toml() -> String {
-    "[package]\nname = \"jobs\"\nversion.workspace = true\nedition.workspace = true\npublish = false\n\n[dependencies]\njerrycan.workspace = true\nserde.workspace = true\nserde_json.workspace = true\n".to_string()
+    "[package]\nname = \"jobs\"\nversion.workspace = true\nedition.workspace = true\npublish = false\n\n[dependencies]\njerrycan.workspace = true\nserde.workspace = true\nserde_json.workspace = true\n\n[dev-dependencies]\ntokio.workspace = true\n".to_string()
 }
 
 /// The tool-owned registry + wiring `src/lib.rs`. Declares one agent-owned task
@@ -65,11 +66,14 @@ pub fn cargo_toml() -> String {
 /// `.queue(...)` per distinct queue (sorted), `.register(...)` per job (array
 /// order), `.cron(...)` per cron job (array order). Byte-identical across runs.
 pub fn registry_rs(design: &Design) -> String {
-    // Agent-owned task module declarations, in array order.
+    // Agent-owned task module declarations, in array order. `pub` so the
+    // tool-owned `tests/acceptance.rs` integration test can reach each task fn
+    // as `jobs::{name}::{name}` (an integration test sees only the crate's
+    // public surface).
     let mods: String = design
         .jobs
         .iter()
-        .map(|j| format!("mod {};\n", j.name))
+        .map(|j| format!("pub mod {};\n", j.name))
         .collect();
 
     // Distinct queues, sorted deterministically — each gets one worker pool.
@@ -164,13 +168,78 @@ pub fn task_rs(job: &JobDesign) -> String {
              use jerrycan::TaskContext;\n\
              use serde::{{Deserialize, Serialize}};\n\n\
              /// The typed payload `{name}` is enqueued with. Add the fields the job needs.\n\
-             #[derive(Debug, Clone, Serialize, Deserialize)]\n\
+             /// `Default` lets the tool-owned acceptance test call the task with an\n\
+             /// empty payload (`{payload}::default()`); keep it derivable as fields grow.\n\
+             #[derive(Debug, Clone, Default, Serialize, Deserialize)]\n\
              pub struct {payload} {{}}\n\n\
              /// The `{name}` queue task, run with its deserialized payload.\n\
              pub async fn {name}(mut _ctx: TaskContext, _payload: {payload}) -> jerrycan::Result<()> {{\n\
              {idempotency}{unimpl}}}\n"
         )
     }
+}
+
+/// The tool-owned `crates/jobs/tests/acceptance.rs` — the TDD-red contract for
+/// the declared jobs, mirroring `crates/routes/<m>/tests/acceptance.rs`. One
+/// `#[tokio::test]` per job that calls the task fn DIRECTLY with a `TaskContext`
+/// and asserts it succeeds.
+///
+/// Why direct task-fn calls (not the HTTP flow): a job runs in an `on_serve`
+/// loop, and `App::into_test` DROPS the `on_serve` registrations — so a job can
+/// never be reached through `TestApp`'s request path. The test instead builds a
+/// `TestApp` purely for its app-level deps (the `Db` every job resolves), takes a
+/// `TaskContext` via `t.task_context()`, and invokes the task fn itself:
+/// - cron job: `jobs::{name}::{name}(t.task_context())`
+/// - queue job: `jobs::{name}::{name}(t.task_context(), Default::default())`
+///   (the `{Name}Payload` derives `Default`).
+///
+/// The stub returns `Err(...)` ⇒ RED; an implemented job returns `Ok(())` ⇒
+/// GREEN. Jobs are emitted in `design.jobs` array order; byte-identical runs.
+pub fn acceptance_rs(design: &Design) -> String {
+    let body: String = design
+        .jobs
+        .iter()
+        .map(|job| {
+            let name = &job.name;
+            // at-least-once reminder mirrors the stub: an implemented job must be
+            // idempotent because the engine may run it more than once.
+            let call = if job.schedule.is_some() {
+                format!("jobs::{name}::{name}(t.task_context()).await")
+            } else {
+                format!("jobs::{name}::{name}(t.task_context(), Default::default()).await")
+            };
+            format!(
+                "/// Job `{name}` must succeed once implemented (jobs are at-least-once —\n\
+                 /// the implementation must be idempotent). RED on the stub (it returns Err).\n\
+                 #[tokio::test]\n\
+                 async fn {name}_succeeds() {{\n\
+                 \x20   let t = app().await;\n\
+                 \x20   let res = {call};\n\
+                 \x20   assert!(res.is_ok(), \"design: job {name} must succeed; got {{res:?}}\");\n\
+                 }}\n\n"
+            )
+        })
+        .collect();
+    // The jobs `app()` preamble: every job resolves the app-level `Db` (jobs
+    // require `db`), so the test app connects an in-memory db, applies the
+    // framework `JOBS_MIGRATIONS` (so the `jerrycan_jobs*` tables an implemented
+    // job may touch exist), and extends the db. `into_test` would drop any
+    // `on_serve` loops, but we call the task fns directly so that's irrelevant.
+    let _ = design; // jobs preamble is design-independent (jobs always need db)
+    format!(
+        "//! GENERATED by jerrycan gen-tests — TOOL-OWNED acceptance criteria for the\n\
+         //! declared jobs. One test per job, calling the task fn directly with a\n\
+         //! TaskContext (a job's on_serve loop is dropped by into_test, so the HTTP\n\
+         //! flow can't reach it). Regenerated on demand; add your own tests in sibling\n\
+         //! files, not here. Green = the design's jobs are implemented.\n\
+         use jerrycan::prelude::*;\n\n\
+         async fn app() -> TestApp {{\n\
+         \x20   let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n\
+         \x20   db.migrate(jerrycan::jobs::JOBS_MIGRATIONS).await.expect(\"jobs migrations\");\n\
+         \x20   App::new().extend(db).into_test()\n\
+         }}\n\n\
+         {body}"
+    )
 }
 
 /// Write (or refresh) the top-level `crates/jobs/` crate under `target` (the app
@@ -193,6 +262,10 @@ pub fn write_jobs(target: &Path, design: &Design) -> Result<Vec<String>, String>
     };
     write_tool("Cargo.toml", &cargo_toml())?;
     write_tool("src/lib.rs", &registry_rs(design))?;
+    // The tool-owned acceptance tests (the TDD-red contract). Rewritten each run
+    // like the registry; the gen-tests path rewrites the SAME file and reports
+    // its count toward `expected_failing`.
+    write_tool("tests/acceptance.rs", &acceptance_rs(design))?;
 
     // Agent-owned task modules: never clobber an existing one.
     for job in &design.jobs {
@@ -205,6 +278,27 @@ pub fn write_jobs(target: &Path, design: &Design) -> Result<Vec<String>, String>
         created.push(format!("crates/jobs/{rel}"));
     }
     Ok(created)
+}
+
+/// Write the tool-owned `crates/jobs/tests/acceptance.rs` and return its
+/// `(rel_path, expected_failing)` — the count of generated job tests that fail on
+/// the stubs. The `gen-tests` command threads this into the same
+/// `expected_failing` total as the HTTP acceptance tests (testgen::write_acceptance).
+/// Returns `None` when the design declares no jobs (nothing to write or count).
+pub fn write_jobs_acceptance(
+    root: &Path,
+    design: &Design,
+) -> Result<Option<(String, usize)>, String> {
+    if !design.wants_jobs() {
+        return Ok(None);
+    }
+    let content = acceptance_rs(design);
+    let rel = "crates/jobs/tests/acceptance.rs".to_string();
+    let path = root.join(&rel);
+    fs::create_dir_all(path.parent().expect("parent")).map_err(|e| e.to_string())?;
+    fs::write(&path, &content).map_err(|e| e.to_string())?;
+    let count = content.matches("#[tokio::test]").count();
+    Ok(Some((rel, count)))
 }
 
 #[cfg(test)]
@@ -267,8 +361,9 @@ mod tests {
             a.find("\"expire_trials\"").unwrap() < a.find("\"overdue_callbacks\"").unwrap(),
             "register order follows design.jobs: {a}"
         );
-        // Task modules declared for each job.
-        assert!(a.contains("mod expire_trials;") && a.contains("mod overdue_callbacks;"));
+        // Task modules declared `pub` for each job (so the acceptance integration
+        // test can reach `jobs::{name}::{name}` through the crate's public surface).
+        assert!(a.contains("pub mod expire_trials;") && a.contains("pub mod overdue_callbacks;"));
     }
 
     /// A queue-only job (no schedule) registers the 2-arg closure that
@@ -331,6 +426,12 @@ mod tests {
             stub.contains("pub struct SendWelcomeEmailPayload {}"),
             "payload struct: {stub}"
         );
+        // The payload derives `Default` so the tool-owned acceptance test can call
+        // the task with `Default::default()`.
+        assert!(
+            stub.contains("#[derive(Debug, Clone, Default, Serialize, Deserialize)]"),
+            "payload derives Default for the acceptance test: {stub}"
+        );
         assert!(
             stub.contains(
                 "pub async fn send_welcome_email(mut _ctx: TaskContext, _payload: SendWelcomeEmailPayload) -> jerrycan::Result<()>"
@@ -340,6 +441,142 @@ mod tests {
         assert!(
             stub.contains("jobs are at-least-once — make this idempotent"),
             "{stub}"
+        );
+    }
+
+    /// The tool-owned `tests/acceptance.rs` for kolli's two CRON jobs: one
+    /// `#[tokio::test]` per job, each calling the task fn DIRECTLY (1-arg cron
+    /// shape) and asserting the result `is_ok()`. This is the TDD-red contract
+    /// the `gen-tests` `expected_failing` count comes from.
+    #[test]
+    fn acceptance_emits_one_is_ok_test_per_cron_job() {
+        let d = kolli();
+        let a = acceptance_rs(&d);
+        // Exactly two tests — one per declared job.
+        assert_eq!(
+            a.matches("#[tokio::test]").count(),
+            2,
+            "one #[tokio::test] per job: {a}"
+        );
+        // Each is a direct 1-arg cron call asserting is_ok (RED on the Err stub).
+        assert!(
+            a.contains("async fn expire_trials_succeeds()")
+                && a.contains("jobs::expire_trials::expire_trials(t.task_context()).await"),
+            "cron job calls the 1-arg task fn directly: {a}"
+        );
+        assert!(
+            a.contains("async fn overdue_callbacks_succeeds()")
+                && a.contains("jobs::overdue_callbacks::overdue_callbacks(t.task_context()).await"),
+            "second cron job: {a}"
+        );
+        assert!(
+            a.matches("assert!(res.is_ok()").count() == 2,
+            "every job test asserts the result is_ok: {a}"
+        );
+        // No 2-arg payload call for cron jobs.
+        assert!(
+            !a.contains("Default::default()"),
+            "cron jobs take no payload: {a}"
+        );
+        // The at-least-once idempotency note rides along in the generated tests.
+        assert!(
+            a.contains("jobs are at-least-once"),
+            "idempotency note present in the generated tests: {a}"
+        );
+        // Tests are emitted in design.jobs array order.
+        assert!(
+            a.find("expire_trials_succeeds").unwrap()
+                < a.find("overdue_callbacks_succeeds").unwrap(),
+            "test order follows design.jobs: {a}"
+        );
+    }
+
+    /// Acceptance generation is byte-identical across two calls — determinism is
+    /// the contract (the gen-tests count and the file content must be stable).
+    #[test]
+    fn acceptance_is_deterministic() {
+        let d = kolli();
+        assert_eq!(
+            acceptance_rs(&d),
+            acceptance_rs(&d),
+            "acceptance generation must be byte-identical across runs"
+        );
+    }
+
+    /// A QUEUE-only job (no schedule) gets the 2-arg acceptance call with
+    /// `Default::default()` as the payload — which compiles because the generated
+    /// `{Name}Payload` derives `Default` (see queue_task_stub test).
+    #[test]
+    fn acceptance_emits_two_arg_default_payload_call_for_queue_job() {
+        let mut d = kolli();
+        d.jobs.push(queue_job());
+        let a = acceptance_rs(&d);
+        assert!(
+            a.contains(
+                "jobs::send_welcome_email::send_welcome_email(t.task_context(), Default::default()).await"
+            ),
+            "queue job calls the 2-arg task fn with a default payload: {a}"
+        );
+        assert!(
+            a.contains("async fn send_welcome_email_succeeds()"),
+            "queue job test fn: {a}"
+        );
+    }
+
+    /// `write_jobs` also writes the tool-owned `tests/acceptance.rs` (so the
+    /// generated jobs crate's acceptance tests are on disk and compile under the
+    /// `--all-targets` clippy/compile gate).
+    #[test]
+    fn write_jobs_writes_the_acceptance_tests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let created = write_jobs(tmp.path(), &kolli()).unwrap();
+        assert!(
+            created.contains(&"crates/jobs/tests/acceptance.rs".to_string()),
+            "write_jobs reports the acceptance file: {created:?}"
+        );
+        let acc = tmp.path().join("crates/jobs/tests/acceptance.rs");
+        assert!(acc.exists(), "tests/acceptance.rs written to disk");
+        assert!(
+            fs::read_to_string(&acc).unwrap().contains("#[tokio::test]"),
+            "the written acceptance file carries the job tests"
+        );
+    }
+
+    /// `write_jobs_acceptance` writes the file and returns its `(rel, count)` —
+    /// the count of `#[tokio::test]` fns that the gen-tests command adds to
+    /// `expected_failing`. For kolli that is its two cron jobs.
+    #[test]
+    fn write_jobs_acceptance_returns_path_and_failing_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rel, count) = write_jobs_acceptance(tmp.path(), &kolli())
+            .unwrap()
+            .unwrap();
+        assert_eq!(rel, "crates/jobs/tests/acceptance.rs");
+        assert_eq!(
+            count, 2,
+            "kolli's two jobs each contribute one failing test"
+        );
+        assert!(
+            tmp.path().join(&rel).exists(),
+            "the acceptance file is written to disk"
+        );
+    }
+
+    /// A design with no jobs writes nothing and contributes nothing to the count
+    /// (`None`) — gen-tests must not add a phantom jobs total.
+    #[test]
+    fn write_jobs_acceptance_is_none_without_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut d = kolli();
+        d.jobs.clear();
+        assert!(!d.wants_jobs());
+        assert!(
+            write_jobs_acceptance(tmp.path(), &d).unwrap().is_none(),
+            "no jobs ⇒ no acceptance file, no count"
+        );
+        assert!(
+            !tmp.path().join("crates/jobs/tests/acceptance.rs").exists(),
+            "nothing written when there are no jobs"
         );
     }
 

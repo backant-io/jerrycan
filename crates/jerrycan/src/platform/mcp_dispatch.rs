@@ -296,14 +296,30 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                 return err_payload("`module` is required");
             };
             match super::testgen::write_acceptance(&root, &design, module) {
-                Ok((rel, count)) => (
-                    false,
-                    json!({
-                        "tests_created": [rel],
-                        "expected_failing": count,
-                        "next_step": format!("run the tests to see them fail, implement crates/routes/{module}/src/handlers.rs, iterate until green (jerrycan test --module {module})"),
-                    }),
-                ),
+                Ok((rel, count)) => {
+                    // The declared jobs get their own tool-owned acceptance tests
+                    // (direct task-fn calls); like the HTTP ones they fail on the
+                    // stubs, so they count toward `expected_failing` too.
+                    match super::jobsgen::write_jobs_acceptance(&root, &design) {
+                        Ok(jobs) => {
+                            let mut tests_created = vec![rel];
+                            let mut count = count;
+                            if let Some((jobs_rel, jobs_count)) = jobs {
+                                tests_created.push(jobs_rel);
+                                count += jobs_count;
+                            }
+                            (
+                                false,
+                                json!({
+                                    "tests_created": tests_created,
+                                    "expected_failing": count,
+                                    "next_step": format!("run the tests to see them fail, implement crates/routes/{module}/src/handlers.rs, iterate until green (jerrycan test --module {module})"),
+                                }),
+                            )
+                        }
+                        Err(e) => err_payload(e),
+                    }
+                }
                 Err(e) => err_payload(e),
             }
         }
