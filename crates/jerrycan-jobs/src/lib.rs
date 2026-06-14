@@ -3,7 +3,9 @@
 //! over a Postgres (default) or Redis store. <https://jerrycan.cc>
 #![forbid(unsafe_code)]
 
+pub mod cron;
 pub mod store;
+pub use cron::{CronError, CronSchedule, due_fire};
 pub use store::{
     DEFAULT_MAX_ATTEMPTS, EnqueueOutcome, InMemoryStore, Job, JobFuture, JobStatus, JobStore,
     NewJob,
