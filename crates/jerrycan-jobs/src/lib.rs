@@ -4,10 +4,12 @@
 #![forbid(unsafe_code)]
 
 pub mod cron;
+pub mod postgres_store;
 pub mod store;
 pub mod worker;
 
 pub use cron::{CronError, CronSchedule, due_fire};
+pub use postgres_store::{JOBS_CRON_ADVISORY_KEY, JOBS_MIGRATIONS, PostgresStore};
 pub use store::{
     DEFAULT_MAX_ATTEMPTS, EnqueueOutcome, InMemoryStore, Job, JobFuture, JobStatus, JobStore,
     NewJob,
@@ -16,6 +18,7 @@ pub use worker::{JobConfig, JobFn, Worker};
 
 use cron::CronSchedule as Schedule;
 use jerrycan_core::{App, Extension};
+use jerrycan_db::Db;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -39,8 +42,12 @@ pub struct Jobs {
     queues: Vec<(String, u32)>,
     /// (job name, schedule, queue): the leader enqueues each due tick.
     crons: Vec<(String, Schedule, String)>,
-    /// In-memory last-fired-per-cron (the Postgres leader uses a table later).
+    /// In-memory last-fired-per-cron (used by the in-memory leader only).
     cron_state: Arc<Mutex<HashMap<String, SystemTime>>>,
+    /// When set, the engine is Postgres-backed: the cron poller uses the
+    /// advisory-lock leader ([`PostgresStore::cron_tick`]) over the
+    /// `jerrycan_jobs_cron` table instead of the in-memory single-process poller.
+    pg_leader: Option<PostgresStore>,
 }
 
 impl Jobs {
@@ -54,12 +61,36 @@ impl Jobs {
             queues: Vec::new(),
             crons: Vec::new(),
             cron_state: Arc::new(Mutex::new(HashMap::new())),
+            pg_leader: None,
         }
     }
 
-    /// Use a custom store (e.g. the Postgres or Redis store from a later task).
+    /// A jobs engine over the durable [`PostgresStore`] (the production default).
+    /// The store is shared as both the `JobStore` (workers + enqueue) and — when
+    /// the `Db` is Postgres-backed — the cron leader, so the cron poller uses the
+    /// `pg_advisory_xact_lock` leader instead of the in-memory single-process one.
+    ///
+    /// Call [`PostgresStore::migrate`] (or apply [`JOBS_MIGRATIONS`]) once before
+    /// serving so the `jerrycan_jobs*` tables exist.
+    pub fn postgres(db: Db) -> Self {
+        let pg = PostgresStore::new(db);
+        Self {
+            store: Arc::new(pg.clone()),
+            config: JobConfig::default(),
+            dispatch: Arc::new(HashMap::new()),
+            queues: Vec::new(),
+            crons: Vec::new(),
+            cron_state: Arc::new(Mutex::new(HashMap::new())),
+            pg_leader: Some(pg),
+        }
+    }
+
+    /// Use a custom store (e.g. the Redis store from a later task). This also
+    /// clears any Postgres cron leader: a custom store falls back to the
+    /// in-memory single-process cron poller.
     pub fn store(mut self, store: Arc<dyn JobStore>) -> Self {
         self.store = store;
+        self.pg_leader = None;
         self
     }
 
@@ -234,7 +265,9 @@ impl Extension for Jobs {
         }
 
         // The cron poller (one loop): each interval, evaluate every cron and
-        // enqueue the newly-due ones. In-memory single-process leader here.
+        // enqueue the newly-due ones. Postgres-backed engines use the
+        // advisory-lock leader (one node polls at a time, enqueue + last_fired
+        // atomic); every other backend uses the in-memory single-process leader.
         if !self.crons.is_empty() {
             let jobs = self.clone();
             let interval = self.config.poll_interval;
@@ -249,9 +282,15 @@ impl Extension for Jobs {
                         match tokio::time::timeout(interval, shutdown.changed()).await {
                             Ok(_) => break, // shutdown fired
                             Err(_) => {
-                                // The mutex is never held across this await:
-                                // cron_tick_once locks → drops → enqueues → re-locks.
-                                let _ = jobs.cron_tick_once(clock.now()).await;
+                                if let Some(pg) = &jobs.pg_leader {
+                                    // Advisory-lock leader: the lock + enqueue +
+                                    // last_fired all live in one transaction.
+                                    let _ = pg.cron_tick(&jobs.crons, clock.now()).await;
+                                } else {
+                                    // The mutex is never held across this await:
+                                    // cron_tick_once locks → drops → enqueues → re-locks.
+                                    let _ = jobs.cron_tick_once(clock.now()).await;
+                                }
                             }
                         }
                     }
