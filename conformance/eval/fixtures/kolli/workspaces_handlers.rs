@@ -8,14 +8,12 @@ use jerrycan::db::{Db, db_error};
 use jerrycan::prelude::*;
 use shared::CurrentUser;
 
-/// Coerce the requested plan onto the design's enum (`trial`|`pro`); anything
-/// else defaults to `trial` so a free-text value can't violate the DB CHECK.
-fn normalize_plan(requested: &str) -> String {
-    match requested {
-        "pro" => "pro".to_string(),
-        _ => "trial".to_string(),
-    }
-}
+/// A new workspace ALWAYS starts on the free tier — the requested `plan` is
+/// deliberately ignored. Letting a caller create a workspace directly as `pro`
+/// would be a billing bypass (self-upgrade without paying); upgrades to `pro`
+/// are billing-driven (the Stripe webhook), and `expire_trials` walks them back.
+/// `trial` is also a valid value for the DB CHECK constraint (`trial`|`pro`).
+const NEW_WORKSPACE_PLAN: &str = "trial";
 
 /// GET / — list all workspaces (public discovery, per the design).
 pub(crate) async fn list_workspaces(repo: Dep<WorkspaceRepo>) -> Result<Json<Vec<Workspace>>> {
@@ -30,7 +28,8 @@ pub(crate) async fn create_workspace(
     user: CurrentUser,
     Json(body): Json<Workspace>,
 ) -> Result<Created<Workspace>> {
-    let plan = normalize_plan(&body.plan);
+    // Ignore any client-supplied `plan`: new workspaces can't self-grant `pro`.
+    let plan = NEW_WORKSPACE_PLAN.to_string();
     let id = repo
         .insert(Workspace {
             id: body.id,
