@@ -48,12 +48,17 @@ assert_eq!(t.get_with("/me", &[("cookie", &cookie_pair)]).await.json::<i64>(), 4
 ```
 
 ## Variations
-- Passwords: `jerrycan::auth::hash_password(pw)` → PHC string for storage;
-  `verify_password(pw, &stored)` → bool. Always argon2id, random salt.
+- Passwords: `jerrycan::auth::hash_password(pw)` → `Result<String>` (a PHC
+  string for storage); `verify_password(pw, &stored)` → `Result<bool>`
+  (`Ok(true)` on match, `Ok(false)` on mismatch — propagate with `?`, then
+  branch on the bool). Always argon2id, random salt.
 - JWT: `Bearer<Claims>` extracts+verifies `Authorization: Bearer <token>`; mint
   with `jerrycan::auth::jwt::encode(&claims, auth.jwt_key())`. Include `exp`.
-- Secret: `Auth::from_env()` reads `JERRYCAN_SECRET` (>= 32 bytes). In
-  production (`JERRYCAN_ENV=prod`) a missing/short secret is a startup error.
+- Secret: `Auth::from_env()` reads `JERRYCAN_SECRET` (>= 32 bytes). The insecure
+  built-in dev key is used ONLY when `JERRYCAN_ENV` is unset/empty or a dev
+  marker (`dev`/`development`/`test`/`local`); any other value (incl. any
+  production spelling) requires a real secret — a missing/short one is a startup
+  error (fail closed).
 
 ## Verifying webhook signatures
 A webhook is an unauthenticated POST from a third party; the only proof it's

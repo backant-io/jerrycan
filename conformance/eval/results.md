@@ -111,13 +111,48 @@ infrastructure this cycle:
 A concurrency gap in `Db::migrate` was found via real Postgres and fixed — it now
 runs in a single transaction under a `pg_advisory_xact_lock`.
 
-## Docs-only LLM rebuild (periodic manual eval)
+## Docs-only LLM rebuild of the Kolli slice — the north star (2026-06-15)
 
-The deterministic battery above is the automated gate; a fresh **docs-only LLM
-rebuild** of the Kolli slice (CLI + `jerrycan docs`/`explain`/`schema` only — no
-framework source, no reference handlers) is the periodic manual eval per the
-PROTOCOL. The docs-only history stands at **5/5 (100%)** on the five reference
+The spec's defining acceptance test (design spec §north-star / §v2.5): **an agent
+rebuilds the Kolli slice docs-only via the CLI/MCP** — no framework source, no
+reference-handler fixtures, no plans. RESULT: **GREEN.** `jerrycan check` reached
+full green (`{"ok":true,"diagnostics":[]}`), all **37/37 generated acceptance
+tests pass** (35 endpoint + 2 job) across all 6 route modules + both cron jobs,
+and live HTTP round-trips were verified against the real serving binary
+(register/login + argon2 + JWT-session cookie, live cross-tenant isolation
+[client `workspace_id` not trusted], owner-gated delete, raw-body Stripe webhook
+200/400, scoped API keys, Google OAuth connect→302 to the real
+`accounts.google.com` URL). The agent ran a **negative control** (swapping a
+scoped `all_for` for the unscoped `all`) and `jerrycan check` went RED — so the
+green is real, not hollow. Notably it independently arrived at the same
+server-assigns-enum / never-trust-client-role security patterns the reference
+backend uses. Isolation confirmed: only `jerrycan docs`/`explain`/`schema`, the
+Kolli design JSON, its own scaffold, and compiler diagnostics were used.
+
+The docs-only history also stands at **5/5 (100%)** on the five simpler reference
 apps (2026-06-10, above).
+
+Doc/generator gaps surfaced (real, fixable — the eval's whole purpose):
+1. **No documented way to return a 302/202/custom success status** — the response
+   vocabulary (`IntoResponse`, `jerrycan::http::Response`, `JcBody::full/empty`)
+   isn't in any doc page; the 302/202 endpoints required compiler-probing. *The
+   single highest-value fix: a "response types" doc page.*
+2. `jerrycan docs --search` caps at 5 results with no `docs --list` index, so
+   enumerating the 15 pages took ~30 searches.
+3. Generator: an OAuth design doesn't auto-enable the `oauth` facade feature, so
+   the generated `integrations` module can't compile against the primitive the
+   docs prescribe (had to add `features=["oauth"]` by hand).
+4. `OAuthClient::new`'s secret arg is `Into<Secret>` but the doc only shows
+   `&'static str`; `&String` fails (needs `.as_str()`).
+5. `verify_password` doc said "→ bool"; it returns `Result<bool>` (FIXED in
+   `docs/ai/10-auth.md`).
+6. **Tool-internal: generated happy-path acceptance tests post `"test-value"`
+   into enum-valued fields, which the generator's own `CHECK (... IN (...))`
+   migrations reject** (surfacing as an opaque `JC0510 "database error"` with the
+   real `CHECK constraint failed` only on stderr). Resolvable the secure way
+   (server-assigns enums) but the gen-test/migration pairing should be reconciled.
+7. Happy-path stubs vs declared error-cases conflict on auth/webhook/oauth (the
+   docs don't say how a stub should behave when the security input is absent).
 
 ### Docs-only schema.json Q&A (2026-06-15)
 

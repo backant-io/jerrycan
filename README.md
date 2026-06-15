@@ -146,9 +146,13 @@ cargo install jerrycan
 The headline metric: an opus agent, given **only** the published docs surface
 (`jerrycan docs …` — no framework source, no test fixtures), scaffolds and
 fully implements backends that build, pass `jerrycan check`, and serve real
-CRUD over HTTP. Latest docs-only run: **5/5 (100%)** across the five reference
-apps — see [`conformance/eval/results.md`](conformance/eval/results.md)
-(floor 4/5, target ≥ 90%).
+CRUD over HTTP. The v2.5 north star — a **docs-only rebuild of the full Kolli
+slice** — is **GREEN**: `jerrycan check` passes, all **37/37** generated
+acceptance tests pass across 6 modules + 2 cron jobs, live HTTP round-trips
+verified, and a negative control (unscoping a tenant query) correctly turns the
+gate red. The five simpler reference apps stand at **5/5 (100%)**. See
+[`conformance/eval/results.md`](conformance/eval/results.md) (floor 4/5,
+target ≥ 90%).
 
 The v2.5 release gate adds a **deterministic Kolli battery**
 ([`crates/jerrycan/tests/kolli_eval.rs`](crates/jerrycan/tests/kolli_eval.rs)):
