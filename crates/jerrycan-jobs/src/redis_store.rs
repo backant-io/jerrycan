@@ -291,14 +291,23 @@ impl RedisStore {
     }
 
     /// Ensure the consumer group exists on `stream` (lazily, idempotently):
-    /// `XGROUP CREATE … $ MKSTREAM`, swallowing the `BUSYGROUP` "already exists"
+    /// `XGROUP CREATE … 0 MKSTREAM`, swallowing the `BUSYGROUP` "already exists"
     /// reply so concurrent leasers race harmlessly.
+    ///
+    /// The start id MUST be `0`, not `$`: `enqueue` `XADD`s onto the ready stream
+    /// *before* any group exists (the group is created lazily here, on the first
+    /// `lease`/`requeue_dead`). `$` would create the group at the stream's current
+    /// tail, so every job enqueued before that first lease would be permanently
+    /// undelivered (and never trimmed). `0` covers the whole stream history,
+    /// including that backlog — the standard choice when producers may write
+    /// before the consumer group exists. The ignored live `redis_store` tests
+    /// fail 5/6 if this regresses to `$`.
     async fn ensure_group(conn: &mut redis::aio::ConnectionManager, stream: &str) -> Result<()> {
         let res: redis::RedisResult<()> = redis::cmd("XGROUP")
             .arg("CREATE")
             .arg(stream)
             .arg(GROUP)
-            .arg("$")
+            .arg("0")
             .arg("MKSTREAM")
             .query_async(conn)
             .await;
