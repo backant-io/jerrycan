@@ -72,6 +72,7 @@
       ],
       "endpoints": [
         { "operation_id": "list_leads", "method": "GET", "path": "/",
+          "auth_required": true,
           "success": { "status": 200, "entity": "Lead", "list": true } },
         { "operation_id": "create_lead", "method": "POST", "path": "/",
           "auth_required": true,
@@ -82,6 +83,7 @@
             { "status": 422, "when": "request body fails validation" }
           ] },
         { "operation_id": "show_lead", "method": "GET", "path": "/{id}",
+          "auth_required": true,
           "success": { "status": 200, "entity": "Lead" },
           "errors": [{ "status": 404, "when": "unknown id" }] },
         { "operation_id": "update_lead", "method": "PUT", "path": "/{id}",
@@ -110,7 +112,8 @@
           "fields": [
             { "name": "id", "type": "integer" },
             { "name": "prefix", "type": "string", "unique": true },
-            { "name": "label", "type": "string" }
+            { "name": "label", "type": "string" },
+            { "name": "scopes", "type": "string" }
           ]}
       ],
       "endpoints": [
@@ -122,6 +125,8 @@
           "request_body": { "entity": "ApiKey" },
           "success": { "status": 201, "entity": "ApiKey" },
           "errors": [{ "status": 422, "when": "request body fails validation" }] },
+        { "operation_id": "usage", "method": "GET", "path": "/usage",
+          "success": { "status": 200 } },
         { "operation_id": "revoke_api_key", "method": "DELETE", "path": "/{id}",
           "auth_required": true,
           "required_roles": ["owner"],
@@ -138,6 +143,16 @@
         { "operation_id": "stripe_webhook", "method": "POST", "path": "/webhook",
           "success": { "status": 200 },
           "errors": [{ "status": 400, "when": "Stripe signature is missing or invalid" }] }
+      ]
+    },
+    {
+      "name": "integrations",
+      "endpoints": [
+        { "operation_id": "google_connect", "method": "GET", "path": "/auth/google/connect",
+          "success": { "status": 302 } },
+        { "operation_id": "google_callback", "method": "GET", "path": "/auth/google/callback",
+          "success": { "status": 200 },
+          "errors": [{ "status": 400, "when": "authorization code is missing, bad, or expired" }] }
       ]
     }
   ]

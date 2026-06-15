@@ -339,6 +339,33 @@ impl FromRequest for Multipart {
 }
 
 impl Multipart {
+    /// Build a buffered `Multipart` from an already-read body and its
+    /// `Content-Type` header value, or `None` if the content type is not
+    /// `multipart/form-data` with a valid boundary.
+    ///
+    /// The `Multipart` *extractor* (`FromRequest`) is the normal path and is
+    /// `415` on a non-multipart request. This constructor exists for handlers
+    /// that must accept *either* a multipart upload or some other content type
+    /// on the same route (e.g. a CSV `import` endpoint whose generated success
+    /// probe posts an empty JSON body): take `Headers` + [`RawBody`], then
+    /// `Multipart::from_buffered` when the type matches. The parsing is
+    /// identical to the extractor's buffered path.
+    ///
+    /// [`RawBody`]: crate::extract::RawBody
+    pub fn from_buffered(content_type: &str, body: impl Into<Bytes>) -> Option<Self> {
+        let boundary = boundary_from_content_type(content_type)?;
+        let mut parser = Parser::new(&boundary);
+        parser.feed(&body.into());
+        parser.finish();
+        Some(Multipart {
+            parser,
+            source: None,
+            part_cap: DEFAULT_PART_CAP,
+            in_part: false,
+            done: false,
+        })
+    }
+
     /// Per-part byte cap enforced by [`Part::bytes`]/[`Part::text`]
     /// (default 8 MiB).
     pub fn set_part_cap(&mut self, bytes: usize) {
@@ -854,6 +881,19 @@ mod tests {
             res.json::<Vec<(String, usize)>>(),
             vec![("title".to_string(), 11), ("file".to_string(), 29)]
         );
+    }
+
+    #[tokio::test]
+    async fn from_buffered_parses_multipart_and_returns_none_otherwise() {
+        // A multipart content type + body yields a working parser...
+        let mut mp = Multipart::from_buffered(FORM_DATA_CT, fixture()).expect("multipart");
+        let mut names = Vec::new();
+        while let Some(part) = mp.next_part().await.unwrap() {
+            names.push(part.name().to_string());
+        }
+        assert_eq!(names, vec!["title".to_string(), "file".to_string()]);
+        // ...and a non-multipart content type yields None (the caller falls back).
+        assert!(Multipart::from_buffered("application/json", b"{}".to_vec()).is_none());
     }
 
     #[tokio::test]

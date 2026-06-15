@@ -472,6 +472,11 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     let fk_pascal = col_pascal(&fk_col);
     let fk_ty = design.target_key_rust_type(&tenancy.entity);
     let key = key_rust_type(e);
+    // The pk is `Set` from `item.id` (the synthetic pk also surfaces as a visible
+    // `id` field), the rest from `item` (active_sets with the id line omitted) —
+    // correct for both declared and synthetic primary keys, and `id` (the path
+    // param) is consumed once by the ownership check, so no clone for text pks.
+    let update_sets = active_sets(e, false);
     format!(
         r#"
     // Tenant-scoped accessors — handlers must use these for tenant-owned data (JL0006).
@@ -500,6 +505,28 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
             .await
             .map_err(db_error)?;
         Ok(r.rows_affected > 0)
+    }}
+
+    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
+        // Scope the write to the tenant: only proceed if the row is already
+        // theirs (a foreign or unknown id is a no-op, returning false → 404).
+        if {snake}::Entity::find_by_id(id)
+            .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)?
+            .is_none()
+        {{
+            return Ok(false);
+        }}
+        let m = {snake}::ActiveModel {{
+            id: Set(item.id),
+{update_sets}        }};
+        match m.update(self.db.conn()).await {{
+            Ok(_) => Ok(true),
+            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
+            Err(e) => Err(db_error(e)),
+        }}
     }}
 "#
     )
@@ -1563,6 +1590,12 @@ mod tests {
         );
         assert!(
             src.contains("pub async fn remove_for(&self, workspace_id: i64, id: i64)"),
+            "{src}"
+        );
+        // A scoped UPDATE accessor exists so a tenant-owned handler can write
+        // without the unscoped `repo.update(` that JL0006 forbids.
+        assert!(
+            src.contains("pub async fn update_for(&self, workspace_id: i64, id: i64, item:"),
             "{src}"
         );
         assert!(

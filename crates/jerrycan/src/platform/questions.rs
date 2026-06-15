@@ -513,10 +513,13 @@ fn validate_module(
                 ),
             ));
         }
-        if !(200..=299).contains(&ep.success.status) {
+        // Success is 2xx, or 3xx for a redirect endpoint (e.g. an OAuth
+        // `connect` that 302s the browser to the provider). 1xx/4xx/5xx are not
+        // success classes.
+        if !(200..=399).contains(&ep.success.status) {
             qs.push(q(
                 format!("{eptr}/success/status"),
-                format!("Success status {} is not 2xx.", ep.success.status),
+                format!("Success status {} is not 2xx/3xx.", ep.success.status),
             ));
         }
         if let Some(ref ent) = ep.success.entity
@@ -677,8 +680,17 @@ mod tests {
 
     #[test]
     fn status_ranges_and_path_shape_are_enforced() {
-        let d = design(&MINIMAL.replace("\"status\": 204", "\"status\": 302"));
-        assert!(validate(&d).iter().any(|q| q.question.contains("2xx")));
+        // 3xx is a valid success class (redirect endpoints, e.g. OAuth connect).
+        let ok3xx = design(&MINIMAL.replace("\"status\": 204", "\"status\": 302"));
+        assert!(
+            !validate(&ok3xx)
+                .iter()
+                .any(|q| q.question.contains("success")),
+            "302 is a valid (redirect) success status"
+        );
+        // A 5xx success status is not a success class and must be rejected.
+        let d = design(&MINIMAL.replace("\"status\": 204", "\"status\": 500"));
+        assert!(validate(&d).iter().any(|q| q.question.contains("2xx/3xx")));
         let d2 = design(&MINIMAL.replace("\"path\": \"/{id}\"", "\"path\": \"{id}\""));
         assert!(
             validate(&d2)
