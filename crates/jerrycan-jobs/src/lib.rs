@@ -1,16 +1,20 @@
 //! Background job engine for jerrycan (spec §v2.3): at-least-once queues with
 //! retries + dead-letter, cron with skip-missed semantics, run_at delayed jobs,
-//! over a Postgres (default) or in-memory store (a Redis store arrives in
-//! v2.3b). <https://jerrycan.cc>
+//! over a Postgres (default), in-memory, or Redis Streams store (the last behind
+//! the `jobs-redis` feature, spec §v2.3b). <https://jerrycan.cc>
 #![forbid(unsafe_code)]
 
 pub mod cron;
 pub mod postgres_store;
+#[cfg(feature = "jobs-redis")]
+pub mod redis_store;
 pub mod store;
 pub mod worker;
 
 pub use cron::{CronError, CronSchedule, due_fire};
 pub use postgres_store::{JOBS_CRON_ADVISORY_KEY, JOBS_MIGRATIONS, PostgresStore};
+#[cfg(feature = "jobs-redis")]
+pub use redis_store::RedisStore;
 pub use store::{
     DEFAULT_MAX_ATTEMPTS, EnqueueOutcome, InMemoryStore, Job, JobFuture, JobStatus, JobStore,
     NewJob,
@@ -93,6 +97,16 @@ impl Jobs {
         self.store = store;
         self.pg_leader = None;
         self
+    }
+
+    /// A jobs engine over the durable, multi-node [`RedisStore`] (spec §v2.3b).
+    /// Like [`store`](Jobs::store) but typed: it clears any Postgres cron leader,
+    /// so the cron poller uses the in-memory single-process leader whose
+    /// duplicate cross-node ticks are collapsed by the store's atomic (Lua,
+    /// `SET NX`) idempotency.
+    #[cfg(feature = "jobs-redis")]
+    pub fn redis(self, store: crate::redis_store::RedisStore) -> Self {
+        self.store(Arc::new(store))
     }
 
     /// Replace the engine config wholesale (backoff/lease/exec/poll/batch).

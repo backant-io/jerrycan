@@ -17,8 +17,14 @@ jerrycan-db = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time", "sync", "rt"] }
-# A Redis Streams store ships in v2.3b as a fast-follow (its own `jobs-redis`
-# feature + optional `redis` dep land then); v2.3 ships the Postgres default.
+# The Redis Streams store (v2.3b) is behind the `jobs-redis` feature; `redis`
+# stays rustls-only (configured in the workspace `[workspace.dependencies]`).
+redis = { workspace = true, optional = true }
+
+[features]
+# The Redis Streams job store (multi-node, durable). Off by default; the
+# Postgres default store always compiles.
+jobs-redis = ["dep:redis"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
