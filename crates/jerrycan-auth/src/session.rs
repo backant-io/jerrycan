@@ -12,15 +12,38 @@ use serde::{Serialize, de::DeserializeOwned};
 const COOKIE_NAME: &str = "jerrycan_session";
 
 /// Encrypts/decrypts session payloads with a per-store AEAD key.
+///
+/// Supports key rotation: `encode` always uses the primary key, while `decode`
+/// tries the primary first, then each retired fallback in order. This lets a
+/// deployment rotate `JERRYCAN_SECRET` without invalidating sessions/tokens
+/// minted under the previous key — the old key is moved to `fallbacks` until it
+/// is fully retired (dropped from the list), at which point its ciphertexts stop
+/// decrypting.
 #[derive(Clone)]
 pub struct SessionStore {
-    cipher: ChaCha20Poly1305,
+    primary: ChaCha20Poly1305,
+    fallbacks: Vec<ChaCha20Poly1305>,
 }
 
 impl SessionStore {
+    /// Single-key store (no rotation). Equivalent to `with_keys(key, &[])`.
     pub fn new(key: &[u8; 32]) -> Self {
         Self {
-            cipher: ChaCha20Poly1305::new(key.into()),
+            primary: ChaCha20Poly1305::new(key.into()),
+            fallbacks: Vec::new(),
+        }
+    }
+
+    /// Rotation-aware store: `encode` uses `primary`; `decode` tries `primary`
+    /// then each entry of `fallbacks` in order. The first key that authenticates
+    /// the ciphertext wins.
+    pub fn with_keys(primary: &[u8; 32], fallbacks: &[[u8; 32]]) -> Self {
+        Self {
+            primary: ChaCha20Poly1305::new(primary.into()),
+            fallbacks: fallbacks
+                .iter()
+                .map(|k| ChaCha20Poly1305::new(k.into()))
+                .collect(),
         }
     }
 
@@ -32,7 +55,7 @@ impl SessionStore {
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = self
-            .cipher
+            .primary
             .encrypt(nonce, plaintext.as_ref())
             .map_err(|_| Error::internal("session encrypt failed"))?;
         let mut combined = Vec::with_capacity(12 + ciphertext.len());
@@ -41,8 +64,10 @@ impl SessionStore {
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(combined))
     }
 
-    /// Decrypt + deserialize. Any failure (bad base64, short input, AEAD
-    /// rejection, JSON shape) is `JC0401` — an untrusted client value.
+    /// Decrypt + deserialize. Tries the primary key, then each rotation fallback
+    /// in order; the first key that authenticates wins. Any failure (bad base64,
+    /// short input, AEAD rejection under *every* key, JSON shape) is `JC0401` —
+    /// an untrusted client value.
     pub fn decode<T: DeserializeOwned>(&self, token: &str) -> Result<T> {
         let combined = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(token)
@@ -51,10 +76,13 @@ impl SessionStore {
             return Err(Error::unauthorized());
         }
         let (nonce_bytes, ciphertext) = combined.split_at(12);
-        let plaintext = self
-            .cipher
-            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
-            .map_err(|_| Error::unauthorized())?;
+        let nonce = Nonce::from_slice(nonce_bytes);
+        // Primary first, then retired keys in order. AEAD authenticates each
+        // attempt, so a wrong key simply fails to decrypt (no false positives).
+        let plaintext = std::iter::once(&self.primary)
+            .chain(self.fallbacks.iter())
+            .find_map(|cipher| cipher.decrypt(nonce, ciphertext).ok())
+            .ok_or_else(Error::unauthorized)?;
         serde_json::from_slice(&plaintext).map_err(|_| Error::unauthorized())
     }
 
@@ -195,5 +223,67 @@ mod tests {
         let mut chars: Vec<char> = s.chars().collect();
         chars[at] = if chars[at] == 'A' { 'B' } else { 'A' };
         chars.into_iter().collect()
+    }
+
+    // --- rotation (multi-key decrypt) ---
+
+    const KEY_OLD: [u8; 32] = [1u8; 32];
+    const KEY_NEW: [u8; 32] = [2u8; 32];
+    const KEY_STRANGER: [u8; 32] = [9u8; 32];
+
+    fn sample() -> Sess {
+        Sess {
+            user_id: 42,
+            role: "user".into(),
+        }
+    }
+
+    #[test]
+    fn rotation_keeps_old_ciphertexts_decryptable_so_no_one_is_logged_out() {
+        // Encrypt under the OLD key (single-key store, pre-rotation).
+        let before = SessionStore::new(&KEY_OLD);
+        let token = before.encode(&sample()).unwrap();
+
+        // Rotate: NEW is primary, OLD becomes a retired fallback.
+        let after = SessionStore::with_keys(&KEY_NEW, &[KEY_OLD]);
+        let back: Sess = after
+            .decode(&token)
+            .expect("a session minted before rotation must still decrypt via fallback");
+        assert_eq!(back, sample());
+    }
+
+    #[test]
+    fn encode_after_rotation_uses_the_new_primary_not_a_fallback() {
+        let after = SessionStore::with_keys(&KEY_NEW, &[KEY_OLD]);
+        let token = after.encode(&sample()).unwrap();
+        // The NEW key alone (no fallbacks) must decrypt it: encode used primary.
+        let new_only = SessionStore::new(&KEY_NEW);
+        assert_eq!(new_only.decode::<Sess>(&token).unwrap(), sample());
+        // The OLD key alone must NOT decrypt it.
+        let old_only = SessionStore::new(&KEY_OLD);
+        assert!(old_only.decode::<Sess>(&token).is_err());
+    }
+
+    #[test]
+    fn a_key_in_neither_primary_nor_fallbacks_is_rejected_401() {
+        // A ciphertext from a stranger key (never primary, never retired).
+        let stranger = SessionStore::new(&KEY_STRANGER);
+        let token = stranger.encode(&sample()).unwrap();
+
+        let store = SessionStore::with_keys(&KEY_NEW, &[KEY_OLD]);
+        let err = store.decode::<Sess>(&token).unwrap_err();
+        assert_eq!(
+            err.code(),
+            "JC0401",
+            "fully-retired/unknown keys must invalidate (rotation is not forever)"
+        );
+    }
+
+    #[test]
+    fn new_with_no_fallbacks_matches_with_keys_empty() {
+        let a = SessionStore::new(&KEY_NEW);
+        let token = a.encode(&sample()).unwrap();
+        let b = SessionStore::with_keys(&KEY_NEW, &[]);
+        assert_eq!(b.decode::<Sess>(&token).unwrap(), sample());
     }
 }

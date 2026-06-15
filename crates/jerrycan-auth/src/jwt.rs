@@ -83,7 +83,7 @@ mod tests {
     }
 
     fn key() -> [u8; 32] {
-        crate::derive_key(b"a-very-long-development-secret-string!!", "jwt")
+        *crate::derive_key(b"a-very-long-development-secret-string!!", "jwt")
     }
 
     #[test]
@@ -140,7 +140,7 @@ mod tests {
             &key(),
         )
         .unwrap();
-        let other = crate::derive_key(b"different-secret-of-at-least-32-bytes!!", "jwt");
+        let other = *crate::derive_key(b"different-secret-of-at-least-32-bytes!!", "jwt");
         assert!(decode::<Claims>(&token, &other).is_err());
     }
 
