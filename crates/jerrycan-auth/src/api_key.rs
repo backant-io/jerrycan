@@ -233,10 +233,11 @@ impl FromRequest for ApiKey {
 
 /// Pull the raw key from the headers: `Authorization: Bearer <key>` takes
 /// precedence over `X-API-Key: <key>`. Returns `None` if neither is present in a
-/// usable form.
+/// usable form. The `Bearer` scheme is matched case-insensitively (RFC 6750 §2.1:
+/// the auth-scheme token is case-insensitive), so `bearer`/`BEARER` also work.
 fn extract_key(headers: &Headers) -> Option<String> {
     if let Some(auth) = headers.get("authorization")
-        && let Some(token) = auth.strip_prefix("Bearer ")
+        && let Some(token) = strip_bearer_prefix(auth)
         && !token.is_empty()
     {
         return Some(token.to_string());
@@ -245,6 +246,14 @@ fn extract_key(headers: &Headers) -> Option<String> {
         .get("x-api-key")
         .filter(|v| !v.is_empty())
         .map(str::to_string)
+}
+
+/// Strip a case-insensitive `Bearer ` scheme prefix, returning the token that
+/// follows. Only the scheme word is matched case-insensitively; the token itself
+/// is returned verbatim. Returns `None` if the header isn't a `Bearer` credential.
+fn strip_bearer_prefix(auth: &str) -> Option<&str> {
+    let (scheme, token) = auth.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
 #[cfg(test)]
@@ -415,11 +424,18 @@ mod tests {
             .route("/reports", get(reports));
         let t = app.into_test();
 
-        // Authorization: Bearer form — both header schemes must work.
-        let bearer = format!("Bearer {}", scoped.plaintext);
-        let res = t.get_with("/reports", &[("authorization", &bearer)]).await;
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(res.json::<String>(), "sk_live");
+        // Authorization: Bearer form — both header schemes must work. RFC 6750 §2.1
+        // makes the scheme token case-insensitive, so every casing must resolve.
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let header = format!("{scheme} {}", scoped.plaintext);
+            let res = t.get_with("/reports", &[("authorization", &header)]).await;
+            assert_eq!(
+                res.status(),
+                StatusCode::OK,
+                "scheme {scheme:?} must be accepted (RFC 6750 case-insensitive)"
+            );
+            assert_eq!(res.json::<String>(), "sk_live");
+        }
     }
 
     #[tokio::test]
