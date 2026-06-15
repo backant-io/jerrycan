@@ -13,6 +13,29 @@
 # Run from the repo root. Rate-limit tolerant (waits between new-crate pushes).
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# PRE-PUBLISH EVAL GATE (v2.5) — a release cannot ship if the eval is red.
+#
+# The Kolli live HTTP battery is the permanent v2.5 gate: it scaffolds the Kolli
+# reference backend, serves it live, and drives every v2 feature over real HTTP
+# (tenant isolation, webhook signature rejection, multipart import, API-key
+# scopes, both crons under the test clock, OAuth via the mock IdP) plus the
+# schema.json data-structure assertions. We run it FIRST, fail-fast, alongside
+# the scripted conformance/eval reference apps. If any of these is red the
+# script exits before a single `cargo publish` runs — so a broken release is
+# impossible to push. (Override only for an emergency republish of crates that
+# are already indexed: SKIP_EVAL_GATE=1.)
+# ---------------------------------------------------------------------------
+if [ "${SKIP_EVAL_GATE:-0}" != "1" ]; then
+  echo "=== pre-publish eval gate: kolli live battery + scripted conformance/eval ==="
+  cargo test -p jerrycan --all-features --test kolli_eval -- --include-ignored --nocapture
+  cargo test -p jerrycan --all-features --test conformance -- --include-ignored
+  cargo test -p jerrycan --test eval -- --include-ignored
+  echo "=== eval gate GREEN — proceeding to publish ==="
+else
+  echo "!!! SKIP_EVAL_GATE=1 — skipping the eval gate (emergency republish only) !!!"
+fi
+
 CRATES=(jerrycan-core jerrycan-macros jerrycan-db jerrycan-auth jerrycan-validate jerrycan-observe jerrycan-ratelimit jerrycan-jobs jerrycan)
 
 for c in "${CRATES[@]}"; do

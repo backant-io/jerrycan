@@ -57,6 +57,7 @@ jobs:
           cargo test -p jerrycan --all-features --test conformance -- --include-ignored
           cargo test -p jerrycan --test genroute_compile -- --include-ignored
           cargo test -p jerrycan --test eval -- --include-ignored
+          cargo test -p jerrycan --all-features --test kolli_eval -- --include-ignored
       - name: Docs build (broken intra-doc links are errors)
         run: cargo doc --workspace --no-deps --all-features
 
