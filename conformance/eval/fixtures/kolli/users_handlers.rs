@@ -9,21 +9,21 @@ use jerrycan::db::{Db, db_error};
 use jerrycan::http::{HeaderValue, header};
 use jerrycan::prelude::*;
 
-/// Roles accepted from the wire; anything else is normalized to "user" so a
-/// caller can't escalate to "admin" just by asking (and never trips the DB
-/// CHECK constraint `role IN ('admin','user')`).
-fn normalize_role(requested: &str) -> String {
-    match requested {
-        "admin" => "admin".to_string(),
-        _ => "user".to_string(),
-    }
-}
+/// Self-registration ALWAYS assigns the lowest-privilege role — the `role`
+/// field on the request body is deliberately ignored, so a caller can never
+/// escalate to "admin" by mass-assigning it (the classic registration
+/// mass-assignment bug). Granting "admin" is a separate, authenticated
+/// promotion path (an existing admin acts on another user); it never rides in
+/// on the public register payload. "user" also satisfies the DB CHECK
+/// constraint `role IN ('admin','user')`.
+const SELF_REGISTRATION_ROLE: &str = "user";
 
 /// POST /register — hash the password with argon2, store the user, echo it back.
 /// A duplicate email surfaces as 409 (the unique index → `db_error` → JC0409).
 pub(crate) async fn register(repo: Dep<UserRepo>, Json(body): Json<User>) -> Result<Created<User>> {
     let hashed = hash_password(&body.password)?;
-    let role = normalize_role(&body.role);
+    // Ignore any client-supplied `role`: self-registration can't grant admin.
+    let role = SELF_REGISTRATION_ROLE.to_string();
     let to_store = User {
         id: body.id,
         email: body.email.clone(),
@@ -31,11 +31,12 @@ pub(crate) async fn register(repo: Dep<UserRepo>, Json(body): Json<User>) -> Res
         role: role.clone(),
     };
     let id = repo.insert(to_store).await?;
-    // Echo the created user; the generated test asserts the echoed `id`.
+    // Echo the created user; the generated test asserts the echoed `id`. Never
+    // return the password (not even the just-submitted one) — blank it out.
     Ok(Created(User {
         id,
         email: body.email,
-        password: body.password,
+        password: String::new(),
         role,
     }))
 }
