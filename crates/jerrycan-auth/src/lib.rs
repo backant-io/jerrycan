@@ -10,7 +10,13 @@ use zeroize::Zeroizing;
 pub mod api_key;
 pub mod guard;
 pub mod jwt;
-#[cfg(feature = "oauth")]
+// The mock IdP is a test/eval-only harness that mints deterministic tokens. It
+// needs the oauth types, so it compiles for this crate's OWN tests when oauth is on
+// (`cfg(test)` + `feature = "oauth"`, so `cargo test --features oauth` keeps seeing
+// it) and for downstream code ONLY behind the explicit `mock-idp` feature (which
+// implies `oauth`) — never in a plain `oauth` prod build, where its public
+// `into_app()` would otherwise be reachable.
+#[cfg(any(all(test, feature = "oauth"), feature = "mock-idp"))]
 pub mod mock_idp;
 #[cfg(feature = "oauth")]
 pub mod oauth;
@@ -23,7 +29,7 @@ pub use api_key::{
     hash_key, mint, require_scope, verify,
 };
 pub use guard::{Bearer, Session, require_role};
-#[cfg(feature = "oauth")]
+#[cfg(any(all(test, feature = "oauth"), feature = "mock-idp"))]
 pub use mock_idp::MockIdp;
 #[cfg(feature = "oauth")]
 pub use oauth::{

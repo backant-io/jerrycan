@@ -35,7 +35,7 @@ webpki-roots = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
 [features]
-# OAuth2 authorization-code client + provider presets + mock IdP harness.
+# OAuth2 authorization-code client + provider presets.
 # Pulls an outbound HTTPS client (hyper + hyper-rustls, rustls/ring only).
 oauth = [
     "dep:hyper",
@@ -46,6 +46,10 @@ oauth = [
     "dep:webpki-roots",
     "dep:rustls",
 ]
+# The deterministic in-process mock OAuth2 IdP (test/eval-only harness). Kept OFF
+# of `oauth` so the token-minting harness can't compile into a normal prod client
+# build; the v2.5 eval + generated tests opt in explicitly. Needs the oauth types.
+mock-idp = ["oauth"]
 
 [dev-dependencies]
 tokio.workspace = true

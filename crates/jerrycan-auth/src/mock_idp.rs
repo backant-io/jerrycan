@@ -1,5 +1,10 @@
-//! A deterministic in-process OAuth2 IdP for tests (spec §v2.4 Task 4), gated
-//! `#[cfg(feature = "oauth")]`.
+//! A deterministic in-process OAuth2 IdP for tests and evals (spec §v2.4 Task 4).
+//!
+//! **Test/eval-only.** This harness mints deterministic tokens and `into_app()`
+//! serves a fully working `/authorize` + `/token` endpoint, so it must never ship
+//! in a production client build. It is compiled for this crate's own `cfg(test)`
+//! and otherwise ONLY behind the explicit, non-default `mock-idp` feature (which
+//! implies `oauth`); a plain `--features oauth` prod build excludes it entirely.
 //!
 //! [`MockIdp`] mints tokens from a monotonic counter (NOT randomness), so a test
 //! that issues `code "c1"` always gets the same `(access, refresh)` — runs are

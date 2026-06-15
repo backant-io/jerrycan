@@ -67,7 +67,12 @@ mod doc_tests {
     doc_page!(page_14_tenancy, "../../../docs/ai/14-tenancy.md");
     #[cfg(feature = "jobs")]
     doc_page!(page_15_jobs, "../../../docs/ai/15-jobs.md");
-    #[cfg(feature = "oauth")]
+    // Page 16 demonstrates the `MockIdp` harness, which is test/eval-only and lives
+    // behind the non-default `mock-idp` feature (kept off plain `oauth` so it can't
+    // reach a prod build). The page's runnable mock snippet only compiles when that
+    // feature is on, so the whole page is gated on it; run it with
+    // `cargo test -p jerrycan --features mock-idp --doc`.
+    #[cfg(feature = "mock-idp")]
     doc_page!(
         page_16_auth_advanced,
         "../../../docs/ai/16-auth-advanced.md"

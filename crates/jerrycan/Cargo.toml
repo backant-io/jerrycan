@@ -22,8 +22,12 @@ cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tokio", "dep:sea-query", 
 db = ["dep:jerrycan-db"]
 validate = ["dep:jerrycan-validate"]
 auth = ["dep:jerrycan-auth"]
-# OAuth2 client + provider presets + mock IdP harness (jerrycan-auth's `oauth`).
+# OAuth2 client + provider presets (jerrycan-auth's `oauth`).
 oauth = ["auth", "jerrycan-auth/oauth"]
+# The deterministic mock OAuth2 IdP harness — test/eval-only. Non-default and kept
+# off `oauth` so the token-minting harness never compiles into a prod client build;
+# the v2.5 eval + generated tests enable it explicitly.
+mock-idp = ["oauth", "jerrycan-auth/mock-idp"]
 observe = ["dep:jerrycan-observe"]
 # Jobs require a database: the engine's default store is Postgres and the
 # generated `jobs(db)` wiring takes a `jerrycan::db::Db`, so `jobs` implies `db`.
