@@ -7,12 +7,17 @@ use jerrycan_core::{App, Extension};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+pub mod api_key;
 pub mod guard;
 pub mod jwt;
 pub mod password;
 pub mod session;
 pub mod webhook;
 
+pub use api_key::{
+    ApiKey, ApiKeyFuture, ApiKeyRecord, ApiKeyStore, ApiKeys, InMemoryApiKeyStore, MintedApiKey,
+    hash_key, mint, require_scope, verify,
+};
 pub use guard::{Bearer, Session, require_role};
 pub use password::{hash_password, verify_password};
 pub use session::SessionStore;

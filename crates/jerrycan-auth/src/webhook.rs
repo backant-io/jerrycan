@@ -47,8 +47,8 @@ pub fn verify_sha1_base64(secret: &[u8], message: &[u8], signature_b64: &str) ->
     mac.verify_slice(&signature).is_ok()
 }
 
-/// Lowercase-hex encode raw MAC bytes.
-fn hex_encode(bytes: &[u8]) -> String {
+/// Lowercase-hex encode raw MAC bytes. Shared with `api_key` (key-hash column).
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         out.push(char::from_digit((b >> 4) as u32, 16).expect("nibble < 16"));
