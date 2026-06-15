@@ -83,3 +83,59 @@ local crate (pre-publish).
 
 Run the eval in a throwaway tmpdir (e.g. `/tmp/jc-eval/<spec>`). Kill any app
 processes you start and remove the tmpdirs when done.
+
+---
+
+# v2.5 eval target — the Kolli slice
+
+The five reference apps above probe CRUD-shaped backends. The **Kolli slice** is
+the v2 showcase: it exercises every v2 primitive on a single, real backend —
+tenancy + JWT/session auth, tenant-scoped CRUD, multipart CSV import, raw-body
+webhook signature verification, scoped API keys, OAuth (connect + callback)
+against a mock IdP, and two cron jobs.
+
+## Isolation rules (Kolli)
+
+Allowed inputs only:
+
+- The `jerrycan` binary: CLI subcommands, `jerrycan docs <page>`,
+  `jerrycan explain <code>`, `jerrycan schema --json`.
+- The Kolli design: `conformance/designs/kolli-slice.design.json`.
+
+Forbidden inputs:
+
+- jerrycan's own source (`crates/*/src/**`).
+- The Kolli **reference handlers** (`conformance/eval/fixtures/kolli/**`) — these
+  are the answer key; rebuilding them docs-only is the point.
+- Any plan / design / spec markdown for the framework itself (including the
+  v2.5 eval-gate plan).
+
+## Pass criteria (Kolli)
+
+A run passes when, on the scaffolded slice:
+
+1. `jerrycan check` is **green** (build + clippy + tests + lints + schema).
+2. The generated acceptance suite is **green**, including the cross-tenant
+   isolation tests (`tenant_a_cannot_read_tenant_b_leads` / `…_api_keys`).
+3. The app, served **live**, answers the full HTTP battery: register/login
+   (JWT session cookie), live cross-tenant isolation (B gets `404` on A's lead
+   and it is absent from B's list), webhook signature `200`/`400`, multipart CSV
+   import `202` with the rows visible afterward, scoped API keys `200`/`403`/`401`,
+   and OAuth connect `302` + callback `200`/`400` against the mock IdP.
+4. Both declared crons (`expire_trials`, `overdue_callbacks`) fire under a
+   controlled test clock.
+5. `schema.json` alone answers the data-structure questions (FK targets +
+   `on_delete`, unique/index, enums, enforcement state) — read via
+   `jerrycan schema --json`, no source.
+
+## The automated gate
+
+The deterministic `kolli_eval` battery
+(`crates/jerrycan/tests/kolli_eval.rs::kolli_slice_live_battery`) encodes the
+pass criteria above as a single `#[ignore]`d test that scaffolds the slice,
+applies the reference handlers, and runs the whole battery end-to-end. It is the
+**un-skippable gate**: CI runs it in the `--include-ignored` heavy step, and
+`scripts/publish.sh` runs it as a fail-fast pre-publish block (with a documented
+`SKIP_EVAL_GATE=1` emergency escape). A fresh **docs-only LLM rebuild** of the
+slice under the isolation rules above is the periodic manual eval, recorded in
+`results.md`.

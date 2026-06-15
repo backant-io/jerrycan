@@ -209,6 +209,34 @@ or design-contract change. Reuses the existing `JC0400`/`JC0401`/`JC0403` codes.
   linked-identities table pattern, the token-at-rest rotation runbook, scoped API
   keys) with compiling doctests; the threat model gains an advanced-auth section.
 
+### Eval gate (v2.5)
+0.2.0's release condition: the Kolli reference slice — the full v2 showcase —
+rebuilt on jerrycan, served live, with every v2 feature exercised over real HTTP,
+wired as a permanent gate.
+- **Kolli reference backend** — `conformance/eval/fixtures/kolli` implements the
+  slice (tenancy + JWT/session auth, tenant-scoped CRUD, multipart CSV import,
+  raw-body webhook verification, scoped API keys, OAuth connect+callback against a
+  mock IdP, two cron jobs) so a fresh scaffold of
+  `conformance/designs/kolli-slice.design.json` is `jerrycan check`-green.
+- **Live HTTP battery** — `crates/jerrycan/tests/kolli_eval.rs`
+  (`kolli_slice_live_battery`) scaffolds the slice, gets `check` green, runs the
+  generated acceptance suite (incl. cross-tenant isolation), serves the app live
+  (sqlite), and drives every feature over a real `TcpStream`: register/login,
+  live cross-tenant isolation (`404` on another tenant's row), webhook signature
+  `200`/`400`, multipart import `202`, scoped API keys `200`/`403`/`401`, OAuth
+  connect `302` + callback `200`/`400` — plus both crons firing under a controlled
+  clock and `schema.json` data-structure questions answered from `SchemaContract`
+  alone.
+- **Permanent, un-skippable gate** — the battery runs in CI's `--include-ignored`
+  heavy step and is a fail-fast pre-publish block in `scripts/publish.sh`
+  (alongside the scripted conformance/eval reference apps), with a documented
+  `SKIP_EVAL_GATE=1` emergency escape. A release can't ship if the eval is red.
+- **Additive design support** — a 3xx success status is allowed for endpoints
+  like OAuth `connect` (`success: 302`), a tenant-scoped `update_for` repo
+  accessor is generated alongside `all_for`/`get_for`/`remove_for`, and
+  `Multipart::from_buffered` lets one route accept multipart or another content
+  type. No contract change.
+
 ### Breaking
 - `Db::pool()` is removed — use `Db::conn()` (a `sea_orm::DatabaseConnection`).
 - Generated apps must regenerate tool-owned files (`model.rs`, `lib.rs`,
