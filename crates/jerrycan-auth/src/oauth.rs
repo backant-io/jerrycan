@@ -13,8 +13,8 @@
 //! [`TokenTransport`] is object-safe (hand-boxed `Send` future, same idiom as
 //! `jerrycan_jobs`'s `JobFuture` — no `async-trait`). Production uses
 //! [`HttpTransport`] (hyper + hyper-rustls, rustls/ring only, HTTPS for real
-//! providers and plain HTTP for the localhost mock). Tests inject
-//! [`crate::mock_idp::MockIdp::token_transport`] via [`OAuthClient::with_transport`].
+//! providers and plain HTTP only for a loopback host — the localhost mock). Tests
+//! inject `MockIdp::token_transport` via [`OAuthClient::with_transport`].
 //!
 //! ## Secret handling (security)
 //! `client_secret` is held in a [`Secret`] newtype that does NOT implement
@@ -126,7 +126,12 @@ impl Provider {
 /// A successful token response. `Serialize + Deserialize` so an app can encrypt it
 /// at rest via `auth.tokens().encode(&token)?` (see [`crate::Auth::tokens`]) and
 /// decode it on read. Extra provider fields are ignored on deserialize.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Debug` is hand-written to REDACT the bearer material: `access_token` prints as
+/// `"***"` and `refresh_token` as `<present>`/`<absent>`, never the real values, so
+/// a `{:?}` or `tracing` line can't leak a token. The derived `Debug` would have
+/// printed both in cleartext.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenResponse {
     pub access_token: String,
     #[serde(default = "default_token_type")]
@@ -137,6 +142,29 @@ pub struct TokenResponse {
     pub expires_in: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    /// Redacting `Debug`: the secret token strings NEVER appear. `access_token` is
+    /// fixed `"***"`; `refresh_token` collapses to whether one is present. The
+    /// non-secret fields (`token_type`, `expires_in`, `scope`) print verbatim so
+    /// the value is still useful in a log without leaking bearer material.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"***")
+            .field("token_type", &self.token_type)
+            .field(
+                "refresh_token",
+                &if self.refresh_token.is_some() {
+                    "<present>"
+                } else {
+                    "<absent>"
+                },
+            )
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 fn default_token_type() -> String {
@@ -351,8 +379,11 @@ fn encode(s: &str) -> String {
 }
 
 /// The production [`TokenTransport`]: a hyper + hyper-rustls client. HTTPS (via
-/// rustls/ring + bundled `webpki-roots`) for real providers; plain HTTP for
-/// `http://` token URLs (the localhost mock IdP).
+/// rustls/ring + bundled `webpki-roots`) for real providers; plain `http://` is
+/// allowed ONLY to a loopback host (`127.0.0.1`, `::1`, `localhost`) — the mock-IdP
+/// escape hatch — and is REFUSED for any other host before a byte is sent, so a
+/// misconfigured `http://` token endpoint can't silently ship `client_secret` +
+/// code + tokens over cleartext to a real provider. See [`is_loopback_http_ok`].
 #[derive(Clone)]
 pub struct HttpTransport {
     client: hyper_util::client::legacy::Client<
@@ -391,6 +422,16 @@ impl TokenTransport for HttpTransport {
         Box::pin(async move {
             use http_body_util::BodyExt;
 
+            // TLS-downgrade guard: an `http://` token endpoint sends client_secret,
+            // the code, and the returned tokens in cleartext. Permit plaintext only
+            // to a loopback host (the mock-IdP path); refuse any other `http://`
+            // host BEFORE sending a single byte. `https://` is always allowed.
+            if !is_loopback_http_ok(url) {
+                return Err(Error::internal(
+                    "oauth: refusing plaintext http:// to a non-loopback token endpoint",
+                ));
+            }
+
             let body = encode_form(form);
             let request = hyper::Request::builder()
                 .method(hyper::Method::POST)
@@ -423,6 +464,48 @@ impl TokenTransport for HttpTransport {
             parse_token_body(&bytes)
         })
     }
+}
+
+/// Whether a token-endpoint URL is allowed to be sent over plaintext transport.
+///
+/// `https://` is always allowed (TLS protects the secret). `http://` is allowed
+/// ONLY when the host is loopback (`127.0.0.1`, `::1`, `localhost`) — the in-repo
+/// mock-IdP escape hatch — so a real provider can never receive `client_secret`,
+/// the code, or tokens in cleartext. Any other scheme, or `http://` to a
+/// non-loopback host (or an unparseable host), is refused.
+fn is_loopback_http_ok(url: &str) -> bool {
+    // Split scheme off `scheme://rest`. Without `://` we can't reason about it, so
+    // refuse (the real transport only ever receives http/https token URLs).
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("https") {
+        return true;
+    }
+    if !scheme.eq_ignore_ascii_case("http") {
+        return false;
+    }
+
+    // Plaintext http://: isolate the host from `host[:port]/path?query#frag`. The
+    // authority ends at the first `/`, `?`, or `#`. (No userinfo `@` handling —
+    // token endpoints don't carry credentials in the URL.)
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .expect("split always yields at least one element");
+
+    // An IPv6 literal is bracketed: `[::1]:8080`. Strip the brackets to compare the
+    // inner address; otherwise the host is everything before the LAST `:` (port).
+    let host = if let Some(after) = authority.strip_prefix('[') {
+        match after.split_once(']') {
+            Some((inner, _port)) => inner,
+            None => return false, // malformed bracketed authority
+        }
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 /// `application/x-www-form-urlencoded` body from key/value pairs (both encoded).
@@ -589,6 +672,99 @@ mod tests {
         assert_eq!(minimal.access_token, "only");
         assert_eq!(minimal.token_type, "Bearer");
         assert!(minimal.refresh_token.is_none());
+    }
+
+    #[test]
+    fn token_response_debug_redacts_access_and_refresh_tokens() {
+        // The redacting Debug must NEVER print the bearer material — a `{:?}` or a
+        // tracing line on a TokenResponse would otherwise leak the live tokens.
+        let token = TokenResponse {
+            access_token: "ACCESS-SECRET-abc123".into(),
+            token_type: "Bearer".into(),
+            refresh_token: Some("REFRESH-SECRET-xyz789".into()),
+            expires_in: Some(3600),
+            scope: Some("email".into()),
+        };
+        let rendered = format!("{token:?}");
+        assert!(
+            !rendered.contains("ACCESS-SECRET-abc123"),
+            "access_token leaked through Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains("REFRESH-SECRET-xyz789"),
+            "refresh_token leaked through Debug: {rendered}"
+        );
+        // It still carries the redaction markers + the non-secret fields.
+        assert!(
+            rendered.contains("access_token: \"***\""),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("<present>"), "got: {rendered}");
+        assert!(rendered.contains("Bearer"), "got: {rendered}");
+
+        // With no refresh token, the marker flips to <absent> (still no secret).
+        let no_refresh = TokenResponse {
+            access_token: "ANOTHER-ACCESS-SECRET".into(),
+            token_type: "Bearer".into(),
+            refresh_token: None,
+            expires_in: None,
+            scope: None,
+        };
+        let rendered = format!("{no_refresh:?}");
+        assert!(
+            !rendered.contains("ANOTHER-ACCESS-SECRET"),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("<absent>"), "got: {rendered}");
+    }
+
+    #[test]
+    fn loopback_http_guard_allows_only_loopback_plaintext_and_all_https() {
+        // https:// is always fine, regardless of host.
+        assert!(is_loopback_http_ok("https://oauth2.googleapis.com/token"));
+        assert!(is_loopback_http_ok("HTTPS://EVIL.example.com/token"));
+
+        // http:// is allowed ONLY to a loopback host (the mock-IdP escape hatch).
+        assert!(is_loopback_http_ok("http://127.0.0.1:8080/token"));
+        assert!(is_loopback_http_ok("http://localhost/token"));
+        assert!(is_loopback_http_ok("http://LocalHost:3000/token"));
+        assert!(is_loopback_http_ok("http://[::1]:9000/token"));
+
+        // http:// to anything else is refused (TLS downgrade).
+        assert!(!is_loopback_http_ok("http://evil.example.com/token"));
+        assert!(!is_loopback_http_ok("http://oauth2.googleapis.com/token"));
+        // A host that merely starts with "localhost" must not pass.
+        assert!(!is_loopback_http_ok("http://localhost.evil.com/token"));
+        assert!(!is_loopback_http_ok("http://127.0.0.1.evil.com/token"));
+        // Unparseable / non-http(s) schemes are refused.
+        assert!(!is_loopback_http_ok("ftp://127.0.0.1/token"));
+        assert!(!is_loopback_http_ok("not-a-url"));
+    }
+
+    #[tokio::test]
+    async fn real_http_transport_rejects_non_loopback_plaintext_without_a_network_call() {
+        // A real HttpTransport must REFUSE an http:// exchange to a non-loopback
+        // host BEFORE any socket is opened — the client_secret never leaves the
+        // process. (No server is listening; the rejection is the guard, not a
+        // connection error.)
+        let provider = Provider {
+            auth_url: "http://evil.example.com/authorize",
+            token_url: "http://evil.example.com/token",
+            default_scopes: &["openid"],
+        };
+        let client = OAuthClient::new(provider, "id", "super-secret-value", "http://app/cb")
+            .with_transport(Arc::new(HttpTransport::new()));
+
+        let err = client.exchange_code("any-code", None).await.unwrap_err();
+        assert!(
+            err.message().contains("refusing plaintext http"),
+            "expected the loopback guard, got: {err}"
+        );
+        // The secret never appears in the rendered error.
+        assert!(
+            !err.to_string().contains("super-secret-value"),
+            "secret leaked into error: {err}"
+        );
     }
 
     #[test]
