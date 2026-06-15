@@ -56,6 +56,18 @@ pub(crate) fn derive_key(secret: &[u8], label: &str) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(hasher.finalize().into())
 }
 
+/// Whether `JERRYCAN_ENV` names an unmistakably non-production context in which
+/// the insecure built-in dev secret may be used. Only an unset/empty value or an
+/// explicit dev marker qualifies; everything else (incl. any production spelling
+/// or a typo) is treated as production and must supply a real secret. The match
+/// is trimmed + lowercased so `" Prod "`/`PRODUCTION` are still production.
+fn dev_context_allowed(env: &str) -> bool {
+    matches!(
+        env.trim().to_ascii_lowercase().as_str(),
+        "" | "dev" | "development" | "test" | "local"
+    )
+}
+
 /// The auth extension: holds the derived session, token-at-rest, and JWT keys,
 /// registered as a dependency so `Session`/`Bearer` extractors can resolve it.
 ///
@@ -111,17 +123,26 @@ impl Auth {
     /// Build from `JERRYCAN_SECRET` (primary) plus optional `JERRYCAN_SECRET_OLD`
     /// (a comma-separated list of retired secrets for key rotation).
     ///
-    /// In production (`JERRYCAN_ENV=prod`) a missing or short primary secret is a
-    /// loud error, and each non-empty retired secret must also meet
-    /// `MIN_SECRET_LEN` (empty entries are skipped — they let you write
-    /// `JERRYCAN_SECRET_OLD=""` or a trailing comma harmlessly). In dev it warns
-    /// and uses a fixed dev key (NEVER use in production). When
+    /// The insecure built-in dev key is used ONLY when `JERRYCAN_ENV` is
+    /// unset/empty or an explicit dev marker (`dev`/`development`/`test`/`local`).
+    /// Any other value — including any production spelling (`production`,
+    /// `prod-eu`, …) or a typo — is treated as production: a missing or short
+    /// primary secret is then a loud error (fail closed), and each non-empty
+    /// retired secret must also meet `MIN_SECRET_LEN` (empty entries are skipped —
+    /// `JERRYCAN_SECRET_OLD=""` or a trailing comma is harmless). When
     /// `JERRYCAN_SECRET_OLD` is unset, behavior is identical to a single secret.
     pub fn from_env() -> jerrycan_core::Result<Self> {
-        let is_prod = std::env::var("JERRYCAN_ENV").as_deref() == Ok("prod");
+        let env = std::env::var("JERRYCAN_ENV").unwrap_or_default();
+        // The insecure dev-secret fallback is allowed ONLY in an unmistakably
+        // non-production context: `JERRYCAN_ENV` unset/empty or an explicit dev
+        // marker. ANY other value — `production`, `prod-eu`, `staging`, a typo —
+        // is treated as production and REQUIRES a real `JERRYCAN_SECRET`, so a
+        // misspelled env can never silently sign sessions with the world-known
+        // development key (fail closed, not open).
+        let dev_ok = dev_context_allowed(&env);
         let secret = std::env::var("JERRYCAN_SECRET").ok();
         let retired_raw = std::env::var("JERRYCAN_SECRET_OLD").unwrap_or_default();
-        Self::from_env_parts(is_prod, secret.as_deref(), &retired_raw)
+        Self::from_env_parts(!dev_ok, secret.as_deref(), &retired_raw)
     }
 
     /// The pure core of [`Auth::from_env`]: all the env-var parsing and prod
@@ -379,5 +400,33 @@ mod secret_tests {
     fn from_env_prod_rejects_short_primary() {
         let err = err_of(Auth::from_env_parts(true, Some("short"), ""));
         assert!(err.to_string().contains("at least"));
+    }
+
+    /// The dev-secret fallback must be FAIL-CLOSED: only an unset/empty env or an
+    /// explicit dev marker may use the world-known development key. Any other
+    /// `JERRYCAN_ENV` (a real production spelling, or a typo) is production, so a
+    /// missing secret is an error — never a silent fall back to the insecure key.
+    #[test]
+    fn dev_secret_fallback_is_opt_in_to_known_dev_envs_only() {
+        for dev in ["", "  ", "dev", "development", "DEV", "Test", "local"] {
+            assert!(
+                dev_context_allowed(dev),
+                "{dev:?} should permit the dev key"
+            );
+        }
+        for prod in [
+            "prod",
+            "production",
+            "Production",
+            "prod-eu",
+            "staging",
+            "prd",
+            "live",
+        ] {
+            assert!(
+                !dev_context_allowed(prod),
+                "{prod:?} must be treated as production (no dev-key fallback)"
+            );
+        }
     }
 }

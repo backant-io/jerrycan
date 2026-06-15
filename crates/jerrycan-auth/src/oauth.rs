@@ -487,12 +487,20 @@ fn is_loopback_http_ok(url: &str) -> bool {
     }
 
     // Plaintext http://: isolate the host from `host[:port]/path?query#frag`. The
-    // authority ends at the first `/`, `?`, or `#`. (No userinfo `@` handling —
-    // token endpoints don't carry credentials in the URL.)
+    // authority ends at the first `/`, `?`, or `#`.
     let authority = rest
         .split(['/', '?', '#'])
         .next()
         .expect("split always yields at least one element");
+
+    // A userinfo component (`user@host`) means the REAL host is after the `@` —
+    // an HTTP client connects to that host, not to `user`. A loopback-looking
+    // userinfo (`http://127.0.0.1@evil.com/`) must never be mistaken for a
+    // loopback host, so refuse any authority carrying credentials outright
+    // (token endpoints never put credentials in the URL anyway).
+    if authority.contains('@') {
+        return false;
+    }
 
     // An IPv6 literal is bracketed: `[::1]:8080`. Strip the brackets to compare the
     // inner address; otherwise the host is everything before the LAST `:` (port).
@@ -736,6 +744,11 @@ mod tests {
         // A host that merely starts with "localhost" must not pass.
         assert!(!is_loopback_http_ok("http://localhost.evil.com/token"));
         assert!(!is_loopback_http_ok("http://127.0.0.1.evil.com/token"));
+        // A userinfo authority is refused: the REAL host is after the `@`, so a
+        // loopback-looking credential must never be read as a loopback host.
+        assert!(!is_loopback_http_ok("http://127.0.0.1@evil.com/token"));
+        assert!(!is_loopback_http_ok("http://localhost@evil.com/token"));
+        assert!(!is_loopback_http_ok("http://evil.com@127.0.0.1/token"));
         // Unparseable / non-http(s) schemes are refused.
         assert!(!is_loopback_http_ok("ftp://127.0.0.1/token"));
         assert!(!is_loopback_http_ok("not-a-url"));
