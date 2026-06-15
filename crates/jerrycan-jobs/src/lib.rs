@@ -99,14 +99,14 @@ impl Jobs {
         self
     }
 
-    /// A jobs engine over the durable, multi-node [`RedisStore`] (spec §v2.3b).
-    /// Like [`store`](Jobs::store) but typed: it clears any Postgres cron leader,
-    /// so the cron poller uses the in-memory single-process leader whose
-    /// duplicate cross-node ticks are collapsed by the store's atomic (Lua,
-    /// `SET NX`) idempotency.
+    /// A jobs engine over the durable, multi-node [`RedisStore`] (spec §v2.3b) —
+    /// the Redis counterpart to [`Jobs::postgres`]. Unlike Postgres there is no
+    /// distributed cron leader: a Redis deploy uses the in-memory single-process
+    /// leader, whose duplicate cross-node ticks are collapsed by the store's
+    /// atomic (Lua, `SET NX`) idempotency, so `pg_leader` is left unset.
     #[cfg(feature = "jobs-redis")]
-    pub fn redis(self, store: crate::redis_store::RedisStore) -> Self {
-        self.store(Arc::new(store))
+    pub fn redis(store: crate::redis_store::RedisStore) -> Self {
+        Self::in_memory().store(Arc::new(store))
     }
 
     /// Replace the engine config wholesale (backoff/lease/exec/poll/batch).

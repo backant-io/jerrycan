@@ -129,8 +129,8 @@ assert!(send_email(t.task_context()).await.is_ok());
   declared queue; `register` maps a job name to its typed task fn.
 - **Store**: `Jobs::postgres(db)` is the production default (durable, multi-node;
   the table is created by `JOBS_MIGRATIONS` / `PostgresStore::migrate`).
-  `Jobs::in_memory()` is the single-process / test store. (A Redis store arrives
-  in v2.3b.)
+  `Jobs::in_memory()` is the single-process / test store. `Jobs::redis(store)`
+  (the `jobs-redis` feature) is the durable multi-node Redis store — see below.
 - **`run_at` delays**: `NewJob::new(..).run_at(at)` holds a job until `at` — it
   is not leased before then.
 - **Retries → dead-letter**: a task that returns `Err` (or times out) is retried
@@ -155,6 +155,42 @@ assert!(send_email(t.task_context()).await.is_ok());
   advance all happen in one transaction, so two nodes can't double-fire.
   Single-process / in-memory deploys are the trivial leader (one process). Cron
   leadership is **Postgres-only** (the in-memory leader is single-process).
+
+## Redis store (multi-node)
+`Jobs::redis(RedisStore::connect(url).await?)` (the `jobs-redis` feature) is a
+durable, multi-node store over Redis Streams + consumer groups, an alternative
+to Postgres when you don't run a database. It satisfies the same `JobStore`
+contract as the Postgres and in-memory stores, so every guarantee above —
+at-least-once, retries → dead-letter, `run_at` delays, idempotency keys —
+holds unchanged:
+```rust
+# #[cfg(feature = "jobs-redis")]
+# async fn wire() -> jerrycan::Result<()> {
+use jerrycan::jobs::{Jobs, RedisStore};
+
+let store = RedisStore::connect("redis://127.0.0.1/").await?;
+let jobs = Jobs::redis(store).queue("email", 4);
+// app.extend(jobs) — same as Jobs::postgres / Jobs::in_memory.
+# let _ = jobs;
+# Ok(())
+# }
+```
+Caveats specific to the Redis store:
+- **Still at-least-once.** A crashed worker's lease is reclaimed and the job
+  re-runs, so the idempotency rule above is unchanged — make every task handler
+  idempotent.
+- **Idempotency dedup is atomic and cross-node.** The enqueue idempotency key is
+  a `SET NX` inside the store's Lua script, so two nodes enqueuing the same key
+  (e.g. duplicate cron ticks) collapse to one job — the in-memory cron leader
+  relies on this.
+- **Reclaim uses the Redis-server clock, not your `now`.** Every other method
+  takes the injected `now`; crashed-worker reclaim is the one exception —
+  `XAUTOCLAIM`'s min-idle is measured against the Redis server's idle time for
+  the lease, inherent to Streams. A still-running worker is never stolen.
+- **No Redis cron leader.** A Redis-only deploy uses the in-memory
+  single-process cron leader; its duplicate cross-node ticks are deduped by the
+  atomic idempotency above (a Postgres-style distributed cron leader is out of
+  scope).
 
 ## Testing
 The worker is invisible to `into_test` (the `on_serve` loops are dropped), so

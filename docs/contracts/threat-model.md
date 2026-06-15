@@ -243,8 +243,24 @@ are below.
   `JOBS_CRON_ADVISORY_KEY = 0x6A_43_43_72_6F_6E_00_01` ("jCCron" + 0001) — so an
   application's own `pg_advisory_xact_lock` calls MUST avoid that key. Cron
   leadership is **Postgres-only**: an in-memory/single-process deploy is the
-  trivial leader (one process), and a Redis-only deploy has NO cron leader (out
-  of scope until the v2.3b Redis store).
+  trivial leader (one process), and a Redis deploy uses the in-memory
+  single-process leader whose duplicate cross-node ticks are deduped by the
+  store's atomic enqueue idempotency (next bullet).
+- **The Redis store shares this jobs threat model.** The Redis Streams store
+  (`crates/jerrycan-jobs/src/redis_store.rs`, the `jobs-redis` feature) is a
+  durable multi-node alternative to Postgres and holds the same properties: it
+  is at-least-once (a crashed worker's lease is reclaimed and the job re-runs, so
+  task handlers MUST be idempotent), and a poisoned job is bounded to
+  `max_attempts` then dead-lettered. Two store-specific properties:
+  **enqueue idempotency is atomic and cross-node** — the idempotency key is a
+  `SET NX` inside the enqueue Lua script, so two nodes (e.g. duplicate cron
+  ticks) enqueuing the same key collapse to one job, which is why the
+  single-process cron leader is safe on Redis; and **crashed-worker reclaim is
+  bounded by the lease** — `XAUTOCLAIM`'s min-idle is the lease, measured against
+  the Redis-server clock (the one place the store uses wall-clock rather than the
+  injected `now`), so a still-running worker (PEL idle < lease) is never stolen
+  and a crashed worker's entry (idle ≥ lease) is reassigned exactly once per
+  lease window.
 - **A poisoned job is bounded — no infinite retry, no runaway.** A task that
   keeps failing is retried with exponential backoff and, after `max_attempts`
   (default 5), moved to the dead-letter set (status `Dead`); it is not leased

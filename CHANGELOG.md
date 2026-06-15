@@ -134,10 +134,11 @@ Background work off the request path: declared cron schedules and
 programmatically-enqueued queue jobs, generated as typed task stubs.
 - **`jerrycan-jobs`** (the `jobs` feature) — at-least-once queues over a durable
   Postgres `SELECT … FOR UPDATE SKIP LOCKED` store (always compiled,
-  `Jobs::postgres(db)`) plus an in-memory test store (`Jobs::in_memory()`). The
-  Redis store is deferred to v2.3b. **Jobs run at LEAST once** (a crashed
-  worker's lease expires and the job re-runs), so task handlers MUST be
-  idempotent — exactly-once is impossible across crashes.
+  `Jobs::postgres(db)`) plus an in-memory test store (`Jobs::in_memory()`) and,
+  behind `jobs-redis`, a Redis Streams store (`Jobs::redis(store)`, see below).
+  **Jobs run at LEAST once** (a crashed worker's lease expires and the job
+  re-runs), so task handlers MUST be idempotent — exactly-once is impossible
+  across crashes.
 - **Retries → dead-letter** — a failing (or timed-out) task is retried with
   exponential backoff; after `max_attempts` (default 5) it moves to the
   dead-letter set, inspectable (`list_dead`) and requeueable (`requeue_dead`),
@@ -159,6 +160,22 @@ programmatically-enqueued queue jobs, generated as typed task stubs.
   deterministically; **`TaskContext::fork`** gives each job a fresh
   dependency-resolution cache (DI isolation between jobs).
 - **`JC0521`** job-failed/dead-lettered added.
+
+### Redis Streams job store (v2.3b)
+- **`Jobs::redis(RedisStore::connect(url).await?)`** (the `jobs-redis` feature, a
+  facade `jerrycan/jobs-redis` feature too) — a durable, multi-node `JobStore`
+  over Redis Streams + consumer groups + `XAUTOCLAIM`, satisfying the existing
+  `JobStore` contract with no trait or generator change. It matches the
+  in-memory/Postgres reference semantics exactly: at-least-once lease/reclaim,
+  retries → dead-letter, `run_at` delays, permanent idempotency dedup,
+  id-ordered `list_dead`, attempts-reset `requeue_dead`.
+- **Atomic, cross-node enqueue idempotency** — the idempotency key is a `SET NX`
+  inside the enqueue Lua script, so duplicate cross-node enqueues (e.g. cron
+  ticks under the single-process leader) collapse to one job.
+- **Crashed-worker reclaim** is `XAUTOCLAIM` keyed on the Redis-server idle time
+  (= the lease) — the one place the store uses wall-clock rather than the
+  injected `now`; a still-running worker is never stolen.
+- `redis` stays rustls-only (no openssl); no new dependencies.
 
 ### Breaking
 - `Db::pool()` is removed — use `Db::conn()` (a `sea_orm::DatabaseConnection`).

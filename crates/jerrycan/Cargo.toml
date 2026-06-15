@@ -26,6 +26,9 @@ observe = ["dep:jerrycan-observe"]
 # Jobs require a database: the engine's default store is Postgres and the
 # generated `jobs(db)` wiring takes a `jerrycan::db::Db`, so `jobs` implies `db`.
 jobs = ["dep:jerrycan-jobs", "db"]
+# The Redis Streams job store (multi-node) as a facade feature. The RedisStore
+# type is re-exported via `pub use jerrycan_jobs` (no extra wiring needed).
+jobs-redis = ["jobs", "jerrycan-jobs/jobs-redis"]
 rate-limit = ["dep:jerrycan-ratelimit"]
 rate-limit-redis = ["rate-limit", "jerrycan-ratelimit/rate-limit-redis"]
 
