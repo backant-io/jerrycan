@@ -8,6 +8,14 @@ use jerrycan::auth::{ApiKeyRecord, ApiKeys, hash_key, mint};
 use jerrycan::prelude::*;
 use shared::Tenant;
 
+/// The scopes a tenant may grant to a minted key — a server-owned allowlist.
+/// A key's scope set is NEVER taken verbatim from the request: the requested
+/// scopes are intersected with this list, so an unknown scope or the `"*"`
+/// wildcard (which would satisfy every `require_scope` check) can never be
+/// granted by a client. This is the difference between delegating access a
+/// tenant already has and escalating to access it does not.
+const GRANTABLE_SCOPES: &[&str] = &["leads:read", "leads:write", "billing:read"];
+
 /// GET / — list the caller's tenant's keys (scoped via `all_for`).
 pub(crate) async fn list_api_keys(
     repo: Dep<ApiKeyRepo>,
@@ -27,7 +35,18 @@ pub(crate) async fn create_api_key(
     Json(body): Json<ApiKey>,
 ) -> Result<Created<serde_json::Value>> {
     let minted = mint("sk_live");
-    let scopes = body.scopes.clone();
+    // Intersect the REQUESTED scopes with the server allowlist: drop anything
+    // unknown (incl. the unsafe `"*"` wildcard) so a client can never grant a
+    // key more than the app permits. The stored, registered, and echoed scopes
+    // are all the GRANTED (filtered) set — never the raw request.
+    let granted: Vec<String> = body
+        .scopes
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| GRANTABLE_SCOPES.contains(s))
+        .map(str::to_string)
+        .collect();
+    let granted_csv = granted.join(",");
     // The `prefix` column is UNIQUE, so store a per-key DISPLAY prefix
     // (`sk_live_<first 8 hex of the hash>`) — non-secret, identifies the key in a
     // list, and is unique because the hash is. `mint`'s class prefix (`sk_live`)
@@ -38,28 +57,23 @@ pub(crate) async fn create_api_key(
         workspace_id: tenant.id(),
         prefix: display_prefix.clone(),
         label: body.label,
-        scopes: scopes.clone(),
+        scopes: granted_csv.clone(),
     };
     let id = repo.insert(row.clone()).await?;
     // Register the lookup record (hash → scopes) in the shared store the `usage`
     // authenticator reads. We persist only the hash, never the plaintext.
-    let scope_list: Vec<String> = scopes
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
     store.0.insert(ApiKeyRecord {
         id,
         prefix: display_prefix.clone(),
         hash: minted.hash.clone(),
-        scopes: scope_list,
+        scopes: granted.clone(),
     });
     Ok(Created(serde_json::json!({
         "id": id,
         "workspace_id": tenant.id(),
         "prefix": display_prefix,
         "label": row.label,
-        "scopes": scopes,
+        "scopes": granted_csv,
         "plaintext": minted.plaintext,
     })))
 }
