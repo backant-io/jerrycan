@@ -313,6 +313,26 @@ keys. The OAuth pieces are behind the `oauth` feature.
   our request — so a provider error (**JC0400**) can never contain the secret
   (`oauth.rs` `parse_token_body`; test
   `oauth_error_response_is_non_500_and_never_leaks_the_secret`).
+- **Tokens are never logged either.** `TokenResponse` has a hand-written redacting
+  `Debug` (`oauth.rs`): `access_token` prints as `"***"` and `refresh_token` as
+  `<present>`/`<absent>`, so a `{:?}` or `tracing` line can't leak the bearer
+  material (the non-secret `token_type`/`expires_in`/`scope` still print). Test
+  `token_response_debug_redacts_access_and_refresh_tokens`.
+- **No silent TLS downgrade to a real provider.** `HttpTransport` permits plaintext
+  `http://` to a token endpoint ONLY when the host is loopback (`127.0.0.1`, `::1`,
+  `localhost`) — the in-repo mock-IdP escape hatch. Any other `http://` host is
+  REFUSED before a byte is sent (`is_loopback_http_ok`; **JC0500** "refusing
+  plaintext http:// to a non-loopback token endpoint"), so a misconfigured `http://`
+  token_url can't silently ship `client_secret` + code + tokens in cleartext to a
+  real provider. `https://` is always allowed (full rustls verification). Tests
+  `loopback_http_guard_allows_only_loopback_plaintext_and_all_https`,
+  `real_http_transport_rejects_non_loopback_plaintext_without_a_network_call`.
+- **The mock IdP can't ship in a prod build.** The deterministic token-minting
+  harness (`mock_idp.rs` `MockIdp`, with a public `into_app()`) is compiled only for
+  jerrycan-auth's own `cfg(test)` and otherwise behind the explicit, non-default
+  `mock-idp` feature (facade: `jerrycan/mock-idp`) — never on a plain `--features
+  oauth` client build, where its symbol is fully `cfg`'d out. It is test/eval-only;
+  the v2.5 eval and generated tests opt in.
 - **Token-at-rest is AEAD + multi-key rotation + zeroize.** Provider tokens are
   encrypted with the session codec's ChaCha20-Poly1305 envelope
   (`base64url(nonce‖ct+tag)`), keyed under a distinct `"oauth-token"` label so a
