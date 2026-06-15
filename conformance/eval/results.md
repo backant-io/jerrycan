@@ -118,3 +118,26 @@ rebuild** of the Kolli slice (CLI + `jerrycan docs`/`explain`/`schema` only — 
 framework source, no reference handlers) is the periodic manual eval per the
 PROTOCOL. The docs-only history stands at **5/5 (100%)** on the five reference
 apps (2026-06-10, above).
+
+### Docs-only schema.json Q&A (2026-06-15)
+
+The v2.5 "answer data-structure questions from `schema.json` alone" pass
+criterion was run docs-only against the Kolli slice (agent restricted to the
+`jerrycan` binary + `jerrycan schema --json`/`docs`; framework source, the schema
+generator, and the reference fixtures off-limits). **Score: 6/6** —
+`jerrycan schema --json` alone confidently answered every question (leads FK +
+`on_delete:cascade`, `phone` unique+indexed, `status` enum `{new,called,dnc}`,
+enforced vs application-enforced relations via the `enforced` flag, the
+`workspaces` integer non-null PK, and the absence of the framework `jerrycan_jobs*`
+tables from the application contract).
+
+Gaps surfaced (real, fixable, non-blocking — the eval's purpose is to find these):
+1. The `enforced` FK flag is in the payload but undocumented at its point of use
+   — an agent reading only schema.json could misread `on_delete:cascade` +
+   `enforced:false` as a DB-guaranteed cascade (it is handler-enforced).
+2. No dedicated doc page specifies the schema.json contract shape (it is
+   described only incidentally in `docs modules` → Relations).
+3. PK "strategy" (autoincrement/identity vs app-assigned) is not expressed beyond
+   `pk:true` + `type:integer` + `nullable:false`.
+4. `indexes` lists index *names*, not the covered columns (column is inferable by
+   convention only).
