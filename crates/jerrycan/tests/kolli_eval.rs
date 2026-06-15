@@ -19,6 +19,11 @@
 //! `jerrycan::jobs::{CronSchedule, due_fire}` and
 //! `jerrycan::platform::schema::SchemaContract`, so it must be built with the
 //! `auth`, `jobs`, and (default) `cli` features. CI runs it `--all-features`.
+//!
+//! The whole file is gated on those features so a default-feature
+//! `cargo test --workspace` compiles it to an empty (0-test) binary instead of
+//! failing on the missing `jerrycan::auth`/`jerrycan::jobs` paths.
+#![cfg(all(feature = "auth", feature = "jobs"))]
 
 use jerrycan::auth::webhook::sign_sha256_hex;
 use jerrycan::jobs::{CronSchedule, due_fire};
