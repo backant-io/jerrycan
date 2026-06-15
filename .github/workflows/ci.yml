@@ -25,6 +25,15 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,7 +46,7 @@ jobs:
       - name: Install verification tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit,cargo-deny
+          tool: cargo-audit,cargo-deny,cargo-semver-checks
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (deny warnings)
@@ -46,6 +55,16 @@ jobs:
         run: cargo audit
       - name: Deny (licenses, bans, sources, yanked)
         run: cargo deny check
+      - name: Semver checks (no unintended breaking API change vs the published baseline)
+        # Only the 7 crates already on crates.io have a 0.1.0 baseline to diff
+        # against; jerrycan-jobs/jerrycan-ratelimit are unpublished (no baseline)
+        # and are added here once they are reserved + published. For a 0.x crate
+        # cargo-semver-checks allows breaking changes on a minor bump (0.1 -> 0.2),
+        # so this passes today and tightens to patch-level once 0.2.0 is published.
+        run: >-
+          cargo semver-checks check-release
+          -p jerrycan-core -p jerrycan-macros -p jerrycan-db -p jerrycan-auth
+          -p jerrycan-validate -p jerrycan-observe -p jerrycan
       - name: Tests (unit + integration + doc-tests)
         run: cargo test --workspace --all-features
       - name: Build benches
@@ -58,8 +77,31 @@ jobs:
           cargo test -p jerrycan --test genroute_compile -- --include-ignored
           cargo test -p jerrycan --test eval -- --include-ignored
           cargo test -p jerrycan --all-features --test kolli_eval -- --include-ignored
+      - name: "Durable-store behavioral tests (ignored: real Postgres + Redis)"
+        # The durable JobStore/RateLimitStore impls and the concurrent-migrator
+        # guarantee are #[ignore]d (they need a live server). With the postgres +
+        # redis services up, run them for real so a regression in the Redis Lua,
+        # the Postgres SKIP-LOCKED leasing, the advisory-lock cron leader, or the
+        # migrate advisory lock is caught by CI — not just by compilation.
+        run: |
+          cargo test -p jerrycan-db --lib tests::concurrent_migrators_do_not_race -- --ignored
+          cargo test -p jerrycan-jobs --test postgres_store -- --ignored
+          cargo test -p jerrycan-jobs --features jobs-redis --test redis_store -- --ignored
+          cargo test -p jerrycan-ratelimit --features rate-limit-redis --test redis_store -- --ignored
       - name: Docs build (broken intra-doc links are errors)
         run: cargo doc --workspace --no-deps --all-features
+
+  msrv:
+    # Enforce the declared MSRV (rust-version = "1.88"): the whole workspace must
+    # compile (incl. test targets) on exactly 1.88, so a post-1.88 std/lang
+    # feature can't silently raise the real minimum below the declared one.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace on MSRV 1.88
+        run: cargo check --workspace --all-features --all-targets
 
   fuzz-build:
     runs-on: ubuntu-latest

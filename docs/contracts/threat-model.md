@@ -215,8 +215,14 @@ boundary-violating code. Mitigations are mechanical.
   justification in the spec that introduces it; audit/deny gates remain
   mandatory; dependency count is tracked per release
   (`docs/superpowers/specs/2026-06-11-jerrycan-v2-design.md` §non-negotiables).
-- **MSRV** is declared (`rust-version = "1.88"`, root `Cargo.toml`) and tested
-  in CI.
+- **MSRV** is declared (`rust-version = "1.88"`, root `Cargo.toml`) and enforced
+  by a dedicated CI `msrv` job that `cargo check`s the whole workspace (incl.
+  test targets) on the pinned 1.88 toolchain — so a post-1.88 std/lang feature
+  can't silently raise the real minimum.
+- **Semver hygiene**: a `cargo-semver-checks` CI step diffs each published
+  crate's public API against its crates.io baseline, so an unintended breaking
+  change cannot ship in a non-major release (the unpublished `jerrycan-jobs`/
+  `jerrycan-ratelimit` join once reserved + published).
 
 ## 6. Background jobs
 
