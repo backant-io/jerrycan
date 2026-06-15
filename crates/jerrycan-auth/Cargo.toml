@@ -24,6 +24,29 @@ base64.workspace = true
 rand.workspace = true
 zeroize.workspace = true
 
+# OAuth2 client (feature-gated). All optional: the base crate (no `oauth`) gains
+# nothing from these. rustls-only — see the workspace `hyper-rustls` entry.
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, features = ["client", "client-legacy"], optional = true }
+hyper-rustls = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+
+[features]
+# OAuth2 authorization-code client + provider presets + mock IdP harness.
+# Pulls an outbound HTTPS client (hyper + hyper-rustls, rustls/ring only).
+oauth = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:hyper-rustls",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:webpki-roots",
+    "dep:rustls",
+]
+
 [dev-dependencies]
 tokio.workspace = true
 criterion = { workspace = true }

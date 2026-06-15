@@ -10,6 +10,10 @@ use zeroize::Zeroizing;
 pub mod api_key;
 pub mod guard;
 pub mod jwt;
+#[cfg(feature = "oauth")]
+pub mod mock_idp;
+#[cfg(feature = "oauth")]
+pub mod oauth;
 pub mod password;
 pub mod session;
 pub mod webhook;
@@ -19,6 +23,13 @@ pub use api_key::{
     hash_key, mint, require_scope, verify,
 };
 pub use guard::{Bearer, Session, require_role};
+#[cfg(feature = "oauth")]
+pub use mock_idp::MockIdp;
+#[cfg(feature = "oauth")]
+pub use oauth::{
+    HttpTransport, OAuthClient, PkceVerifier, Provider, Secret, TokenFuture, TokenResponse,
+    TokenTransport, parse_token_body,
+};
 pub use password::{hash_password, verify_password};
 pub use session::SessionStore;
 

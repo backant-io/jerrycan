@@ -22,6 +22,8 @@ cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tokio", "dep:sea-query", 
 db = ["dep:jerrycan-db"]
 validate = ["dep:jerrycan-validate"]
 auth = ["dep:jerrycan-auth"]
+# OAuth2 client + provider presets + mock IdP harness (jerrycan-auth's `oauth`).
+oauth = ["auth", "jerrycan-auth/oauth"]
 observe = ["dep:jerrycan-observe"]
 # Jobs require a database: the engine's default store is Postgres and the
 # generated `jobs(db)` wiring takes a `jerrycan::db::Db`, so `jobs` implies `db`.

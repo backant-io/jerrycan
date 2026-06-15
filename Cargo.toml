@@ -47,6 +47,14 @@ sea-query-binder = { version = "0.7", default-features = false, features = ["sql
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+# OAuth outbound client (behind jerrycan-auth's `oauth` feature only). rustls-only
+# via the `ring` provider + `webpki-roots` bundled roots — no openssl, no
+# native-certs. `client-legacy` gives the high-level `hyper_util` client.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "webpki-tokio", "tls12"] }
+webpki-roots = "1"
+# Direct handle on rustls only to pick the `ring` crypto provider explicitly
+# (so the OAuth client never depends on a process-global default being installed).
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
