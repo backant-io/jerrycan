@@ -383,7 +383,7 @@ fn encode(s: &str) -> String {
 /// allowed ONLY to a loopback host (`127.0.0.1`, `::1`, `localhost`) — the mock-IdP
 /// escape hatch — and is REFUSED for any other host before a byte is sent, so a
 /// misconfigured `http://` token endpoint can't silently ship `client_secret` +
-/// code + tokens over cleartext to a real provider. See [`is_loopback_http_ok`].
+/// code + tokens over cleartext to a real provider.
 #[derive(Clone)]
 pub struct HttpTransport {
     client: hyper_util::client::legacy::Client<
