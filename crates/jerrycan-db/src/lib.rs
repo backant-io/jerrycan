@@ -5,7 +5,17 @@
 #![forbid(unsafe_code)]
 
 use jerrycan_core::{App, Error, Extension, Result};
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
+
+/// The reserved 64-bit Postgres advisory-lock key that serializes a migration
+/// run. Concurrent migrators (e.g. several app nodes booting at once) all take
+/// `pg_advisory_xact_lock(MIGRATION_ADVISORY_KEY)` at the top of the migration
+/// transaction; the first holder applies the DDL and the others block, then
+/// proceed and find every migration already recorded (applying nothing). The
+/// lock auto-releases at COMMIT. Distinct from `jerrycan_jobs`'
+/// `JOBS_CRON_ADVISORY_KEY` so a migration and a cron tick never contend.
+/// Value is an arbitrary jerrycan-migrate magic constant ("jCmig" + 0001).
+pub const MIGRATION_ADVISORY_KEY: i64 = 0x6A_43_6D_69_67_00_00_01;
 
 // Connections are driven by sea-orm; generated repos build ALL SQL through
 // sea-query (dialect rendering is library-owned: placeholders, RETURNING,
@@ -116,8 +126,11 @@ pub struct OwnedMigration {
 
 impl Db {
     /// Apply pending migrations in slice order; returns the names applied.
-    /// Tracking table `_jerrycan_migrations` remembers what ran. A failure
-    /// stops the run and records nothing for the failed entry.
+    /// Tracking table `_jerrycan_migrations` remembers what ran. The whole run
+    /// is **atomic and concurrency-safe**: it runs in one transaction guarded by
+    /// a Postgres advisory lock, so several app instances booting at once can't
+    /// race the not-yet-applied check and double-apply the DDL — a failure rolls
+    /// the entire run back (all-or-nothing; no half-migrated state).
     pub async fn migrate(&self, migrations: &[Migration]) -> Result<Vec<String>> {
         self.migrate_iter(migrations.iter().map(|m| (m.name, m.sqlite, m.postgres)))
             .await
@@ -134,22 +147,41 @@ impl Db {
     }
 
     /// The shared core: apply each `(name, sqlite, postgres)` in order, skipping
-    /// already-recorded names. A failure stops the run, recording nothing for it.
+    /// already-recorded names. The whole run is one transaction; on Postgres a
+    /// transaction-scoped advisory lock serializes concurrent migrators so the
+    /// not-yet-applied check and the (non-`IF NOT EXISTS`) DDL can't race. A
+    /// failure rolls the transaction back — all-or-nothing.
     async fn migrate_iter<'a>(
         &self,
         items: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
     ) -> Result<Vec<String>> {
-        self.conn
-            .execute_unprepared(
-                "CREATE TABLE IF NOT EXISTS _jerrycan_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)",
-            )
+        // One transaction for the whole run: atomic, and the pinned connection
+        // lets the Postgres advisory lock span every statement. On SQLite the
+        // single writer (pool max = 1) already serializes; the transaction just
+        // makes the run atomic.
+        let txn = self.conn.begin().await.map_err(db_error)?;
+
+        if self.backend == Backend::Postgres {
+            // Serialize concurrent migrators: the first node holds the lock and
+            // migrates; the rest block here, then proceed and find every name
+            // already recorded (applying nothing). Auto-released at COMMIT.
+            txn.execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!("SELECT pg_advisory_xact_lock({MIGRATION_ADVISORY_KEY})"),
+            ))
             .await
             .map_err(db_error)?;
+        }
+
+        txn.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS _jerrycan_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .await
+        .map_err(db_error)?;
 
         let mut applied = Vec::new();
         for (name, sqlite, postgres) in items {
-            let seen = self
-                .conn
+            let seen = txn
                 .query_one(Statement::from_sql_and_values(
                     self.backend_db(),
                     self.sql("SELECT name FROM _jerrycan_migrations WHERE name = ?"),
@@ -164,20 +196,20 @@ impl Db {
                 Backend::Sqlite => sqlite,
                 Backend::Postgres => postgres,
             };
-            self.conn.execute_unprepared(statement).await.map_err(|e| {
+            txn.execute_unprepared(statement).await.map_err(|e| {
                 eprintln!("jerrycan-db: migration `{name}` failed");
                 db_error(e)
             })?;
-            self.conn
-                .execute(Statement::from_sql_and_values(
-                    self.backend_db(),
-                    self.sql("INSERT INTO _jerrycan_migrations (name, applied_at) VALUES (?, ?)"),
-                    [name.into(), chrono_free_timestamp().into()],
-                ))
-                .await
-                .map_err(db_error)?;
+            txn.execute(Statement::from_sql_and_values(
+                self.backend_db(),
+                self.sql("INSERT INTO _jerrycan_migrations (name, applied_at) VALUES (?, ?)"),
+                [name.into(), chrono_free_timestamp().into()],
+            ))
+            .await
+            .map_err(db_error)?;
             applied.push(name.to_string());
         }
+        txn.commit().await.map_err(db_error)?;
         Ok(applied)
     }
 }
@@ -463,5 +495,69 @@ mod tests {
         }];
         let applied = db.migrate(&good).await.unwrap();
         assert_eq!(applied, vec!["0001_broken"]);
+    }
+
+    /// Several app instances booting at once all call `migrate()` against the
+    /// same Postgres. Without the advisory-lock serialization they race the
+    /// not-yet-applied check and double-apply the (non-`IF NOT EXISTS`) DDL —
+    /// one node crashes with a unique violation (JC0409/JC0510). With it, every
+    /// migrator succeeds and the migration is applied EXACTLY once. Needs a live
+    /// Postgres; run with `JERRYCAN_TEST_PG_URL=… cargo test -p jerrycan-db -- --ignored`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "needs a local postgres (set JERRYCAN_TEST_PG_URL)"]
+    async fn concurrent_migrators_do_not_race() {
+        let Ok(url) = std::env::var("JERRYCAN_TEST_PG_URL") else {
+            eprintln!("SKIP: JERRYCAN_TEST_PG_URL not set");
+            return;
+        };
+        // A run-unique table so repeated runs against a persistent DB don't
+        // collide (the tracking row is keyed by the unique migration name).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let table = format!("mig_race_{nanos}");
+        let name = format!("{table}_0001");
+        let migrations = vec![Migration {
+            name: Box::leak(name.clone().into_boxed_str()),
+            sqlite: "",
+            postgres: Box::leak(
+                format!("CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, v TEXT NOT NULL)")
+                    .into_boxed_str(),
+            ),
+        }];
+        let migrations = std::sync::Arc::new(migrations);
+
+        // 8 separate connection pools = 8 genuine concurrent "nodes".
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let url = url.clone();
+            let migrations = migrations.clone();
+            handles.push(tokio::spawn(async move {
+                let db = Db::connect(&url).await.expect("connect");
+                db.migrate(&migrations).await
+            }));
+        }
+
+        let mut total_applied = 0usize;
+        for h in handles {
+            let applied = h.await.expect("task").expect("migrate must not error");
+            total_applied += applied.len();
+        }
+        assert_eq!(
+            total_applied, 1,
+            "exactly one migrator applies the migration; the rest see it recorded"
+        );
+
+        // The table exists and is usable.
+        let db = Db::connect(&url).await.unwrap();
+        db.conn()
+            .execute_unprepared(&format!("INSERT INTO {table} (v) VALUES ('ok')"))
+            .await
+            .unwrap();
+        db.conn()
+            .execute_unprepared(&format!("DROP TABLE {table}"))
+            .await
+            .unwrap();
     }
 }
