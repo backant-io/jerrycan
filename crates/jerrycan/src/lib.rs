@@ -67,4 +67,9 @@ mod doc_tests {
     doc_page!(page_14_tenancy, "../../../docs/ai/14-tenancy.md");
     #[cfg(feature = "jobs")]
     doc_page!(page_15_jobs, "../../../docs/ai/15-jobs.md");
+    #[cfg(feature = "oauth")]
+    doc_page!(
+        page_16_auth_advanced,
+        "../../../docs/ai/16-auth-advanced.md"
+    );
 }

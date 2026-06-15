@@ -281,7 +281,74 @@ are below.
   today; the actual behavior is the single most-recent-tick fire described above
   (`cron.rs` `due_fire` doc).
 
-## 7. Residual risks / out of scope
+## 7. Advanced auth: OAuth2, token-at-rest, API keys
+
+The auth-expansion surface (`crates/jerrycan-auth`, v2.4) — the OAuth2
+authorization-code client, the encrypted token-at-rest codec, and scoped API
+keys. The OAuth pieces are behind the `oauth` feature.
+
+- **OAuth2 client — CSRF/`state` is the application's job.** The client forwards
+  the `state` parameter verbatim (percent-encoded) but neither generates nor
+  validates it (`crates/jerrycan-auth/src/oauth.rs` `authorize_url`). The app
+  MUST generate a random `state`, bind it to the session, and compare it to the
+  value the provider echoes on the callback — otherwise it accepts forged
+  callbacks. This obligation cannot be enforced by the client; it is named here
+  and in docs/ai/16-auth-advanced.md so it is not skipped.
+- **OAuth2 PKCE is S256.** `authorize_url_pkce` generates a 32-byte CSPRNG
+  verifier, sends `code_challenge = base64url(SHA256(verifier))` with
+  `code_challenge_method=S256` (never `plain`), and returns the `PkceVerifier`
+  for the app to store server-side and replay into `exchange_code`
+  (`oauth.rs` `PkceVerifier`, `authorize_url_pkce`).
+- **`redirect_uri` allowlisting is the provider's and the app's job.** The
+  client sends the configured `redirect_uri`; defending against an open redirect
+  (registering only exact callback URLs at the provider, and refusing to honor a
+  client-supplied redirect target) is the operator's configuration, not a
+  framework mechanism.
+- **The `client_secret` is never logged.** It lives in a `Secret` newtype with
+  no `Debug`/`Display` impl (`oauth.rs` `Secret`); the only accessor is a
+  crate-private `expose` used solely to place it in the outbound form. Transport
+  and TLS failures map to a generic message that never interpolates the request
+  body (`HttpTransport::post_form` → **JC0500**), and an OAuth error response is
+  built only from the provider's `error`/`error_description` fields — never from
+  our request — so a provider error (**JC0400**) can never contain the secret
+  (`oauth.rs` `parse_token_body`; test
+  `oauth_error_response_is_non_500_and_never_leaks_the_secret`).
+- **Token-at-rest is AEAD + multi-key rotation + zeroize.** Provider tokens are
+  encrypted with the session codec's ChaCha20-Poly1305 envelope
+  (`base64url(nonce‖ct+tag)`), keyed under a distinct `"oauth-token"` label so a
+  leaked session key cannot read tokens and vice-versa
+  (`crates/jerrycan-auth/src/lib.rs` `derive_key`, `Auth::tokens`;
+  `session.rs`). Rotation is multi-key decrypt: the primary secret encrypts, each
+  retired secret only decrypts, so rotating `JERRYCAN_SECRET` (with the old value
+  moved to `JERRYCAN_SECRET_OLD`) does not invalidate existing tokens until the
+  operator drops the retired key (`Auth::with_secrets`, `from_env_parts`; tests
+  `rotated_token_at_rest_still_decodes...`,
+  `a_secret_in_neither_primary_nor_retired_fails_401...`). Derived key bytes are
+  wrapped in `zeroize::Zeroizing` so the intermediate `[u8; 32]` derivations are
+  wiped on drop (`derive_key`).
+- **API keys: hash-at-rest, constant-time compare, scope enforcement,
+  show-once.** `mint` draws 32 bytes from the OS CSPRNG and returns the plaintext
+  ONCE; only the hex SHA-256 hash is stored
+  (`crates/jerrycan-auth/src/api_key.rs` `mint`, `hash_key`). SHA-256 (not
+  argon2) is deliberate: a 256-bit random key has no brute-forceable preimage, so
+  a fast fixed-width lookup column is the right tradeoff (module docs). `verify`
+  compares the raw 32-byte digests in constant time via `hmac`'s `verify_slice`,
+  never `==` on the hex `String` (which would short-circuit and leak a
+  partial-match prefix length through timing); a malformed stored hash fails
+  rather than panicking (`api_key.rs` `verify`, `decode_hex_digest`). The `ApiKey`
+  extractor authenticates (unknown/missing key → **JC0401**) and `require_scope`
+  authorizes separately (missing scope → **JC0403**, wildcard `"*"` is an admin
+  grant) (`api_key.rs` `ApiKey`, `require_scope`).
+
+Known residual in the token-at-rest zeroization: only the `Zeroizing`-wrapped
+derivations are wiped. The long-lived `Auth::jwt_key: [u8; 32]` field and the two
+transient `Vec<[u8; 32]>` fallback-key buffers built inside `with_secrets` (the
+copies handed to `SessionStore::with_keys`) are plain arrays and are NOT zeroized
+on drop (`lib.rs` `Auth`, `with_secrets`). The `ChaCha20Poly1305` cipher owns its
+key internally and is not separately wiped. Tightening these is tracked for the
+pending crypto review (§8).
+
+## 8. Residual risks / out of scope
 
 Stated honestly; these are not defended today.
 

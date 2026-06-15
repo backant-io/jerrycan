@@ -177,6 +177,38 @@ programmatically-enqueued queue jobs, generated as typed task stubs.
   injected `now`; a still-running worker is never stolen.
 - `redis` stays rustls-only (no openssl); no new dependencies.
 
+### Auth expansion (v2.4)
+The auth surface beyond sessions and JWTs — all in `jerrycan-auth`, no generator
+or design-contract change. Reuses the existing `JC0400`/`JC0401`/`JC0403` codes.
+- **Key rotation + encrypted token-at-rest** — `Auth::with_secrets(primary,
+  retired)` and `JERRYCAN_SECRET` / `JERRYCAN_SECRET_OLD` (comma-separated)
+  do multi-key decrypt: the primary encrypts, retired secrets only decrypt, so
+  rotating the master secret never logs users out until the old key is dropped.
+  `Auth::tokens()` is a rotation-aware ChaCha20-Poly1305 codec keyed under a
+  distinct `"oauth-token"` label (non-cross-decryptable with sessions) — encrypt
+  a provider `TokenResponse` at rest with `auth.tokens().encode(&t)?`. Derived
+  key bytes are `zeroize`d on drop.
+- **Scoped API keys** — `mint(prefix)` draws 32 CSPRNG bytes, shows the plaintext
+  once, and stores only its hex SHA-256 `hash`. `verify` is a constant-time digest
+  compare (never `==` on the hex string). The `ApiKey` extractor reads
+  `Authorization: Bearer` or `X-API-Key`, resolves the `ApiKeys` store
+  (`InMemoryApiKeyStore` for tests/small deploys, a DB-backed `ApiKeyStore` in
+  prod), and `require_scope` gates the handler (wildcard `"*"` is an admin grant).
+- **OAuth2 authorization-code client** (the `oauth` feature; facade
+  `jerrycan/oauth = ["auth", "jerrycan-auth/oauth"]`) — `Provider` presets
+  (`google`/`github`/`hubspot`/`salesforce`) as config not code, `authorize_url`
+  (+ S256 PKCE), `exchange_code`, and `refresh` over a `TokenTransport` seam
+  (production `HttpTransport` is hyper + hyper-rustls, rustls-only). The
+  `client_secret` lives in a non-`Debug` `Secret` and is never logged; a provider
+  error surfaces as a non-500 `JC0400` naming the reason, never the secret.
+- **Mock IdP harness** — `MockIdp` (deterministic, counter-driven) exposes both an
+  in-process `token_transport()` for hermetic `OAuthClient` tests and an
+  `into_app()` real `App` (`GET /authorize` 302, `POST /token`) sharing one core,
+  so the wire path and the in-process path can't diverge.
+- **Docs** — new `docs/ai/16-auth-advanced.md` (OAuth connect/refresh, the
+  linked-identities table pattern, the token-at-rest rotation runbook, scoped API
+  keys) with compiling doctests; the threat model gains an advanced-auth section.
+
 ### Breaking
 - `Db::pool()` is removed — use `Db::conn()` (a `sea_orm::DatabaseConnection`).
 - Generated apps must regenerate tool-owned files (`model.rs`, `lib.rs`,

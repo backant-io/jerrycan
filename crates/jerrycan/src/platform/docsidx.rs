@@ -41,6 +41,10 @@ pub const PAGES: &[(&str, &str)] = &[
     ),
     ("tenancy", include_str!("../../embedded/ai/14-tenancy.md")),
     ("jobs", include_str!("../../embedded/ai/15-jobs.md")),
+    (
+        "auth-advanced",
+        include_str!("../../embedded/ai/16-auth-advanced.md"),
+    ),
 ];
 
 fn slug(heading: &str) -> String {
