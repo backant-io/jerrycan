@@ -77,4 +77,10 @@ mod doc_tests {
         page_16_auth_advanced,
         "../../../docs/ai/16-auth-advanced.md"
     );
+    // Page 17 uses only default-facade response types (Json/Created/NoContent/
+    // Redirect/StatusCode/the (StatusCode, body) tuple), so it needs no feature.
+    doc_page!(
+        page_17_response_types,
+        "../../../docs/ai/17-response-types.md"
+    );
 }

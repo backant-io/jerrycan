@@ -45,6 +45,10 @@ pub const PAGES: &[(&str, &str)] = &[
         "auth-advanced",
         include_str!("../../embedded/ai/16-auth-advanced.md"),
     ),
+    (
+        "response-types",
+        include_str!("../../embedded/ai/17-response-types.md"),
+    ),
 ];
 
 fn slug(heading: &str) -> String {
