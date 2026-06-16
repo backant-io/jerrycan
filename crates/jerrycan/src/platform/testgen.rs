@@ -5,8 +5,16 @@
 
 use super::design::*;
 
-fn fixture_value(t: FieldType) -> &'static str {
-    match t {
+/// The JSON request-body fixture literal for a field. Enum fields (those with a
+/// declared `values` set) use their FIRST declared value, so the generated
+/// happy-path body satisfies the migration's `CHECK (... IN (...))` constraint
+/// instead of tripping it with `"test-value"` (an opaque `JC0510` at run time).
+/// Mirrors `seed_sql_value` on the SQL seed side — the two must agree.
+fn fixture_value(f: &Field) -> String {
+    if let Some(first) = f.values.as_ref().and_then(|v| v.first()) {
+        return format!("\"{first}\"");
+    }
+    match f.field_type {
         FieldType::String => "\"test-value\"",
         FieldType::Integer => "1",
         FieldType::Float => "1.0",
@@ -15,6 +23,7 @@ fn fixture_value(t: FieldType) -> &'static str {
         FieldType::Uuid => "\"00000000-0000-0000-0000-000000000000\"",
         FieldType::Json => "{}",
     }
+    .to_string()
 }
 
 /// The fixture literal for a belongs_to fk column, valued at the SEEDED tenant
@@ -45,7 +54,7 @@ fn fixture_json(design: &Design, m: &ModuleDesign, entity: &str) -> String {
     let cols = e
         .fields
         .iter()
-        .map(|f| format!("\"{}\": {}", f.name, fixture_value(f.field_type)));
+        .map(|f| format!("\"{}\": {}", f.name, fixture_value(f)));
     let fields = fks.chain(cols).collect::<Vec<_>>().join(", ");
     format!("{{{fields}}}")
 }
@@ -138,8 +147,8 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         .and_then(|ep| ep.request_body.as_ref())
         .and_then(|rb| unit.entities.iter().find(|e| e.name == rb.entity))
         .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
-        .map(|f| fixture_value(f.field_type).trim_matches('"'))
-        .unwrap_or("1");
+        .map(|f| fixture_value(f).trim_matches('"').to_string())
+        .unwrap_or_else(|| "1".to_string());
     let seed = creator(unit).map(|ep| {
         let body = fixture_json(
             design,
@@ -174,7 +183,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
                 .map(|f| format!(
                     "    let body: serde_json::Value = serde_json::from_str(&res.text()).expect(\"json body\");\n    assert_eq!(body[\"id\"], serde_json::json!({}), \"design: created {} echoes its id\");\n",
-                    fixture_value(f.field_type), ep.success.entity.as_deref().unwrap_or("entity")
+                    fixture_value(f), ep.success.entity.as_deref().unwrap_or("entity")
                 ))
                 .unwrap_or_default();
             out.code.push_str(&format!(
@@ -185,7 +194,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 push_401_test(design, out, unit, ep, &full_path, false);
             }
         } else if param_count(ep) == 1 && seed.is_some() {
-            let seeded_path = full_path.replacen(&regex_free_param(&ep.path), seed_id, 1);
+            let seeded_path = full_path.replacen(&regex_free_param(&ep.path), &seed_id, 1);
             let request = request_expr(design, unit, ep, &seeded_path, guarded);
             out.code.push_str(&format!(
                 "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n}}\n\n",

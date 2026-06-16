@@ -219,6 +219,40 @@ fn tenancy_module_tests_seed_membership_and_provide_the_guard() {
     );
 }
 
+/// The generated JSON request BODY for an enum field must use a DECLARED value,
+/// not the generic `"test-value"` placeholder. WHY: the generator's own
+/// migration emits `CHECK ("role" IN ('admin','user'))`, so a body with
+/// `"role": "test-value"` makes the happy-path acceptance test fail at run time
+/// with an opaque `JC0510` even when the handler is correctly implemented — the
+/// gen-test would contradict the gen-migration. The body must agree with the
+/// SQL seed (`seed_sql_value`), which already uses the first declared value.
+#[test]
+fn generated_request_body_uses_a_declared_enum_value_not_the_placeholder() {
+    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let design: Design = serde_json::from_str(s).unwrap();
+    let users = design
+        .modules
+        .iter()
+        .find(|m| m.name == "users")
+        .expect("users module");
+    let generated = testgen::acceptance_rs(&design, users);
+    // `register`'s body posts the `User` entity, whose `role` is an enum
+    // `["admin","user"]` → the first declared value, NOT `"test-value"`.
+    assert!(
+        generated.contains("\"role\": \"admin\""),
+        "enum field uses its first declared value: {generated}"
+    );
+    assert!(
+        !generated.contains("\"role\": \"test-value\""),
+        "enum field must NOT use the placeholder (trips the CHECK): {generated}"
+    );
+    // A plain (non-enum) string field still uses the placeholder.
+    assert!(
+        generated.contains("\"email\": \"test-value\""),
+        "non-enum string keeps the placeholder: {generated}"
+    );
+}
+
 /// A tenant-owned entity's create/update bodies must carry the fk column the
 /// `belongs_to` derives, valued at the SEEDED tenant (workspace 1). WHY: without
 /// it the generated request body is missing a NOT-NULL column, so the handler's
