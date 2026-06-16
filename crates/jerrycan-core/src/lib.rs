@@ -29,7 +29,8 @@ pub use middleware::{Middleware, MiddlewareFuture, Next};
 pub use module::Module;
 pub use multipart::Multipart;
 pub use response::{
-    BodyError, BodySender, Created, IntoResponse, JcBody, Json, NoContent, Response, StreamBody,
+    BodyError, BodySender, Created, IntoResponse, JcBody, Json, NoContent, Redirect, Response,
+    StreamBody,
 };
 pub use router::{MethodRouter, delete, get, patch, post, put};
 pub use test_client::{TestApp, TestPart, TestResponse};
@@ -46,6 +47,7 @@ pub mod prelude {
     pub use crate::{
         App, Clock, CorsConfig, CorsOrigins, Created, Dep, Error, Extension, Headers, IntoResponse,
         Json, Middleware, MiddlewareFuture, Module, Multipart, Next, NoContent, Path, Query,
-        RawBody, RequestCtx, Result, StreamBody, TestApp, TestPart, delete, get, patch, post, put,
+        RawBody, Redirect, RequestCtx, Result, StreamBody, TestApp, TestPart, delete, get, patch,
+        post, put,
     };
 }

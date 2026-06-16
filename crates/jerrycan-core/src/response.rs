@@ -100,6 +100,68 @@ pub struct Created<T>(pub T);
 /// 204 No Content.
 pub struct NoContent;
 
+/// An HTTP redirect: an empty body plus a `Location` header and a 3xx status.
+/// Use the constructor that names the semantics you want — `to`/`see_other`/
+/// `temporary`/`permanent` — rather than hand-setting a status code.
+pub struct Redirect {
+    status: StatusCode,
+    location: String,
+}
+
+impl Redirect {
+    /// 302 Found — the default redirect. The method may change to GET on follow
+    /// (legacy behavior); prefer [`Redirect::see_other`] after a POST.
+    pub fn to(location: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FOUND,
+            location: location.into(),
+        }
+    }
+
+    /// 303 See Other — redirect a POST/PUT to a GET (the POST-redirect-GET pattern).
+    pub fn see_other(location: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SEE_OTHER,
+            location: location.into(),
+        }
+    }
+
+    /// 307 Temporary Redirect — preserves the method and body on follow.
+    pub fn temporary(location: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TEMPORARY_REDIRECT,
+            location: location.into(),
+        }
+    }
+
+    /// 308 Permanent Redirect — preserves the method and body, and is cacheable.
+    pub fn permanent(location: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PERMANENT_REDIRECT,
+            location: location.into(),
+        }
+    }
+}
+
+impl IntoResponse for Redirect {
+    fn into_response(self) -> Response {
+        // A control char (or other non-token byte) in the location can't go into
+        // a header value. That's a programming error in the handler, not a client
+        // fault, so surface it as a 500 rather than panicking the request task.
+        let value = match HeaderValue::from_str(&self.location) {
+            Ok(v) => v,
+            Err(_) => {
+                return Error::internal("redirect location is not a valid header value")
+                    .into_response();
+            }
+        };
+        let mut r = http::Response::new(JcBody::empty());
+        *r.status_mut() = self.status;
+        r.headers_mut().insert(header::LOCATION, value);
+        r
+    }
+}
+
 fn full(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> Response {
     let mut r = http::Response::new(JcBody::full(body));
     *r.status_mut() = status;
@@ -165,6 +227,19 @@ impl IntoResponse for NoContent {
     fn into_response(self) -> Response {
         let mut r = http::Response::new(JcBody::empty());
         *r.status_mut() = StatusCode::NO_CONTENT;
+        r
+    }
+}
+
+/// Render the inner value, then overwrite the status. This is what makes
+/// `(StatusCode::ACCEPTED, Json(body))` a 202-with-JSON and
+/// `(StatusCode::ACCEPTED, "queued")` a 202 text response — the body's own
+/// content type and bytes are kept, only the status line changes.
+impl<T: IntoResponse> IntoResponse for (StatusCode, T) {
+    fn into_response(self) -> Response {
+        let (status, inner) = self;
+        let mut r = inner.into_response();
+        *r.status_mut() = status;
         r
     }
 }
@@ -456,6 +531,63 @@ mod tests {
         assert_eq!(ok.into_response().status(), StatusCode::OK);
         let err: crate::Result<&'static str> = Err(Error::bad_request("x"));
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn redirect_to_is_302_with_location_and_empty_body() {
+        let r = Redirect::to("/x").into_response();
+        assert_eq!(r.status(), StatusCode::FOUND);
+        assert_eq!(r.headers()[header::LOCATION], "/x");
+        assert_eq!(body_of(r), "");
+    }
+
+    #[test]
+    fn redirect_constructors_set_their_status_and_location() {
+        // Each named constructor encodes a distinct redirect semantic; a regression
+        // that collapses them to one status would change browser follow behavior.
+        for (build, status) in [
+            (Redirect::see_other("/a") as Redirect, StatusCode::SEE_OTHER),
+            (Redirect::temporary("/b"), StatusCode::TEMPORARY_REDIRECT),
+            (Redirect::permanent("/c"), StatusCode::PERMANENT_REDIRECT),
+        ] {
+            let r = build.into_response();
+            assert_eq!(r.status(), status);
+            assert!(r.headers().contains_key(header::LOCATION));
+        }
+    }
+
+    #[test]
+    fn redirect_with_invalid_location_is_a_non_panicking_500() {
+        // A control char can't be a header value; the handler shouldn't panic the
+        // request task, it should surface a 500 the connection can report.
+        let r = Redirect::to("/bad\nlocation").into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(r.headers().get(header::LOCATION).is_none());
+    }
+
+    #[test]
+    fn status_tuple_overrides_status_keeping_the_json_body() {
+        // (StatusCode, Json) must render the JSON body (content type + bytes) and
+        // only swap the status — that's what lets a 202 carry a payload.
+        #[derive(Serialize)]
+        struct Summary {
+            queued: u32,
+        }
+        let r = (StatusCode::ACCEPTED, Json(Summary { queued: 3 })).into_response();
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(body_of(r), r#"{"queued":3}"#);
+    }
+
+    #[test]
+    fn status_tuple_overrides_status_keeping_the_text_body() {
+        let r = (StatusCode::ACCEPTED, "queued").into_response();
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            r.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(body_of(r), "queued");
     }
 
     #[tokio::test]
