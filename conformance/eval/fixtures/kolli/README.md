@@ -44,21 +44,22 @@ scaffold the design → apply these files → patch the app Cargo features → r
    files are **extra** files the kolli slice needs beyond the eval.rs handler-only
    layout — the Phase 5b harness must copy them too (see destinations above).
 
-3. **Cargo feature patch (REQUIRED — friction finding):** the design's
-   `dependencies` array (`db`/`auth`/`validate`/`observe`/`jobs`) has **no keyword
-   for `oauth`/`mock-idp`**, so the scaffolder cannot enable them. The
-   `integrations` module does not compile without them. Patch the generated root
-   `Cargo.toml` `[workspace.dependencies]` jerrycan line to add the two features:
+3. **Cargo feature patch (test-only — just `mock-idp`):** the kolli design now
+   declares the **`oauth` dependency**, so the scaffolder wires the `oauth` facade
+   feature AUTOMATICALLY — the `integrations` module compiles out of the box.
+   The only remaining patch is `mock-idp`, the **test-only** IdP harness (never a
+   production dependency, so not expressible as a design dependency). Patch the
+   generated root `Cargo.toml` `[workspace.dependencies]` jerrycan line:
    ```
-   # before:
-   jerrycan = { path = "…", default-features = false, features = ["db", "validate", "auth", "observe", "jobs"] }
-   # after:
+   # before (scaffolded, oauth auto-wired):
+   jerrycan = { path = "…", default-features = false, features = ["db", "validate", "auth", "observe", "jobs", "oauth"] }
+   # after (add the test-only mock IdP):
    jerrycan = { path = "…", default-features = false, features = ["db", "validate", "auth", "observe", "jobs", "oauth", "mock-idp"] }
    ```
    (`mock-idp` is enabled because the reference slice wires the OAuth client's
    token transport to an in-process `MockIdp` so the flow is hermetic — no
-   socket. A real deployment would drop `mock-idp` and the `.with_transport(...)`
-   line and read client credentials from env.)
+   socket. A real deployment drops `mock-idp` and the `.with_transport(...)` line
+   and reads client credentials from env.)
 
 4. `jerrycan --json check` → `ok: true`. The generated acceptance suite passes,
    including the cross-tenant isolation tests

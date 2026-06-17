@@ -282,6 +282,16 @@ impl Design {
         !self.jobs.is_empty()
     }
 
+    /// Reserved dependency name `oauth` enables the facade `oauth` feature, so a
+    /// generated handler can use `jerrycan::auth::oauth::{OAuthClient, Provider}`
+    /// (the OAuth2 authorization-code client). The facade `oauth` feature implies
+    /// `auth`, so the auth surface is available even without a separate `auth`
+    /// dependency. The client is constructed in agent-owned handler code (no
+    /// app-level extension wiring), so this only gates the Cargo feature.
+    pub fn wants_oauth(&self) -> bool {
+        self.dependencies.iter().any(|d| d == "oauth")
+    }
+
     /// The facade features this design's mode requires on the `jerrycan` dep,
     /// in a stable order (scaffold and mounting must agree byte-for-byte).
     pub fn facade_features(&self) -> Vec<&'static str> {
@@ -300,6 +310,10 @@ impl Design {
         }
         if self.wants_jobs() {
             features.push("jobs");
+        }
+        // Appended last so existing designs' feature order is unchanged.
+        if self.wants_oauth() {
+            features.push("oauth");
         }
         features
     }
@@ -478,6 +492,37 @@ pub(crate) mod tests {
         let no_jobs: Design = serde_json::from_str(MINIMAL).unwrap();
         assert!(!no_jobs.wants_jobs());
         assert!(!no_jobs.facade_features().contains(&"jobs"));
+    }
+
+    #[test]
+    fn wants_oauth_gates_on_the_dependency_and_appends_the_facade_feature() {
+        // A design declaring the `oauth` dependency enables the `oauth` facade
+        // feature so a generated handler can use the OAuth2 client without a
+        // manual Cargo patch. `oauth` is appended LAST, after `jobs`.
+        let s = r#"{ "name": "x", "contract_version": 1,
+            "dependencies": ["db", "auth", "oauth"],
+            "modules": [{ "name": "m", "endpoints": [
+                { "operation_id": "go", "method": "GET", "path": "/go",
+                  "success": { "status": 302 } }] }] }"#;
+        let d: Design = serde_json::from_str(s).unwrap();
+        assert!(
+            d.wants_oauth(),
+            "the `oauth` dependency must set wants_oauth"
+        );
+        let feats = d.facade_features();
+        assert!(
+            feats.contains(&"oauth"),
+            "wants_oauth must surface the `oauth` facade feature: {feats:?}"
+        );
+        assert_eq!(
+            feats.last(),
+            Some(&"oauth"),
+            "oauth is appended last: {feats:?}"
+        );
+        // No `oauth` dependency → no `oauth` feature.
+        let no_oauth: Design = serde_json::from_str(MINIMAL).unwrap();
+        assert!(!no_oauth.wants_oauth());
+        assert!(!no_oauth.facade_features().contains(&"oauth"));
     }
 
     #[test]
