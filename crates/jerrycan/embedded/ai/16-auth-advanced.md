@@ -20,12 +20,17 @@ the PKCE variant for public clients), then `exchange_code` on the callback:
 # fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
 use jerrycan::auth::{OAuthClient, Provider};
 
-// client_secret comes from the environment, never a literal — and lives in a
-// `Secret` newtype that has no Debug/Display, so it can't reach a log line.
+// In real code the credentials come from config/env as `String`s, never a
+// literal. `client_secret` is `impl Into<Secret>`, and `Secret: From<&str>` /
+// `From<String>` — so pass a `String` by value, or `&str` (e.g. `s.as_str()`).
+// A `&String` does NOT convert (`Into<Secret>` is for `&str`/`String`), which is
+// the confusing trait error to avoid; call `.as_str()` on the `&String`.
+let client_id = std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default();          // String
+let client_secret = std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default();  // String
 let client = OAuthClient::new(
     Provider::google(),
-    "my-client-id",
-    "my-client-secret",                       // std::env::var("GOOGLE_CLIENT_SECRET")?
+    client_id,                                // String → impl Into<String>
+    client_secret.as_str(),                   // &str → Secret (a &String would NOT)
     "https://app.example.com/oauth/callback",
 );
 
