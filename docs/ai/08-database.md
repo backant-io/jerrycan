@@ -14,7 +14,9 @@ entity code runs on both. Enable with the design dependency `"db"`
 # fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
 use jerrycan::db::{Db, Migration};
 
-let db = Db::connect("sqlite::memory:").await.unwrap();   // or postgres://…; from_env() reads JERRYCAN_DATABASE_URL
+// `from_env()` reads JERRYCAN_DATABASE_URL, defaulting to `sqlite::memory:`
+// when it's unset — so dev/test "just works" with no database to provision.
+let db = Db::connect("sqlite::memory:").await.unwrap();   // or postgres://…
 db.migrate(&[Migration {                                   // dual-dialect: the connected backend picks its column
     name: "0001_create_notes",
     sqlite: "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL)",
@@ -172,3 +174,6 @@ code must keep. The `belongs_to` derivation rules behind this live in
 - JSON columns are `sea_orm` `Json` (`serde_json::Value`) — store the value
   directly. Never `serde_json::to_string` it first; double-encoding turns a JSON
   object into a quoted string the next reader can't parse.
+- `datetime` and `uuid` design fields are `String` at the Rust layer (no native
+  time/uuid type yet) — the column is TEXT and the model field is `String`. Parse
+  and format them yourself in handlers; there is no built-in `now() → rfc3339`.

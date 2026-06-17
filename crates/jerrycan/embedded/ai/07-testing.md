@@ -66,8 +66,11 @@ assert_eq!(res.headers()["content-type"], "application/json");
 ```
 
 Post a `multipart/form-data` request with `post_multipart` — `TestPart::text`
-for fields, `TestPart::file` for uploads (it builds the boundary and wire body
-for you). `post_multipart_with` adds request headers (auth cookies, etc.).
+for fields, `TestPart::file(name, filename, content_type, bytes)` for uploads (it
+builds the boundary and wire body for you). On the handler side each `part`
+exposes `name()`, `filename() -> Option<&str>`, and `content_type() -> Option<&str>`
+(the `content_type` you passed to `TestPart::file`) before you read its body.
+`post_multipart_with` adds request headers (auth cookies, etc.).
 `TestResponse::bytes()` returns the raw response body for non-text downloads:
 ```rust
 # use jerrycan::prelude::*;

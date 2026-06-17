@@ -40,6 +40,9 @@ use serde::{Deserialize, Serialize};
 // CRON job: owned ctx, no payload (the leader enqueues it each tick).
 pub async fn expire_trials(mut ctx: TaskContext) -> Result<()> {
     // jobs are at-least-once — make this idempotent (it may run more than once).
+    // No request here, so reach app-level deps via ctx.resolve::<T>() (-> Arc<T>),
+    // NOT a Dep<T> extractor (extractors need a request and fail JC1003):
+    //   let db = ctx.resolve::<jerrycan::db::Db>().await?;
     let _ = &mut ctx;
     Ok(())
 }
@@ -124,9 +127,11 @@ assert!(send_email(t.task_context()).await.is_ok());
 
 ## Variations
 - **Wiring**: the generated `crates/jobs/src/lib.rs` builds the extension —
-  `Jobs::postgres(db).queue("email", 4).register("send_email", f).cron(..)` —
-  and the app installs it with `app.extend(jobs(db))`. One worker pool per
-  declared queue; `register` maps a job name to its typed task fn.
+  `Jobs::postgres(db).queue("email", 4).register("send_email", f).cron("expire_trials", "0 * * * *", "billing")`
+  — and the app installs it with `app.extend(jobs(db))`. `cron(job, expr, queue)`
+  takes the job name, the 5-field cron expression, and the queue it enqueues onto
+  (it is a builder taking `self` and PANICS at build time on an invalid `expr`).
+  One worker pool per declared queue; `register` maps a job name to its typed task fn.
 - **Store**: `Jobs::postgres(db)` is the production default (durable, multi-node;
   the table is created by `JOBS_MIGRATIONS` / `PostgresStore::migrate`).
   `Jobs::in_memory()` is the single-process / test store. `Jobs::redis(store)`

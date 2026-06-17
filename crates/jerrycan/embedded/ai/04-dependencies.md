@@ -67,10 +67,35 @@ assert_eq!(t.get("/admin").await.text(), "ada@pg://prod");
 Per-request memoization: a factory runs at most once per request, no matter how
 many handlers/factories ask for its type; a fresh request resolves afresh.
 
+## Resolving deps outside a request (TaskContext)
+A handler gets its deps through `Dep<T>` extractors, but background jobs and
+app-level setup run with NO request. There you resolve deps imperatively from a
+`TaskContext` — `ctx.resolve::<T>().await` returns `Result<Arc<T>>` (T must be
+`Send + Sync + 'static`). Get a `TaskContext` from a built/test app with
+`task_context()`; it sees every app-level `.provide`/`.provide_dep`, but NOT
+request-only deps (those fail `JC1003`).
+```rust
+# use jerrycan::prelude::*;
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+struct Config { region: &'static str }
+
+let t = App::new().provide(Config { region: "eu" }).into_test();
+let mut ctx = t.task_context();
+let cfg = ctx.resolve::<Config>().await.unwrap();   // Arc<Config>
+assert_eq!(cfg.region, "eu");
+# }); }
+```
+`ctx.fork()` returns a fresh `TaskContext` sharing the same app-level singletons
+and factories but with an EMPTY resolution cache — the job worker forks one per
+job so per-request-scope factories re-run and cached state never leaks between
+jobs. See 15-jobs for using `resolve` inside a task body.
+
 ## Errors you'll hit
 - Consuming an unregistered type → `500 JC1001` naming the missing type. Fix:
   `.provide`/`.provide_dep` it on the app or the module.
 - A factory chain deeper than 32 (or cyclic) → `500 JC1002`. Break the cycle.
+- An HTTP-only dependency (or extractor) resolved from a `TaskContext` → `JC1003`:
+  a task has no request, so only app-level `Dep<T>` resolve there.
 
 ## Anti-patterns
 - Don't pass `Dep<T>` values into helper functions by cloning everywhere —

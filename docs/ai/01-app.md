@@ -234,6 +234,16 @@ assert_eq!(res.text(), "id,name\n1,row1\n2,row2\n3,row3\n");
 # }); }
 ```
 
+The other constructor wraps an existing `Stream` (a SeaORM streaming query, a
+hand-rolled producer) instead of a channel — same body, source you already have:
+```text
+StreamBody::new(stream)
+    where stream: futures_core::Stream<Item = Result<bytes::Bytes, Error>> + Send + Sync + 'static
+```
+An `Err` item from the stream aborts the connection (truncation, never a clean
+short body). Both constructors return the same `StreamBody`, so the
+`.content_type(..)`/`.attachment(..)`/`.frame_timeout(..)` builders apply to either.
+
 **Failure is honest, not silent.** A streamed body that fails mid-way ABORTS the
 connection — the client sees a truncated (invalid) chunked stream, never a
 cleanly-ended body that is actually incomplete. Two things trigger an abort: a

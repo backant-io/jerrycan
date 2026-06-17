@@ -192,6 +192,12 @@ let res = t.post_multipart("/import", &[
 assert_eq!(res.json::<(String, usize)>(), ("leads".to_string(), 3)); // header + 2 rows
 # }); }
 ```
+Each `Part` exposes its headers before you read its body: `part.name() -> &str`
+(the form field name), `part.filename() -> Option<&str>` (the uploaded
+filename, if any), and `part.content_type() -> Option<&str>` (the part's
+declared `Content-Type`, e.g. `"text/csv"` — branch on it to accept or reject an
+upload before draining it).
+
 Rules and limits:
 - Wrong content type (not `multipart/form-data` with a boundary) → `415 JC0415`.
 - `bytes()`/`text()` buffer a whole part, capped at the per-part cap (default

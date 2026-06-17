@@ -24,6 +24,33 @@ impl Middleware for AuditLog {
 # let _ = AuditLog;
 ```
 
+## Reading the request (`RequestCtx`)
+The `ctx` handed to `handle` (and to dependency factories) exposes the request's
+head — useful for audit and rate-limit policy:
+- `ctx.method() -> &http::Method`
+- `ctx.uri() -> &http::Uri`
+- `ctx.headers() -> &http::HeaderMap`
+- `ctx.peer_addr() -> Option<std::net::SocketAddr>` — the client socket address
+  (the OWNED `SocketAddr` by value, `None` when there's no peer, e.g. an
+  in-memory `TestApp` request unless you use `t.get_from(path, addr)`). Use it to
+  key an audit log or a rate-limit partition.
+
+```rust
+# use jerrycan::prelude::*;
+struct AuditPeer;
+impl Middleware for AuditPeer {
+    fn handle<'a>(&'a self, ctx: &'a mut RequestCtx, next: Next<'a>) -> MiddlewareFuture<'a> {
+        Box::pin(async move {
+            let who = ctx.peer_addr().map(|a| a.to_string()).unwrap_or_else(|| "-".into());
+            let line = format!("{} {} from {who}", ctx.method(), ctx.uri());
+            let _ = line;  // emit to your access log
+            next.run(&mut *ctx).await
+        })
+    }
+}
+# let _ = AuditPeer;
+```
+
 ## Minimal example
 ```rust
 # use jerrycan::prelude::*;

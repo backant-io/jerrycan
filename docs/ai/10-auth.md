@@ -115,6 +115,22 @@ async fn stripe(
 # }); }
 ```
 
+**Signing (for tests, or producing your own webhook).** The same module exposes
+the producer side: `sign_sha256_hex(secret, message) -> String` (hex HMAC-SHA256,
+what Stripe's `v1=` carries) and `sign_sha1_base64(secret, message) -> String`
+(base64 HMAC-SHA1, what Twilio sends). Use them to forge a valid signature when
+testing a webhook handler — `verify_*` is the exact inverse:
+```rust
+# use jerrycan::prelude::*;
+use jerrycan::auth::webhook::{sign_sha256_hex, verify_sha256_hex};
+
+let secret = b"whsec_test";
+let body = b"{\"event\":\"invoice.paid\"}";
+let sig = sign_sha256_hex(secret, body);              // hex digest, like Stripe's v1=
+assert!(verify_sha256_hex(secret, body, &sig));       // round-trips
+assert!(!verify_sha256_hex(secret, body, "deadbeef")); // a wrong sig is rejected
+```
+
 **Twilio** sends `X-Twilio-Signature`: base64 HMAC-SHA1 over the full request
 URL with the POST form params appended, sorted by key (`key+value`, no
 separators). The body is `application/x-www-form-urlencoded`, parsed with the

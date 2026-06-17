@@ -38,19 +38,35 @@ let e = Error::new(jerrycan::http::StatusCode::CONFLICT, "JC0409", "title alread
 assert_eq!(e.code(), "JC0409");
 ```
 
-The full constructor set (prefer these over raw `Error::new`):
+The full constructor set — every named helper on `Error` (prefer these over raw
+`Error::new`). The comment is `<HTTP status> <JC code>`:
 ```rust
 # use jerrycan::prelude::*;
 let all = [
-    Error::bad_request("bad input"),      // 400 JC0400
-    Error::not_found(),                   // 404 JC0404
-    Error::method_not_allowed(),          // 405 JC0405
-    Error::payload_too_large(),           // 413 JC0413
-    Error::unprocessable("bad field"),    // 422 JC0422
-    Error::internal("boom"),              // 500 JC0500
+    Error::bad_request("bad input"),       // 400 JC0400
+    Error::unauthorized(),                 // 401 JC0401
+    Error::forbidden(),                    // 403 JC0403
+    Error::not_found(),                    // 404 JC0404
+    Error::method_not_allowed(),           // 405 JC0405
+    Error::conflict("title taken"),        // 409 JC0409
+    Error::payload_too_large(),            // 413 JC0413
+    Error::unsupported_media_type(),       // 415 JC0415
+    Error::unprocessable("bad field"),     // 422 JC0422
+    Error::too_many_requests(),            // 429 JC0429
+    Error::internal("boom"),               // 500 JC0500
+    Error::handler_timeout(),              // 503 JC0503
+    Error::job_failed("retry exhausted"),  // 500 JC0521 (code 0521, wire status 500)
+    Error::missing_dependency("Db"),       // 500 JC1001
+    Error::dependency_cycle(),             // 500 JC1002
+    Error::task_context(),                 // 500 JC1003
 ];
 assert_eq!(all[0].code(), "JC0400");
+assert_eq!(all[1].code(), "JC0401");
+assert_eq!(Error::job_failed("x").status().as_u16(), 500); // 0521 maps to a 500 wire status
 ```
+`conflict`, `job_failed`, and `internal`/`bad_request`/`unprocessable` take
+`impl Into<String>`; `missing_dependency` takes `&str` (the type name); the rest
+take no argument. `job_failed` carries code `JC0521` but responds with HTTP 500.
 
 ## Errors you'll hit (the built-in code table)
 | Code | Status | Produced when |
@@ -61,13 +77,18 @@ assert_eq!(all[0].code(), "JC0400");
 | JC0404 | 404 | No route matched, or `Error::not_found()` |
 | JC0405 | 405 | Path exists, method doesn't |
 | JC0408 | 408 | Request body wasn't received within the read budget (default 30s) |
+| JC0409 | 409 | `Error::conflict` — unique-key violation (a re-POSTed id), version conflict |
 | JC0413 | 413 | Body over the limit (default 1 MiB) |
+| JC0415 | 415 | `Error::unsupported_media_type` — wrong content type (e.g. multipart without a boundary) |
 | JC0422 | 422 | JSON body failed to parse, or `Valid<T>` found violations (structured `details` array) |
+| JC0429 | 429 | `Error::too_many_requests` — rate limit exceeded (jerrycan::ratelimit) |
 | JC0500 | 500 | `Error::internal` / response serialization failure |
-| JC0503 | 503 | Handler exceeded its time budget (default 30s) |
+| JC0503 | 503 | Handler exceeded its time budget (default 30s), or `Error::handler_timeout` |
 | JC0510 | 500 | Database failure (jerrycan::db) — detail on stderr, never in the body |
-| JC1001 | 500 | Dependency type has no provider |
-| JC1002 | 500 | Dependency cycle / chain > 32 |
+| JC0521 | 500 | `Error::job_failed` — a background job exhausted its retries / dead-lettered (code 0521, wire status 500) |
+| JC1001 | 500 | Dependency type has no provider (`Error::missing_dependency`) |
+| JC1002 | 500 | Dependency cycle / chain > 32 (`Error::dependency_cycle`) |
+| JC1003 | 500 | A request-only dependency was resolved in a background task (`Error::task_context`) |
 
 ## Anti-patterns
 - Don't `panic!`/`unwrap()` in handlers for expected failures — return `Err`.
