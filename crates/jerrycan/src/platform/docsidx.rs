@@ -5,6 +5,10 @@ use serde::Serialize;
 /// (topic, markdown) — embedded at compile time from the SAME files the
 /// doc-tests execute, so served docs can never drift from verified docs.
 pub const PAGES: &[(&str, &str)] = &[
+    (
+        "designing",
+        include_str!("../../embedded/ai/00-designing.md"),
+    ),
     ("app", include_str!("../../embedded/ai/01-app.md")),
     ("modules", include_str!("../../embedded/ai/02-modules.md")),
     (

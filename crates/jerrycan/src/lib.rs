@@ -44,6 +44,7 @@ mod doc_tests {
             mod $name {}
         };
     }
+    doc_page!(page_00_designing, "../../../docs/ai/00-designing.md");
     doc_page!(page_01_app, "../../../docs/ai/01-app.md");
     doc_page!(page_02_modules, "../../../docs/ai/02-modules.md");
     doc_page!(page_03_extractors, "../../../docs/ai/03-extractors.md");
