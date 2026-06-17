@@ -223,7 +223,7 @@
     },
     {
       "name": "jerrycan_schema",
-      "description": "Derive the data contract from the app's module migrations: the schema.json shape (tables, columns, foreign keys, unique constraints, indexes, enums) with design-declared field types overlaid. The reviewable, never-hand-written source of truth for the data layer. Governed by https://jerrycan.cc/schemas/db-schema-v1.json.",
+      "description": "Derive the data contract from the app's module migrations: the schema.json shape (tables, columns, foreign keys, unique constraints, indexes, enums) with design-declared field types overlaid. The reviewable, never-hand-written source of truth for the data layer. Each foreign key carries an `enforced` flag: true = a real database FOREIGN KEY (same-module); false = an indexed but application-enforced cross-module relation whose `on_delete` is honored by handlers, NOT the database. Governed by https://jerrycan.cc/schemas/db-schema-v1.json.",
       "inputSchema": {
         "type": "object",
         "properties": {

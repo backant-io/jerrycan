@@ -86,7 +86,8 @@
           }
         },
         "on_delete": {
-          "enum": ["cascade", "set_null", "restrict", "no_action"]
+          "enum": ["cascade", "set_null", "restrict", "no_action"],
+          "description": "The delete policy. Read it WITH `enforced`: when enforced=true the database applies it; when enforced=false it is honored by handlers, NOT the database (so on_delete=cascade does not DB-cascade a cross-module relation)."
         },
         "enforced": {
           "type": "boolean",

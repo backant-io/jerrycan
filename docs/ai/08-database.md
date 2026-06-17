@@ -133,6 +133,25 @@ db.conn()
   # }).unwrap(); }
   ```
 
+## Foreign keys in the schema contract (`enforced`)
+`jerrycan schema` (and the committed `schema.json`) emits an `"enforced"` bool on
+every foreign key. It tells you **who upholds the relation** — don't read
+`on_delete` without it:
+- **`enforced: true`** — a same-module `belongs_to` becomes a real database
+  `FOREIGN KEY` constraint (introspected from the migration). The `on_delete`
+  policy (`cascade`/`set_null`/`restrict`) is enforced by the DB itself.
+- **`enforced: false`** — a cross-module `belongs_to` is an *indexed but
+  application-enforced* relation: the fk column exists (and is indexed) but there
+  is **no** DB constraint, because per-module migrations only create their own
+  tables. Here `on_delete` is honored by your handlers, **NOT** the database — so
+  `{ "on_delete": "cascade", "enforced": false }` does *not* mean the DB will
+  cascade-delete; a child row outlives its parent unless a handler removes it.
+
+So `enforced` is the line between a DB-guaranteed constraint and a contract the
+code must keep. The `belongs_to` derivation rules behind this live in
+`jerrycan docs modules` (Relations); tenant-scoped relations in
+`jerrycan docs tenancy`.
+
 ## Errors you'll hit
 - A unique-key violation surfaces as `409 JC0409` (a re-POSTed id is the
   client's fault); every other database failure is `500 JC0510`. Neither leaks
