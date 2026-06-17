@@ -66,6 +66,13 @@ enum Cmd {
         topic: Option<String>,
         #[arg(long)]
         search: Option<String>,
+        /// List every page (slug + title + one-line summary). Implied when no
+        /// topic and no --search are given.
+        #[arg(long)]
+        list: bool,
+        /// Max search hits to return (default: enough to never hide a page).
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Explain a diagnostic code (JC#### / JL####)
     Explain { code: String },
@@ -177,7 +184,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Check { module } => cmd_check(module.as_deref(), cli.json),
         Cmd::Test { module } => cmd_test(module.as_deref()),
         Cmd::GenTests { module } => cmd_gen_tests(&module, cli.json),
-        Cmd::Docs { topic, search } => cmd_docs(topic.as_deref(), search.as_deref(), cli.json),
+        Cmd::Docs {
+            topic,
+            search,
+            list,
+            limit,
+        } => cmd_docs(topic.as_deref(), search.as_deref(), list, limit, cli.json),
         Cmd::Explain { code } => cmd_explain(&code, cli.json),
         Cmd::Add { extension } => cmd_add(&extension, cli.json),
         Cmd::Db {
@@ -194,10 +206,32 @@ fn run(cli: Cli) -> Result<(), Failure> {
     }
 }
 
-fn cmd_docs(topic: Option<&str>, query: Option<&str>, json_mode: bool) -> Result<(), Failure> {
+fn cmd_docs(
+    topic: Option<&str>,
+    query: Option<&str>,
+    list: bool,
+    limit: Option<usize>,
+    json_mode: bool,
+) -> Result<(), Failure> {
     use jerrycan::platform::docsidx;
+    // Enumerate the whole surface: explicit --list, or the bare `jerrycan docs`
+    // (no topic, no --search) so an agent gets the page index in one call.
+    if list || (topic.is_none() && query.is_none()) {
+        let pages = docsidx::list();
+        if json_mode {
+            println!("{}", serde_json::json!({ "pages": pages }));
+        } else {
+            for p in &pages {
+                println!("{}  — {}", p.page, p.summary);
+            }
+        }
+        return Ok(());
+    }
     if let Some(q) = query {
-        let results = docsidx::search(q, 5);
+        // Default the cap to the page count so a broad query never silently hides
+        // a page (the search scores each page at most once); --limit overrides.
+        let limit = limit.unwrap_or_else(|| docsidx::PAGES.len());
+        let results = docsidx::search(q, limit);
         let payload = serde_json::json!({ "results": results });
         if json_mode {
             println!("{payload}");
@@ -214,8 +248,9 @@ fn cmd_docs(topic: Option<&str>, query: Option<&str>, json_mode: bool) -> Result
         return Ok(());
     }
     let Some(topic) = topic else {
+        // Unreachable: handled by the list branch above, but keep the guard.
         return Err(Failure::usage(
-            "provide a topic (`jerrycan docs dependencies`) or --search <query>",
+            "provide a topic (`jerrycan docs dependencies`), --search <query>, or --list",
         ));
     };
     let (page, anchor) = match topic.split_once('#') {

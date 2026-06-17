@@ -485,3 +485,72 @@ fn docs_command_prints_pages_and_searches() {
     let out = jerrycan().args(["docs", "nope"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn docs_list_enumerates_every_page_in_one_call() {
+    // Gap A: an agent must be able to enumerate the whole docs surface in a
+    // single call, not ~30 searches. `--json docs --list` returns every page.
+    let listed: serde_json::Value = {
+        let out = jerrycan()
+            .args(["--json", "docs", "--list"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let pages = listed["pages"].as_array().expect("pages array");
+    // The well-known slugs an agent expects must all appear (covers the surface).
+    let slugs: Vec<&str> = pages.iter().map(|p| p["page"].as_str().unwrap()).collect();
+    for must in ["app", "testing", "database", "tenancy", "auth-advanced"] {
+        assert!(
+            slugs.contains(&must),
+            "page index must list `{must}`: {slugs:?}"
+        );
+    }
+    assert!(
+        pages.len() >= 15,
+        "index lists the whole surface: {}",
+        pages.len()
+    );
+    // Every row carries a one-line summary so a page can be picked without a get.
+    assert!(
+        pages
+            .iter()
+            .all(|p| !p["summary"].as_str().unwrap_or("").is_empty()),
+        "each page row has a summary"
+    );
+
+    // Bare `jerrycan docs` (no topic, no --search) lists too, same page count.
+    let bare: serde_json::Value = {
+        let out = jerrycan().args(["--json", "docs"]).output().unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    assert_eq!(bare["pages"].as_array().unwrap().len(), pages.len());
+}
+
+#[test]
+fn docs_search_default_limit_does_not_silently_truncate() {
+    // Gap A: a broad query used to be capped at 5 hits, silently hiding pages.
+    // The default limit is now the page count, so a near-universal term returns
+    // more than the old cap of 5 (one hit per matching page).
+    let out = jerrycan()
+        .args(["--json", "docs", "--search", "jerrycan"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = payload["results"].as_array().unwrap();
+    assert!(
+        results.len() > 5,
+        "default search no longer caps at 5: got {}",
+        results.len()
+    );
+    // --limit still honored (and can clamp below the default).
+    let out = jerrycan()
+        .args(["--json", "docs", "--search", "jerrycan", "--limit", "3"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["results"].as_array().unwrap().len(), 3);
+}

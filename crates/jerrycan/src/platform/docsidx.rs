@@ -96,7 +96,81 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
-/// Case-insensitive substring search; hits ranked by per-page match count.
+/// One row of the page index: slug + the `# Title` + a one-line summary (the
+/// first prose line under `## Purpose`). Lets an agent enumerate the whole docs
+/// surface in a single call instead of guessing search terms.
+#[derive(Debug, Serialize)]
+pub struct PageInfo {
+    pub page: String,
+    pub title: String,
+    pub summary: String,
+}
+
+/// The `# Title` of a page (first `# ` heading), falling back to the slug.
+fn page_title(md: &str, slug: &str) -> String {
+    md.lines()
+        .find_map(|l| l.strip_prefix("# ").map(|t| t.trim().to_string()))
+        .unwrap_or_else(|| slug.to_string())
+}
+
+/// A one-line summary: the first prose line under `## Purpose`, or — for the few
+/// pages with no Purpose section (packaging, error-codes) — the first prose line
+/// after the `# Title`. Skips blank lines, headings, and code blocks so the row
+/// always reads as a sentence.
+fn page_summary(md: &str) -> String {
+    let mut in_purpose = false;
+    let mut after_title = false;
+    let mut in_code = false;
+    let mut fallback: Option<String> = None;
+    for line in md.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            in_purpose = rest.trim().eq_ignore_ascii_case("purpose");
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            // A `# Title` opens the body; deeper headings just aren't Purpose.
+            after_title = true;
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if in_purpose {
+            return trimmed.to_string();
+        }
+        // First prose line of the page, kept as a fallback for Purpose-less pages.
+        if after_title && fallback.is_none() {
+            fallback = Some(trimmed.to_string());
+        }
+    }
+    fallback.unwrap_or_default()
+}
+
+/// Every page as (slug, title, one-line summary), in `PAGES` order. The complete
+/// docs surface in one call — no result cap, so nothing is hidden.
+pub fn list() -> Vec<PageInfo> {
+    PAGES
+        .iter()
+        .map(|(slug, md)| PageInfo {
+            page: (*slug).to_string(),
+            title: page_title(md, slug),
+            summary: page_summary(md),
+        })
+        .collect()
+}
+
+/// Case-insensitive substring search; hits ranked by per-page match count, then
+/// truncated to `limit`. A page matches at most once, so `limit >= PAGES.len()`
+/// can never hide a hit. To enumerate the whole surface, use [`list`] instead of
+/// a broad search with a small limit.
 pub fn search(query: &str, limit: usize) -> Vec<SearchHit> {
     let q = query.to_lowercase();
     let mut scored: Vec<(usize, SearchHit)> = Vec::new();
@@ -154,5 +228,47 @@ mod tests {
         assert_eq!(results[0].page, "testing");
         assert!(results[0].snippet.to_lowercase().contains("override"));
         assert!(search("zzz-not-a-real-term", 5).is_empty());
+    }
+
+    #[test]
+    fn list_enumerates_every_page_with_title_and_summary() {
+        let pages = list();
+        // The index covers the whole surface, 1:1 with PAGES.
+        assert_eq!(pages.len(), PAGES.len());
+        let slugs: Vec<&str> = pages.iter().map(|p| p.page.as_str()).collect();
+        let expected: Vec<&str> = PAGES.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            slugs, expected,
+            "list() preserves PAGES order and covers all"
+        );
+        // Each row carries a real title (a `# ` heading) and a Purpose summary —
+        // the two fields an agent reads to pick a page without a search.
+        for p in &pages {
+            assert!(!p.title.is_empty(), "page {} has a title", p.page);
+            assert!(!p.summary.is_empty(), "page {} has a summary", p.page);
+        }
+        let testing = pages.iter().find(|p| p.page == "testing").unwrap();
+        assert_eq!(testing.title, "Testing");
+    }
+
+    #[test]
+    fn a_broad_search_at_the_page_count_limit_hides_nothing() {
+        // "jerrycan" appears on nearly every page; with a limit at least the page
+        // count, no matching page is silently truncated away (the Gap A footgun:
+        // a hardcoded small cap hid pages from an enumerating agent).
+        let n = PAGES.len();
+        let broad = search("the", n);
+        // Every hit is a distinct page (search scores each page once), so a limit
+        // of `n` can never drop a page that matched.
+        let mut seen: Vec<&str> = broad.iter().map(|h| h.page.as_str()).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), broad.len(), "one hit per page");
+        // A small cap DOES truncate — proving the cap is the thing `list()`/a
+        // higher limit fixes, not an accident of the corpus.
+        assert!(
+            search("the", 2).len() <= 2,
+            "a small limit truncates; raise it (or use list) to see all"
+        );
     }
 }
