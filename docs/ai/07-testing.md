@@ -98,6 +98,29 @@ assert_eq!(res.bytes()[0], b'[');   // raw bytes, for binary downloads
 # }); }
 ```
 
+## Generated tests: happy path vs declared error-cases
+`jerrycan gen-tests` writes one TOOL-OWNED `tests/acceptance.rs` per module. Know
+exactly what it does and does NOT cover so you author the rest:
+- **Success probe.** Each endpoint gets a test that sends a *minimal valid body*
+  (required fields filled with type-shaped fixtures, enum fields set to their
+  first declared value, `belongs_to` fks pointed at the seeded tenant) and
+  asserts the design's declared `success.status`. It is the success path, not a
+  security probe — it carries no signature/credential beyond what the design
+  declares.
+- **Auth guard.** A session-guarded endpoint (auth mode) also gets a
+  `<op>_without_auth_is_401` test: the same request with **no** cookie must 401.
+  That covers the framework's session guard — NOT a custom credential.
+- **Custom credentials (signatures, webhook secrets, API-key headers).** The probe
+  posts the unsigned/minimal shape and expects `success.status`. That's only
+  correct if your endpoint is *meant* to accept that shape — e.g. a "no signing
+  secret configured" mode that processes the body. If instead the endpoint must
+  **reject** a missing/invalid signature (e.g. webhook → `400`/`401`/`403`), that
+  rejection is NOT generated: every design error-case that isn't a `404` on a
+  single-`{id}` path is emitted as an `// AGENT TODO` comment. Turn each TODO into
+  a real error test in a sibling file (send a body with a bad/missing signature,
+  assert the rejection status) — don't loosen the handler to make the happy-path
+  probe pass.
+
 ## Errors you'll hit
 - `panic: app failed to build` — your route table has a conflict; the message
   names the path. This is the same failure `serve()` would return.
