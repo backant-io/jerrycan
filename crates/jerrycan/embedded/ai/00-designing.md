@@ -101,6 +101,12 @@ complete. Fix every question before scaffolding.
     DB's.
 - `fields` (REQUIRED) — at least one (see Field).
 
+The SQL **table name** is `lowercase(entity) + "s"` — `Ticket` → `tickets`,
+`Workspace` → `workspaces`, `ApiKey` → `apikeys`. Note this is NOT snake_case, so
+a multi-word entity's table differs from its fk column: `ApiKey` → table
+`apikeys` but fk column `api_key_id`. You need the exact table name only for
+hand-written cross-module SQL (the generated repo handles intra-module access).
+
 ### The `id` field (primary key)
 Every entity has an `id` primary key. You usually do NOT declare it:
 - **Omit `id`** → the generator synthesizes an auto-increment integer PK
@@ -170,8 +176,13 @@ Every entity has an `id` primary key. You usually do NOT declare it:
   done here; do it in-handler via `tenant.require_role(...)`. See Tenancy.)
 - `public?` — defaults to `false`. Marks the route unauthenticated by design
   (exempt from the auth lint and the generated 401 test). It CANNOT combine with
-  `auth_required` or `required_roles` (each is a distinct error), and it cannot
-  sit on a tenant-owned entity (it would bypass the Tenant guard).
+  `auth_required` or `required_roles` (each is a distinct error). It also cannot
+  live in a module whose entity is **tenant-owned**: the generator binds an
+  endpoint to its module's entity, so a `public` endpoint there (even one with no
+  `request_body` of its own) would bypass the Tenant guard and expose one
+  tenant's rows. **Put public endpoints — webhooks, an inbound-ingest route, a
+  login/register — in their OWN module** that has no tenant-owned entity
+  (entity-less is fine).
 - `request_body?` — `{ "entity": "<Name>" }` ONLY. The body is the named entity;
   the entity must be declared in THIS module. There is no narrower/custom input
   DTO in the design — for an endpoint that takes untrusted public input, defend
@@ -191,6 +202,19 @@ Every entity has an `id` primary key. You usually do NOT declare it:
   REQUIRED prose. **Only a `404` on a single-`{id}` path is auto-tested** (the
   generator emits a missing-id test). Every other declared error becomes an
   `// AGENT TODO` in the generated acceptance test for you to encode.
+
+> **Un-greenable success probes (expected — don't fight them).** The generator
+> emits one happy-path test per endpoint that posts a MINIMAL body with **no
+> credential, no signature, no API key**, and asserts `success.status`. For an
+> endpoint whose success genuinely REQUIRES a credential — a `login` that 401s
+> bad creds, a signed webhook that 401/400s a bad signature, an API-key-gated
+> route — that 2xx probe is **un-satisfiable by construction**, so `jerrycan
+> check` will not be fully green for it. That is normal and correct: **do NOT
+> weaken the handler to make the probe pass.** Leave the probe red, and cover the
+> real behavior (the 200 WITH a valid credential, and the 401/400 without) in
+> your own agent-owned test. (Same for the `404`-probe-as-`GET` on a POST-only
+> `/{id}` action, which the framework correctly answers `405`.) See
+> `jerrycan docs testing`.
 
 ## Worked examples
 

@@ -21,7 +21,12 @@ docs --list`); read the relevant page before each step rather than guessing an A
 1. **Never guess what to build.** If you don't know an entity, a field, a status
    value, an endpoint, a role, or a behavior — ask. One question at a time.
 2. **`jerrycan check` and the validator are the truth.** Loop them; never claim
-   green you haven't seen. Never weaken a generated check to pass it.
+   green you haven't seen. Never weaken a generated check to pass it. **But a few
+   generated tests are un-greenable BY CONSTRUCTION** (a happy-path probe that
+   posts no credential to a login/webhook/API-key endpoint; the `404`-probe sent
+   as `GET` to a POST-only route). For those, `check` will not be fully green and
+   that is correct — recognize them (see Phase 5), leave them, and move on; do
+   NOT thrash trying to green them or weaken the handler.
 3. **Read the doc page before using a feature.** `jerrycan docs <page>` /
    `jerrycan explain <CODE>`. Start every project by reading `jerrycan docs designing`.
 4. **Flag scope walls EARLY** (Phase 2). If the user needs something jerrycan can't
@@ -170,9 +175,25 @@ For each module, read the relevant doc page, then implement every handler stub:
 - Validation: `jerrycan docs validation`. Jobs: `jerrycan docs jobs`. Errors:
   `jerrycan docs error-codes` / `jerrycan explain JCxxxx`.
 
-Apply the **gotchas** (below). Loop `jerrycan --json check` until `ok: true`
+Apply the **gotchas** (below). Loop `jerrycan --json check` toward `ok: true`
 (build + clippy + tests + lints + audit/deny + schema). The JL0006 lint will catch
 cross-tenant leaks — fix by using the scoped repo accessors, don't suppress it.
+
+**Expect a few un-greenable generated tests — this is not your bug, and `ok:true`
+may not be fully reachable.** The generator emits one happy-path probe per
+endpoint that posts a minimal body with **no credential/signature/API key**. For
+an endpoint whose success requires one (a `login` that 401s bad creds; a signed
+webhook that 401/400s a bad signature; an API-key-gated route), that 2xx probe
+**cannot pass** — the handler correctly rejects it. Likewise the `404`-missing-id
+probe is sent as `GET` even to a POST-only `/{id}` action, which the framework
+correctly answers `405`. **Do NOT weaken the handler to make these pass.** Leave
+the probe, and prove the REAL behavior (success WITH a valid credential, and the
+4xx without) in an **agent-owned test file** you write. Get every test you CAN
+green green, then tell the user exactly which generated probes are un-satisfiable
+and why. (Two further known generator rough edges: a `unique` non-PK field on the
+tenant entity collides in the two-tenant isolation seed — make it a plain `index`
+instead; and a single-value enum makes its "wrong value → 4xx" branch
+unreachable.)
 
 ## Phase 6 — Verify
 
@@ -211,6 +232,12 @@ agent-owned handlers are untouched — re-implement only new stubs).
 - **Cross-module `belongs_to` gets no scoped accessors.** A grandchild
   (`Application` → `Posting` → `Org`) isn't auto tenant-scoped; scope it by joining
   through the parent in your handler/repo.
+- **Table name = `lowercase(entity) + "s"`** (`Ticket` → `tickets`, `ApiKey` →
+  `apikeys`) — NOT snake_case, so it differs from the fk column (`api_key_id`).
+  You need the exact table name only for hand-written cross-module SQL.
+- **`public` endpoints can't live in a module that owns a tenant-owned entity**
+  (the generator binds the endpoint to that entity → guard bypass). Put webhooks /
+  login / inbound-ingest routes in their OWN module (entity-less is fine).
 - **`request_body` is entity-only.** A public endpoint receives `Json<Entity>`
   (all fields), so the untrusted client can send server-controlled fields — force
   them in-handler (take the id from the path, fix the status, etc.).
