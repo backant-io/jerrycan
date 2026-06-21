@@ -340,3 +340,266 @@ fn tenant_owned_modules_get_isolation_tests() {
         "non-tenant-owned module gets no isolation test: {ws_gen}"
     );
 }
+
+/// A credential/signature-gated endpoint's SUCCESS test would be UN-GREENABLE: the
+/// generator can't supply the credential, so a minimal-body probe can never reach
+/// the designed success status (a `public` login 401s bad creds; a signed webhook
+/// 400/401s a bad signature). WHY (Rule 9): emitting a hard `_returns_<status>`
+/// assertion for these would leave a generated test that NO correct implementation
+/// can pass — `jerrycan check` could never go green. So the generator must emit an
+/// `// AGENT TODO` instead, and the agent writes the credentialed test by hand.
+/// This locks BOTH gated shapes: (a) a public POST declaring 401 and (b) a
+/// signature-authenticated webhook (declares a 4xx whose `when` names "signature").
+#[test]
+fn credential_gated_endpoints_get_an_agent_todo_not_a_success_test() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "gated-api",
+        "contract_version": 1,
+        "auth": { "model": "jwt", "roles": ["admin"] },
+        "dependencies": ["auth"],
+        "modules": [{
+            "name": "accounts",
+            "endpoints": [
+                // (a) a public login: declares 401 on bad creds, no body.
+                { "operation_id": "login", "method": "POST", "path": "/login",
+                  "public": true,
+                  "success": { "status": 200 },
+                  "errors": [{ "status": 401, "when": "invalid email or password" }] },
+                // (b) a signature-authenticated webhook: declares a 400 whose
+                // `when` names a signature check (Stripe-style).
+                { "operation_id": "stripe_webhook", "method": "POST", "path": "/webhook",
+                  "success": { "status": 200 },
+                  "errors": [{ "status": 400, "when": "Stripe signature is missing or invalid" }] }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+
+    // Neither gated endpoint gets an un-greenable `_returns_` success assertion...
+    assert!(
+        !generated.contains("async fn login_returns_"),
+        "credential-gated login must NOT get a success test: {generated}"
+    );
+    assert!(
+        !generated.contains("async fn stripe_webhook_returns_"),
+        "signature webhook must NOT get a success test: {generated}"
+    );
+    // ...each instead carries an AGENT TODO naming the credential it needs.
+    assert!(
+        generated.contains(
+            "// AGENT TODO: login (POST /accounts/login) authenticates via a credential/signature"
+        ),
+        "login must get a credential AGENT TODO: {generated}"
+    );
+    assert!(
+        generated.contains(
+            "// AGENT TODO: stripe_webhook (POST /accounts/webhook) authenticates via a credential/signature"
+        ),
+        "webhook must get a credential AGENT TODO: {generated}"
+    );
+}
+
+/// A db-mode module whose EVERY endpoint is a TODO (e.g. a billing module whose
+/// only route is a signature-gated webhook) emits ZERO `#[tokio::test]` functions.
+/// The generated file must then carry NO `app()` helper and NO `use` imports —
+/// they would be dead code and trip the generated workspace's `-D warnings`,
+/// blocking `jerrycan check` from ever going green. WHY (Rule 9): this is the
+/// exact regression Fix 1 first introduced (billing's webhook became a TODO,
+/// leaving `app()` unused); the file must degrade to banner + TODOs only.
+#[test]
+fn module_with_only_todos_emits_no_dead_app_helper() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "webhook-only-api",
+        "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "billing",
+            "endpoints": [
+                { "operation_id": "stripe_webhook", "method": "POST", "path": "/webhook",
+                  "success": { "status": 200 },
+                  "errors": [{ "status": 400, "when": "Stripe signature is missing or invalid" }] }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    // The webhook becomes a TODO, so there are no tests at all.
+    assert_eq!(
+        testgen::test_count(&generated),
+        0,
+        "a signature-only billing module emits no tests: {generated}"
+    );
+    // The TODO is still present (the agent must hand-write the webhook test)...
+    assert!(
+        generated.contains("// AGENT TODO: stripe_webhook"),
+        "the webhook TODO must be emitted: {generated}"
+    );
+    // ...but the dead `app()` helper and the `use` imports must be GONE, or the
+    // generated crate fails to build under `-D warnings`.
+    assert!(
+        !generated.contains("async fn app()"),
+        "a tests-less module must NOT emit a dead app() helper: {generated}"
+    );
+    assert!(
+        !generated.contains("use jerrycan::prelude::*;") && !generated.contains("::module;"),
+        "a tests-less module must NOT emit dead imports: {generated}"
+    );
+    // The banner stays (it identifies the tool-owned file).
+    assert!(
+        generated.contains("GENERATED by jerrycan gen-tests"),
+        "the tool banner must remain: {generated}"
+    );
+}
+
+/// A public POST that declares NO 401/403 (e.g. register: 409/422) is NOT
+/// credential-gated — a minimal body CAN reach success — so it keeps its
+/// `_returns_` test. WHY: the gate is narrow; widening it to every public route
+/// would drop greenable success coverage for register/create-style endpoints.
+#[test]
+fn public_post_without_401_keeps_its_success_test() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "reg-api",
+        "contract_version": 1,
+        "auth": { "model": "jwt", "roles": ["admin"] },
+        "dependencies": ["auth"],
+        "modules": [{
+            "name": "accounts",
+            "entities": [{ "name": "User", "fields": [
+                { "name": "email", "type": "string" }
+            ]}],
+            "endpoints": [
+                { "operation_id": "register", "method": "POST", "path": "/register",
+                  "public": true,
+                  "request_body": { "entity": "User" },
+                  "success": { "status": 201, "entity": "User" },
+                  "errors": [
+                    { "status": 409, "when": "email already registered" },
+                    { "status": 422, "when": "request body fails validation" }
+                  ] }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        generated.contains("async fn register_returns_201"),
+        "a public POST with no 401/403 keeps its success test: {generated}"
+    );
+}
+
+/// A POST-only `/{id}` action that declares a 404 must get a 404 probe built with
+/// the endpoint's REAL method (POST), not a hardcoded GET. WHY (Rule 9): the router
+/// returns 405 for a GET against a POST-only route, so a GET probe would assert 404
+/// against an observed 405 and fail forever — an un-greenable generated test. The
+/// fix routes the missing-id probe through `request_expr` (the success builder), so
+/// it POSTs and the handler's real 404-on-missing path is exercised.
+#[test]
+fn post_only_id_action_404_probe_uses_post_not_get() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "tickets-api",
+        "contract_version": 1,
+        "modules": [{
+            "name": "tickets",
+            "endpoints": [
+                { "operation_id": "close_ticket", "method": "POST", "path": "/{id}/close",
+                  "success": { "status": 200 },
+                  "errors": [{ "status": 404, "when": "unknown id" }] }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        generated.contains("async fn close_ticket_missing_id_is_404"),
+        "POST-only /{{id}} action with a 404 gets a 404 test: {generated}"
+    );
+    // The probe must POST to the missing id (use the endpoint's method), NOT GET —
+    // a GET would 405 and the 404 assertion could never pass.
+    assert!(
+        generated.contains("t.post_json(\"/tickets/999999/close\""),
+        "404 probe must POST (the endpoint's method), not GET: {generated}"
+    );
+    assert!(
+        !generated.contains("t.get(\"/tickets/999999/close\")"),
+        "404 probe must NOT be a hardcoded GET: {generated}"
+    );
+}
+
+/// A tenant entity with a `unique` non-PK column must seed tenant 1 and tenant 2
+/// with DISTINCT values for that column, or the second-tenant seed the isolation
+/// test depends on crashes every test at setup with a UNIQUE-constraint violation.
+/// WHY (Rule 9): tenant 1 and tenant 2 previously shared `'test-value'` for every
+/// string column; a `unique` column then collides. Tenant 1 must stay byte-identical
+/// (`'test-value'`) and tenant 2 must differ (`'test-value-2'`).
+#[test]
+fn two_tenant_seed_uses_distinct_values_for_a_unique_field() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "slug-api",
+        "contract_version": 1,
+        "auth": { "model": "jwt", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+        "modules": [
+            {
+                "name": "orgs",
+                "entities": [{ "name": "Org", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "slug", "type": "string", "unique": true }
+                ]}],
+                "endpoints": []
+            },
+            {
+                "name": "projects",
+                "entities": [{ "name": "Project",
+                    "belongs_to": [{ "entity": "Org" }],
+                    "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "title", "type": "string" }
+                    ]}],
+                "endpoints": [
+                    { "operation_id": "list_projects", "method": "GET", "path": "/",
+                      "auth_required": true,
+                      "success": { "status": 200, "entity": "Project", "list": true } },
+                    { "operation_id": "create_project", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Project" },
+                      "success": { "status": 201, "entity": "Project" } },
+                    { "operation_id": "show_project", "method": "GET", "path": "/{id}",
+                      "auth_required": true,
+                      "success": { "status": 200, "entity": "Project" },
+                      "errors": [{ "status": 404, "when": "unknown id" }] }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+    let projects = design
+        .modules
+        .iter()
+        .find(|m| m.name == "projects")
+        .expect("projects module");
+    let generated = testgen::acceptance_rs(&design, projects);
+
+    // Tenant 1's seed keeps the byte-identical placeholder for the unique slug.
+    assert!(
+        generated.contains("VALUES (1, 'test-value')"),
+        "tenant 1 seeds the unchanged placeholder slug: {generated}"
+    );
+    // Tenant 2's seed (in seed_second_tenant) must NOT reuse the SAME slug literal —
+    // it carries a distinct value so the UNIQUE constraint holds.
+    assert!(
+        generated.contains("VALUES (2, 'test-value-2')"),
+        "tenant 2 seeds a DISTINCT slug so the unique column doesn't collide: {generated}"
+    );
+    // Belt-and-suspenders: the two org INSERTs must not share the same slug literal.
+    let org_inserts: Vec<&str> = generated
+        .lines()
+        .filter(|l| l.contains("INSERT INTO \\\"orgs\\\""))
+        .collect();
+    assert_eq!(org_inserts.len(), 2, "two org rows seeded: {generated}");
+    assert_ne!(
+        org_inserts[0], org_inserts[1],
+        "the two tenant org INSERTs must differ on the unique slug: {generated}"
+    );
+}

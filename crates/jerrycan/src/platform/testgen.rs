@@ -70,6 +70,19 @@ fn param_count(ep: &Endpoint) -> usize {
     ep.path.matches('{').count()
 }
 
+/// True when this endpoint's SUCCESS requires a credential/signature the generator
+/// cannot synthesize, so a minimal-body probe can never reach the designed success
+/// status. Two shapes: (a) a signature-authenticated webhook (Stripe-style — a bad
+/// or missing signature 400/401s), and (b) a NON-session endpoint that declares a
+/// 401/403 (a `public` login 401s bad creds; an api-key route 401/403s a missing
+/// key). A session-GUARDED endpoint is excluded: the generator threads its cookie,
+/// so its success test IS greenable. For these gated endpoints we emit an AGENT
+/// TODO instead of an un-greenable `_returns_<status>` assertion.
+fn endpoint_is_credential_gated(ep: &Endpoint) -> bool {
+    ep.declares_signature_auth()
+        || (!ep.is_guarded() && ep.errors.iter().any(|e| e.status == 401 || e.status == 403))
+}
+
 struct TestOut {
     code: String,
     todos: Vec<String>,
@@ -170,8 +183,18 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         let fn_base = &ep.operation_id;
         let status = ep.success.status;
         let guarded = auth && ep.is_guarded();
+        // Endpoints whose success needs a credential/signature the generator can't
+        // supply (login, signed webhook, api-key route): no un-greenable success
+        // probe — emit a TODO instead. These are never session-guarded (a guard
+        // would be threaded), so `guarded` is false and no 401 test is emitted.
+        let gated = endpoint_is_credential_gated(ep);
 
-        if param_count(ep) == 0 {
+        if gated {
+            out.todos.push(format!(
+                "// AGENT TODO: {fn_base} ({:?} {full_path}) authenticates via a credential/signature the generator can't supply — write its success test (with a valid credential) and its 401/403 rejection test in your own test file.",
+                ep.method
+            ));
+        } else if param_count(ep) == 0 {
             let request = request_expr(design, unit, ep, &full_path, guarded);
             // A creator that echoes its entity must echo the id it was given —
             // catches inserts that return a backend default (0) instead.
@@ -212,25 +235,14 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         }
 
         for ec in &ep.errors {
-            if ec.status == 404 && param_count(ep) == 1 {
+            if ec.status == 404 && param_count(ep) == 1 && !gated {
                 let missing_path = full_path.replacen(&regex_free_param(&ep.path), "999999", 1);
+                // Build the probe with the endpoint's REAL method (and body/cookie)
+                // via the same builder the success test uses — a GET probe at a
+                // POST-only `/{id}` action would hit 405, not the 404 we assert.
                 // Guarded endpoints run the auth guard before not-found logic, so
-                // a credential-less request would 401; thread the cookie here.
-                let request = if guarded {
-                    match ep.method {
-                        HttpMethod::DELETE => format!(
-                            "t.delete_with(\"{missing_path}\", &[(\"cookie\", &test_cookie())]).await"
-                        ),
-                        _ => format!(
-                            "t.get_with(\"{missing_path}\", &[(\"cookie\", &test_cookie())]).await"
-                        ),
-                    }
-                } else {
-                    match ep.method {
-                        HttpMethod::DELETE => format!("t.delete(\"{missing_path}\").await"),
-                        _ => format!("t.get(\"{missing_path}\").await"),
-                    }
-                };
+                // `request_expr` threads the cookie when guarded.
+                let request = request_expr(design, unit, ep, &missing_path, guarded);
                 out.code.push_str(&format!(
                     "#[tokio::test]\nasync fn {fn_base}_missing_id_is_404() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 404, \"design: {fn_base} lists 404 ({when}); body: {{}}\", res.text());\n}}\n\n",
                     when = ec.when
@@ -367,7 +379,7 @@ fn tenant_seed(design: &Design, module: &ModuleDesign) -> String {
     // value to satisfy the CHECK constraint). Column identifiers are double-quoted
     // in the SQL; since the whole statement is a Rust string literal, those quotes
     // are escaped (`\\\"`) so the generated source stays valid.
-    let (cols, vals) = tenant_row_cols_vals(entity, "1");
+    let (cols, vals) = tenant_row_cols_vals(entity, "1", 1);
     format!(
         "    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant row\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (1, 1, '{role}')\")\n        .await\n        .expect(\"seed membership\");\n"
     )
@@ -399,12 +411,12 @@ fn isolation_member_role<'a>(design: &'a Design, module: &'a ModuleDesign) -> &'
 /// fields use a declared value to satisfy the CHECK). Returns (cols, vals) as
 /// the comma-joined SQL fragments. The tenant pk is an integer in practice (the
 /// kolli-slice Workspace), so the literal is numeric.
-fn tenant_row_cols_vals(entity: &Entity, pk: &str) -> (String, String) {
+fn tenant_row_cols_vals(entity: &Entity, pk: &str, n: u32) -> (String, String) {
     let mut cols = vec!["id".to_string()];
     let mut vals = vec![pk.to_string()];
     for f in entity.fields.iter().filter(|f| f.name != "id") {
         cols.push(format!("\\\"{}\\\"", f.name));
-        vals.push(seed_sql_value(f));
+        vals.push(seed_sql_value_n(f, n));
     }
     (cols.join(", "), vals.join(", "))
 }
@@ -430,7 +442,7 @@ fn seed_second_tenant_fn(design: &Design, module: &ModuleDesign) -> String {
     let members = format!("{}_members", Design::to_snake(&tenancy.entity));
     let fk = Design::fk_column(&tenancy.entity);
     let role = isolation_member_role(design, module);
-    let (cols, vals) = tenant_row_cols_vals(entity, "2");
+    let (cols, vals) = tenant_row_cols_vals(entity, "2", 2);
     format!(
         "async fn seed_second_tenant(db: &jerrycan::db::Db) {{\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant 2 row\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (2, 2, '{role}')\")\n        .await\n        .expect(\"seed tenant 2 membership\");\n}}\n\n"
     )
@@ -550,6 +562,30 @@ fn seed_sql_value(f: &Field) -> String {
     }
 }
 
+/// A SQL literal for seeding the Nth tenant's row, made DISTINCT from earlier
+/// tenants so a `unique` non-PK column (e.g. `Workspace.slug`) doesn't collide
+/// when the isolation test seeds tenant 2. Tenant 1 (`n == 1`) is byte-identical
+/// to `seed_sql_value` (keeps every existing seed unchanged). Enum fields stay
+/// fixed at the first declared value — they can't vary without violating the
+/// CHECK — which is safe because an enum column is not the unique key in practice.
+fn seed_sql_value_n(f: &Field, n: u32) -> String {
+    if n == 1 {
+        return seed_sql_value(f);
+    }
+    if let Some(values) = &f.values
+        && let Some(first) = values.first()
+    {
+        return format!("'{first}'");
+    }
+    match f.field_type {
+        FieldType::String | FieldType::Datetime | FieldType::Uuid => format!("'test-value-{n}'"),
+        FieldType::Integer => n.to_string(),
+        FieldType::Float => format!("{n}.0"),
+        FieldType::Boolean => "false".to_string(),
+        FieldType::Json => "'{}'".to_string(),
+    }
+}
+
 fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool) -> String {
     let mount = module.effective_mount();
     // The cookie helpers (`test_cookie`/`test_cookie_for`) are only emitted when
@@ -652,11 +688,20 @@ pub fn acceptance_rs(design: &Design, module: &ModuleDesign) -> String {
     } else {
         format!("\n{}\n", out.todos.join("\n"))
     };
+    let banner = "//! GENERATED by jerrycan gen-tests — TOOL-OWNED acceptance criteria from design.json.\n//! Regenerated on demand; add your own tests in sibling files, not here.\n";
+    // A module whose every endpoint is a TODO (e.g. a billing module whose only
+    // route is a signature-gated webhook) emits ZERO #[tokio::test] functions. The
+    // preamble's `app()` helper and the `use` imports would then be dead code and
+    // trip the generated workspace's `-D warnings`. Emit only the banner + the
+    // TODOs in that case — there is nothing for the imports/app() to support.
+    if !out.code.contains("#[tokio::test]") {
+        return format!("{banner}{todos}");
+    }
     // Only emit the cookie helpers if the rendered tests reference them (a module
     // with no guarded endpoint and no isolation test uses neither).
     let uses_cookies = out.code.contains("test_cookie");
     format!(
-        "//! GENERATED by jerrycan gen-tests — TOOL-OWNED acceptance criteria from design.json.\n//! Regenerated on demand; add your own tests in sibling files, not here.\nuse jerrycan::prelude::*;\nuse {ident}::module;\n\n{preamble}\n{code}{todos}",
+        "{banner}use jerrycan::prelude::*;\nuse {ident}::module;\n\n{preamble}\n{code}{todos}",
         ident = super::genroute::crate_ident(&module.name),
         preamble = preamble(design, module, uses_cookies),
         code = out.code,
