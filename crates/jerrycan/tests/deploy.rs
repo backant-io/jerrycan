@@ -42,3 +42,25 @@ fn unknown_target_is_an_error() {
     assert!(err.contains("unknown deploy target"), "{err}");
     assert!(err.contains("render"), "lists the supported targets: {err}");
 }
+
+#[test]
+fn render_yaml_declares_a_web_service_a_db_and_secret_envs() {
+    let artifacts = deploy::emit("render", &demo_design()).unwrap();
+    let yaml = &artifacts[2].1; // render.yaml
+    assert!(yaml.contains("type: web_service"), "{yaml}");
+    assert!(yaml.contains("name: acme-api"), "{yaml}");
+    assert!(yaml.contains("healthCheckPath: /healthz"), "{yaml}");
+    assert!(
+        yaml.contains("databases:") && yaml.contains("name: acme-api-db"),
+        "{yaml}"
+    );
+    // JERRYCAN_SECRET is generateValue (Render generates + stores it), never inline.
+    assert!(
+        yaml.contains("key: JERRYCAN_SECRET") && yaml.contains("generateValue: true"),
+        "{yaml}"
+    );
+    assert!(
+        yaml.contains("key: JERRYCAN_ENV") && yaml.contains("value: prod"),
+        "{yaml}"
+    );
+}
