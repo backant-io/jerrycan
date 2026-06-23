@@ -1,5 +1,7 @@
 //! `jerrycan deploy <target>` generates a self-contained deploy kit.
 use jerrycan::platform::{deploy, design::Design};
+use std::io::Write;
+use std::process::Command;
 
 fn demo_design() -> Design {
     serde_json::from_str(
@@ -97,4 +99,47 @@ fn deploy_sh_has_the_secure_idempotent_flow() {
     );
     // Writes resource ids (not secrets) for idempotent re-run + teardown.
     assert!(sh.contains(".deploy-state.json"), "{sh}");
+}
+
+fn shellcheck(script: &str) {
+    if Command::new("shellcheck").arg("--version").output().is_err() {
+        eprintln!("SKIP shellcheck (not installed)");
+        return;
+    }
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(script.as_bytes()).unwrap();
+    let out = Command::new("shellcheck")
+        .args(["-S", "warning"]) // warnings + errors fail
+        .arg(f.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shellcheck:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn generated_scripts_pass_shellcheck() {
+    let a = deploy::emit("render", &demo_design()).unwrap();
+    shellcheck(&a[0].1); // deploy.sh
+    shellcheck(&a[1].1); // teardown.sh
+}
+
+#[test]
+fn teardown_deletes_the_service_and_db_with_a_guard() {
+    let a = deploy::emit("render", &demo_design()).unwrap();
+    let td = &a[1].1;
+    assert!(
+        td.starts_with("#!/usr/bin/env bash\n") && td.contains("set -euo pipefail"),
+        "{td}"
+    );
+    assert!(td.contains("DELETE") && td.contains("/v1/services/"), "{td}");
+    assert!(td.contains("/v1/postgres/"), "{td}");
+    assert!(td.contains(".deploy-state.json"), "reads stored ids: {td}");
+    assert!(
+        td.to_lowercase().contains("destroy") || td.contains("read -r"),
+        "confirmation guard: {td}"
+    );
 }

@@ -4,7 +4,7 @@
 #   RENDER_API_KEY=rnd_… ./deploy/render/teardown.sh
 set -euo pipefail
 
-API="${RENDER_API_BASE:-https://api.render.com/v1}"
+API="${RENDER_API_BASE:-https://api.render.com}"        # host root; /v1 is in each path
 STATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.deploy-state.json"
 : "${RENDER_API_KEY:?set RENDER_API_KEY}"
 for bin in curl jq; do command -v "$bin" >/dev/null || { echo "missing: $bin" >&2; exit 1; }; done
@@ -17,7 +17,7 @@ read -r -p "Type 'destroy' to confirm: " ans
 [ "$ans" = "destroy" ] || { echo "aborted" >&2; exit 1; }
 
 del() { curl -sS -X DELETE "${API}$1" -H "Authorization: Bearer ${RENDER_API_KEY}" -o /dev/null -w '%{http_code}\n'; }
-[ -n "$SVC_ID" ] && { echo "→ deleting service ${SVC_ID}"; del "/services/${SVC_ID}"; }
-[ -n "$PG_ID" ] && { echo "→ deleting database ${PG_ID}"; del "/postgres/${PG_ID}"; }
+[ -n "$SVC_ID" ] && { echo "→ deleting service ${SVC_ID}"; del "/v1/services/${SVC_ID}"; }
+[ -n "$PG_ID" ] && { echo "→ deleting database ${PG_ID}"; del "/v1/postgres/${PG_ID}"; }
 rm -f "$STATE"
 echo "✓ torn down."
