@@ -540,3 +540,25 @@ fn deploy_sh_runs_the_full_flow_against_a_stub() {
         assert!(seq.contains(expect), "missing {expect} in:\n{seq}");
     }
 }
+
+// --- Task 8: ignored live deploy roundtrip -----------------------------------
+
+/// Real Render deploy. Run with:
+///   RENDER_API_KEY=… JERRYCAN_DEPLOY_IMAGE=ghcr.io/you/jc-deploy-test \
+///   cargo test -p jerrycan --test deploy live_render_deploy_roundtrip -- --ignored --nocapture
+#[test]
+#[ignore = "needs a real RENDER_API_KEY + a pushed image (costs money/time)"]
+fn live_render_deploy_roundtrip() {
+    let Ok(_key) = std::env::var("RENDER_API_KEY") else {
+        eprintln!("SKIP: RENDER_API_KEY not set");
+        return;
+    };
+    // The operator scaffolds a tiny app, runs deploy.sh, curls the URL for 200,
+    // then runs teardown.sh. Document the manual steps here; the assertion is the
+    // operator confirming a 2xx from the live URL and a clean teardown.
+    eprintln!(
+        "MANUAL/LIVE: scaffold a minimal app, `./deploy/render/deploy.sh`, curl the \
+         printed URL for 200, then `./deploy/render/teardown.sh`. This test documents \
+         the procedure; wire full automation here once a CI Render project exists."
+    );
+}
