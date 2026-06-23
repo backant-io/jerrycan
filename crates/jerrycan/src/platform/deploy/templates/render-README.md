@@ -15,9 +15,17 @@ RENDER_API_KEY=rnd_xxx ./deploy/render/deploy.sh
   only services + postgres scopes.
 - **A registry the script can push to** — image-based deploy builds the hardened
   container and pushes it. Defaults to `ghcr.io`; override with
-  `JERRYCAN_DEPLOY_IMAGE=registry/owner/name`. `docker` must be logged in to it.
-  To skip the build (e.g. you already pushed an image), set
-  `JERRYCAN_DEPLOY_SKIP_BUILD=1` and point `JERRYCAN_DEPLOY_IMAGE`/`_TAG` at it.
+  `JERRYCAN_DEPLOY_IMAGE=registry/owner/name` (or set `JERRYCAN_DEPLOY_REGISTRY_OWNER`).
+  `docker` must be logged in to it. To skip the build (e.g. you already pushed an
+  image), set `JERRYCAN_DEPLOY_SKIP_BUILD=1` and point `JERRYCAN_DEPLOY_IMAGE`/`_TAG` at it.
+- **Private-image pull credentials (if your image is private)** — a private image
+  (the common GHCR case) can't be pulled without a Render registry credential, so
+  the deploy would hang/fail. Provide auth and the script find-or-creates a Render
+  registry credential and references it from the service:
+  - `JERRYCAN_DEPLOY_REGISTRY_USER` + `JERRYCAN_DEPLOY_REGISTRY_TOKEN`.
+  - For `ghcr.io` these default to the image owner + `${GITHUB_TOKEN}` (needs
+    `read:packages`), so a CI run with `GITHUB_TOKEN` usually needs nothing extra.
+  - With no auth provided the image is deployed as **public** (and the script says so).
 
 ## Security
 - `JERRYCAN_SECRET` and the database URL are generated/captured at deploy time and

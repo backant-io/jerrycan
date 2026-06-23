@@ -12,6 +12,7 @@ for bin in curl jq; do command -v "$bin" >/dev/null || { echo "missing: $bin" >&
 
 SVC_ID="$(jq -r '.service_id // empty' "$STATE")"
 PG_ID="$(jq -r '.pg_id // empty' "$STATE")"
+REG_CRED_ID="$(jq -r '.registry_credential_id // empty' "$STATE")"
 echo "This will DESTROY service ${SVC_ID:-none} and database ${PG_ID:-none} (all data)."
 read -r -p "Type 'destroy' to confirm: " ans
 [ "$ans" = "destroy" ] || { echo "aborted" >&2; exit 1; }
@@ -19,5 +20,6 @@ read -r -p "Type 'destroy' to confirm: " ans
 del() { curl -sS -X DELETE "${API}$1" -H "Authorization: Bearer ${RENDER_API_KEY}" -o /dev/null -w '%{http_code}\n'; }
 [ -n "$SVC_ID" ] && { echo "→ deleting service ${SVC_ID}"; del "/v1/services/${SVC_ID}"; }
 [ -n "$PG_ID" ] && { echo "→ deleting database ${PG_ID}"; del "/v1/postgres/${PG_ID}"; }
+[ -n "$REG_CRED_ID" ] && { echo "→ deleting registry credential ${REG_CRED_ID}"; del "/v1/registrycredentials/${REG_CRED_ID}"; }
 rm -f "$STATE"
 echo "✓ torn down."
