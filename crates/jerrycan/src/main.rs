@@ -656,9 +656,11 @@ fn cmd_deploy(target: &str, json_mode: bool) -> Result<(), Failure> {
             std::fs::set_permissions(&path, perms).map_err(|e| Failure::gate(e.to_string()))?;
         }
     }
-    // Keep deploy state (resource ids) out of version control.
+    // Keep deploy state (resource ids) out of version control. Derived from the
+    // target so it stays correct as more targets land (not hardcoded `render`).
     let gitignore = root.join(".gitignore");
-    let line = "deploy/render/.deploy-state.json";
+    let line = format!("deploy/{target}/.deploy-state.json");
+    let line = line.as_str();
     let cur = std::fs::read_to_string(&gitignore).unwrap_or_default();
     if !cur.lines().any(|l| l.trim() == line) {
         let mut next = cur;
