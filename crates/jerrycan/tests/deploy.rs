@@ -394,3 +394,16 @@ fn deploy_sh_error_path_never_leaks_the_secret() {
         "the echoed request body (carrying secrets) must not be printed:\n{combined}"
     );
 }
+
+// --- Task 6: determinism -----------------------------------------------------
+
+#[test]
+fn deploy_kit_is_byte_deterministic() {
+    // The generator is pure templating (no timestamps, no HashMap iteration), so
+    // the same design must always produce the byte-identical deploy kit — the
+    // precondition for committing generated artifacts and reviewing diffs.
+    let d = demo_design();
+    let a = deploy::emit("render", &d).unwrap();
+    let b = deploy::emit("render", &d).unwrap();
+    assert_eq!(a, b, "same design -> byte-identical deploy kit");
+}
