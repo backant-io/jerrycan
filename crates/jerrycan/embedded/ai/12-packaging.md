@@ -38,3 +38,49 @@ kubectl apply -f deploy/k8s.yaml
   sets the latter; provide the secret via your secrets manager).
 - Set `JERRYCAN_DATABASE_URL` for db-backed apps.
 - The container binds `0.0.0.0:8000`; the Service maps port 80 → 8000.
+
+## Deploy (Render)
+
+`jerrycan deploy render` generates a self-contained `deploy/render/` kit — a
+pure-HTTP `deploy.sh`, a `teardown.sh`, a `render.yaml` blueprint, and a
+`README.md` — that an agent runs with only a `RENDER_API_KEY` to stand the app up
+on Render: hardened image, managed Postgres, secrets in Render's store, TLS, and
+a health-checked service that prints a live HTTPS URL.
+
+```text
+jerrycan deploy render
+# → deploy/render/{deploy.sh, teardown.sh, render.yaml, README.md}
+RENDER_API_KEY=rnd_xxx ./deploy/render/deploy.sh
+```
+
+`deploy.sh` drives Render's REST API idempotently (find-or-create), so re-running
+it updates the deployment in place. It writes `deploy/render/.deploy-state.json`
+(resource ids only — **no secrets**; the command appends it to `.gitignore`). The
+app self-migrates on boot, so there is no separate migration step.
+
+### Registry prereq
+The deploy is image-based: `deploy.sh` builds the hardened container and pushes
+it, then points Render at the pushed tag.
+- Set `JERRYCAN_DEPLOY_IMAGE=registry/owner/name` (or
+  `JERRYCAN_DEPLOY_REGISTRY_OWNER` with the default `ghcr.io`) so the build has a
+  push target. `docker` must be logged in to that registry.
+- To skip the build (you already pushed an image), set
+  `JERRYCAN_DEPLOY_SKIP_BUILD=1` and point `JERRYCAN_DEPLOY_IMAGE`/`_TAG` at it.
+- Private images (the common GHCR case) need a Render registry credential:
+  `JERRYCAN_DEPLOY_REGISTRY_USER` + `JERRYCAN_DEPLOY_REGISTRY_TOKEN` (for
+  `ghcr.io` these default to the image owner + `GITHUB_TOKEN` with
+  `read:packages`). Without them the image is deployed as public.
+
+### Security
+- `JERRYCAN_SECRET` is generated at deploy time and the database URL is captured
+  from Render; both are set **only** in Render's secret store — never written to
+  the repo, never printed (the script redacts them from all output).
+- `JERRYCAN_ENV=prod` is set, so the app fails closed if a real secret is missing
+  (it never falls back to the insecure dev key). TLS is Render-managed.
+- Use a least-privilege Render API key (services + postgres scopes).
+
+### Tear down (destructive)
+```text
+RENDER_API_KEY=rnd_xxx ./deploy/render/teardown.sh
+```
+Deletes the service and the database (all data), then removes the state file.

@@ -237,6 +237,18 @@ wired as a permanent gate.
   `Multipart::from_buffered` lets one route accept multipart or another content
   type. No contract change.
 
+### Deploy (Render)
+- **Zero-touch deploy**: `jerrycan deploy render` generates an idempotent,
+  secret-safe Render deploy kit (pure HTTP API) — a self-contained `deploy/render/`
+  (`deploy.sh`, `teardown.sh`, `render.yaml`, `README.md`) an agent runs with only
+  `RENDER_API_KEY` to stand the app up on Render: hardened image, managed Postgres,
+  secrets generated into Render's store (never printed), `JERRYCAN_ENV=prod`
+  fail-closed, TLS, health-checked, and a live HTTPS URL. Re-runs update in place
+  (find-or-create); resource ids land in a gitignored `.deploy-state.json` (no
+  secrets); `teardown.sh` removes the service + database. Private-registry pulls
+  are wired via `JERRYCAN_DEPLOY_REGISTRY_USER`/`_TOKEN` (GHCR defaults to the
+  image owner + `GITHUB_TOKEN`).
+
 ### Breaking
 - `Db::pool()` is removed — use `Db::conn()` (a `sea_orm::DatabaseConnection`).
 - Generated apps must regenerate tool-owned files (`model.rs`, `lib.rs`,

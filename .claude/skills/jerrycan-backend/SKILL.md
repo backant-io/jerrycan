@@ -211,6 +211,8 @@ unreachable.)
 
 Tell the user what was built: the endpoints, how to run it (`jerrycan dev`,
 env vars), how to test (`jerrycan test`), and how to package (`jerrycan package`).
+To ship it: `jerrycan deploy render` generates `deploy/render/deploy.sh`; run it
+with `RENDER_API_KEY` for a live, secure URL (see `jerrycan docs packaging`).
 Get feedback and iterate from the relevant phase. To change the data model or
 endpoints, edit `design.json` and regenerate (tool-owned files refresh;
 agent-owned handlers are untouched — re-implement only new stubs).
