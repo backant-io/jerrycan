@@ -233,3 +233,164 @@ fn cmd_deploy_writes_artifacts_and_gitignores_the_state_file() {
         .count();
     assert_eq!(count, 1, "gitignore line duplicated: {gitignore2}");
 }
+
+// --- security regression: the API error path must never leak a secret --------
+
+/// A known DB password the stub plants in the connection-info response. The
+/// script puts it into `JERRYCAN_DATABASE_URL` (a `postgres://…` URL) and sends
+/// it inside the `POST /v1/services` request body. The stub then returns 400
+/// echoing that body — exactly the Render-validation-error shape that leaked the
+/// secret before the fix. The test asserts this token never reaches the output.
+const STUB_DB_PASSWORD: &str = "S3cr3tDbPassw0rdDoNotLeak";
+
+/// A stub Render API that drives the generated `deploy.sh` to the
+/// `POST /v1/services` step, then returns **HTTP 400 echoing the request body**
+/// (which carries `JERRYCAN_SECRET` + the `postgres://` DB URL). Returns the
+/// host-root base URL (no `/v1` — the script's paths already include it).
+fn spawn_leaky_render_stub() -> String {
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut s = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            if r.read_line(&mut line).is_err() || line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let (method, path) = (parts[0].to_string(), parts[1].to_string());
+            // Drain headers; capture Content-Length to read the body.
+            let mut clen = 0usize;
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).unwrap_or(0) == 0 {
+                    break;
+                }
+                if h == "\r\n" || h == "\n" {
+                    break;
+                }
+                if let Some(v) = h.to_lowercase().strip_prefix("content-length:") {
+                    clen = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; clen];
+            if clen > 0 {
+                r.read_exact(&mut body).ok();
+            }
+            let req_body = String::from_utf8_lossy(&body).to_string();
+
+            let p = path.split('?').next().unwrap();
+            // Reach the service-create step with canned 200s; the DB URL the
+            // script forwards carries STUB_DB_PASSWORD (the leak under test).
+            let (status, resp): (&str, String) = match (method.as_str(), p) {
+                ("GET", "/v1/owners") => ("200 OK", r#"[{"owner":{"id":"own_1"}}]"#.into()),
+                ("GET", "/v1/postgres") => ("200 OK", "[]".into()),
+                ("POST", "/v1/postgres") => {
+                    ("200 OK", r#"{"id":"pg_1","status":"creating"}"#.into())
+                }
+                ("GET", "/v1/postgres/pg_1") => ("200 OK", r#"{"status":"available"}"#.into()),
+                ("GET", "/v1/postgres/pg_1/connection-info") => (
+                    "200 OK",
+                    format!(
+                        r#"{{"internalConnectionString":"postgres://u:{STUB_DB_PASSWORD}@h:5432/d"}}"#
+                    ),
+                ),
+                ("GET", "/v1/services") => ("200 OK", "[]".into()),
+                // The leak: a Render validation 400 that mirrors the request body
+                // — which embeds JERRYCAN_SECRET + the postgres:// DB URL.
+                ("POST", "/v1/services") => (
+                    "400 Bad Request",
+                    format!(r#"{{"message":"validation failed","request":{req_body}}}"#),
+                ),
+                _ => ("200 OK", "{}".into()),
+            };
+            let http = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}",
+                resp.len()
+            );
+            use std::io::Write as _;
+            s.write_all(http.as_bytes()).ok();
+        }
+    });
+    addr
+}
+
+#[test]
+fn deploy_sh_error_path_never_leaks_the_secret() {
+    // Run the REAL generated deploy.sh against a stub whose POST /v1/services
+    // returns HTTP 400 echoing the request body (the secret + DB URL live in that
+    // body). The script must fail (non-zero) AND no secret may reach stdout/stderr.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("deploy").join("render");
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = deploy::emit("render", &demo_design()).unwrap();
+    let script = dir.join("deploy.sh");
+    std::fs::write(&script, &a[0].1).unwrap();
+
+    let base = spawn_leaky_render_stub();
+    // RENDER_API_BASE is the HOST ROOT (the script paths already carry /v1).
+    let out = Command::new("bash")
+        .arg(&script)
+        .env("RENDER_API_KEY", "rnd_testkey")
+        .env("RENDER_API_BASE", &base)
+        .env("JERRYCAN_DEPLOY_SKIP_BUILD", "1")
+        .env("JERRYCAN_DEPLOY_IMAGE", "registry/test/acme-api")
+        .env("JERRYCAN_DEPLOY_TAG", "test")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+
+    // 1. The 400 on the secret-carrying call must FAIL the deploy.
+    assert!(
+        !out.status.success(),
+        "deploy.sh should fail when POST /v1/services returns 400.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    // 2. The DB password (a postgres:// URL component the script forwarded in the
+    //    request body) must NOT appear anywhere — neither raw nor inside a URL.
+    assert!(
+        !combined.contains(STUB_DB_PASSWORD),
+        "DB password leaked into output:\n{combined}"
+    );
+    assert!(
+        !combined.contains("postgres://"),
+        "a postgres:// URL (DB credentials) reached the output:\n{combined}"
+    );
+
+    // 3. The generated JERRYCAN_SECRET is `openssl rand -base64 48` → a 64-char
+    //    base64 blob. No base64-ish run of 40+ chars may survive into the output.
+    let leaked_base64 = combined
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='))
+        .any(|tok| {
+            let core = tok.trim_end_matches('=');
+            core.len() >= 40
+                && core
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
+        });
+    assert!(
+        !leaked_base64,
+        "a base64-ish secret blob (40+ chars) reached the output:\n{combined}"
+    );
+
+    // 4. The error line for the service call must be body-free: it names the
+    //    method+path+code but withholds the (secret-bearing) response body.
+    assert!(
+        stderr.contains("POST /v1/services -> 400"),
+        "expected a body-free 'POST /v1/services -> 400' error line:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("validation failed") || !combined.contains("\"request\""),
+        "the echoed request body (carrying secrets) must not be printed:\n{combined}"
+    );
+}
