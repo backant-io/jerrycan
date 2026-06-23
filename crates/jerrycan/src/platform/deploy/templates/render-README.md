@@ -14,10 +14,13 @@ RENDER_API_KEY=rnd_xxx ./deploy/render/deploy.sh
   API key in the Render dashboard (Account Settings → API Keys). The script uses
   only services + postgres scopes.
 - **A registry the script can push to** — image-based deploy builds the hardened
-  container and pushes it. Defaults to `ghcr.io`; override with
-  `JERRYCAN_DEPLOY_IMAGE=registry/owner/name` (or set `JERRYCAN_DEPLOY_REGISTRY_OWNER`).
-  `docker` must be logged in to it. To skip the build (e.g. you already pushed an
-  image), set `JERRYCAN_DEPLOY_SKIP_BUILD=1` and point `JERRYCAN_DEPLOY_IMAGE`/`_TAG` at it.
+  container (from this kit's own `deploy/render/Dockerfile` — no separate
+  `jerrycan package` step needed) and pushes it. Defaults to `ghcr.io`; override
+  the registry host with `JERRYCAN_DEPLOY_REGISTRY=<host>` (e.g. `docker.io`), or
+  the full image with `JERRYCAN_DEPLOY_IMAGE=registry/owner/name` (or set
+  `JERRYCAN_DEPLOY_REGISTRY_OWNER`). `docker` must be logged in to it. To skip the
+  build (e.g. you already pushed an image), set `JERRYCAN_DEPLOY_SKIP_BUILD=1` and
+  point `JERRYCAN_DEPLOY_IMAGE`/`_TAG` at it.
 - **Private-image pull credentials (if your image is private)** — a private image
   (the common GHCR case) can't be pulled without a Render registry credential, so
   the deploy would hang/fail. Provide auth and the script find-or-creates a Render

@@ -42,14 +42,16 @@ kubectl apply -f deploy/k8s.yaml
 ## Deploy (Render)
 
 `jerrycan deploy render` generates a self-contained `deploy/render/` kit — a
-pure-HTTP `deploy.sh`, a `teardown.sh`, a `render.yaml` blueprint, and a
-`README.md` — that an agent runs with only a `RENDER_API_KEY` to stand the app up
-on Render: hardened image, managed Postgres, secrets in Render's store, TLS, and
-a health-checked service that prints a live HTTPS URL.
+pure-HTTP `deploy.sh`, a `teardown.sh`, a `render.yaml` blueprint, a `README.md`,
+and the hardened `Dockerfile` the deploy builds from — that an agent runs with
+only a `RENDER_API_KEY` to stand the app up on Render: hardened image, managed
+Postgres, secrets in Render's store, TLS, and a health-checked service that
+prints a live HTTPS URL. The kit emits its own `Dockerfile`, so no separate
+`jerrycan package --docker` step is needed.
 
 ```text
 jerrycan deploy render
-# → deploy/render/{deploy.sh, teardown.sh, render.yaml, README.md}
+# → deploy/render/{deploy.sh, teardown.sh, render.yaml, README.md, Dockerfile}
 RENDER_API_KEY=rnd_xxx ./deploy/render/deploy.sh
 ```
 
@@ -59,11 +61,13 @@ it updates the deployment in place. It writes `deploy/render/.deploy-state.json`
 app self-migrates on boot, so there is no separate migration step.
 
 ### Registry prereq
-The deploy is image-based: `deploy.sh` builds the hardened container and pushes
-it, then points Render at the pushed tag.
+The deploy is image-based: `deploy.sh` builds the hardened container (from the
+kit's own `deploy/render/Dockerfile`) and pushes it, then points Render at the
+pushed tag.
 - Set `JERRYCAN_DEPLOY_IMAGE=registry/owner/name` (or
   `JERRYCAN_DEPLOY_REGISTRY_OWNER` with the default `ghcr.io`) so the build has a
-  push target. `docker` must be logged in to that registry.
+  push target. Override just the registry host with `JERRYCAN_DEPLOY_REGISTRY=<host>`
+  (default `ghcr.io`). `docker` must be logged in to that registry.
 - To skip the build (you already pushed an image), set
   `JERRYCAN_DEPLOY_SKIP_BUILD=1` and point `JERRYCAN_DEPLOY_IMAGE`/`_TAG` at it.
 - Private images (the common GHCR case) need a Render registry credential:
