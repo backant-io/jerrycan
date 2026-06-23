@@ -33,7 +33,9 @@ const TEARDOWN_SH: &str = include_str!("templates/render-teardown.sh");
 const RENDER_YAML: &str = include_str!("templates/render.yaml");
 const README_MD: &str = include_str!("templates/render-README.md");
 
-/// `(relative_path, contents)` for the four artifacts, deterministic order.
+/// `(relative_path, contents)` for the five artifacts, deterministic order.
+/// The kit is self-contained: it emits its own hardened Dockerfile (the same one
+/// `jerrycan package --docker` produces) so a deploy needs no prior `package` run.
 pub fn artifacts(design: &Design) -> Vec<(String, String)> {
     let slug = app_slug(design);
     let fill = |t: &str| t.replace("{{APP_SLUG}}", &slug);
@@ -42,6 +44,10 @@ pub fn artifacts(design: &Design) -> Vec<(String, String)> {
         ("deploy/render/teardown.sh".into(), fill(TEARDOWN_SH)),
         ("deploy/render/render.yaml".into(), fill(RENDER_YAML)),
         ("deploy/render/README.md".into(), fill(README_MD)),
+        (
+            "deploy/render/Dockerfile".into(),
+            crate::platform::package::dockerfile(design),
+        ),
     ]
 }
 

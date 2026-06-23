@@ -94,7 +94,7 @@ else
   IMAGE_REF="${IMAGE}:${TAG}"
   command -v docker >/dev/null || { echo "missing: docker (or set JERRYCAN_DEPLOY_SKIP_BUILD=1)" >&2; exit 1; }
   echo "→ build: docker build -> ${IMAGE_REF}"
-  ( cd "${STATE_DIR}/../.." && docker build -t "${IMAGE_REF}" -f Dockerfile . )
+  ( cd "${STATE_DIR}/../.." && docker build -t "${IMAGE_REF}" -f deploy/render/Dockerfile . )
   echo "→ push: ${IMAGE_REF}"
   docker push "${IMAGE_REF}"
 fi
@@ -133,7 +133,7 @@ if [ -n "$REG_USER" ] && [ -n "$REG_TOKEN" ] && [ -n "$REG_TYPE" ]; then
     # The create body carries the registry token → withhold its error body.
     REG_CRED_ID="$(api POST /v1/registrycredentials "$(jq -n \
       --arg o "$OWNER_ID" --arg n "$CRED_NAME" --arg r "$REG_TYPE" --arg u "$REG_USER" --arg t "$REG_TOKEN" \
-      '{ownerId:$o, name:$n, registry:$r, username:$u, authToken:$t}')" "" 1 | jq -r '.id // empty')"
+      '{ownerId:$o, name:$n, registry:$r, username:$u, authToken:$t}')" 1 | jq -r '.id // empty')"
   fi
   [ -n "$REG_CRED_ID" ] || { echo "failed to obtain a registry credential id" >&2; exit 1; }
   state_set registry_credential_id "$REG_CRED_ID"
@@ -197,7 +197,8 @@ state_set service_id "$SVC_ID"
 # --- 6. deploy + poll to healthy --------------------------------------------
 echo "→ deploy: waiting for ${APP} to go live"
 LIVE=0
-for _ in $(seq 1 120); do
+POLL_MAX="${JERRYCAN_DEPLOY_POLL_MAX:-120}"   # iterations; overridable (tests set it low)
+for _ in $(seq 1 "$POLL_MAX"); do
   dstat="$(api GET "/v1/services/${SVC_ID}/deploys?limit=1" | jq -r '.[0].deploy.status // empty')"
   case "$dstat" in
     live) LIVE=1; break ;;
