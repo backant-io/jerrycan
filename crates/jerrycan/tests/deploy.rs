@@ -407,3 +407,136 @@ fn deploy_kit_is_byte_deterministic() {
     let b = deploy::emit("render", &d).unwrap();
     assert_eq!(a, b, "same design -> byte-identical deploy kit");
 }
+
+// --- Task 7: mock-Render-API happy-path flow ---------------------------------
+
+/// A tiny stub of the Render REST API: records each `METHOD PATH` it serves and
+/// replies with canned 200 JSON so the generated `deploy.sh` can run end-to-end
+/// with no real Render (and no docker). Returns the **host-root** base URL (no
+/// `/v1` — the script's paths already carry it) plus the shared call log.
+fn spawn_render_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("http://{}", listener.local_addr().unwrap());
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let rec = calls.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut s = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 || line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let (method, path) = (parts[0].to_string(), parts[1].to_string());
+            // Drain headers; capture Content-Length so we consume any body.
+            let mut clen = 0usize;
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).unwrap_or(0) == 0 {
+                    break;
+                }
+                if h == "\r\n" || h == "\n" {
+                    break;
+                }
+                if let Some(v) = h.to_lowercase().strip_prefix("content-length:") {
+                    clen = v.trim().parse().unwrap_or(0);
+                }
+            }
+            if clen > 0 {
+                let mut b = vec![0u8; clen];
+                r.read_exact(&mut b).ok();
+            }
+            rec.lock().unwrap().push(format!("{method} {path}"));
+            let body = render_stub_body(&method, &path);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            use std::io::Write as _;
+            s.write_all(resp.as_bytes()).ok();
+        }
+    });
+    (addr, calls)
+}
+
+/// Canned 200 bodies that walk the deploy through to a `live` deploy + a URL.
+fn render_stub_body(method: &str, path: &str) -> String {
+    // Strip the query string for matching.
+    let p = path.split('?').next().unwrap();
+    match (method, p) {
+        ("GET", "/v1/owners") => r#"[{"owner":{"id":"own_1"}}]"#.into(),
+        ("GET", "/v1/postgres") => "[]".into(),
+        ("POST", "/v1/postgres") => r#"{"id":"pg_1","status":"creating"}"#.into(),
+        ("GET", "/v1/postgres/pg_1") => r#"{"status":"available"}"#.into(),
+        ("GET", "/v1/postgres/pg_1/connection-info") => {
+            r#"{"internalConnectionString":"postgres://u:p@h:5432/d"}"#.into()
+        }
+        ("GET", "/v1/services") => "[]".into(),
+        ("POST", "/v1/services") => {
+            r#"{"service":{"id":"srv_1","serviceDetails":{"url":"https://acme-api.onrender.com"}}}"#
+                .into()
+        }
+        ("GET", "/v1/services/srv_1") => {
+            r#"{"service":{"serviceDetails":{"url":"https://acme-api.onrender.com"}}}"#.into()
+        }
+        ("GET", _) if p.ends_with("/deploys") => r#"[{"deploy":{"status":"live"}}]"#.into(),
+        _ => "{}".into(),
+    }
+}
+
+#[test]
+fn deploy_sh_runs_the_full_flow_against_a_stub() {
+    // Run the REAL generated deploy.sh against a stub Render API with the build
+    // skipped (no docker). It must exit 0, print the live URL, never print the
+    // secret value, and hit the expected create sequence (owners → postgres →
+    // services). Proves the orchestration + happy path actually work end-to-end.
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("deploy").join("render");
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = deploy::emit("render", &demo_design()).unwrap();
+    let script = dir.join("deploy.sh");
+    std::fs::write(&script, &a[0].1).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (base, calls) = spawn_render_stub();
+    // RENDER_API_BASE is the HOST ROOT (the script paths already carry /v1).
+    let out = Command::new("bash")
+        .arg(&script)
+        .env("RENDER_API_KEY", "rnd_test")
+        .env("RENDER_API_BASE", &base)
+        .env("JERRYCAN_DEPLOY_SKIP_BUILD", "1")
+        .env("JERRYCAN_DEPLOY_IMAGE", "registry/test/acme-api")
+        .env("JERRYCAN_DEPLOY_TAG", "test")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "deploy.sh failed.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Deployed acme-api") && stdout.contains("onrender.com"),
+        "expected the live URL in the summary:\n{stdout}"
+    );
+    // The secret value must never appear in any output.
+    assert!(
+        !stdout.contains("JERRYCAN_SECRET="),
+        "secret value leaked: {stdout}"
+    );
+    // The expected create sequence happened.
+    let seq = calls.lock().unwrap().join("\n");
+    for expect in ["GET /v1/owners", "POST /v1/postgres", "POST /v1/services"] {
+        assert!(seq.contains(expect), "missing {expect} in:\n{seq}");
+    }
+}
