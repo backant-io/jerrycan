@@ -7,7 +7,7 @@ set -euo pipefail
 
 APP="{{APP_SLUG}}"
 DB="${APP}-db"
-API="${RENDER_API_BASE:-https://api.render.com/v1}"     # overridable for tests
+API="${RENDER_API_BASE:-https://api.render.com}"        # overridable for tests (host root; /v1 is in each path)
 STATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE="${STATE_DIR}/.deploy-state.json"
 IMAGE="${JERRYCAN_DEPLOY_IMAGE:-ghcr.io/${JERRYCAN_DEPLOY_REGISTRY_OWNER:-USER}/${APP}}"
@@ -37,7 +37,7 @@ state_set() { # state_set KEY VALUE  (no secrets — ids only)
 
 # --- 1. preflight ------------------------------------------------------------
 echo "→ preflight: validating the Render API key"
-OWNER_ID="$(api GET /owners | jq -r '.[0].owner.id')"
+OWNER_ID="$(api GET /v1/owners | jq -r '.[0].owner.id')"
 [ -n "$OWNER_ID" ] && [ "$OWNER_ID" != "null" ] || { echo "no owner for this key" >&2; exit 1; }
 
 # --- 2. build + push the hardened image -------------------------------------
@@ -57,20 +57,20 @@ fi
 echo "→ database: find-or-create ${DB}"
 PG_ID="$(state_get pg_id)"
 if [ -z "$PG_ID" ]; then
-  PG_ID="$(api GET "/postgres?name=${DB}" | jq -r '.[0].postgres.id // empty')"
+  PG_ID="$(api GET "/v1/postgres?name=${DB}" | jq -r '.[0].postgres.id // empty')"
 fi
 if [ -z "$PG_ID" ]; then
-  PG_ID="$(api POST /postgres "$(jq -n --arg o "$OWNER_ID" --arg n "$DB" \
+  PG_ID="$(api POST /v1/postgres "$(jq -n --arg o "$OWNER_ID" --arg n "$DB" \
     '{ownerId:$o, name:$n, plan:"free", region:"oregon", version:"16"}')" | jq -r '.id // .postgres.id')"
 fi
 state_set pg_id "$PG_ID"
 echo "→ database: waiting for ${DB} to be available"
 for _ in $(seq 1 60); do
-  st="$(api GET "/postgres/${PG_ID}" | jq -r '.status // .postgres.status')"
+  st="$(api GET "/v1/postgres/${PG_ID}" | jq -r '.status // .postgres.status')"
   [ "$st" = "available" ] && break
   sleep 5
 done
-DB_URL="$(api GET "/postgres/${PG_ID}/connection-info" | jq -r '.internalConnectionString')"
+DB_URL="$(api GET "/v1/postgres/${PG_ID}/connection-info" | jq -r '.internalConnectionString')"
 [ -n "$DB_URL" ] && [ "$DB_URL" != "null" ] || { echo "no DB connection string" >&2; exit 1; }
 
 # --- 4. secrets (generated; never persisted to the repo) --------------------
@@ -81,7 +81,7 @@ ENV_VARS="$(jq -n --arg s "$SECRET" --arg d "$DB_URL" \
 # --- 5. web service (find-or-create) ----------------------------------------
 echo "→ service: find-or-create ${APP}"
 SVC_ID="$(state_get service_id)"
-[ -z "$SVC_ID" ] && SVC_ID="$(api GET "/services?name=${APP}" | jq -r '.[0].service.id // empty')"
+[ -z "$SVC_ID" ] && SVC_ID="$(api GET "/v1/services?name=${APP}" | jq -r '.[0].service.id // empty')"
 SVC_BODY="$(jq -n --arg o "$OWNER_ID" --arg n "$APP" --arg img "$IMAGE_REF" --argjson env "$ENV_VARS" \
   '{type:"web_service", name:$n, ownerId:$o,
     image:{ownerId:$o, imagePath:$img},
@@ -89,18 +89,18 @@ SVC_BODY="$(jq -n --arg o "$OWNER_ID" --arg n "$APP" --arg img "$IMAGE_REF" --ar
       envSpecificDetails:{healthCheckPath:"/healthz"}},
     envVars:$env}')"
 if [ -z "$SVC_ID" ]; then
-  SVC_ID="$(api POST /services "$SVC_BODY" | jq -r '.service.id // .id')"
+  SVC_ID="$(api POST /v1/services "$SVC_BODY" | jq -r '.service.id // .id')"
 else
-  api PATCH "/services/${SVC_ID}" "$SVC_BODY" >/dev/null
-  api PUT "/services/${SVC_ID}/env-vars" "$ENV_VARS" >/dev/null
-  api POST "/services/${SVC_ID}/deploys" '{"clearCache":"do_not_clear"}' >/dev/null
+  api PATCH "/v1/services/${SVC_ID}" "$SVC_BODY" >/dev/null
+  api PUT "/v1/services/${SVC_ID}/env-vars" "$ENV_VARS" >/dev/null
+  api POST "/v1/services/${SVC_ID}/deploys" '{"clearCache":"do_not_clear"}' >/dev/null
 fi
 state_set service_id "$SVC_ID"
 
 # --- 6. deploy + poll to healthy --------------------------------------------
 echo "→ deploy: waiting for ${APP} to go live"
 for _ in $(seq 1 120); do
-  dstat="$(api GET "/services/${SVC_ID}/deploys?limit=1" | jq -r '.[0].deploy.status // empty')"
+  dstat="$(api GET "/v1/services/${SVC_ID}/deploys?limit=1" | jq -r '.[0].deploy.status // empty')"
   case "$dstat" in
     live) break ;;
     build_failed|update_failed|canceled|deactivated)
@@ -110,7 +110,7 @@ for _ in $(seq 1 120); do
 done
 
 # --- 7. summary (secrets redacted) ------------------------------------------
-URL="$(api GET "/services/${SVC_ID}" | jq -r '.service.serviceDetails.url // .serviceDetails.url // empty')"
+URL="$(api GET "/v1/services/${SVC_ID}" | jq -r '.service.serviceDetails.url // .serviceDetails.url // empty')"
 [ -n "$URL" ] || URL="https://${APP}.onrender.com"
 cat <<EOF
 
