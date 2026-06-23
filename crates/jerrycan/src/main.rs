@@ -104,6 +104,11 @@ enum Cmd {
         #[arg(long)]
         systemd: bool,
     },
+    /// Generate a zero-touch deploy kit (run it with your platform API key)
+    Deploy {
+        /// Deploy target (currently: render)
+        target: String,
+    },
     /// Serve MCP over stdio
     Mcp,
 }
@@ -202,6 +207,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             k8s,
             systemd,
         } => cmd_package(docker, binary, k8s, systemd, cli.json),
+        Cmd::Deploy { target } => cmd_deploy(&target, cli.json),
         Cmd::Mcp => jerrycan::platform::mcp::serve_stdio().map_err(Failure::environment),
     }
 }
@@ -625,6 +631,56 @@ fn cmd_package(
         json_mode,
         &payload,
         &format!("packaged {} artifact(s)", artifacts.len()),
+    );
+    Ok(())
+}
+
+fn cmd_deploy(target: &str, json_mode: bool) -> Result<(), Failure> {
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+    let artifacts = jerrycan::platform::deploy::emit(target, &design).map_err(Failure::gate)?;
+    for (rel, contents) in &artifacts {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Failure::gate(e.to_string()))?;
+        }
+        std::fs::write(&path, contents).map_err(|e| Failure::gate(e.to_string()))?;
+        // The scripts must be executable.
+        #[cfg(unix)]
+        if rel.ends_with(".sh") {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .map_err(|e| Failure::gate(e.to_string()))?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).map_err(|e| Failure::gate(e.to_string()))?;
+        }
+    }
+    // Keep deploy state (resource ids) out of version control.
+    let gitignore = root.join(".gitignore");
+    let line = "deploy/render/.deploy-state.json";
+    let cur = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    if !cur.lines().any(|l| l.trim() == line) {
+        let mut next = cur;
+        if !next.is_empty() && !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push_str(line);
+        next.push('\n');
+        std::fs::write(&gitignore, next).map_err(|e| Failure::gate(e.to_string()))?;
+    }
+    let written: Vec<&str> = artifacts.iter().map(|(p, _)| p.as_str()).collect();
+    let payload = serde_json::json!({
+        "target": target,
+        "artifacts": written,
+        "next_step": format!(
+            "set the platform key and run the script, e.g. `RENDER_API_KEY=… ./deploy/{target}/deploy.sh`"
+        ),
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!("deploy kit for `{target}` written"),
     );
     Ok(())
 }

@@ -1,0 +1,26 @@
+# Render blueprint for {{APP_SLUG}} — `render.yaml` (https://render.com/docs/blueprint-spec).
+# This is the declarative alternative to deploy.sh, for repo-connected IaC.
+# Secrets are NEVER written here: JERRYCAN_SECRET uses Render's generateValue.
+databases:
+  - name: {{APP_SLUG}}-db
+    plan: free
+    postgresMajorVersion: "16"
+
+services:
+  - type: web_service
+    name: {{APP_SLUG}}
+    runtime: image
+    plan: free
+    region: oregon
+    healthCheckPath: /healthz
+    image:
+      url: docker.io/library/{{APP_SLUG}}:latest # overwritten by deploy.sh with the pushed tag
+    envVars:
+      - key: JERRYCAN_ENV
+        value: prod
+      - key: JERRYCAN_SECRET
+        generateValue: true
+      - key: JERRYCAN_DATABASE_URL
+        fromDatabase:
+          name: {{APP_SLUG}}-db
+          property: connectionString

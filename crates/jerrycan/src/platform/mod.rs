@@ -4,6 +4,7 @@
 
 pub mod checkpipe;
 pub mod codes;
+pub mod deploy;
 pub mod design;
 pub mod docsidx;
 pub mod genroute;
