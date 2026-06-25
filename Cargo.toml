@@ -16,7 +16,7 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 homepage = "https://jerrycan.cc"
 repository = "https://github.com/backant-io/jerrycan"
 authors = ["Pavel Hegler"]

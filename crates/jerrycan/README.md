@@ -28,4 +28,4 @@ cargo install jerrycan
   <https://github.com/backant-io/jerrycan>
 - AI-native docs ship in the binary: `jerrycan docs`
 
-Licensed under MIT OR Apache-2.0.
+Licensed under MIT.
