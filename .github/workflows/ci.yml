@@ -76,7 +76,7 @@ jobs:
           cargo test -p jerrycan --all-features --test conformance -- --include-ignored
           cargo test -p jerrycan --test genroute_compile -- --include-ignored
           cargo test -p jerrycan --test eval -- --include-ignored
-          cargo test -p jerrycan --all-features --test kolli_eval -- --include-ignored
+          cargo test -p jerrycan --all-features --test reference_eval -- --include-ignored
       - name: "Durable-store behavioral tests (ignored: real Postgres + Redis)"
         # The durable JobStore/RateLimitStore impls and the concurrent-migrator
         # guarantee are #[ignore]d (they need a live server). With the postgres +

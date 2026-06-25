@@ -28,7 +28,7 @@ fn tree_digest(root: &Path) -> Vec<(String, Vec<u8>)> {
 
 #[test]
 fn generation_is_byte_deterministic() {
-    let src = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let src = include_str!("../../../conformance/designs/reference-slice.design.json");
     let d: Design = serde_json::from_str(src).unwrap();
     let (ta, tb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (a, b) = (ta.path().join("app"), tb.path().join("app"));
@@ -45,7 +45,7 @@ fn generation_is_byte_deterministic() {
 #[tokio::test]
 async fn schema_derivation_is_deterministic() {
     use jerrycan::platform::schema;
-    let src = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let src = include_str!("../../../conformance/designs/reference-slice.design.json");
     let d: Design = serde_json::from_str(src).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("app");

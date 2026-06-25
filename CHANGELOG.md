@@ -62,7 +62,7 @@ per-route limits, task-scoped DI, an extension lifecycle, and injectable time.
   domain time (rate windows, schedules, expiry); tests move it with
   `TestApp::clock().advance(..)`/`.set(..)`. Transport timeouts stay on real time.
 - **Public endpoints**: routes can be marked `public: true` (a `JL0004` carve-out
-  for credential-issuing routes); the `kolli` users module gains `register`/`login`.
+  for credential-issuing routes); the `reference` users module gains `register`/`login`.
 - **Cross-module relations** are unenforced fk columns by default; `schema.json`
   reports the enforcement state per relation.
 - **MCP stdio**: lines are capped at 16 MiB — an overlong line fails loud with
@@ -210,16 +210,16 @@ or design-contract change. Reuses the existing `JC0400`/`JC0401`/`JC0403` codes.
   keys) with compiling doctests; the threat model gains an advanced-auth section.
 
 ### Eval gate (v2.5)
-0.2.0's release condition: the Kolli reference slice — the full v2 showcase —
+0.2.0's release condition: the reference slice — the full v2 showcase —
 rebuilt on jerrycan, served live, with every v2 feature exercised over real HTTP,
 wired as a permanent gate.
-- **Kolli reference backend** — `conformance/eval/fixtures/kolli` implements the
+- **Reference backend** — `conformance/eval/fixtures/reference` implements the
   slice (tenancy + JWT/session auth, tenant-scoped CRUD, multipart CSV import,
   raw-body webhook verification, scoped API keys, OAuth connect+callback against a
   mock IdP, two cron jobs) so a fresh scaffold of
-  `conformance/designs/kolli-slice.design.json` is `jerrycan check`-green.
-- **Live HTTP battery** — `crates/jerrycan/tests/kolli_eval.rs`
-  (`kolli_slice_live_battery`) scaffolds the slice, gets `check` green, runs the
+  `conformance/designs/reference-slice.design.json` is `jerrycan check`-green.
+- **Live HTTP battery** — `crates/jerrycan/tests/reference_eval.rs`
+  (`reference_slice_live_battery`) scaffolds the slice, gets `check` green, runs the
   generated acceptance suite (incl. cross-tenant isolation), serves the app live
   (sqlite), and drives every feature over a real `TcpStream`: register/login,
   live cross-tenant isolation (`404` on another tenant's row), webhook signature

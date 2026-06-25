@@ -26,7 +26,7 @@ jerrycan is two inseparable halves:
 
 **Humans don't write the code — agents do**, guided by documentation where every example is a compiling, *running* doc-test, and by machine-readable contracts for every tool.
 
-> **Status: 0.1.0 released; 0.2.0 in development on `main`.** Phases 0 (core API + frozen contracts), 1 (CLI + MCP core loop), 2 (data & test-first generation), 3 (auth, observability, `jerrycan package`), and 4 (fuzzing, agent evals, diagnostics polish) are complete and fully tested. The crates are published at `0.1.0` on [crates.io](https://crates.io/crates/jerrycan). The full v2 cycle toward `0.2.0` has landed on `main` — the data foundation (relations, constraints, first-class tenancy, SeaORM), the protocol surface (multipart, raw-body webhooks, streaming), the middleware kit (CORS, rate limiting), jerrycan-jobs (Postgres + Redis stores, cron, retries), auth expansion (OAuth2, encrypted tokens, scoped API keys), and the v2.5 eval gate (the Kolli reference slice driven live over HTTP as a permanent release gate); see the [v2 design spec](docs/superpowers/specs/2026-06-11-jerrycan-v2-design.md). Early but real; expect rough edges as it grows.
+> **Status: 0.1.0 released; 0.2.0 in development on `main`.** Phases 0 (core API + frozen contracts), 1 (CLI + MCP core loop), 2 (data & test-first generation), 3 (auth, observability, `jerrycan package`), and 4 (fuzzing, agent evals, diagnostics polish) are complete and fully tested. The crates are published at `0.1.0` on [crates.io](https://crates.io/crates/jerrycan). The full v2 cycle toward `0.2.0` has landed on `main` — the data foundation (relations, constraints, first-class tenancy, SeaORM), the protocol surface (multipart, raw-body webhooks, streaming), the middleware kit (CORS, rate limiting), jerrycan-jobs (Postgres + Redis stores, cron, retries), auth expansion (OAuth2, encrypted tokens, scoped API keys), and the v2.5 eval gate (the reference slice driven live over HTTP as a permanent release gate); see the [v2 design spec](docs/superpowers/specs/2026-06-11-jerrycan-v2-design.md). Early but real; expect rough edges as it grows.
 
 ## A taste
 
@@ -125,7 +125,7 @@ jerrycan_package  → hardened artifacts + SBOM, only when everything is green
 | **v2.2 — Middleware kit** | CORS in core; rate limiting as an extension (`429 JC0429`) | ✅ complete |
 | **v2.3 — jerrycan-jobs** | `JobStore` (Postgres / Redis), retries + dead-letter, named queues, cron, idempotency, `run_at` | ✅ complete (incl. v2.3b Redis Streams) |
 | **v2.4 — Auth expansion** | OAuth2 client, encrypted token storage + key rotation, scoped API keys, mock IdP harness | ✅ complete |
-| **v2.5 — Eval gate → v0.2.0** | Kolli reference slice rebuilt on jerrycan, served live, every v2 feature driven over real HTTP — wired as a permanent, un-skippable CI + publish gate | ✅ complete |
+| **v2.5 — Eval gate → v0.2.0** | Reference slice rebuilt on jerrycan, served live, every v2 feature driven over real HTTP — wired as a permanent, un-skippable CI + publish gate | ✅ complete |
 
 The original plan lives in the [v1 design spec](docs/superpowers/specs/2026-06-09-jerrycan-design.md); the v2 roadmap is in the [v2 design spec](docs/superpowers/specs/2026-06-11-jerrycan-v2-design.md); deferred items are tracked in the [backlog](docs/phase1-backlog.md).
 
@@ -146,7 +146,7 @@ cargo install jerrycan
 The headline metric: an opus agent, given **only** the published docs surface
 (`jerrycan docs …` — no framework source, no test fixtures), scaffolds and
 fully implements backends that build, pass `jerrycan check`, and serve real
-CRUD over HTTP. The v2.5 north star — a **docs-only rebuild of the full Kolli
+CRUD over HTTP. The v2.5 north star — a **docs-only rebuild of the full Reference
 slice** — is **GREEN**: `jerrycan check` passes, all **37/37** generated
 acceptance tests pass across 6 modules + 2 cron jobs, live HTTP round-trips
 verified, and a negative control (unscoping a tenant query) correctly turns the
@@ -154,9 +154,9 @@ gate red. The five simpler reference apps stand at **5/5 (100%)**. See
 [`conformance/eval/results.md`](conformance/eval/results.md) (floor 4/5,
 target ≥ 90%).
 
-The v2.5 release gate adds a **deterministic Kolli battery**
-([`crates/jerrycan/tests/kolli_eval.rs`](crates/jerrycan/tests/kolli_eval.rs)):
-it scaffolds the Kolli reference slice on jerrycan, gets `jerrycan check` green,
+The v2.5 release gate adds a **deterministic Reference battery**
+([`crates/jerrycan/tests/reference_eval.rs`](crates/jerrycan/tests/reference_eval.rs)):
+it scaffolds the reference slice on jerrycan, gets `jerrycan check` green,
 runs the generated acceptance suite (including cross-tenant isolation), serves
 the app **live** and drives every v2 feature over real HTTP — register/login
 (JWT sessions), live cross-tenant isolation, webhook signature verification
@@ -166,8 +166,8 @@ under a controlled clock and `schema.json` data-structure questions answered fro
 the published `SchemaContract` alone. It runs in CI (the `--include-ignored`
 heavy step) and is a fail-fast pre-publish block in `scripts/publish.sh`, so a
 release can't ship if it's red. Cold-build time (the SeaORM compile-tax baseline)
-is measured in CI by the kolli conformance test, which prints
-`kolli-slice cold build: …` to the log.
+is measured in CI by the reference conformance test, which prints
+`reference-slice cold build: …` to the log.
 
 ## Development
 

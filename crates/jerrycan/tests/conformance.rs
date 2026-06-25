@@ -12,7 +12,7 @@ const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.
 /// The v2 north-star eval slice: a tenant-scoped, JWT-guarded, db-backed
 /// sales-engagement backend (workspaces/leads/api-keys/billing). This is the
 /// heavy gate proving the full SeaORM stack scaffolds, builds, and behaves.
-const KOLLI: &str = include_str!("../../../conformance/designs/kolli-slice.design.json");
+const REFERENCE: &str = include_str!("../../../conformance/designs/reference-slice.design.json");
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -838,7 +838,7 @@ fn golden_app_deploys_everywhere() {
     }
 }
 
-/// THE v2 north-star gate: the kolli-slice design — a tenant-scoped, JWT-guarded,
+/// THE v2 north-star gate: the reference-slice design — a tenant-scoped, JWT-guarded,
 /// db-backed multi-module backend (workspaces/leads/api-keys/billing) — scaffolds
 /// onto the full SeaORM stack, the generated workspace BUILDS, its generated
 /// acceptance + isolation tests run and fail ONLY on unimplemented stubs (JC0500),
@@ -856,15 +856,15 @@ fn golden_app_deploys_everywhere() {
 /// `*_without_auth_is_401` guard tests are expected to PASS (the guard runs before
 /// the stub, so a credential-less request is correctly rejected pre-implementation).
 #[test]
-#[ignore = "heavy: kolli-slice (SeaORM) scaffolds, builds, reds-on-stubs; records cold-build baseline"]
-fn kolli_slice_scaffold_passes_check() {
+#[ignore = "heavy: reference-slice (SeaORM) scaffolds, builds, reds-on-stubs; records cold-build baseline"]
+fn reference_slice_scaffold_passes_check() {
     let tmp = tempfile::tempdir().unwrap();
 
-    // Scaffold the kolli-slice design wired to the LOCAL framework path dep, the
+    // Scaffold the reference-slice design wired to the LOCAL framework path dep, the
     // same way every other heavy test wires it (env passed to the child only).
     let design_path = tmp.path().join("design.json");
-    std::fs::write(&design_path, KOLLI).unwrap();
-    let app = tmp.path().join("kolli-slice");
+    std::fs::write(&design_path, REFERENCE).unwrap();
+    let app = tmp.path().join("reference-slice");
     let dep = format!(
         "jerrycan = {{ path = \"{}\", default-features = false }}",
         repo_root().join("crates/jerrycan").display()
@@ -877,7 +877,7 @@ fn kolli_slice_scaffold_passes_check() {
         .arg(&design_path)
         .status()
         .unwrap();
-    assert!(st.success(), "kolli-slice must scaffold");
+    assert!(st.success(), "reference-slice must scaffold");
 
     // schema.json is written by the db-mode scaffold (derived from migrations).
     assert!(
@@ -926,10 +926,10 @@ fn kolli_slice_scaffold_passes_check() {
     let cold_build = t0.elapsed();
     assert!(
         build.status.success(),
-        "kolli-slice (SeaORM) generated workspace must build:\n{}",
+        "reference-slice (SeaORM) generated workspace must build:\n{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    eprintln!("kolli-slice cold build: {cold_build:?}");
+    eprintln!("reference-slice cold build: {cold_build:?}");
 
     // INCREMENTAL test-build baseline: build (don't run) the route-leads test
     // binary now that deps are warm — the tightest agent inner-loop signal. `cargo
@@ -946,7 +946,7 @@ fn kolli_slice_scaffold_passes_check() {
         "route-leads test binary must compile:\n{}",
         String::from_utf8_lossy(&leads_build.stderr)
     );
-    eprintln!("kolli-slice route-leads incremental test-build: {leads_test_build:?}");
+    eprintln!("reference-slice route-leads incremental test-build: {leads_test_build:?}");
 
     // RED on stubs: run every generated test. `--no-fail-fast` so cargo runs all
     // test binaries (it otherwise halts at the first failing crate).
@@ -1007,7 +1007,7 @@ fn kolli_slice_scaffold_passes_check() {
     // The lighter check gates, run directly (audit/deny are too heavy here and are
     // covered by the db-mode golden test): jerrycan lints and schema-contract
     // freshness must both be clean on the fresh scaffold.
-    let design: jerrycan::platform::design::Design = serde_json::from_str(KOLLI).unwrap();
+    let design: jerrycan::platform::design::Design = serde_json::from_str(REFERENCE).unwrap();
     let lints = jerrycan::platform::lints::run(&app, &design);
     assert!(
         lints.is_empty(),

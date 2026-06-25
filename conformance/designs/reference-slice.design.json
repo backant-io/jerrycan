@@ -1,5 +1,5 @@
 {
-  "name": "kolli-slice",
+  "name": "reference-slice",
   "contract_version": 1,
   "description": "The v2 north-star eval slice: a sales-engagement backend (workspaces, leads, api keys, billing webhooks) modeled on a real app. Tenant-scoped, JWT-guarded, with declared background jobs.",
   "auth": { "model": "jwt", "roles": ["owner", "member"] },

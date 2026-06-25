@@ -309,26 +309,26 @@ pub fn write_jobs_acceptance(
 mod tests {
     use super::*;
 
-    fn kolli() -> Design {
+    fn reference() -> Design {
         Design::from_path(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../conformance/designs/kolli-slice.design.json"
+            "/../../conformance/designs/reference-slice.design.json"
         )))
         .unwrap()
     }
 
-    /// A queue-only job (no schedule) we graft onto kolli to exercise the payload
+    /// A queue-only job (no schedule) we graft onto reference to exercise the payload
     /// path without touching the frozen fixture.
     fn queue_job() -> JobDesign {
         serde_json::from_str(r#"{ "name": "send_welcome_email" }"#).unwrap()
     }
 
-    /// The registry for kolli's two CRON jobs is byte-identical across two calls
+    /// The registry for reference's two CRON jobs is byte-identical across two calls
     /// (determinism is the contract: JL0003 compares against exactly this output).
     /// Both jobs carry a schedule, so both register the 1-arg cron closure.
     #[test]
     fn registry_is_deterministic_and_wires_cron_jobs() {
-        let d = kolli();
+        let d = reference();
         let a = registry_rs(&d);
         let b = registry_rs(&d);
         assert_eq!(
@@ -375,7 +375,7 @@ mod tests {
     /// `.cron(...)` line. Its queue defaults to "default".
     #[test]
     fn registry_wires_queue_job_with_payload_deserialization() {
-        let mut d = kolli();
+        let mut d = reference();
         d.jobs.push(queue_job());
         let r = registry_rs(&d);
         assert!(
@@ -408,7 +408,7 @@ mod tests {
     /// carries the at-least-once idempotency reminder. No payload struct.
     #[test]
     fn cron_task_stub_is_one_arg_owned_ctx() {
-        let d = kolli();
+        let d = reference();
         let stub = task_rs(&d.jobs[0]); // expire_trials (cron)
         assert!(
             stub.contains(
@@ -457,13 +457,13 @@ mod tests {
         );
     }
 
-    /// The tool-owned `tests/acceptance.rs` for kolli's two CRON jobs: one
+    /// The tool-owned `tests/acceptance.rs` for reference's two CRON jobs: one
     /// `#[tokio::test]` per job, each calling the task fn DIRECTLY (1-arg cron
     /// shape) and asserting the result `is_ok()`. This is the TDD-red contract
     /// the `gen-tests` `expected_failing` count comes from.
     #[test]
     fn acceptance_emits_one_is_ok_test_per_cron_job() {
-        let d = kolli();
+        let d = reference();
         let a = acceptance_rs(&d);
         // Exactly two tests — one per declared job.
         assert_eq!(
@@ -508,7 +508,7 @@ mod tests {
     /// the contract (the gen-tests count and the file content must be stable).
     #[test]
     fn acceptance_is_deterministic() {
-        let d = kolli();
+        let d = reference();
         assert_eq!(
             acceptance_rs(&d),
             acceptance_rs(&d),
@@ -521,7 +521,7 @@ mod tests {
     /// `{Name}Payload` derives `Default` (see queue_task_stub test).
     #[test]
     fn acceptance_emits_two_arg_default_payload_call_for_queue_job() {
-        let mut d = kolli();
+        let mut d = reference();
         d.jobs.push(queue_job());
         let a = acceptance_rs(&d);
         assert!(
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn write_jobs_writes_the_acceptance_tests() {
         let tmp = tempfile::tempdir().unwrap();
-        let created = write_jobs(tmp.path(), &kolli()).unwrap();
+        let created = write_jobs(tmp.path(), &reference()).unwrap();
         assert!(
             created.contains(&"crates/jobs/tests/acceptance.rs".to_string()),
             "write_jobs reports the acceptance file: {created:?}"
@@ -557,17 +557,17 @@ mod tests {
 
     /// `write_jobs_acceptance` writes the file and returns its `(rel, count)` —
     /// the count of `#[tokio::test]` fns that the gen-tests command adds to
-    /// `expected_failing`. For kolli that is its two cron jobs.
+    /// `expected_failing`. For reference that is its two cron jobs.
     #[test]
     fn write_jobs_acceptance_returns_path_and_failing_count() {
         let tmp = tempfile::tempdir().unwrap();
-        let (rel, count) = write_jobs_acceptance(tmp.path(), &kolli())
+        let (rel, count) = write_jobs_acceptance(tmp.path(), &reference())
             .unwrap()
             .unwrap();
         assert_eq!(rel, "crates/jobs/tests/acceptance.rs");
         assert_eq!(
             count, 2,
-            "kolli's two jobs each contribute one failing test"
+            "reference's two jobs each contribute one failing test"
         );
         assert!(
             tmp.path().join(&rel).exists(),
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn write_jobs_acceptance_is_none_without_jobs() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut d = kolli();
+        let mut d = reference();
         d.jobs.clear();
         assert!(!d.wants_jobs());
         assert!(
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn write_jobs_respects_the_ownership_rule() {
         let tmp = tempfile::tempdir().unwrap();
-        let d = kolli();
+        let d = reference();
         let created = write_jobs(tmp.path(), &d).unwrap();
         assert!(created.contains(&"crates/jobs/Cargo.toml".to_string()));
         assert!(created.contains(&"crates/jobs/src/lib.rs".to_string()));

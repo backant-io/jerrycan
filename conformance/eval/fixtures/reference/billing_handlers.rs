@@ -9,7 +9,7 @@ use jerrycan::prelude::*;
 /// value). NEVER a literal secret in real code — this is a reference slice.
 fn webhook_secret() -> Vec<u8> {
     std::env::var("STRIPE_WEBHOOK_SECRET")
-        .unwrap_or_else(|_| "whsec_kolli_reference_secret".to_string())
+        .unwrap_or_else(|_| "whsec_reference_reference_secret".to_string())
         .into_bytes()
 }
 

@@ -410,7 +410,7 @@ fn isolation_member_role<'a>(design: &'a Design, module: &'a ModuleDesign) -> &'
 /// literal, then each declared non-id field with a seed-safe fixture (enum
 /// fields use a declared value to satisfy the CHECK). Returns (cols, vals) as
 /// the comma-joined SQL fragments. The tenant pk is an integer in practice (the
-/// kolli-slice Workspace), so the literal is numeric.
+/// reference-slice Workspace), so the literal is numeric.
 fn tenant_row_cols_vals(entity: &Entity, pk: &str, n: u32) -> (String, String) {
     let mut cols = vec!["id".to_string()];
     let mut vals = vec![pk.to_string()];

@@ -165,7 +165,7 @@ fn public_endpoints_get_no_401_test_and_no_cookie() {
 /// passes, and (c) insert the membership row, then provide the `tenant` factory.
 #[test]
 fn tenancy_module_tests_seed_membership_and_provide_the_guard() {
-    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
     let design: Design = serde_json::from_str(s).unwrap();
     let leads = design
         .modules
@@ -228,7 +228,7 @@ fn tenancy_module_tests_seed_membership_and_provide_the_guard() {
 /// SQL seed (`seed_sql_value`), which already uses the first declared value.
 #[test]
 fn generated_request_body_uses_a_declared_enum_value_not_the_placeholder() {
-    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
     let design: Design = serde_json::from_str(s).unwrap();
     let users = design
         .modules
@@ -261,7 +261,7 @@ fn generated_request_body_uses_a_declared_enum_value_not_the_placeholder() {
 /// present the request reaches the stub (500 on stubs → green when implemented).
 #[test]
 fn tenant_owned_fixtures_carry_the_foreign_key() {
-    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
     let design: Design = serde_json::from_str(s).unwrap();
     let leads = design
         .modules
@@ -296,7 +296,7 @@ fn tenant_owned_fixtures_carry_the_foreign_key() {
 /// would return the foreign row), going green only with scoped get_for.
 #[test]
 fn tenant_owned_modules_get_isolation_tests() {
-    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
     let d: Design = serde_json::from_str(s).unwrap();
     let leads = d
         .modules

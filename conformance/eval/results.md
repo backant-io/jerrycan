@@ -60,17 +60,17 @@ None. No failure was a framework bug; nothing was papered over.
 
 ---
 
-# v2.5 eval gate — the Kolli slice
+# v2.5 eval gate — the Reference slice
 
 - Date: 2026-06-15
-- Procedure: `conformance/eval/PROTOCOL.md` → "v2.5 eval target — the Kolli slice"
-- Target: `conformance/designs/kolli-slice.design.json`
+- Procedure: `conformance/eval/PROTOCOL.md` → "v2.5 eval target — the Reference slice"
+- Target: `conformance/designs/reference-slice.design.json`
 
 ## Deterministic battery (the automated gate)
 
-The deterministic Kolli battery
-(`crates/jerrycan/tests/kolli_eval.rs::kolli_slice_live_battery`) **PASSES**. It
-scaffolds the Kolli reference slice on jerrycan, applies the reference handlers,
+The deterministic Reference battery
+(`crates/jerrycan/tests/reference_eval.rs::reference_slice_live_battery`) **PASSES**. It
+scaffolds the reference slice on jerrycan, applies the reference handlers,
 gets `jerrycan --json check` green, runs the generated acceptance suite (incl.
 the cross-tenant isolation tests `tenant_a_cannot_read_tenant_b_leads` /
 `…_api_keys`), serves the app live on a free port (sqlite file DB), and drives
@@ -89,12 +89,12 @@ every v2 feature over a real `TcpStream`:
 
 This battery is wired as a **permanent, un-skippable gate**: CI runs it in the
 `--include-ignored` heavy step (`cargo test -p jerrycan --all-features --test
-kolli_eval -- --include-ignored`), and `scripts/publish.sh` runs it as a
+reference_eval -- --include-ignored`), and `scripts/publish.sh` runs it as a
 fail-fast pre-publish block (with a documented `SKIP_EVAL_GATE=1` emergency
 escape). Cold-build time (the SeaORM compile-tax baseline) is host-dependent and
-recorded in the CI log — `kolli_eval` prints the from-scratch acceptance-suite
-compile, and the kolli conformance test (`kolli_slice_scaffold_passes_check`)
-prints `kolli-slice cold build: …`.
+recorded in the CI log — `reference_eval` prints the from-scratch acceptance-suite
+compile, and the reference conformance test (`reference_slice_scaffold_passes_check`)
+prints `reference-slice cold build: …`.
 
 ## Real-infra verification (Dockerized Postgres 16 + Redis 7)
 
@@ -111,10 +111,10 @@ infrastructure this cycle:
 A concurrency gap in `Db::migrate` was found via real Postgres and fixed — it now
 runs in a single transaction under a `pg_advisory_xact_lock`.
 
-## Docs-only LLM rebuild of the Kolli slice — the north star (2026-06-15)
+## Docs-only LLM rebuild of the Reference slice — the north star (2026-06-15)
 
 The spec's defining acceptance test (design spec §north-star / §v2.5): **an agent
-rebuilds the Kolli slice docs-only via the CLI/MCP** — no framework source, no
+rebuilds the Reference slice docs-only via the CLI/MCP** — no framework source, no
 reference-handler fixtures, no plans. RESULT: **GREEN.** `jerrycan check` reached
 full green (`{"ok":true,"diagnostics":[]}`), all **37/37 generated acceptance
 tests pass** (35 endpoint + 2 job) across all 6 route modules + both cron jobs,
@@ -127,7 +127,7 @@ scoped `all_for` for the unscoped `all`) and `jerrycan check` went RED — so th
 green is real, not hollow. Notably it independently arrived at the same
 server-assigns-enum / never-trust-client-role security patterns the reference
 backend uses. Isolation confirmed: only `jerrycan docs`/`explain`/`schema`, the
-Kolli design JSON, its own scaffold, and compiler diagnostics were used.
+Reference design JSON, its own scaffold, and compiler diagnostics were used.
 
 The docs-only history also stands at **5/5 (100%)** on the five simpler reference
 apps (2026-06-10, above).
@@ -157,7 +157,7 @@ Doc/generator gaps surfaced (real, fixable — the eval's whole purpose):
 ### Docs-only schema.json Q&A (2026-06-15)
 
 The v2.5 "answer data-structure questions from `schema.json` alone" pass
-criterion was run docs-only against the Kolli slice (agent restricted to the
+criterion was run docs-only against the Reference slice (agent restricted to the
 `jerrycan` binary + `jerrycan schema --json`/`docs`; framework source, the schema
 generator, and the reference fixtures off-limits). **Score: 6/6** —
 `jerrycan schema --json` alone confidently answered every question (leads FK +

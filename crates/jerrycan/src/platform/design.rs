@@ -429,7 +429,7 @@ pub(crate) mod tests {
     }"#;
 
     pub(crate) const V1_FULL: &str = r#"{
-        "name": "kolli-mini", "contract_version": 1,
+        "name": "reference-mini", "contract_version": 1,
         "auth": { "model": "jwt", "roles": ["owner", "member"] },
         "dependencies": ["db", "auth"],
         "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
@@ -480,7 +480,7 @@ pub(crate) mod tests {
     #[test]
     fn wants_jobs_gates_on_declared_jobs_and_adds_the_facade_feature() {
         // A design that declares a job switches on the jobs crate + the `jobs`
-        // facade feature; the kolli eval slice (V1_FULL) carries one.
+        // facade feature; the reference eval slice (V1_FULL) carries one.
         let with_jobs: Design = serde_json::from_str(V1_FULL).unwrap();
         assert!(with_jobs.wants_jobs(), "a declared job must set wants_jobs");
         assert!(

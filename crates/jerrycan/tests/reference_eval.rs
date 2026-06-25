@@ -1,7 +1,7 @@
-//! The Kolli live HTTP battery — the permanent v2.5 eval gate.
+//! The Reference live HTTP battery — the permanent v2.5 eval gate.
 //!
-//! This replays the Phase 5a reference backend (`conformance/eval/fixtures/kolli`)
-//! exactly per its README: scaffold the kolli design → `gen-tests` each module →
+//! This replays the Phase 5a reference backend (`conformance/eval/fixtures/reference`)
+//! exactly per its README: scaffold the reference design → `gen-tests` each module →
 //! copy the 10 reference files to their destinations → patch the app's Cargo
 //! features to add `oauth,mock-idp` → `jerrycan check` → run the generated
 //! acceptance suite → serve the app live on a free port (sqlite file DB) → drive
@@ -54,19 +54,19 @@ fn framework_dep() -> String {
 
 /// The fixed test secret the live app signs sessions with, matched in-test where
 /// we need to read a cookie. Long enough for the auth secret floor.
-const SECRET: &str = "kolli-battery-secret-string-very-long-1234";
+const SECRET: &str = "reference-battery-secret-string-very-long-1234";
 
 /// The README battery hooks: the webhook signing secret default and the fixed
 /// mock OAuth code `connect` re-issues. Kept here so the assertions read against
 /// the documented contract, not magic strings.
-const WEBHOOK_SECRET: &str = "whsec_kolli_reference_secret";
-const MOCK_CODE: &str = "kolli-mock-code";
+const WEBHOOK_SECRET: &str = "whsec_reference_reference_secret";
+const MOCK_CODE: &str = "reference-mock-code";
 
 #[test]
-#[ignore = "heavy: scaffolds/builds/serves the kolli reference backend"]
-fn kolli_slice_live_battery() {
+#[ignore = "heavy: scaffolds/builds/serves the reference backend"]
+fn reference_slice_live_battery() {
     let tmp = tempfile::tempdir().unwrap();
-    let app = tmp.path().join("kolli");
+    let app = tmp.path().join("reference");
 
     // ---- 1. Scaffold + gen-tests + apply fixtures + feature patch -----------
     scaffold_and_apply_fixtures(&app);
@@ -117,7 +117,7 @@ fn kolli_slice_live_battery() {
     // ---- 7 (recorded early). Cold-build time to stderr ----------------------
     // The acceptance run above is the first full compile of the generated
     // workspace in this tempdir's own target root — a genuine cold build.
-    eprintln!("kolli-slice cold build (acceptance suite, from scratch): {cold_build:?}");
+    eprintln!("reference-slice cold build (acceptance suite, from scratch): {cold_build:?}");
 
     // ---- 4. Serve live + raw-HTTP battery -----------------------------------
     let port = {
@@ -159,7 +159,7 @@ fn kolli_slice_live_battery() {
     // ---- 6. schema.json answers the structural questions --------------------
     schema_answers_structural_questions(&app);
 
-    eprintln!("kolli live battery: PASS (all v2 features over real HTTP)");
+    eprintln!("reference live battery: PASS (all v2 features over real HTTP)");
 }
 
 // ============================ replay (step 1) ===============================
@@ -173,10 +173,10 @@ fn scaffold_and_apply_fixtures(app: &Path) {
         .arg("new")
         .arg(app)
         .arg("--design")
-        .arg(repo_root().join("conformance/designs/kolli-slice.design.json"))
+        .arg(repo_root().join("conformance/designs/reference-slice.design.json"))
         .status()
-        .expect("scaffold kolli");
-    assert!(st.success(), "kolli design must scaffold");
+        .expect("scaffold reference");
+    assert!(st.success(), "reference design must scaffold");
 
     // gen-tests per module (makes the generated acceptance suite, incl. the
     // cross-tenant isolation tests, present and runnable).
@@ -197,7 +197,7 @@ fn scaffold_and_apply_fixtures(app: &Path) {
     }
 
     // Copy each fixture to its README destination.
-    let fx = repo_root().join("conformance/eval/fixtures/kolli");
+    let fx = repo_root().join("conformance/eval/fixtures/reference");
     let copies: &[(&str, &str)] = &[
         ("users_handlers.rs", "crates/routes/users/src/handlers.rs"),
         (
@@ -239,7 +239,7 @@ fn scaffold_and_apply_fixtures(app: &Path) {
     }
 
     // Cargo feature patch: the `oauth` facade feature is now wired AUTOMATICALLY
-    // (the kolli design declares the `oauth` dependency), so only `mock-idp` —
+    // (the reference design declares the `oauth` dependency), so only `mock-idp` —
     // the test-only IdP harness, never a production dependency — needs adding so
     // the integrations module's hermetic mock transport compiles in this test.
     let cargo = app.join("Cargo.toml");
@@ -267,7 +267,7 @@ fn run_http_battery(addr: &str) {
             addr,
             "/users/register",
             "",
-            r#"{"id":1,"email":"a@kolli.test","password":"pwAAAA123","role":"user"}"#,
+            r#"{"id":1,"email":"a@reference.test","password":"pwAAAA123","role":"user"}"#,
         ),
         201,
         "register user A",
@@ -277,7 +277,7 @@ fn run_http_battery(addr: &str) {
             addr,
             "/users/register",
             "",
-            r#"{"id":2,"email":"b@kolli.test","password":"pwBBBB123","role":"user"}"#,
+            r#"{"id":2,"email":"b@reference.test","password":"pwBBBB123","role":"user"}"#,
         ),
         201,
         "register user B",
@@ -289,14 +289,14 @@ fn run_http_battery(addr: &str) {
             addr,
             "/users/register",
             "",
-            r#"{"id":3,"email":"a@kolli.test","password":"pwAAAA123","role":"user"}"#,
+            r#"{"id":3,"email":"a@reference.test","password":"pwAAAA123","role":"user"}"#,
         ),
         409,
         "duplicate email → 409",
     );
 
-    let cookie_a = login(addr, "a@kolli.test", "pwAAAA123");
-    let cookie_b = login(addr, "b@kolli.test", "pwBBBB123");
+    let cookie_a = login(addr, "a@reference.test", "pwAAAA123");
+    let cookie_b = login(addr, "b@reference.test", "pwBBBB123");
     assert!(
         cookie_a.starts_with("jerrycan_session=") && cookie_b.starts_with("jerrycan_session="),
         "login must mint jerrycan_session cookies (A={cookie_a}, B={cookie_b})"
@@ -479,7 +479,7 @@ fn create_api_key(addr: &str, cookie: &str, id: i64, label: &str, scopes: &str) 
 
 // ============================ crons (step 5) ================================
 
-/// Drive BOTH kolli crons under a hand-advanced clock and assert each becomes
+/// Drive BOTH reference crons under a hand-advanced clock and assert each becomes
 /// due after its interval.
 ///
 /// WHY this approach (chosen for faithfulness + determinism): a *live* server's
@@ -488,13 +488,13 @@ fn create_api_key(addr: &str, cookie: &str, id: i64, label: &str, scopes: &str) 
 /// is the pure function `jerrycan_jobs::cron::due_fire(schedule, last_fired,
 /// now)` — the EXACT primitive the live cron leader calls each tick (see
 /// `jerrycan-jobs/src/lib.rs`, where the worker maps `due_fire` over the cron
-/// rows). Driving it with the two real kolli schedules and a controlled `now`
+/// rows). Driving it with the two real reference schedules and a controlled `now`
 /// exercises the same decision logic the server uses, with zero wall-clock wait.
 /// The *task bodies* themselves are separately proven green by the generated
 /// `crates/jobs/tests/acceptance.rs` run in step 3 (both `expire_trials` and
 /// `overdue_callbacks` execute against the jobs-only DB).
 fn crons_fire_under_test_clock() {
-    // The two declared kolli schedules, verbatim from the design.
+    // The two declared reference schedules, verbatim from the design.
     let expire_trials = CronSchedule::parse("0 * * * *").expect("expire_trials cron parses");
     let overdue_callbacks =
         CronSchedule::parse("*/5 * * * *").expect("overdue_callbacks cron parses");
@@ -549,7 +549,7 @@ fn crons_fire_under_test_clock() {
     );
 
     // First-run policy: a never-fired cron (NULL last_fired) fires its most-recent
-    // tick immediately on the leader's first pass — both kolli crons included.
+    // tick immediately on the leader's first pass — both reference crons included.
     let later = base + Duration::from_secs(2 * 60);
     assert!(
         due_fire(&expire_trials, None, later).is_some(),
@@ -720,7 +720,7 @@ fn await_listen(addr: &str, secs: u64) {
         }
         std::thread::sleep(Duration::from_millis(400));
     }
-    panic!("kolli app did not start listening on {addr} within {secs}s");
+    panic!("reference app did not start listening on {addr} within {secs}s");
 }
 
 /// Send a fully-formed request and parse the response.
@@ -784,7 +784,7 @@ fn post_multipart(
     filename: &str,
     content: &str,
 ) -> HttpResponse {
-    let boundary = "----kollibattery7f4b2c9e";
+    let boundary = "----referencebattery7f4b2c9e";
     let body = format!(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\nContent-Type: text/csv\r\n\r\n{content}\r\n--{boundary}--\r\n"
     );

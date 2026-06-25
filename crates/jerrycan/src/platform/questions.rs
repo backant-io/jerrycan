@@ -963,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn kolli_shaped_v1_design_is_question_free() {
+    fn reference_shaped_v1_design_is_question_free() {
         let d: Design = serde_json::from_str(V1_FULL).unwrap();
         assert!(validate(&d).is_empty(), "{:?}", validate(&d));
     }
@@ -990,15 +990,15 @@ mod tests {
 
     #[test]
     fn public_endpoints_on_non_tenant_owned_entities_do_not_false_positive() {
-        // The kolli-slice north-star design has public register/login in the
+        // The reference-slice north-star design has public register/login in the
         // `users` module; User is NOT tenant-owned, so the resolution (request_body
         // entity for register, first-entity fallback for login) must not flag them.
-        let kolli = include_str!("../../../../conformance/designs/kolli-slice.design.json");
-        let d: Design = serde_json::from_str(kolli).unwrap();
+        let reference = include_str!("../../../../conformance/designs/reference-slice.design.json");
+        let d: Design = serde_json::from_str(reference).unwrap();
         let qs = validate(&d);
         assert!(
             qs.is_empty(),
-            "kolli-slice must validate question-free; public users endpoints must not false-positive: {qs:?}"
+            "reference-slice must validate question-free; public users endpoints must not false-positive: {qs:?}"
         );
     }
 }

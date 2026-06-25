@@ -1,13 +1,13 @@
-# Kolli slice — reference backend fixtures (Phase 5a)
+# Reference slice — reference backend fixtures (Phase 5a)
 
 These are the **working, agent-owned** source files that turn a fresh scaffold of
-`conformance/designs/kolli-slice.design.json` into a real, `jerrycan check`-green
+`conformance/designs/reference-slice.design.json` into a real, `jerrycan check`-green
 backend exercising every v2 primitive: JWT/session auth, argon2 passwords,
 tenant-scoped CRUD, multipart CSV import, raw-body webhook signature
 verification, scoped API keys, OAuth (connect + callback) against an in-process
 mock IdP, and two cron jobs.
 
-The Phase 5b live battery (`crates/jerrycan/tests/kolli_eval.rs`) replays this:
+The Phase 5b live battery (`crates/jerrycan/tests/reference_eval.rs`) replays this:
 scaffold the design → apply these files → patch the app Cargo features → run
 `jerrycan check` → serve and drive the HTTP battery.
 
@@ -17,8 +17,8 @@ scaffold the design → apply these files → patch the app Cargo features → r
    each module:
    ```
    JERRYCAN_FRAMEWORK_DEP='jerrycan = { path = "<repo>/crates/jerrycan", default-features = false }' \
-     <jerrycan-bin> new <tmp>/kolli --design conformance/designs/kolli-slice.design.json
-   cd <tmp>/kolli
+     <jerrycan-bin> new <tmp>/reference --design conformance/designs/reference-slice.design.json
+   cd <tmp>/reference
    for m in users workspaces leads api-keys billing integrations; do
      <jerrycan-bin> gen-tests --module "$m"; done
    ```
@@ -41,10 +41,10 @@ scaffold the design → apply these files → patch the app Cargo features → r
    The `*_handlers.rs` mapping matches the existing `eval.rs` rule
    (`<module>_handlers.rs` → `crates/routes/<module>/src/handlers.rs`); the
    hyphen in `api-keys` is preserved. The two `*_deps.rs` and two `jobs_*.rs`
-   files are **extra** files the kolli slice needs beyond the eval.rs handler-only
+   files are **extra** files the reference slice needs beyond the eval.rs handler-only
    layout — the Phase 5b harness must copy them too (see destinations above).
 
-3. **Cargo feature patch (test-only — just `mock-idp`):** the kolli design now
+3. **Cargo feature patch (test-only — just `mock-idp`):** the reference design now
    declares the **`oauth` dependency**, so the scaffolder wires the `oauth` facade
    feature AUTOMATICALLY — the `integrations` module compiles out of the box.
    The only remaining patch is `mock-idp`, the **test-only** IdP harness (never a
@@ -109,11 +109,11 @@ handlers accept the probe's shape AND the real flow:
 - **`billing::stripe_webhook`** returns `200` when there is no
   `Stripe-Signature` header (the unsigned probe), verifies the HMAC-SHA256 hex
   signature over the **raw** body otherwise (`200` valid / `400` invalid). The
-  signing secret is `STRIPE_WEBHOOK_SECRET` (default `whsec_kolli_reference_secret`).
+  signing secret is `STRIPE_WEBHOOK_SECRET` (default `whsec_reference_reference_secret`).
 - **`integrations::google_callback`** returns `200` with no `code` (the probe /
   a direct hit), exchanges a present code via the mock (`200`), and `400`s a
-  bad/expired code. `connect` re-issues the fixed mock code `kolli-mock-code`,
-  so a battery can drive `callback?code=kolli-mock-code` after `connect`.
+  bad/expired code. `connect` re-issues the fixed mock code `reference-mock-code`,
+  so a battery can drive `callback?code=reference-mock-code` after `connect`.
 - **`leads::import_leads`** takes `Headers` + `RawBody` and builds the real
   `Multipart` parser via `Multipart::from_buffered` **only when the request is
   multipart**, so the generated `post_json({})` probe imports zero rows and still

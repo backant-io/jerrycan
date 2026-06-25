@@ -490,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn schema_contract_reflects_migrations_and_design_types() {
-        let s = include_str!("../../../../conformance/designs/kolli-slice.design.json");
+        let s = include_str!("../../../../conformance/designs/reference-slice.design.json");
         let d: Design = serde_json::from_str(s).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("app");

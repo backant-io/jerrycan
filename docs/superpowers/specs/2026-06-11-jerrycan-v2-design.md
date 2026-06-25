@@ -1,16 +1,16 @@
-# jerrycan v2 — "Kolli-complete" (framework 0.2.0, design contract v1)
+# jerrycan v2 — "Reference-complete" (framework 0.2.0, design contract v1)
 
 Validated 2026-06-11 with the founder. Successor to the
 [v0 design spec](2026-06-09-jerrycan-design.md); informed by the v0.1.0
-end-to-end audit and the gap analysis against backant-send ("Kolli"), a
+end-to-end audit and the gap analysis against a
 production Flask sales-engagement backend (~213 endpoints, 33 tables, 97 FKs,
 Celery worker, Stripe/Twilio/CRM integrations).
 
 ## North star and definition of done
 
-**v2 is done when Kolli's REST API service could genuinely be rebuilt on
+**v2 is done when Reference's REST API service could genuinely be rebuilt on
 jerrycan**, proven by an agent building a representative slice docs-only via
-MCP (the v2.5 eval gate). Every feature is built generically; Kolli is the
+MCP (the v2.5 eval gate). Every feature is built generically; Reference is the
 acceptance test, not the customer. The realtime voice-copilot service
 (WebSockets, Twilio Media Streams, Deepgram) is explicitly out of scope — it
 remains a separate service in any stack.
@@ -19,7 +19,7 @@ remains a separate service in any stack.
 
 | Decision | Choice | Key rationale |
 |---|---|---|
-| North star | Kolli-complete | Sharp, real acceptance test; guards against speculative features |
+| North star | Reference-complete | Sharp, real acceptance test; guards against speculative features |
 | Data layer | **Adopt SeaORM 1.x now** (on the existing sea-query + sqlx stack) | Relations arrived (97 FKs in the target); transactions + eager loading come with the library; founder decision after trade-off review |
 | Jobs engine | **Own minimal queue** (`JobStore` trait; Postgres default, Redis optional) | Generator controls all call sites, so a general-purpose jobs API solves problems we do not have; semantics capped by contract (below) |
 | Sequencing | Data-first ladder, eval design written day one | The schema/SeaORM change is the most invasive; break the contract once, first |
@@ -91,7 +91,7 @@ in v2.3 — so the contract breaks exactly once:
   and the new MCP tool `jerrycan_schema` return identical JSON
   (mcp-tools.json grows 9 → 10 tools, additive).
 
-**Day one of this phase:** write `conformance/designs/kolli-slice.design.json`
+**Day one of this phase:** write `conformance/designs/reference-slice.design.json`
 (workspaces + members tenancy, leads with relations + CSV import, API keys, a
 Stripe-style signed webhook, two cron jobs, an OAuth connect flow). Every
 later phase builds against it.
@@ -169,7 +169,7 @@ discipline).
 
 ### v2.5 — The eval gate (release condition for 0.2.0)
 
-An agent rebuilds the Kolli slice via MCP, docs-only. Pass requires:
+An agent rebuilds the Reference slice via MCP, docs-only. Pass requires:
 `jerrycan check` green; generated acceptance tests green (including
 cross-tenant isolation); a live HTTP battery (tenant isolation, webhook
 signature rejection, multipart CSV import, API-key scopes, both crons firing
@@ -221,7 +221,7 @@ SeaORM compile-tax check, with feature-trimming as the lever if it regresses.
 Each phase keeps the full estate green (workspace tests, doc-tests, heavy
 conformance, fuzz). New parsers (multipart, cron expressions) get fuzz
 targets. Jobs and rate limiting test deterministically via the Clock
-dependency. Tenancy ships with generated isolation tests. The kolli-slice
+dependency. Tenancy ships with generated isolation tests. The reference-slice
 eval is the integration test of record.
 
 ## Housekeeping

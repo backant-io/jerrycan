@@ -16,7 +16,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # PRE-PUBLISH EVAL GATE (v2.5) — a release cannot ship if the eval is red.
 #
-# The Kolli live HTTP battery is the permanent v2.5 gate: it scaffolds the Kolli
+# The Reference live HTTP battery is the permanent v2.5 gate: it scaffolds the Reference
 # reference backend, serves it live, and drives every v2 feature over real HTTP
 # (tenant isolation, webhook signature rejection, multipart import, API-key
 # scopes, both crons under the test clock, OAuth via the mock IdP) plus the
@@ -27,8 +27,8 @@ set -euo pipefail
 # are already indexed: SKIP_EVAL_GATE=1.)
 # ---------------------------------------------------------------------------
 if [ "${SKIP_EVAL_GATE:-0}" != "1" ]; then
-  echo "=== pre-publish eval gate: kolli live battery + scripted conformance/eval ==="
-  cargo test -p jerrycan --all-features --test kolli_eval -- --include-ignored --nocapture
+  echo "=== pre-publish eval gate: reference live battery + scripted conformance/eval ==="
+  cargo test -p jerrycan --all-features --test reference_eval -- --include-ignored --nocapture
   cargo test -p jerrycan --all-features --test conformance -- --include-ignored
   cargo test -p jerrycan --test eval -- --include-ignored
   echo "=== eval gate GREEN — proceeding to publish ==="

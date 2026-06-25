@@ -172,7 +172,7 @@ fn sql_identifiers_are_quoted_so_reserved_words_survive() {
 
 #[test]
 fn tenancy_generates_the_tenant_guard_in_shared() {
-    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
     let d: jerrycan::platform::design::Design = serde_json::from_str(s).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("app");
@@ -195,8 +195,8 @@ fn tenancy_generates_the_tenant_guard_in_shared() {
 }
 
 #[test]
-fn kolli_slice_design_is_valid_contract_v1() {
-    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+fn reference_slice_design_is_valid_contract_v1() {
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
     let d: jerrycan::platform::design::Design = serde_json::from_str(s).unwrap();
     assert_eq!(d.contract_version, 1);
     let qs = jerrycan::platform::questions::validate(&d);
@@ -233,7 +233,7 @@ fn generate_migration_emits_numbered_pair_and_rewires() {
 
 #[tokio::test]
 async fn schema_verify_flags_staleness_with_jc0520() {
-    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
     let d: jerrycan::platform::design::Design = serde_json::from_str(s).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("app");
@@ -280,7 +280,7 @@ async fn schema_verify_flags_staleness_with_jc0520() {
 async fn cross_module_fk_lets_per_module_migration_insert_under_fk_enforcement() {
     use jerrycan::db::sea_orm::ConnectionTrait;
 
-    let s = include_str!("../../../conformance/designs/kolli-slice.design.json");
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
     let d: Design = serde_json::from_str(s).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("app");

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 /// The fixed one-time code the slice's mock IdP exchanges. `connect` re-issues it
 /// each call so a `callback?code=<this>` round-trip is always available.
-pub(crate) const MOCK_CODE: &str = "kolli-mock-code";
+pub(crate) const MOCK_CODE: &str = "reference-mock-code";
 
 /// OAuth wiring shared by `connect` and `callback`: the client (mock transport)
 /// and the IdP handle used to (re-)issue the one-time code.
@@ -38,8 +38,8 @@ pub(crate) fn configure(module: Module) -> Module {
     idp.issue_code(MOCK_CODE);
     let client = OAuthClient::new(
         Provider::google(),
-        "kolli-client-id",
-        "kolli-client-secret",
+        "reference-client-id",
+        "reference-client-secret",
         "http://127.0.0.1/integrations/auth/google/callback",
     )
     .with_transport(idp.token_transport());

@@ -86,31 +86,31 @@ processes you start and remove the tmpdirs when done.
 
 ---
 
-# v2.5 eval target — the Kolli slice
+# v2.5 eval target — the Reference slice
 
-The five reference apps above probe CRUD-shaped backends. The **Kolli slice** is
+The five reference apps above probe CRUD-shaped backends. The **Reference slice** is
 the v2 showcase: it exercises every v2 primitive on a single, real backend —
 tenancy + JWT/session auth, tenant-scoped CRUD, multipart CSV import, raw-body
 webhook signature verification, scoped API keys, OAuth (connect + callback)
 against a mock IdP, and two cron jobs.
 
-## Isolation rules (Kolli)
+## Isolation rules (Reference)
 
 Allowed inputs only:
 
 - The `jerrycan` binary: CLI subcommands, `jerrycan docs <page>`,
   `jerrycan explain <code>`, `jerrycan schema --json`.
-- The Kolli design: `conformance/designs/kolli-slice.design.json`.
+- The Reference design: `conformance/designs/reference-slice.design.json`.
 
 Forbidden inputs:
 
 - jerrycan's own source (`crates/*/src/**`).
-- The Kolli **reference handlers** (`conformance/eval/fixtures/kolli/**`) — these
+- The Reference **reference handlers** (`conformance/eval/fixtures/reference/**`) — these
   are the answer key; rebuilding them docs-only is the point.
 - Any plan / design / spec markdown for the framework itself (including the
   v2.5 eval-gate plan).
 
-## Pass criteria (Kolli)
+## Pass criteria (Reference)
 
 A run passes when, on the scaffolded slice:
 
@@ -130,8 +130,8 @@ A run passes when, on the scaffolded slice:
 
 ## The automated gate
 
-The deterministic `kolli_eval` battery
-(`crates/jerrycan/tests/kolli_eval.rs::kolli_slice_live_battery`) encodes the
+The deterministic `reference_eval` battery
+(`crates/jerrycan/tests/reference_eval.rs::reference_slice_live_battery`) encodes the
 pass criteria above as a single `#[ignore]`d test that scaffolds the slice,
 applies the reference handlers, and runs the whole battery end-to-end. It is the
 **un-skippable gate**: CI runs it in the `--include-ignored` heavy step, and
