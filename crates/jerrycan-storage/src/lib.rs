@@ -255,6 +255,60 @@ impl Storage {
         meta::delete_row(db, bucket.name, id).await?;
         self.store.delete(bucket.name, &m.key).await
     }
+
+    /// Issue a time-limited download URL for an object the caller can reach
+    /// (scoped lookup — a foreign object is a 404, so signing can't leak).
+    /// Native backend presign when available (S3), else app-HMAC. TTL clamps
+    /// to [1s, 24h].
+    pub async fn sign_object(
+        &self,
+        db: &jerrycan_db::Db,
+        bucket: &Bucket,
+        scope: &Scope,
+        id: &str,
+        ttl_secs: u64,
+        now: SystemTime,
+    ) -> Result<SignedUrl> {
+        let ttl = ttl_secs.clamp(1, 86_400);
+        let m = meta::get_scoped(db, bucket.name, id, scope)
+            .await?
+            .ok_or_else(Error::not_found)?;
+        assert_prefix(bucket, Some(scope), &m)?;
+        let expires_at = unix_secs(now) + ttl;
+        if let Some(url) = self
+            .store
+            .presign_get(bucket.name, &m.key, Duration::from_secs(ttl))
+            .await?
+        {
+            return Ok(SignedUrl { url, expires_at });
+        }
+        let sig = sign::sign(self.sign_key()?, bucket.name, id, expires_at);
+        Ok(SignedUrl {
+            url: format!("/{}/{}?exp={}&sig={}", bucket.name, id, expires_at, sig),
+            expires_at,
+        })
+    }
+
+    /// Redeem an app-HMAC signed URL: constant-time verify + expiry, then an
+    /// UNSCOPED fetch (the signature IS the credential). Invalid/expired = 401.
+    pub async fn get_signed(
+        &self,
+        db: &jerrycan_db::Db,
+        bucket: &Bucket,
+        id: &str,
+        exp: u64,
+        sig: &str,
+        now: SystemTime,
+    ) -> Result<(ObjectMeta, Bytes)> {
+        if !sign::verify(self.sign_key()?, bucket.name, id, exp, sig, unix_secs(now)) {
+            return Err(Error::unauthorized());
+        }
+        let m = meta::get_scoped(db, bucket.name, id, &Scope::default())
+            .await?
+            .ok_or_else(Error::not_found)?;
+        let bytes = self.store.get(bucket.name, &m.key).await?;
+        Ok((m, bytes))
+    }
 }
 
 /// The owner_prefix path assertion (spec: "adds a path-prefix assertion to
@@ -280,6 +334,10 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Build the download response: Content-Type from the metadata, `ETag` = the
@@ -449,5 +507,61 @@ mod tests {
         let res = t.get("/probe").await;
         assert_eq!(res.status().as_u16(), 200);
         assert_eq!(res.text(), "true");
+    }
+
+    #[tokio::test]
+    async fn sign_object_falls_back_to_app_hmac_and_get_signed_verifies() {
+        // WHY: local/memory backends have no native presign — sign must fall
+        // back to the app-HMAC URL, and get_signed must honor it WITHOUT any
+        // session (that is the whole point of a signed URL).
+        let db = db().await;
+        let s = Storage::memory().with_sign_secret(SECRET);
+        let meta = s.put_object(&db, &INVOICES, &owner("1"), "inv.pdf", "application/pdf", Bytes::from_static(b"pdf")).await.unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let signed = s.sign_object(&db, &INVOICES, &owner("1"), &meta.id, 300, now).await.unwrap();
+        assert_eq!(signed.expires_at, 1_300);
+        assert!(signed.url.starts_with("/invoices/"), "app-HMAC fallback URL: {}", signed.url);
+        // Parse exp/sig back out of the URL and redeem it.
+        let query = signed.url.split_once('?').unwrap().1;
+        let mut exp = 0u64;
+        let mut sig = String::new();
+        for pair in query.split('&') {
+            match pair.split_once('=').unwrap() {
+                ("exp", v) => exp = v.parse().unwrap(),
+                ("sig", v) => sig = v.to_string(),
+                _ => {}
+            }
+        }
+        let (got, bytes) = s.get_signed(&db, &INVOICES, &meta.id, exp, &sig, now).await.unwrap();
+        assert_eq!(got.id, meta.id);
+        assert_eq!(bytes, Bytes::from_static(b"pdf"));
+        // Tampered sig and expired URL are 401 — an invalid credential.
+        assert_eq!(s.get_signed(&db, &INVOICES, &meta.id, exp, "00aa", now).await.unwrap_err().code(), "JC0401");
+        let later = now + Duration::from_secs(9_999);
+        assert_eq!(s.get_signed(&db, &INVOICES, &meta.id, exp, &sig, later).await.unwrap_err().code(), "JC0401");
+    }
+
+    #[tokio::test]
+    async fn sign_object_is_scoped_and_clamps_ttl() {
+        // WHY: signing is an access grant — a caller must not be able to mint
+        // a URL for a foreign object, nor stretch the TTL beyond the cap.
+        let db = db().await;
+        let s = Storage::memory().with_sign_secret(SECRET);
+        let meta = s.put_object(&db, &INVOICES, &owner("1"), "inv.pdf", "application/pdf", Bytes::from_static(b"p")).await.unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let err = s.sign_object(&db, &INVOICES, &owner("2"), &meta.id, 300, now).await.unwrap_err();
+        assert_eq!(err.code(), "JC0404", "cross-owner sign is a 404");
+        let capped = s.sign_object(&db, &INVOICES, &owner("1"), &meta.id, 999_999, now).await.unwrap();
+        assert_eq!(capped.expires_at, 1_000 + 86_400, "TTL clamps to 24h");
+    }
+
+    #[tokio::test]
+    async fn sign_without_secret_fails_loud() {
+        let db = db().await;
+        let s = Storage::memory(); // no sign secret
+        let meta = s.put_object(&db, &INVOICES, &owner("1"), "a.bin", "application/octet-stream", Bytes::from_static(b"x")).await.unwrap();
+        let now = SystemTime::now();
+        let err = s.sign_object(&db, &INVOICES, &owner("1"), &meta.id, 300, now).await.unwrap_err();
+        assert!(err.message().contains("JERRYCAN_SECRET"), "{err}");
     }
 }
