@@ -60,6 +60,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
+# S3 XML parsing (error + multipart-initiate bodies only; listing is DB-backed
+# so object keys never round-trip through XML). Pure safe Rust, MIT.
+quick-xml = "0.37"
 bytes = "1"
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
