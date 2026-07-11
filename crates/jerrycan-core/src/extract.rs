@@ -315,6 +315,17 @@ impl FromRequest for RawBody {
     }
 }
 
+/// Optional extraction: `Some` when the inner extractor succeeds, `None` on
+/// ANY extraction failure. For genuinely optional inputs — the canonical use
+/// is optional auth (`Option<CurrentUser>` on a route that also accepts a
+/// signed URL). Do NOT use it to paper over malformed required input: the
+/// failure reason is discarded by design.
+impl<T: FromRequest> FromRequest for Option<T> {
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        Ok(T::from_request(ctx).await.ok())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +390,25 @@ mod tests {
         let mut c = ctx("/todos?limit=10&offset=20", "");
         let Query(p): Query<Page> = Query::from_request(&mut c).await.unwrap();
         assert_eq!((p.limit, p.offset), (10, 20));
+    }
+
+    #[tokio::test]
+    async fn option_extractor_yields_none_on_failure_and_some_on_success() {
+        // WHY: a private bucket's GET must accept EITHER a session OR a signed
+        // URL — the handler needs optional extraction instead of a hard 401
+        // from the extractor. Option<T> is None on ANY extraction failure.
+        #[derive(serde::Deserialize)]
+        struct P { n: i64 }
+        async fn probe(q: Option<Query<P>>) -> Result<Json<Option<i64>>> {
+            Ok(Json(q.map(|Query(p)| p.n)))
+        }
+        let t = crate::App::new()
+            .route("/probe", crate::get(probe))
+            .into_test();
+        assert_eq!(t.get("/probe?n=7").await.text(), "7");
+        // Missing/malformed query → None, not a 400.
+        assert_eq!(t.get("/probe").await.text(), "null");
+        assert_eq!(t.get("/probe?n=not-a-number").await.text(), "null");
     }
 
     #[tokio::test]
