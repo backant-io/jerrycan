@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://jerrycan.cc/schemas/design-v1.json",
   "title": "jerrycan design.json",
-  "description": "The validated design an app is generated from. Module-grouped with nested subroutes (spec \u00a75). Produced by jerrycan_design; consumed by scaffold/generate/gen_tests. Contract v1 adds entity belongs_to (foreign keys), top-level tenancy (tenant-owned entities), top-level jobs, and field unique/index/values; v0 documents remain valid.",
+  "description": "The validated design an app is generated from. Module-grouped with nested subroutes (spec \u00a75). Produced by jerrycan_design; consumed by scaffold/generate/gen_tests. Contract v1 adds entity belongs_to (foreign keys), top-level tenancy (tenant-owned entities), top-level jobs, and field unique/index/values; v0 documents remain valid. Contract v2 adds the top-level storage block (design-modeled object buckets); v0/v1 documents remain valid.",
   "type": "object",
   "required": [
     "name",
@@ -18,7 +18,8 @@
     "contract_version": {
       "enum": [
         0,
-        1
+        1,
+        2
       ]
     },
     "description": {
@@ -106,6 +107,55 @@
             "type": "string",
             "pattern": "^[a-z][a-z0-9_]*$",
             "description": "Optional queue name the job runs on."
+          }
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["buckets"],
+      "description": "Contract v2: design-modeled object storage. Each bucket mounts guarded endpoints at /<name> (upload, list, download, delete, sign); object metadata lives in the storage_objects table; bytes live in the env-configured blob backend (JERRYCAN_STORAGE). Requires the db dependency and an active auth model.",
+      "properties": {
+        "buckets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "visibility"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*$",
+                "description": "Mounts at /<name>; must not collide with a module mount."
+              },
+              "visibility": {
+                "enum": ["public", "private"],
+                "description": "public = unauthenticated GET list/download (still metadata-tracked, cache-friendly); private = every endpoint guarded."
+              },
+              "owner": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Za-z0-9]*$",
+                "description": "Owning entity. The tenancy entity makes the bucket tenant-owned (Tenant-guard scoped); any other declared entity stamps the authenticated user id as owner_id. If the owner entity belongs_to the tenancy entity, objects are additionally tenant-isolated."
+              },
+              "owner_prefix": {
+                "type": "boolean",
+                "default": false,
+                "description": "Store keys as {owner_id}/… and assert the first path segment on every access — the Supabase storage.foldername(name)[1] = auth.uid() pattern, made mechanical. Requires owner."
+              },
+              "max_size": {
+                "type": "string",
+                "pattern": "^[0-9]+(B|KB|MB|GB)?$",
+                "description": "Per-object cap (over-limit is 413 JC0413). Default 50MB."
+              },
+              "allowed_mime": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string" },
+                "description": "Content-type allowlist; image/* globs supported. Violation is 415 JC0415."
+              }
+            }
           }
         }
       }
