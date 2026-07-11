@@ -1,0 +1,350 @@
+//! The S3-compatible blob store (AWS S3, Cloudflare R2, MinIO, Supabase's S3
+//! endpoint), built on jerrycan's own outbound stack: hyper_util's legacy
+//! client + hyper-rustls (rustls/ring, bundled webpki roots) — the identical
+//! shape to jerrycan-auth's OAuth transport. Always path-style addressing:
+//! `/{s3_bucket}/{app_bucket}/{key}`. Plaintext http:// endpoints are refused
+//! unless loopback (the MinIO harness), mirroring the OAuth TLS-downgrade guard.
+
+use crate::sigv4::{self, Credentials};
+use crate::store::{BlobFuture, BlobStore};
+use crate::xml;
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use jerrycan_core::{Error, Result};
+use std::time::Duration;
+
+/// Multipart threshold AND part size: bodies above this upload in 8 MiB parts.
+const PART_SIZE: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub(crate) struct S3Config {
+    pub bucket: String,
+    pub region: String,
+    pub endpoint: String, // scheme://host[:port], no trailing slash
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+impl S3Config {
+    /// Parse `s3://bucket?region=…&endpoint=…`; credentials are passed in
+    /// (from_env reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).
+    pub(crate) fn from_url(url: &str, access_key: Option<String>, secret_key: Option<String>) -> Result<Self> {
+        let rest = url.strip_prefix("s3://").ok_or_else(|| {
+            Error::internal(format!("s3 config: `{url}` does not start with s3://"))
+        })?;
+        let (bucket, query) = rest.split_once('?').unwrap_or((rest, ""));
+        if bucket.is_empty() {
+            return Err(Error::internal("s3 config: missing bucket — use s3://<bucket>?region=…"));
+        }
+        let mut region = "us-east-1".to_string();
+        let mut endpoint = None;
+        for pair in query.split('&').filter(|p| !p.is_empty()) {
+            match pair.split_once('=') {
+                Some(("region", v)) => region = v.to_string(),
+                Some(("endpoint", v)) => endpoint = Some(v.trim_end_matches('/').to_string()),
+                _ => {
+                    return Err(Error::internal(format!(
+                        "s3 config: unknown parameter `{pair}` — supported: region, endpoint"
+                    )));
+                }
+            }
+        }
+        let endpoint = endpoint.unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+        if !plaintext_endpoint_ok(&endpoint) {
+            return Err(Error::internal(
+                "s3 config: refusing a plaintext http:// endpoint to a non-loopback host — use https:// (http is allowed only for a local MinIO)",
+            ));
+        }
+        let access_key = access_key.ok_or_else(|| {
+            Error::internal("s3 config: AWS_ACCESS_KEY_ID is not set")
+        })?;
+        let secret_key = secret_key.ok_or_else(|| {
+            Error::internal("s3 config: AWS_SECRET_ACCESS_KEY is not set")
+        })?;
+        Ok(Self { bucket: bucket.to_string(), region, endpoint, access_key, secret_key })
+    }
+
+    /// Path-style object path, key encoded per segment (slashes kept).
+    pub(crate) fn object_path(&self, app_bucket: &str, key: &str) -> String {
+        format!("/{}/{}/{}", self.bucket, app_bucket, sigv4::uri_encode(key, true))
+    }
+
+    fn host(&self) -> &str {
+        self.endpoint.split_once("://").map(|(_, rest)| rest).unwrap_or(&self.endpoint)
+    }
+
+    fn credentials(&self) -> Credentials {
+        Credentials {
+            access_key: self.access_key.clone(),
+            secret_key: self.secret_key.clone(),
+            region: self.region.clone(),
+        }
+    }
+}
+
+/// `https://` always; `http://` only to 127.0.0.1 / ::1 / localhost (the local
+/// MinIO harness). Same policy as `jerrycan-auth::oauth::is_loopback_http_ok`.
+fn plaintext_endpoint_ok(endpoint: &str) -> bool {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("https") {
+        return true;
+    }
+    if !scheme.eq_ignore_ascii_case("http") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().expect("split yields one element");
+    if authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(after) = authority.strip_prefix('[') {
+        match after.split_once(']') {
+            Some((inner, _)) => inner,
+            None => return false,
+        }
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+type Client = hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    http_body_util::Full<Bytes>,
+>;
+
+/// The S3-compatible [`BlobStore`]. Construct via [`S3Store::from_url`].
+pub struct S3Store {
+    config: S3Config,
+    client: Client,
+}
+
+impl S3Store {
+    /// `s3://bucket?region=…&endpoint=…`; credentials from the standard
+    /// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars.
+    pub fn from_url(url: &str) -> Result<Self> {
+        let config = S3Config::from_url(
+            url,
+            std::env::var("AWS_ACCESS_KEY_ID").ok(),
+            std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
+        )?;
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())
+            .expect("ring provider supports rustls' safe default protocol versions")
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build(connector);
+        Ok(Self { config, client })
+    }
+
+    /// `YYYYMMDDTHHMMSSZ` for now — SystemTime-derived, no chrono (mirrors the
+    /// epoch-millis philosophy in jerrycan-jobs).
+    fn amz_datetime() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Civil-from-days (Howard Hinnant's algorithm) — correct for all dates
+        // the process will ever see; leap seconds are not S3's concern.
+        let days = (secs / 86_400) as i64;
+        let (h, m, s) = ((secs % 86_400) / 3_600, (secs % 3_600) / 60, secs % 60);
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if mo <= 2 { y + 1 } else { y };
+        format!("{y:04}{mo:02}{d:02}T{h:02}{m:02}{s:02}Z")
+    }
+
+    /// One signed request. Non-2xx maps NoSuchKey/404 → not_found, everything
+    /// else → an internal error carrying the parsed `<Code>: <Message>` (never
+    /// the signature or credentials).
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(String, String)],
+        body: Bytes,
+        content_type: Option<&str>,
+    ) -> Result<(http::StatusCode, http::HeaderMap, Bytes)> {
+        let datetime = Self::amz_datetime();
+        let payload_hash = sigv4::sha256_hex(&body);
+        let mut headers: Vec<(String, String)> = vec![
+            ("host".into(), self.config.host().to_string()),
+            ("x-amz-content-sha256".into(), payload_hash.clone()),
+            ("x-amz-date".into(), datetime.clone()),
+        ];
+        if let Some(ct) = content_type {
+            headers.push(("content-type".into(), ct.to_string()));
+        }
+        let (auth, _sig) = sigv4::authorization(
+            &self.config.credentials(),
+            "s3",
+            method,
+            path,
+            query,
+            &headers,
+            &payload_hash,
+            &datetime,
+        );
+        let qs = if query.is_empty() {
+            String::new()
+        } else {
+            let pairs: Vec<String> = query
+                .iter()
+                .map(|(k, v)| {
+                    if v.is_empty() {
+                        sigv4::uri_encode(k, false)
+                    } else {
+                        format!("{}={}", sigv4::uri_encode(k, false), sigv4::uri_encode(v, false))
+                    }
+                })
+                .collect();
+            format!("?{}", pairs.join("&"))
+        };
+        let uri = format!("{}{}{}", self.config.endpoint, path, qs);
+        let mut builder = hyper::Request::builder()
+            .method(method)
+            .uri(&uri)
+            .header("authorization", &auth);
+        for (k, v) in &headers {
+            if k != "host" {
+                builder = builder.header(k, v);
+            }
+        }
+        let request = builder
+            .body(http_body_util::Full::new(body))
+            .map_err(|e| Error::internal(format!("s3: building request failed: {e}")))?;
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|_| Error::internal("s3: request to the storage endpoint failed"))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|_| Error::internal("s3: reading the response body failed"))?
+            .to_bytes();
+        Ok((status, headers, bytes))
+    }
+
+    /// Map a non-2xx S3 response to a jerrycan error.
+    fn s3_error(status: http::StatusCode, body: &[u8]) -> Error {
+        match xml::parse_error(body) {
+            Some((code, _)) if code == "NoSuchKey" || status == http::StatusCode::NOT_FOUND => Error::not_found(),
+            Some((code, message)) => Error::internal(format!("s3: {code}: {message}")),
+            None if status == http::StatusCode::NOT_FOUND => Error::not_found(),
+            None => Error::internal(format!("s3: unexpected status {status}")),
+        }
+    }
+
+    async fn put_multipart(&self, _bucket: &str, _key: &str, _body: Bytes, _mime: &str) -> Result<()> {
+        Err(Error::internal("s3: multipart upload lands in the next task"))
+    }
+}
+
+impl BlobStore for S3Store {
+    fn put<'a>(&'a self, bucket: &'a str, key: &'a str, body: Bytes, mime: &'a str) -> BlobFuture<'a, ()> {
+        Box::pin(async move {
+            crate::store::validate_key(key)?;
+            if body.len() > PART_SIZE {
+                return self.put_multipart(bucket, key, body, mime).await; // Task 12
+            }
+            let path = self.config.object_path(bucket, key);
+            let (status, _h, resp) = self.request("PUT", &path, &[], body, Some(mime)).await?;
+            if status.is_success() { Ok(()) } else { Err(Self::s3_error(status, &resp)) }
+        })
+    }
+
+    fn get<'a>(&'a self, bucket: &'a str, key: &'a str) -> BlobFuture<'a, Bytes> {
+        Box::pin(async move {
+            let path = self.config.object_path(bucket, key);
+            let (status, _h, resp) = self.request("GET", &path, &[], Bytes::new(), None).await?;
+            if status.is_success() { Ok(resp) } else { Err(Self::s3_error(status, &resp)) }
+        })
+    }
+
+    fn delete<'a>(&'a self, bucket: &'a str, key: &'a str) -> BlobFuture<'a, ()> {
+        Box::pin(async move {
+            let path = self.config.object_path(bucket, key);
+            let (status, _h, resp) = self.request("DELETE", &path, &[], Bytes::new(), None).await?;
+            // 204 success; 404 is idempotent-ok (the metadata row is the truth).
+            if status.is_success() || status == http::StatusCode::NOT_FOUND {
+                Ok(())
+            } else {
+                Err(Self::s3_error(status, &resp))
+            }
+        })
+    }
+
+    fn presign_get<'a>(&'a self, bucket: &'a str, key: &'a str, ttl: Duration) -> BlobFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let path = self.config.object_path(bucket, key);
+            Ok(Some(sigv4::presign_url(
+                &self.config.credentials(),
+                &self.config.endpoint,
+                &path,
+                ttl.as_secs().max(1),
+                &Self::amz_datetime(),
+            )))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(url: &str) -> Result<S3Config, jerrycan_core::Error> {
+        S3Config::from_url(url, Some("ak".into()), Some("sk".into()))
+    }
+
+    #[test]
+    fn config_parses_bucket_region_and_endpoint() {
+        let c = cfg("s3://my-bucket?region=eu-central-1&endpoint=https://minio.example.com:9000").unwrap();
+        assert_eq!(c.bucket, "my-bucket");
+        assert_eq!(c.region, "eu-central-1");
+        assert_eq!(c.endpoint, "https://minio.example.com:9000");
+        // Defaults: us-east-1 + the AWS regional endpoint, derived from region.
+        let d = cfg("s3://my-bucket").unwrap();
+        assert_eq!(d.region, "us-east-1");
+        assert_eq!(d.endpoint, "https://s3.us-east-1.amazonaws.com");
+    }
+
+    #[test]
+    fn config_requires_credentials_and_a_bucket() {
+        let err = S3Config::from_url("s3://b", None, Some("sk".into())).unwrap_err();
+        assert!(err.message().contains("AWS_ACCESS_KEY_ID"), "{err}");
+        let err = cfg("s3://?region=x").unwrap_err();
+        assert!(err.message().contains("bucket"), "{err}");
+    }
+
+    #[test]
+    fn plaintext_endpoints_are_loopback_only() {
+        // WHY: an http:// endpoint ships the SigV4-authorized payload in
+        // cleartext — allowed only for the local MinIO harness (same
+        // TLS-downgrade guard as jerrycan-auth's OAuth transport).
+        assert!(cfg("s3://b?endpoint=http://127.0.0.1:9000").is_ok());
+        assert!(cfg("s3://b?endpoint=http://localhost:9000").is_ok());
+        let err = cfg("s3://b?endpoint=http://minio.internal:9000").unwrap_err();
+        assert!(err.message().contains("plaintext"), "{err}");
+        assert!(cfg("s3://b?endpoint=https://minio.internal:9000").is_ok());
+    }
+
+    #[test]
+    fn object_paths_are_path_style_and_segment_encoded() {
+        let c = cfg("s3://my-bucket?endpoint=https://x.example.com").unwrap();
+        assert_eq!(c.object_path("avatars", "u 1/pic.png"), "/my-bucket/avatars/u%201/pic.png");
+    }
+}
