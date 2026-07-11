@@ -40,6 +40,10 @@ rate-limit-redis = ["rate-limit", "jerrycan-ratelimit/rate-limit-redis"]
 # Object storage: design-modeled buckets + blob backends. Metadata lives in a
 # jerrycan-db table, so `storage` implies `db` (like `jobs`).
 storage = ["dep:jerrycan-storage", "db"]
+# The S3-compatible backend (AWS/R2/MinIO/Supabase-S3) as a facade feature.
+# Generated storage apps enable THIS one: JERRYCAN_STORAGE switches backends
+# by env at runtime, so the S3 code must be compiled into the packaged binary.
+storage-s3 = ["storage", "jerrycan-storage/storage-s3"]
 
 [[bin]]
 name = "jerrycan"

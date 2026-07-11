@@ -335,6 +335,46 @@ fn complete_multipart_body(parts: &[(usize, String)]) -> String {
     body
 }
 
+impl S3Store {
+    /// Create the configured bucket if it does not exist (idempotent:
+    /// BucketAlreadyOwnedByYou / BucketAlreadyExists are success). Used by the
+    /// MinIO harness and first-boot provisioning.
+    pub async fn ensure_bucket(&self) -> Result<()> {
+        let path = format!("/{}", self.config.bucket);
+        let (status, _h, resp) = self.request("PUT", &path, &[], Bytes::new(), None).await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        match xml::parse_error(&resp) {
+            Some((code, _)) if code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" => Ok(()),
+            _ => Err(Self::s3_error(status, &resp)),
+        }
+    }
+
+    /// GET an absolute URL with NO SigV4 headers — proves a presigned URL is
+    /// self-authorizing. Errors on any non-2xx.
+    pub async fn fetch_unauthenticated(&self, url: &str) -> Result<Bytes> {
+        let request = hyper::Request::builder()
+            .method("GET")
+            .uri(url)
+            .body(http_body_util::Full::new(Bytes::new()))
+            .map_err(|e| Error::internal(format!("s3: building request failed: {e}")))?;
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|_| Error::internal("s3: presigned fetch failed"))?;
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|_| Error::internal("s3: reading the response body failed"))?
+            .to_bytes();
+        if status.is_success() { Ok(bytes) } else { Err(Self::s3_error(status, &bytes)) }
+    }
+}
+
 impl BlobStore for S3Store {
     fn put<'a>(&'a self, bucket: &'a str, key: &'a str, body: Bytes, mime: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
