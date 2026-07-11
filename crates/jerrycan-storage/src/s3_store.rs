@@ -249,9 +249,90 @@ impl S3Store {
         }
     }
 
-    async fn put_multipart(&self, _bucket: &str, _key: &str, _body: Bytes, _mime: &str) -> Result<()> {
-        Err(Error::internal("s3: multipart upload lands in the next task"))
+    /// Multipart upload: initiate (XML UploadId) → PUT each 8 MiB part
+    /// (collecting ETag headers) → complete (XML part manifest). An error at
+    /// any stage aborts the upload so the bucket carries no dangling parts.
+    async fn put_multipart(&self, bucket: &str, key: &str, body: Bytes, mime: &str) -> Result<()> {
+        let path = self.config.object_path(bucket, key);
+        let (status, _h, resp) = self
+            .request("POST", &path, &[("uploads".into(), String::new())], Bytes::new(), Some(mime))
+            .await?;
+        if !status.is_success() {
+            return Err(Self::s3_error(status, &resp));
+        }
+        let upload_id = xml::parse_upload_id(&resp)?;
+
+        let mut parts: Vec<(usize, String)> = Vec::new();
+        for (i, (start, end)) in part_ranges(body.len()).into_iter().enumerate() {
+            let n = i + 1;
+            let query = vec![
+                ("partNumber".into(), n.to_string()),
+                ("uploadId".into(), upload_id.clone()),
+            ];
+            let (status, headers, resp) = self
+                .request("PUT", &path, &query, body.slice(start..end), None)
+                .await?;
+            if !status.is_success() {
+                self.abort_multipart(&path, &upload_id).await;
+                return Err(Self::s3_error(status, &resp));
+            }
+            let etag = headers
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .ok_or_else(|| Error::internal("s3: UploadPart response carried no ETag"))?;
+            parts.push((n, etag));
+        }
+
+        let manifest = complete_multipart_body(&parts);
+        let (status, _h, resp) = self
+            .request(
+                "POST",
+                &path,
+                &[("uploadId".into(), upload_id.clone())],
+                Bytes::from(manifest),
+                Some("application/xml"),
+            )
+            .await?;
+        // CompleteMultipartUpload can return 200 with an <Error> body.
+        if !status.is_success() || xml::parse_error(&resp).is_some() {
+            self.abort_multipart(&path, &upload_id).await;
+            return Err(Self::s3_error(status, &resp));
+        }
+        Ok(())
     }
+
+    /// Best-effort abort — failure here is logged, not surfaced (the original
+    /// error is what the caller needs).
+    async fn abort_multipart(&self, path: &str, upload_id: &str) {
+        let query = vec![("uploadId".into(), upload_id.to_string())];
+        if let Err(e) = self.request("DELETE", path, &query, Bytes::new(), None).await {
+            eprintln!("jerrycan-storage: abort multipart upload failed: {e}");
+        }
+    }
+}
+
+/// `(start, end)` byte ranges of PART_SIZE chunks covering `len`.
+fn part_ranges(len: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < len {
+        out.push((start, (start + PART_SIZE).min(len)));
+        start += PART_SIZE;
+    }
+    out
+}
+
+/// The CompleteMultipartUpload request body. ETags pass through verbatim
+/// (S3 returns them quoted). Building XML is trivial string work — quick-xml
+/// is for PARSING only.
+fn complete_multipart_body(parts: &[(usize, String)]) -> String {
+    let mut body = String::from("<CompleteMultipartUpload>");
+    for (n, etag) in parts {
+        body.push_str(&format!("<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"));
+    }
+    body.push_str("</CompleteMultipartUpload>");
+    body
 }
 
 impl BlobStore for S3Store {
@@ -346,5 +427,26 @@ mod tests {
     fn object_paths_are_path_style_and_segment_encoded() {
         let c = cfg("s3://my-bucket?endpoint=https://x.example.com").unwrap();
         assert_eq!(c.object_path("avatars", "u 1/pic.png"), "/my-bucket/avatars/u%201/pic.png");
+    }
+
+    #[test]
+    fn part_split_covers_the_body_exactly() {
+        // 20 MiB → 8 + 8 + 4.
+        let chunks = part_ranges(20 * 1024 * 1024);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], (0, 8 * 1024 * 1024));
+        assert_eq!(chunks[1], (8 * 1024 * 1024, 16 * 1024 * 1024));
+        assert_eq!(chunks[2], (16 * 1024 * 1024, 20 * 1024 * 1024));
+        // Exactly one part size → a single range (multipart not even entered).
+        assert_eq!(part_ranges(8 * 1024 * 1024), vec![(0, 8 * 1024 * 1024)]);
+    }
+
+    #[test]
+    fn complete_body_lists_parts_in_order_with_their_etags() {
+        let body = complete_multipart_body(&[(1, "\"etag-a\"".into()), (2, "\"etag-b\"".into())]);
+        assert_eq!(
+            body,
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"etag-a\"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>\"etag-b\"</ETag></Part></CompleteMultipartUpload>"
+        );
     }
 }
