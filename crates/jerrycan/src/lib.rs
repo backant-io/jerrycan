@@ -87,4 +87,8 @@ mod doc_tests {
         page_17_response_types,
         "../../../docs/ai/17-response-types.md"
     );
+    // Storage examples resolve jerrycan::storage + db, so the page is gated on
+    // the storage feature; run with `cargo test -p jerrycan --features storage --doc`.
+    #[cfg(feature = "storage")]
+    doc_page!(page_18_storage, "../../../docs/ai/18-storage.md");
 }

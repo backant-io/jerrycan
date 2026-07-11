@@ -18,6 +18,9 @@ mod sigv4;
 #[cfg(feature = "storage-s3")]
 mod xml;
 
+/// Re-exported so `jerrycan::storage::bytes::Bytes` is reachable from generated
+/// apps and doc-tests without a separate `bytes` dependency.
+pub use bytes;
 pub use meta::{ObjectMeta, STORAGE_MIGRATIONS};
 pub use store::{BlobFuture, BlobStore, LocalStore, MemoryStore};
 #[cfg(feature = "storage-s3")]

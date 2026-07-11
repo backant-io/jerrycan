@@ -53,6 +53,7 @@ pub const PAGES: &[(&str, &str)] = &[
         "response-types",
         include_str!("../../embedded/ai/17-response-types.md"),
     ),
+    ("storage", include_str!("../../embedded/ai/18-storage.md")),
 ];
 
 fn slug(heading: &str) -> String {

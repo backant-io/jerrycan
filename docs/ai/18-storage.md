@@ -1,0 +1,79 @@
+# Storage
+
+Buckets are modeled in `design.json` (contract v2); the generator emits guarded
+per-bucket endpoints; object metadata lives in the `storage_objects` table;
+bytes live in a pluggable blob store.
+
+## Declaring buckets (contract v2)
+
+```json
+{
+  "contract_version": 2,
+  "storage": {
+    "buckets": [
+      { "name": "avatars", "visibility": "public", "owner": "User",
+        "max_size": "5MB", "allowed_mime": ["image/*"] },
+      { "name": "invoices", "visibility": "private", "owner": "Org",
+        "owner_prefix": true, "max_size": "20MB" }
+    ]
+  }
+}
+```
+
+- `visibility: public` — unauthenticated `GET` reads; mutations are ALWAYS guarded.
+- `owner` — the tenancy entity makes the bucket tenant-owned (Tenant-guard
+  scoped); any other entity stamps the session user id.
+- `owner_prefix: true` — keys stored as `{owner_id}/…`, prefix-asserted on every
+  access (the Supabase folder-per-user pattern).
+- Storage requires the `db` dependency and an active auth model.
+
+## Generated endpoints (per bucket `<b>`)
+
+| Route | Behavior |
+|---|---|
+| `POST /<b>?key=<path>` | upload a raw body; `Content-Type` is the mime (415 `JC0415` outside `allowed_mime`; over `max_size` is 413 `JC0413`; duplicate key is 409) |
+| `GET /<b>` | list (owner/tenant scoped; open when public) |
+| `GET /<b>/{id}` | download — emits `ETag` (sha256) + `Cache-Control`; private buckets also accept `?exp=…&sig=…` |
+| `DELETE /<b>/{id}` | delete row + bytes (scoped; foreign object = 404) |
+| `POST /<b>/{id}/sign?ttl=300` | a time-limited signed URL |
+
+## Configuring the backend (env, zero-touch)
+
+```text
+JERRYCAN_STORAGE=local:/var/data                      # filesystem (default: local:./storage)
+JERRYCAN_STORAGE=s3://bucket?region=eu-central-1      # AWS S3
+JERRYCAN_STORAGE=s3://bucket?endpoint=https://…       # R2 / MinIO / Supabase S3
+```
+
+S3 credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; signed
+URLs use `JERRYCAN_SECRET`. The packaged binary carries both backends — the env
+var alone switches them.
+
+## Using the service directly
+
+Generated handlers take `Dep<Storage>`; you can also call the service yourself.
+`put_object` validates the key, enforces `max_size`/`allowed_mime`, prepends the
+owner prefix, and stamps the metadata row. `bytes` is re-exported as
+`jerrycan::storage::bytes` so no separate dependency is needed:
+
+```rust
+use jerrycan::prelude::*;
+use jerrycan::storage::{Bucket, Scope, Storage, bytes::Bytes};
+
+const REPORTS: Bucket = Bucket {
+    name: "reports",
+    public: false,
+    owner_prefix: false,
+    max_size: 1024 * 1024,
+    allowed_mime: &["application/pdf"],
+};
+
+async fn archive(storage: Dep<Storage>, db: Dep<jerrycan::db::Db>) -> Result<Json<String>> {
+    let scope = Scope { owner_id: Some("1".into()), tenant_id: None };
+    let meta = storage
+        .put_object(&db, &REPORTS, &scope, "q3.pdf", "application/pdf", Bytes::from_static(b"%PDF-"))
+        .await?;
+    Ok(Json(meta.id))
+}
+# let _ = archive;
+```
