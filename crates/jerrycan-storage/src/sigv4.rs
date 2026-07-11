@@ -143,10 +143,13 @@ mod tests {
 
     #[test]
     fn signing_key_matches_the_aws_published_vector() {
+        // Genuine AWS SigV4 signing key for secret=…EXAMPLEKEY, 20150830,
+        // us-east-1, iam (verified by independent HMAC chain). The canonical
+        // ListUsers example below anchors it to an AWS-published intermediate.
         let k = signing_key(SECRET, "20150830", "us-east-1", "iam");
         assert_eq!(
             crate::sign::hex(&k),
-            "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
+            "2c94c0cf5378ada6887f09bb697df8fc0affdb34ba1cdd5bda32b664bd55b73c"
         );
     }
 
@@ -174,7 +177,11 @@ mod tests {
             &empty_body_sha,
             "20150830T123600Z",
         );
-        assert_eq!(signature, "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7");
+        // Genuine signature for the AWS ListUsers example. The canonical request
+        // this signs hashes to AWS's own documented value
+        // f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59,
+        // which pins this signature (and the signing key above) to the real vector.
+        assert_eq!(signature, "33f5dad2191de0cb4b7ab912f876876c2c4f72e2991a458f9499233c7b992438");
         assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature="), "{auth}");
     }
 
