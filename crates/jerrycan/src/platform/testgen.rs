@@ -411,7 +411,7 @@ fn isolation_member_role<'a>(design: &'a Design, module: &'a ModuleDesign) -> &'
 /// fields use a declared value to satisfy the CHECK). Returns (cols, vals) as
 /// the comma-joined SQL fragments. The tenant pk is an integer in practice (the
 /// reference-slice Workspace), so the literal is numeric.
-fn tenant_row_cols_vals(entity: &Entity, pk: &str, n: u32) -> (String, String) {
+pub(crate) fn tenant_row_cols_vals(entity: &Entity, pk: &str, n: u32) -> (String, String) {
     let mut cols = vec!["id".to_string()];
     let mut vals = vec![pk.to_string()];
     for f in entity.fields.iter().filter(|f| f.name != "id") {
