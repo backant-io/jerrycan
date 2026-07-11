@@ -213,7 +213,7 @@ jerrycan is built by one developer and a fleet of agents. Sponsorship pays for t
 
 <!-- sponsor logos land here, Diamond and Gold sponsors get their logo placed once they sponsor -->
 
-<a href="https://github.com/sponsors/Sorcecoder"><img src="https://img.shields.io/badge/GitHub%20Sponsors-sponsor%20jerrycan-EA4AAA?logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub"></a>
+<a href="https://github.com/sponsors/backant-io"><img src="https://img.shields.io/badge/GitHub%20Sponsors-sponsor%20jerrycan-EA4AAA?logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub"></a>
 <a href="https://buymeacoffee.com/sorcecoder"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-sorcecoder-FFDD00?logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee"></a>
 
 ## License
