@@ -1,0 +1,28 @@
+[package]
+name = "jerrycan-storage"
+description = "Object-storage extension for the jerrycan framework: design-modeled buckets, local + S3-compatible blob stores, signed URLs, owner/tenant-scoped metadata. https://jerrycan.cc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["storage", "s3", "blob", "web"]
+categories = ["web-programming"]
+
+[dependencies]
+jerrycan-core = { workspace = true }
+jerrycan-db = { workspace = true }
+bytes.workspace = true
+http.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
