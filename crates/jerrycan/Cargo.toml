@@ -37,6 +37,9 @@ jobs = ["dep:jerrycan-jobs", "db"]
 jobs-redis = ["jobs", "jerrycan-jobs/jobs-redis"]
 rate-limit = ["dep:jerrycan-ratelimit"]
 rate-limit-redis = ["rate-limit", "jerrycan-ratelimit/rate-limit-redis"]
+# Object storage: design-modeled buckets + blob backends. Metadata lives in a
+# jerrycan-db table, so `storage` implies `db` (like `jobs`).
+storage = ["dep:jerrycan-storage", "db"]
 
 [[bin]]
 name = "jerrycan"
@@ -51,6 +54,7 @@ jerrycan-auth = { workspace = true, optional = true }
 jerrycan-observe = { workspace = true, optional = true }
 jerrycan-jobs = { workspace = true, optional = true }
 jerrycan-ratelimit = { workspace = true, optional = true }
+jerrycan-storage = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 sea-query = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

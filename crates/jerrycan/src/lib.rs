@@ -27,6 +27,9 @@ pub use jerrycan_observe as observe;
 #[cfg(feature = "jobs")]
 pub use jerrycan_jobs as jobs;
 
+#[cfg(feature = "storage")]
+pub use jerrycan_storage as storage;
+
 #[cfg(feature = "cli")]
 pub mod platform;
 
