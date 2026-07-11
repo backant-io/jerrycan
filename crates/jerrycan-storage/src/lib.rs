@@ -3,9 +3,11 @@
 //! DB-backed object metadata, and signed URLs. <https://jerrycan.cc>
 #![forbid(unsafe_code)]
 
+pub mod meta;
 mod sign;
 pub mod store;
 
+pub use meta::{ObjectMeta, STORAGE_MIGRATIONS};
 pub use store::{BlobFuture, BlobStore, LocalStore, MemoryStore};
 
 /// One bucket's generated, compile-time rules. The generator emits a
