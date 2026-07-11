@@ -188,7 +188,7 @@ pub(crate) async fn download(storage: Dep<Storage>, db: Dep<Db>, Path(id): Path<
     } else {
         format!(
             r#"#[derive(serde::Deserialize)]
-struct GetQuery {{
+pub(crate) struct GetQuery {{
     #[serde(default)]
     exp: Option<u64>,
     #[serde(default)]
@@ -243,12 +243,12 @@ pub fn module() -> Module {{
 }}
 
 #[derive(serde::Deserialize)]
-struct UploadQuery {{
+pub(crate) struct UploadQuery {{
     key: String,
 }}
 
 #[derive(serde::Deserialize)]
-struct SignQuery {{
+pub(crate) struct SignQuery {{
     #[serde(default = "default_ttl")]
     ttl: u64,
 }}
