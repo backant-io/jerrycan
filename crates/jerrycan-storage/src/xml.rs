@@ -22,7 +22,9 @@ fn texts_of(body: &[u8], wanted: &[&str]) -> Vec<(String, String)> {
                 current = wanted.contains(&name.as_str()).then_some(name);
             }
             Ok(Event::Text(t)) => {
-                if let (Some(name), Ok(text)) = (current.take(), t.decode()) {
+                // quick-xml 0.37 `BytesText` exposes `unescape()` (not `decode()`);
+                // it both decodes and resolves XML entities in `<Message>` text.
+                if let (Some(name), Ok(text)) = (current.take(), t.unescape()) {
                     out.push((name, text.into_owned()));
                 }
             }
