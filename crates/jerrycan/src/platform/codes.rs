@@ -71,8 +71,8 @@ pub const REGISTRY: &[CodeInfo] = &[
     CodeInfo {
         code: "JC0415",
         title: "unsupported media type",
-        cause: "the request's content type is not what the endpoint consumes (e.g. Multipart requires multipart/form-data with a boundary)",
-        fix: "send the content type the endpoint declares; for uploads, multipart/form-data with a valid boundary parameter",
+        cause: "the request's content type is not what the endpoint consumes: Multipart requires multipart/form-data with a boundary, and a storage bucket upload must match the bucket's allowed_mime allowlist",
+        fix: "send the content type the endpoint declares; for uploads, multipart/form-data with a valid boundary parameter, or a Content-Type inside the bucket's allowed_mime list",
         doc: "jerrycan docs extractors",
     },
     CodeInfo {
@@ -207,6 +207,15 @@ mod tests {
         // completeness walk would mistake for an emitted code.
         let absent = format!("JC{}", 9999);
         assert!(lookup(&absent).is_none());
+    }
+
+    #[test]
+    fn jc0415_covers_bucket_mime_allowlists() {
+        // WHY: `jerrycan explain JC0415` is the agent's first stop when a
+        // generated bucket rejects an upload — the registry must name the
+        // allowlist cause, not just the Multipart boundary case.
+        let info = lookup("JC0415").unwrap();
+        assert!(info.cause.contains("allowed_mime"), "cause: {}", info.cause);
     }
 
     #[test]

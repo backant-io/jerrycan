@@ -14,7 +14,7 @@ the cause + fix for any of them.
 | JC0408 | Request body read timeout — on a `stream_body()` route this is the per-frame deadline (a stalled client between chunks) |
 | JC0409 | Conflict — the write violates a unique key (jerrycan-db) |
 | JC0413 | Payload too large — body over the route limit (default 1 MiB), or a multipart part over the per-part cap (8 MiB), >256 parts, or part headers over 8 KiB |
-| JC0415 | Unsupported media type — content type is not what the endpoint consumes (e.g. `Multipart` needs `multipart/form-data` with a boundary) |
+| JC0415 | Unsupported media type — content type is not what the endpoint consumes (e.g. `Multipart` needs `multipart/form-data` with a boundary; a storage bucket upload must match the bucket's `allowed_mime` allowlist) |
 | JC0422 | Unprocessable — bad JSON or validation violations |
 | JC0429 | Too many requests — the client exceeded its rate limit for the current window (the rate-limit extension); the response carries a `Retry-After` header |
 | JC0500 | Internal error (or handler panic) |
