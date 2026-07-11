@@ -211,11 +211,7 @@ The project is built docs-first and test-first: documentation examples are the e
 
 jerrycan is built by one developer and a fleet of agents. Sponsorship pays for the eval infrastructure, the deploy targets, and the time it takes to keep the gate honest.
 
-| Tier | Monthly | What you get |
-|---|---|---|
-| 💎 **Diamond** | $500 | Your logo at the top of this README and on [jerrycan.cc](https://jerrycan.cc), priority issue triage, and a monthly 1:1 call on your agent-backend setup |
-| 🥇 **Gold** | $250 | Your logo in this README, priority issue triage |
-| 🥈 **Silver** | $100 | Your name in this README, sponsor badge |
+<!-- sponsor logos land here, Diamond and Gold sponsors get their logo placed once they sponsor -->
 
 <a href="https://github.com/sponsors/Sorcecoder"><img src="https://img.shields.io/badge/GitHub%20Sponsors-sponsor%20jerrycan-EA4AAA?logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub"></a>
 <a href="https://buymeacoffee.com/sorcecoder"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-sorcecoder-FFDD00?logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee"></a>
