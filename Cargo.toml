@@ -34,6 +34,7 @@ jerrycan-ratelimit = { path = "crates/jerrycan-ratelimit", version = "0.2.0" }
 jerrycan-jobs = { path = "crates/jerrycan-jobs", version = "0.2.0" }
 jerrycan-storage = { path = "crates/jerrycan-storage", version = "0.2.0" }
 argon2 = "0.5"
+bcrypt = "0.17"
 chacha20poly1305 = "0.10"
 hmac = "0.12"
 sha1 = "0.10"
