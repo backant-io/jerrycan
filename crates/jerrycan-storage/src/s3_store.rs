@@ -28,13 +28,19 @@ pub(crate) struct S3Config {
 impl S3Config {
     /// Parse `s3://bucket?region=…&endpoint=…`; credentials are passed in
     /// (from_env reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).
-    pub(crate) fn from_url(url: &str, access_key: Option<String>, secret_key: Option<String>) -> Result<Self> {
+    pub(crate) fn from_url(
+        url: &str,
+        access_key: Option<String>,
+        secret_key: Option<String>,
+    ) -> Result<Self> {
         let rest = url.strip_prefix("s3://").ok_or_else(|| {
             Error::internal(format!("s3 config: `{url}` does not start with s3://"))
         })?;
         let (bucket, query) = rest.split_once('?').unwrap_or((rest, ""));
         if bucket.is_empty() {
-            return Err(Error::internal("s3 config: missing bucket — use s3://<bucket>?region=…"));
+            return Err(Error::internal(
+                "s3 config: missing bucket — use s3://<bucket>?region=…",
+            ));
         }
         let mut region = "us-east-1".to_string();
         let mut endpoint = None;
@@ -55,22 +61,34 @@ impl S3Config {
                 "s3 config: refusing a plaintext http:// endpoint to a non-loopback host — use https:// (http is allowed only for a local MinIO)",
             ));
         }
-        let access_key = access_key.ok_or_else(|| {
-            Error::internal("s3 config: AWS_ACCESS_KEY_ID is not set")
-        })?;
-        let secret_key = secret_key.ok_or_else(|| {
-            Error::internal("s3 config: AWS_SECRET_ACCESS_KEY is not set")
-        })?;
-        Ok(Self { bucket: bucket.to_string(), region, endpoint, access_key, secret_key })
+        let access_key =
+            access_key.ok_or_else(|| Error::internal("s3 config: AWS_ACCESS_KEY_ID is not set"))?;
+        let secret_key = secret_key
+            .ok_or_else(|| Error::internal("s3 config: AWS_SECRET_ACCESS_KEY is not set"))?;
+        Ok(Self {
+            bucket: bucket.to_string(),
+            region,
+            endpoint,
+            access_key,
+            secret_key,
+        })
     }
 
     /// Path-style object path, key encoded per segment (slashes kept).
     pub(crate) fn object_path(&self, app_bucket: &str, key: &str) -> String {
-        format!("/{}/{}/{}", self.bucket, app_bucket, sigv4::uri_encode(key, true))
+        format!(
+            "/{}/{}/{}",
+            self.bucket,
+            app_bucket,
+            sigv4::uri_encode(key, true)
+        )
     }
 
     fn host(&self) -> &str {
-        self.endpoint.split_once("://").map(|(_, rest)| rest).unwrap_or(&self.endpoint)
+        self.endpoint
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&self.endpoint)
     }
 
     fn credentials(&self) -> Credentials {
@@ -94,7 +112,10 @@ fn plaintext_endpoint_ok(endpoint: &str) -> bool {
     if !scheme.eq_ignore_ascii_case("http") {
         return false;
     }
-    let authority = rest.split(['/', '?', '#']).next().expect("split yields one element");
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .expect("split yields one element");
     if authority.contains('@') {
         return false;
     }
@@ -135,8 +156,9 @@ impl S3Store {
             .https_or_http()
             .enable_http1()
             .build();
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(connector);
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(connector);
         Ok(Self { config, client })
     }
 
@@ -204,7 +226,11 @@ impl S3Store {
                     if v.is_empty() {
                         sigv4::uri_encode(k, false)
                     } else {
-                        format!("{}={}", sigv4::uri_encode(k, false), sigv4::uri_encode(v, false))
+                        format!(
+                            "{}={}",
+                            sigv4::uri_encode(k, false),
+                            sigv4::uri_encode(v, false)
+                        )
                     }
                 })
                 .collect();
@@ -242,7 +268,9 @@ impl S3Store {
     /// Map a non-2xx S3 response to a jerrycan error.
     fn s3_error(status: http::StatusCode, body: &[u8]) -> Error {
         match xml::parse_error(body) {
-            Some((code, _)) if code == "NoSuchKey" || status == http::StatusCode::NOT_FOUND => Error::not_found(),
+            Some((code, _)) if code == "NoSuchKey" || status == http::StatusCode::NOT_FOUND => {
+                Error::not_found()
+            }
             Some((code, message)) => Error::internal(format!("s3: {code}: {message}")),
             None if status == http::StatusCode::NOT_FOUND => Error::not_found(),
             None => Error::internal(format!("s3: unexpected status {status}")),
@@ -255,7 +283,13 @@ impl S3Store {
     async fn put_multipart(&self, bucket: &str, key: &str, body: Bytes, mime: &str) -> Result<()> {
         let path = self.config.object_path(bucket, key);
         let (status, _h, resp) = self
-            .request("POST", &path, &[("uploads".into(), String::new())], Bytes::new(), Some(mime))
+            .request(
+                "POST",
+                &path,
+                &[("uploads".into(), String::new())],
+                Bytes::new(),
+                Some(mime),
+            )
             .await?;
         if !status.is_success() {
             return Err(Self::s3_error(status, &resp));
@@ -306,7 +340,10 @@ impl S3Store {
     /// error is what the caller needs).
     async fn abort_multipart(&self, path: &str, upload_id: &str) {
         let query = vec![("uploadId".into(), upload_id.to_string())];
-        if let Err(e) = self.request("DELETE", path, &query, Bytes::new(), None).await {
+        if let Err(e) = self
+            .request("DELETE", path, &query, Bytes::new(), None)
+            .await
+        {
             eprintln!("jerrycan-storage: abort multipart upload failed: {e}");
         }
     }
@@ -329,7 +366,9 @@ fn part_ranges(len: usize) -> Vec<(usize, usize)> {
 fn complete_multipart_body(parts: &[(usize, String)]) -> String {
     let mut body = String::from("<CompleteMultipartUpload>");
     for (n, etag) in parts {
-        body.push_str(&format!("<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"));
+        body.push_str(&format!(
+            "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
     }
     body.push_str("</CompleteMultipartUpload>");
     body
@@ -346,7 +385,11 @@ impl S3Store {
             return Ok(());
         }
         match xml::parse_error(&resp) {
-            Some((code, _)) if code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" => Ok(()),
+            Some((code, _))
+                if code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" =>
+            {
+                Ok(())
+            }
             _ => Err(Self::s3_error(status, &resp)),
         }
     }
@@ -371,12 +414,22 @@ impl S3Store {
             .await
             .map_err(|_| Error::internal("s3: reading the response body failed"))?
             .to_bytes();
-        if status.is_success() { Ok(bytes) } else { Err(Self::s3_error(status, &bytes)) }
+        if status.is_success() {
+            Ok(bytes)
+        } else {
+            Err(Self::s3_error(status, &bytes))
+        }
     }
 }
 
 impl BlobStore for S3Store {
-    fn put<'a>(&'a self, bucket: &'a str, key: &'a str, body: Bytes, mime: &'a str) -> BlobFuture<'a, ()> {
+    fn put<'a>(
+        &'a self,
+        bucket: &'a str,
+        key: &'a str,
+        body: Bytes,
+        mime: &'a str,
+    ) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             crate::store::validate_key(key)?;
             if body.len() > PART_SIZE {
@@ -384,7 +437,11 @@ impl BlobStore for S3Store {
             }
             let path = self.config.object_path(bucket, key);
             let (status, _h, resp) = self.request("PUT", &path, &[], body, Some(mime)).await?;
-            if status.is_success() { Ok(()) } else { Err(Self::s3_error(status, &resp)) }
+            if status.is_success() {
+                Ok(())
+            } else {
+                Err(Self::s3_error(status, &resp))
+            }
         })
     }
 
@@ -392,14 +449,20 @@ impl BlobStore for S3Store {
         Box::pin(async move {
             let path = self.config.object_path(bucket, key);
             let (status, _h, resp) = self.request("GET", &path, &[], Bytes::new(), None).await?;
-            if status.is_success() { Ok(resp) } else { Err(Self::s3_error(status, &resp)) }
+            if status.is_success() {
+                Ok(resp)
+            } else {
+                Err(Self::s3_error(status, &resp))
+            }
         })
     }
 
     fn delete<'a>(&'a self, bucket: &'a str, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             let path = self.config.object_path(bucket, key);
-            let (status, _h, resp) = self.request("DELETE", &path, &[], Bytes::new(), None).await?;
+            let (status, _h, resp) = self
+                .request("DELETE", &path, &[], Bytes::new(), None)
+                .await?;
             // 204 success; 404 is idempotent-ok (the metadata row is the truth).
             if status.is_success() || status == http::StatusCode::NOT_FOUND {
                 Ok(())
@@ -409,7 +472,12 @@ impl BlobStore for S3Store {
         })
     }
 
-    fn presign_get<'a>(&'a self, bucket: &'a str, key: &'a str, ttl: Duration) -> BlobFuture<'a, Option<String>> {
+    fn presign_get<'a>(
+        &'a self,
+        bucket: &'a str,
+        key: &'a str,
+        ttl: Duration,
+    ) -> BlobFuture<'a, Option<String>> {
         Box::pin(async move {
             let path = self.config.object_path(bucket, key);
             Ok(Some(sigv4::presign_url(
@@ -433,7 +501,8 @@ mod tests {
 
     #[test]
     fn config_parses_bucket_region_and_endpoint() {
-        let c = cfg("s3://my-bucket?region=eu-central-1&endpoint=https://minio.example.com:9000").unwrap();
+        let c = cfg("s3://my-bucket?region=eu-central-1&endpoint=https://minio.example.com:9000")
+            .unwrap();
         assert_eq!(c.bucket, "my-bucket");
         assert_eq!(c.region, "eu-central-1");
         assert_eq!(c.endpoint, "https://minio.example.com:9000");
@@ -466,7 +535,10 @@ mod tests {
     #[test]
     fn object_paths_are_path_style_and_segment_encoded() {
         let c = cfg("s3://my-bucket?endpoint=https://x.example.com").unwrap();
-        assert_eq!(c.object_path("avatars", "u 1/pic.png"), "/my-bucket/avatars/u%201/pic.png");
+        assert_eq!(
+            c.object_path("avatars", "u 1/pic.png"),
+            "/my-bucket/avatars/u%201/pic.png"
+        );
     }
 
     #[test]

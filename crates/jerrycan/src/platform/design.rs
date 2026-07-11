@@ -578,7 +578,11 @@ pub(crate) mod tests {
         // can switch backends by env WITHOUT recompiling (zero-touch config).
         let d: Design = serde_json::from_str(V2_STORAGE).unwrap();
         let feats = d.facade_features();
-        assert_eq!(feats.last(), Some(&"storage-s3"), "storage-s3 appended last: {feats:?}");
+        assert_eq!(
+            feats.last(),
+            Some(&"storage-s3"),
+            "storage-s3 appended last: {feats:?}"
+        );
         assert!(feats.contains(&"db") && feats.contains(&"auth"));
         // No storage block → no storage feature (order of the rest unchanged).
         let no: Design = serde_json::from_str(V1_FULL).unwrap();
@@ -593,7 +597,11 @@ pub(crate) mod tests {
         assert_eq!(Design::parse_size("1GB"), Some(1024 * 1024 * 1024));
         assert_eq!(Design::parse_size("123B"), Some(123));
         assert_eq!(Design::parse_size("123"), Some(123), "bare number = bytes");
-        assert_eq!(Design::parse_size("5mb"), None, "suffixes are uppercase (schema-validated)");
+        assert_eq!(
+            Design::parse_size("5mb"),
+            None,
+            "suffixes are uppercase (schema-validated)"
+        );
         assert_eq!(Design::parse_size("lots"), None);
     }
 
@@ -789,6 +797,10 @@ pub(crate) mod tests {
                 && s.contains("\"unique\"")
                 && s.contains("\"values\"")
         );
-        assert!(s.contains("\"storage\"") && s.contains("\"buckets\"") && s.contains("\"owner_prefix\""));
+        assert!(
+            s.contains("\"storage\"")
+                && s.contains("\"buckets\"")
+                && s.contains("\"owner_prefix\"")
+        );
     }
 }

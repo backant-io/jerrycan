@@ -65,11 +65,12 @@ pub fn expected_main(design: &Design) -> String {
     modules.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut mounts = String::new();
-    for dep in design
-        .dependencies
-        .iter()
-        .filter(|d| !matches!(d.as_str(), "db" | "validate" | "auth" | "observe" | "storage"))
-    {
+    for dep in design.dependencies.iter().filter(|d| {
+        !matches!(
+            d.as_str(),
+            "db" | "validate" | "auth" | "observe" | "storage"
+        )
+    }) {
         mounts.push_str(&format!(
             "        // app dependency `{dep}`: provide here once its extension lands\n"
         ));
@@ -470,7 +471,9 @@ mod tests {
             app_mig < st_mig && st_mig < app_new,
             "storage migrations after app migrations, before App::new: {main}"
         );
-        let module_mount = main.find(".mount(\"/orgs\", route_orgs::module())").unwrap();
+        let module_mount = main
+            .find(".mount(\"/orgs\", route_orgs::module())")
+            .unwrap();
         let avatars = main
             .find(".mount(\"/avatars\", storage::avatars::module())")
             .unwrap();

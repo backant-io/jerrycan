@@ -314,14 +314,20 @@ fn concrete_mime(b: &BucketDesign) -> String {
 /// gen-tests does NOT count them toward expected_failing.
 pub fn acceptance_rs(design: &Design) -> String {
     let buckets = sorted_buckets(design);
-    let needs_tenant = buckets
-        .iter()
-        .any(|b| matches!(bucket_scope(design, b), BucketScope::Tenant | BucketScope::UserInTenant));
+    let needs_tenant = buckets.iter().any(|b| {
+        matches!(
+            bucket_scope(design, b),
+            BucketScope::Tenant | BucketScope::UserInTenant
+        )
+    });
 
     // Tenant plumbing (migration include + tenant 1/2 + membership seeds),
     // reusing testgen's column/value derivation so the two seeds can't drift.
     let (seed_use, tenant_setup, tenant_dep) = if needs_tenant {
-        let tenancy = design.tenancy.as_ref().expect("validated: tenant buckets require tenancy");
+        let tenancy = design
+            .tenancy
+            .as_ref()
+            .expect("validated: tenant buckets require tenancy");
         let t = tenant_module(design).expect("validated: tenancy entity is declared");
         let entity = t
             .entities
@@ -332,7 +338,11 @@ pub fn acceptance_rs(design: &Design) -> String {
         let table = format!("{}s", tenancy.entity.to_lowercase());
         let members = format!("{}_members", Design::to_snake(&tenancy.entity));
         let fk = Design::fk_column(&tenancy.entity);
-        let role = tenancy.member_roles.first().map(String::as_str).unwrap_or("owner");
+        let role = tenancy
+            .member_roles
+            .first()
+            .map(String::as_str)
+            .unwrap_or("owner");
         let (cols1, vals1) = super::testgen::tenant_row_cols_vals(entity, "1", 1);
         let (cols2, vals2) = super::testgen::tenant_row_cols_vals(entity, "2", 2);
         let setup = format!(
@@ -350,7 +360,13 @@ pub fn acceptance_rs(design: &Design) -> String {
 
     let mounts: String = buckets
         .iter()
-        .map(|b| format!("        .mount(\"/{}\", storage::{}::module())\n", b.name, bucket_ident(&b.name)))
+        .map(|b| {
+            format!(
+                "        .mount(\"/{}\", storage::{}::module())\n",
+                b.name,
+                bucket_ident(&b.name)
+            )
+        })
         .collect();
 
     let mut tests = String::new();
@@ -396,13 +412,19 @@ fn bucket_tests(design: &Design, b: &BucketDesign, out: &mut String) {
     let public = matches!(b.visibility, Visibility::Public);
     let owned = bucket_scope(design, b) != BucketScope::Unowned;
     let mime = concrete_mime(b);
-    let cache = if public { "public, max-age=3600" } else { "private, no-store" };
+    let cache = if public {
+        "public, max-age=3600"
+    } else {
+        "private, no-store"
+    };
 
     // 1. Round trip + ETag/Cache-Control (headers checked on every bucket).
     let download_1 = if public {
         format!("t.get(&format!(\"/{name}/{{id}}\")).await")
     } else {
-        format!("t.get_with(&format!(\"/{name}/{{id}}\"), &[(\"cookie\", &test_cookie_for(1))]).await")
+        format!(
+            "t.get_with(&format!(\"/{name}/{{id}}\"), &[(\"cookie\", &test_cookie_for(1))]).await"
+        )
     };
     out.push_str(&format!(
         "#[tokio::test]\nasync fn {ident}_upload_then_download_round_trips() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"/{name}?key=probe.bin\", b\"{ident}-bytes\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(created.status().as_u16(), 201, \"upload; body: {{}}\", created.text());\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\").to_string();\n    let checksum = meta[\"checksum\"].as_str().expect(\"checksum\").to_string();\n    let res = {download_1};\n    assert_eq!(res.status().as_u16(), 200, \"download; body: {{}}\", res.text());\n    assert_eq!(res.bytes(), &b\"{ident}-bytes\"[..]);\n    let etag = res.headers().get(\"etag\").and_then(|v| v.to_str().ok()).expect(\"etag header\");\n    assert_eq!(etag, format!(\"\\\"{{checksum}}\\\"\"), \"ETag is the sha256 checksum\");\n    let cc = res.headers().get(\"cache-control\").and_then(|v| v.to_str().ok()).expect(\"cache-control header\");\n    assert_eq!(cc, \"{cache}\");\n}}\n\n"
@@ -499,7 +521,10 @@ pub fn write_storage(target: &Path, design: &Design) -> Result<Vec<String>, Stri
     write_tool("Cargo.toml", &cargo_toml())?;
     write_tool("src/lib.rs", &lib_rs(design))?;
     for b in sorted_buckets(design) {
-        write_tool(&format!("src/{}.rs", bucket_ident(&b.name)), &bucket_rs(design, b))?;
+        write_tool(
+            &format!("src/{}.rs", bucket_ident(&b.name)),
+            &bucket_rs(design, b),
+        )?;
     }
     write_tool("tests/acceptance.rs", &acceptance_rs(design))?;
     Ok(created)
@@ -527,7 +552,11 @@ mod tests {
     #[test]
     fn generation_is_deterministic_and_lib_declares_sorted_buckets() {
         let d = design();
-        assert_eq!(lib_rs(&d), lib_rs(&d), "byte-identical across runs (JL0003)");
+        assert_eq!(
+            lib_rs(&d),
+            lib_rs(&d),
+            "byte-identical across runs (JL0003)"
+        );
         assert_eq!(
             bucket_rs(&d, bucket(&d, "avatars")),
             bucket_rs(&d, bucket(&d, "avatars"))
@@ -536,7 +565,10 @@ mod tests {
         let a = lib.find("pub mod avatars;").unwrap();
         let i = lib.find("pub mod invoices;").unwrap();
         assert!(a < i, "bucket modules sorted by name: {lib}");
-        assert!(lib.contains("GENERATED by jerrycan"), "tool-owned banner: {lib}");
+        assert!(
+            lib.contains("GENERATED by jerrycan"),
+            "tool-owned banner: {lib}"
+        );
     }
 
     /// avatars: public, owner: User (plain user scope), 5MB, image/*.
@@ -545,19 +577,45 @@ mod tests {
         let d = design();
         let m = bucket_rs(&d, bucket(&d, "avatars"));
         // The design-derived const.
-        assert!(m.contains("name: \"avatars\"") && m.contains("public: true"), "{m}");
-        assert!(m.contains("owner_prefix: false") && m.contains("max_size: 5242880"), "{m}");
+        assert!(
+            m.contains("name: \"avatars\"") && m.contains("public: true"),
+            "{m}"
+        );
+        assert!(
+            m.contains("owner_prefix: false") && m.contains("max_size: 5242880"),
+            "{m}"
+        );
         assert!(m.contains("allowed_mime: &[\"image/*\"]"), "{m}");
         // Route table: body_limit = max_size; all five endpoints.
-        assert!(m.contains(".route(\"/\", get(list).post(upload).body_limit(5242880))"), "{m}");
-        assert!(m.contains(".route(\"/{id}\", get(download).delete(remove))"), "{m}");
+        assert!(
+            m.contains(".route(\"/\", get(list).post(upload).body_limit(5242880))"),
+            "{m}"
+        );
+        assert!(
+            m.contains(".route(\"/{id}\", get(download).delete(remove))"),
+            "{m}"
+        );
         assert!(m.contains(".route(\"/{id}/sign\", post(sign))"), "{m}");
         // Mutations guarded by the session user; owner_id = user id.
-        assert!(m.contains("async fn upload(storage: Dep<Storage>, db: Dep<Db>, user: CurrentUser,"), "{m}");
-        assert!(m.contains("Scope { owner_id: Some(user.0.id.to_string()), tenant_id: None }"), "{m}");
+        assert!(
+            m.contains("async fn upload(storage: Dep<Storage>, db: Dep<Db>, user: CurrentUser,"),
+            "{m}"
+        );
+        assert!(
+            m.contains("Scope { owner_id: Some(user.0.id.to_string()), tenant_id: None }"),
+            "{m}"
+        );
         // Public reads: download/list take NO guard, and download is cacheable.
-        assert!(m.contains("async fn download(storage: Dep<Storage>, db: Dep<Db>, Path(id): Path<String>)"), "{m}");
-        assert!(m.contains("async fn list(storage: Dep<Storage>, db: Dep<Db>)"), "{m}");
+        assert!(
+            m.contains(
+                "async fn download(storage: Dep<Storage>, db: Dep<Db>, Path(id): Path<String>)"
+            ),
+            "{m}"
+        );
+        assert!(
+            m.contains("async fn list(storage: Dep<Storage>, db: Dep<Db>)"),
+            "{m}"
+        );
         assert!(m.contains("object_response(&meta, bytes, true)"), "{m}");
         // No tenant machinery on a plain user bucket.
         assert!(!m.contains("Tenant"), "{m}");
@@ -568,9 +626,15 @@ mod tests {
     fn tenant_owned_private_prefix_bucket_takes_the_tenant_guard() {
         let d = design();
         let m = bucket_rs(&d, bucket(&d, "invoices"));
-        assert!(m.contains("public: false") && m.contains("owner_prefix: true"), "{m}");
+        assert!(
+            m.contains("public: false") && m.contains("owner_prefix: true"),
+            "{m}"
+        );
         assert!(m.contains("use shared::Tenant;"), "{m}");
-        assert!(m.contains("async fn upload(storage: Dep<Storage>, db: Dep<Db>, tenant: Dep<Tenant>,"), "{m}");
+        assert!(
+            m.contains("async fn upload(storage: Dep<Storage>, db: Dep<Db>, tenant: Dep<Tenant>,"),
+            "{m}"
+        );
         assert!(
             m.contains("Scope { owner_id: Some(tenant.id().to_string()), tenant_id: Some(tenant.id().to_string()) }"),
             "{m}"
@@ -580,7 +644,10 @@ mod tests {
         assert!(m.contains("get_signed(&db, &BUCKET, &id, exp, sig,"), "{m}");
         assert!(m.contains("ok_or_else(Error::unauthorized)?"), "{m}");
         // Private list is scoped.
-        assert!(m.contains("async fn list(storage: Dep<Storage>, db: Dep<Db>, tenant: Dep<Tenant>,"), "{m}");
+        assert!(
+            m.contains("async fn list(storage: Dep<Storage>, db: Dep<Db>, tenant: Dep<Tenant>,"),
+            "{m}"
+        );
         // Default max on the missing allowed_mime: allow-all.
         assert!(m.contains("allowed_mime: &[]"), "{m}");
         assert!(m.contains("max_size: 20971520"), "{m}");
@@ -592,7 +659,8 @@ mod tests {
     fn user_in_tenant_bucket_takes_both_guards() {
         let mut d = design();
         // Graft: User belongs_to Org, and repoint avatars' semantics.
-        d.modules[0].entities[1].belongs_to = vec![serde_json::from_str(r#"{ "entity": "Org" }"#).unwrap()];
+        d.modules[0].entities[1].belongs_to =
+            vec![serde_json::from_str(r#"{ "entity": "Org" }"#).unwrap()];
         let m = bucket_rs(&d, &d.storage.as_ref().unwrap().buckets[0].clone());
         assert!(m.contains("user: CurrentUser, tenant: Dep<Tenant>,"), "{m}");
         assert!(
@@ -604,7 +672,10 @@ mod tests {
     #[test]
     fn cargo_toml_depends_on_the_facade_and_shared() {
         let c = cargo_toml();
-        assert!(c.contains("name = \"storage\"") && c.contains("jerrycan.workspace = true"), "{c}");
+        assert!(
+            c.contains("name = \"storage\"") && c.contains("jerrycan.workspace = true"),
+            "{c}"
+        );
         assert!(c.contains("shared = { path = \"../shared\" }"), "{c}");
     }
 
@@ -615,14 +686,36 @@ mod tests {
         assert_eq!(a, acceptance_rs(&d), "deterministic");
         // Shared app() plumbing: memory blob store + storage migrations + auth
         // + the tenant guard (invoices is tenant-owned).
-        assert!(a.contains("jerrycan::storage::Storage::memory().with_sign_secret(TEST_SECRET)"), "{a}");
-        assert!(a.contains("db.migrate(jerrycan::storage::STORAGE_MIGRATIONS)"), "{a}");
+        assert!(
+            a.contains("jerrycan::storage::Storage::memory().with_sign_secret(TEST_SECRET)"),
+            "{a}"
+        );
+        assert!(
+            a.contains("db.migrate(jerrycan::storage::STORAGE_MIGRATIONS)"),
+            "{a}"
+        );
         assert!(a.contains(".provide_dep(shared::tenant)"), "{a}");
-        assert!(a.contains(".mount(\"/avatars\", storage::avatars::module())"), "{a}");
-        assert!(a.contains(".mount(\"/invoices\", storage::invoices::module())"), "{a}");
+        assert!(
+            a.contains(".mount(\"/avatars\", storage::avatars::module())"),
+            "{a}"
+        );
+        assert!(
+            a.contains(".mount(\"/invoices\", storage::invoices::module())"),
+            "{a}"
+        );
         // Tenant seeds: two tenants, two memberships (isolation acts as user 2).
-        assert!(a.contains("INSERT INTO \\\"org_members\\\" (user_id, org_id, role) VALUES (1, 1, 'owner')"), "{a}");
-        assert!(a.contains("INSERT INTO \\\"org_members\\\" (user_id, org_id, role) VALUES (2, 2, 'owner')"), "{a}");
+        assert!(
+            a.contains(
+                "INSERT INTO \\\"org_members\\\" (user_id, org_id, role) VALUES (1, 1, 'owner')"
+            ),
+            "{a}"
+        );
+        assert!(
+            a.contains(
+                "INSERT INTO \\\"org_members\\\" (user_id, org_id, role) VALUES (2, 2, 'owner')"
+            ),
+            "{a}"
+        );
         // Per-bucket surface tests.
         for needle in [
             "async fn avatars_upload_then_download_round_trips()",
@@ -641,7 +734,10 @@ mod tests {
         // The negative controls encode the SECURITY contract: cross-owner GET
         // 404s and the row survives a cross-owner DELETE.
         assert!(a.contains("cross-owner delete must 404"), "{a}");
-        assert!(a.contains("\"2/same.bin\""), "prefix control asserts B's prefixed key: {a}");
+        assert!(
+            a.contains("\"2/same.bin\""),
+            "prefix control asserts B's prefixed key: {a}"
+        );
         // Public bucket: cache headers asserted; no download-401 test.
         assert!(a.contains("\"public, max-age=3600\""), "{a}");
         assert!(!a.contains("avatars_download_without_auth_is_401"), "{a}");
@@ -670,7 +766,9 @@ mod tests {
         fs::write(&handler, "// hand edit\n").unwrap();
         write_storage(tmp.path(), &d).unwrap();
         assert!(
-            fs::read_to_string(&handler).unwrap().contains("const BUCKET"),
+            fs::read_to_string(&handler)
+                .unwrap()
+                .contains("const BUCKET"),
             "tool-owned bucket module restored"
         );
     }

@@ -70,7 +70,14 @@ pub(crate) fn new_object_id() -> String {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h = crate::sign::hex(&b);
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 fn stmt(db: &Db, sql: &str, values: Vec<Value>) -> Statement {
@@ -96,14 +103,24 @@ fn row_to_meta(row: &QueryResult) -> Result<ObjectMeta> {
     };
     Ok(ObjectMeta {
         id: row.try_get("", "id").map_err(|e| col_err("id", e))?,
-        bucket: row.try_get("", "bucket").map_err(|e| col_err("bucket", e))?,
+        bucket: row
+            .try_get("", "bucket")
+            .map_err(|e| col_err("bucket", e))?,
         key: row.try_get("", "key").map_err(|e| col_err("key", e))?,
-        owner_id: row.try_get("", "owner_id").map_err(|e| col_err("owner_id", e))?,
-        tenant_id: row.try_get("", "tenant_id").map_err(|e| col_err("tenant_id", e))?,
+        owner_id: row
+            .try_get("", "owner_id")
+            .map_err(|e| col_err("owner_id", e))?,
+        tenant_id: row
+            .try_get("", "tenant_id")
+            .map_err(|e| col_err("tenant_id", e))?,
         size: row.try_get("", "size").map_err(|e| col_err("size", e))?,
         mime: row.try_get("", "mime").map_err(|e| col_err("mime", e))?,
-        checksum: row.try_get("", "checksum").map_err(|e| col_err("checksum", e))?,
-        created_at: row.try_get("", "created_at").map_err(|e| col_err("created_at", e))?,
+        checksum: row
+            .try_get("", "checksum")
+            .map_err(|e| col_err("checksum", e))?,
+        created_at: row
+            .try_get("", "created_at")
+            .map_err(|e| col_err("created_at", e))?,
     })
 }
 
@@ -134,11 +151,20 @@ pub(crate) async fn insert(db: &Db, m: &ObjectMeta) -> Result<()> {
 
 /// One object by id within a bucket, filtered by whatever the scope sets —
 /// a scoped read of a foreign row is None (the caller's 404).
-pub(crate) async fn get_scoped(db: &Db, bucket: &str, id: &str, scope: &Scope) -> Result<Option<ObjectMeta>> {
+pub(crate) async fn get_scoped(
+    db: &Db,
+    bucket: &str,
+    id: &str,
+    scope: &Scope,
+) -> Result<Option<ObjectMeta>> {
     let mut sql = format!("SELECT {COLS} FROM storage_objects WHERE bucket = ? AND id = ?");
     let mut values: Vec<Value> = vec![bucket.into(), id.into()];
     scope_sql(scope, &mut sql, &mut values);
-    let row = db.conn().query_one(stmt(db, &sql, values)).await.map_err(db_error)?;
+    let row = db
+        .conn()
+        .query_one(stmt(db, &sql, values))
+        .await
+        .map_err(db_error)?;
     row.as_ref().map(row_to_meta).transpose()
 }
 
@@ -148,7 +174,11 @@ pub(crate) async fn list_scoped(db: &Db, bucket: &str, scope: &Scope) -> Result<
     let mut values: Vec<Value> = vec![bucket.into()];
     scope_sql(scope, &mut sql, &mut values);
     sql.push_str(" ORDER BY \"key\"");
-    let rows = db.conn().query_all(stmt(db, &sql, values)).await.map_err(db_error)?;
+    let rows = db
+        .conn()
+        .query_all(stmt(db, &sql, values))
+        .await
+        .map_err(db_error)?;
     rows.iter().map(row_to_meta).collect()
 }
 
@@ -173,7 +203,9 @@ mod tests {
 
     async fn db() -> Db {
         let db = Db::connect("sqlite::memory:").await.expect("test db");
-        db.migrate(STORAGE_MIGRATIONS).await.expect("storage migrations");
+        db.migrate(STORAGE_MIGRATIONS)
+            .await
+            .expect("storage migrations");
         db
     }
 
@@ -192,18 +224,40 @@ mod tests {
     }
 
     fn scope(owner: Option<&str>, tenant: Option<&str>) -> Scope {
-        Scope { owner_id: owner.map(String::from), tenant_id: tenant.map(String::from) }
+        Scope {
+            owner_id: owner.map(String::from),
+            tenant_id: tenant.map(String::from),
+        }
     }
 
     #[tokio::test]
     async fn insert_get_list_delete_round_trip() {
         let db = db().await;
-        insert(&db, &meta("id-1", "a.txt", Some("1"), None)).await.unwrap();
-        let got = get_scoped(&db, "b", "id-1", &Scope::default()).await.unwrap().unwrap();
-        assert_eq!((got.key.as_str(), got.size, got.checksum.as_str()), ("a.txt", 3, "abc123"));
-        assert_eq!(list_scoped(&db, "b", &Scope::default()).await.unwrap().len(), 1);
+        insert(&db, &meta("id-1", "a.txt", Some("1"), None))
+            .await
+            .unwrap();
+        let got = get_scoped(&db, "b", "id-1", &Scope::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (got.key.as_str(), got.size, got.checksum.as_str()),
+            ("a.txt", 3, "abc123")
+        );
+        assert_eq!(
+            list_scoped(&db, "b", &Scope::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         delete_row(&db, "b", "id-1").await.unwrap();
-        assert!(get_scoped(&db, "b", "id-1", &Scope::default()).await.unwrap().is_none());
+        assert!(
+            get_scoped(&db, "b", "id-1", &Scope::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -211,8 +265,12 @@ mod tests {
         // WHY: unique(bucket, key) is the Supabase-parity contract — a re-upload
         // to the same key must be a client 409, not a silent overwrite or a 500.
         let db = db().await;
-        insert(&db, &meta("id-1", "same.txt", None, None)).await.unwrap();
-        let err = insert(&db, &meta("id-2", "same.txt", None, None)).await.unwrap_err();
+        insert(&db, &meta("id-1", "same.txt", None, None))
+            .await
+            .unwrap();
+        let err = insert(&db, &meta("id-2", "same.txt", None, None))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "JC0409");
     }
 
@@ -222,20 +280,44 @@ mod tests {
         // foreign row must come back None (the handler's 404), and a scoped
         // list must only contain the caller's rows.
         let db = db().await;
-        insert(&db, &meta("o1", "a.txt", Some("1"), Some("10"))).await.unwrap();
-        insert(&db, &meta("o2", "b.txt", Some("2"), Some("20"))).await.unwrap();
+        insert(&db, &meta("o1", "a.txt", Some("1"), Some("10")))
+            .await
+            .unwrap();
+        insert(&db, &meta("o2", "b.txt", Some("2"), Some("20")))
+            .await
+            .unwrap();
         // Cross-owner get: None. Same-owner get: Some.
-        assert!(get_scoped(&db, "b", "o1", &scope(Some("2"), None)).await.unwrap().is_none());
-        assert!(get_scoped(&db, "b", "o1", &scope(Some("1"), None)).await.unwrap().is_some());
+        assert!(
+            get_scoped(&db, "b", "o1", &scope(Some("2"), None))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            get_scoped(&db, "b", "o1", &scope(Some("1"), None))
+                .await
+                .unwrap()
+                .is_some()
+        );
         // Cross-tenant get: None even with the right owner filter absent.
-        assert!(get_scoped(&db, "b", "o1", &scope(None, Some("20"))).await.unwrap().is_none());
+        assert!(
+            get_scoped(&db, "b", "o1", &scope(None, Some("20")))
+                .await
+                .unwrap()
+                .is_none()
+        );
         // Scoped list sees only the caller's row.
-        let mine = list_scoped(&db, "b", &scope(Some("1"), Some("10"))).await.unwrap();
+        let mine = list_scoped(&db, "b", &scope(Some("1"), Some("10")))
+            .await
+            .unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].id, "o1");
         // Unscoped (public) list sees both, ordered by key.
         let all = list_scoped(&db, "b", &Scope::default()).await.unwrap();
-        assert_eq!(all.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(), vec!["a.txt", "b.txt"]);
+        assert_eq!(
+            all.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(),
+            vec!["a.txt", "b.txt"]
+        );
     }
 
     #[test]

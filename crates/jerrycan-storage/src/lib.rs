@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod meta;
-mod sign;
-pub mod store;
 #[cfg(feature = "storage-s3")]
 mod s3_store;
+mod sign;
 #[cfg(feature = "storage-s3")]
 mod sigv4;
+pub mod store;
 #[cfg(feature = "storage-s3")]
 mod xml;
 
@@ -22,9 +22,9 @@ mod xml;
 /// apps and doc-tests without a separate `bytes` dependency.
 pub use bytes;
 pub use meta::{ObjectMeta, STORAGE_MIGRATIONS};
-pub use store::{BlobFuture, BlobStore, LocalStore, MemoryStore};
 #[cfg(feature = "storage-s3")]
 pub use s3_store::S3Store;
+pub use store::{BlobFuture, BlobStore, LocalStore, MemoryStore};
 
 /// One bucket's generated, compile-time rules. The generator emits a
 /// `const BUCKET: Bucket` per bucket module — everything here is design-derived.
@@ -48,7 +48,12 @@ impl Bucket {
         if self.allowed_mime.is_empty() {
             return true;
         }
-        let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let mime = mime
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         self.allowed_mime.iter().any(|pat| {
             let pat = pat.to_ascii_lowercase();
             if pat == "*/*" {
@@ -113,7 +118,10 @@ impl Storage {
 
     /// Any custom backend.
     pub fn with_store(store: Arc<dyn BlobStore>) -> Self {
-        Self { store, sign_key: None }
+        Self {
+            store,
+            sign_key: None,
+        }
     }
 
     /// Key the app-HMAC signed URLs (normally `JERRYCAN_SECRET` via from_env).
@@ -126,7 +134,8 @@ impl Storage {
     /// Grammar: `local:<root>` | `s3://bucket?region=<r>&endpoint=<url>`
     /// (s3 credentials from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).
     pub fn from_env() -> Result<Self> {
-        let url = std::env::var("JERRYCAN_STORAGE").unwrap_or_else(|_| "local:./storage".to_string());
+        let url =
+            std::env::var("JERRYCAN_STORAGE").unwrap_or_else(|_| "local:./storage".to_string());
         Self::from_config(&url, std::env::var("JERRYCAN_SECRET").ok().as_deref())
     }
 
@@ -179,8 +188,17 @@ impl Storage {
         if body.len() > bucket.max_size {
             return Err(Error::payload_too_large());
         }
-        let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-        let mime = if mime.is_empty() { "application/octet-stream".to_string() } else { mime };
+        let mime = mime
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let mime = if mime.is_empty() {
+            "application/octet-stream".to_string()
+        } else {
+            mime
+        };
         if !bucket.allows_mime(&mime) {
             return Err(Error::unsupported_media_type());
         }
@@ -340,14 +358,24 @@ fn now_millis() -> i64 {
 }
 
 fn unix_secs(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Build the download response: Content-Type from the metadata, `ETag` = the
 /// sha256 checksum (quoted), and a Cache-Control that is cache-friendly for
 /// public buckets and cache-hostile for private ones.
-pub fn object_response(meta: &ObjectMeta, bytes: Bytes, public: bool) -> Result<jerrycan_core::Response> {
-    let cache = if public { "public, max-age=3600" } else { "private, no-store" };
+pub fn object_response(
+    meta: &ObjectMeta,
+    bytes: Bytes,
+    public: bool,
+) -> Result<jerrycan_core::Response> {
+    let cache = if public {
+        "public, max-age=3600"
+    } else {
+        "private, no-store"
+    };
     http::Response::builder()
         .status(200)
         .header("content-type", &meta.mime)
@@ -379,18 +407,35 @@ mod tests {
     }
 
     const AVATARS: Bucket = Bucket {
-        name: "avatars", public: true, owner_prefix: false, max_size: 16, allowed_mime: &["image/*"],
+        name: "avatars",
+        public: true,
+        owner_prefix: false,
+        max_size: 16,
+        allowed_mime: &["image/*"],
     };
     const INVOICES: Bucket = Bucket {
-        name: "invoices", public: false, owner_prefix: true, max_size: 1024, allowed_mime: &[],
+        name: "invoices",
+        public: false,
+        owner_prefix: true,
+        max_size: 1024,
+        allowed_mime: &[],
     };
 
     fn owner(id: &str) -> Scope {
-        Scope { owner_id: Some(id.to_string()), tenant_id: None }
+        Scope {
+            owner_id: Some(id.to_string()),
+            tenant_id: None,
+        }
     }
 
     fn bucket(allowed: &'static [&'static str]) -> Bucket {
-        Bucket { name: "b", public: false, owner_prefix: false, max_size: 1024, allowed_mime: allowed }
+        Bucket {
+            name: "b",
+            public: false,
+            owner_prefix: false,
+            max_size: 1024,
+            allowed_mime: allowed,
+        }
     }
 
     #[test]
@@ -407,9 +452,15 @@ mod tests {
         assert!(b.allows_mime("image/png"));
         assert!(b.allows_mime("IMAGE/JPEG"), "case-insensitive");
         assert!(b.allows_mime("application/pdf"));
-        assert!(b.allows_mime("application/pdf; charset=binary"), "parameters stripped");
+        assert!(
+            b.allows_mime("application/pdf; charset=binary"),
+            "parameters stripped"
+        );
         assert!(!b.allows_mime("text/plain"));
-        assert!(!b.allows_mime("imagex/png"), "prefix must be a whole type segment");
+        assert!(
+            !b.allows_mime("imagex/png"),
+            "prefix must be a whole type segment"
+        );
         assert!(!b.allows_mime("application/pdfx"), "exact match is exact");
         assert!(bucket(&["*/*"]).allows_mime("anything/at-all"));
     }
@@ -424,7 +475,8 @@ mod tests {
         assert!(err.message().contains("JERRYCAN_STORAGE"), "{err}");
         #[cfg(not(feature = "storage-s3"))]
         {
-            let err = Storage::from_config("s3://bucket?region=us-east-1", Some(SECRET)).unwrap_err();
+            let err =
+                Storage::from_config("s3://bucket?region=us-east-1", Some(SECRET)).unwrap_err();
             assert!(err.message().contains("storage-s3"), "{err}");
         }
     }
@@ -434,16 +486,49 @@ mod tests {
         let db = db().await;
         let s = Storage::memory().with_sign_secret(SECRET);
         // Disallowed mime → 415 JC0415.
-        let err = s.put_object(&db, &AVATARS, &owner("1"), "a.txt", "text/plain", Bytes::from_static(b"x")).await.unwrap_err();
+        let err = s
+            .put_object(
+                &db,
+                &AVATARS,
+                &owner("1"),
+                "a.txt",
+                "text/plain",
+                Bytes::from_static(b"x"),
+            )
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "JC0415");
         // Oversize → 413 JC0413 (max_size 16).
-        let err = s.put_object(&db, &AVATARS, &owner("1"), "big.png", "image/png", Bytes::from(vec![0u8; 17])).await.unwrap_err();
+        let err = s
+            .put_object(
+                &db,
+                &AVATARS,
+                &owner("1"),
+                "big.png",
+                "image/png",
+                Bytes::from(vec![0u8; 17]),
+            )
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "JC0413");
         // Happy path: checksum is the sha256 hex; owner is stamped.
-        let meta = s.put_object(&db, &AVATARS, &owner("1"), "a.png", "image/png", Bytes::from_static(b"png-bytes")).await.unwrap();
+        let meta = s
+            .put_object(
+                &db,
+                &AVATARS,
+                &owner("1"),
+                "a.png",
+                "image/png",
+                Bytes::from_static(b"png-bytes"),
+            )
+            .await
+            .unwrap();
         assert_eq!(meta.owner_id.as_deref(), Some("1"));
         assert_eq!(meta.size, 9);
-        assert_eq!(meta.checksum, sign::hex(&<sha2::Sha256 as sha2::Digest>::digest(b"png-bytes")));
+        assert_eq!(
+            meta.checksum,
+            sign::hex(&<sha2::Sha256 as sha2::Digest>::digest(b"png-bytes"))
+        );
         // Round trip through the store.
         let (got, bytes) = s.get_object(&db, &AVATARS, None, &meta.id).await.unwrap();
         assert_eq!(bytes, Bytes::from_static(b"png-bytes"));
@@ -456,27 +541,91 @@ mod tests {
         // mechanical — B must never read/delete under A's prefix.
         let db = db().await;
         let s = Storage::memory().with_sign_secret(SECRET);
-        let meta = s.put_object(&db, &INVOICES, &owner("1"), "inv.pdf", "application/pdf", Bytes::from_static(b"pdf")).await.unwrap();
-        assert_eq!(meta.key, "1/inv.pdf", "key is stored under the owner prefix");
+        let meta = s
+            .put_object(
+                &db,
+                &INVOICES,
+                &owner("1"),
+                "inv.pdf",
+                "application/pdf",
+                Bytes::from_static(b"pdf"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            meta.key, "1/inv.pdf",
+            "key is stored under the owner prefix"
+        );
         // Same relative key from owner 2: a distinct object, no collision.
-        let meta2 = s.put_object(&db, &INVOICES, &owner("2"), "inv.pdf", "application/pdf", Bytes::from_static(b"pdf")).await.unwrap();
+        let meta2 = s
+            .put_object(
+                &db,
+                &INVOICES,
+                &owner("2"),
+                "inv.pdf",
+                "application/pdf",
+                Bytes::from_static(b"pdf"),
+            )
+            .await
+            .unwrap();
         assert_eq!(meta2.key, "2/inv.pdf");
         // Cross-owner read/delete: 404, and the row survives.
-        assert_eq!(s.get_object(&db, &INVOICES, Some(&owner("2")), &meta.id).await.unwrap_err().code(), "JC0404");
-        assert_eq!(s.delete_object(&db, &INVOICES, &owner("2"), &meta.id).await.unwrap_err().code(), "JC0404");
-        assert!(s.get_object(&db, &INVOICES, Some(&owner("1")), &meta.id).await.is_ok(), "owner still reads their object");
+        assert_eq!(
+            s.get_object(&db, &INVOICES, Some(&owner("2")), &meta.id)
+                .await
+                .unwrap_err()
+                .code(),
+            "JC0404"
+        );
+        assert_eq!(
+            s.delete_object(&db, &INVOICES, &owner("2"), &meta.id)
+                .await
+                .unwrap_err()
+                .code(),
+            "JC0404"
+        );
+        assert!(
+            s.get_object(&db, &INVOICES, Some(&owner("1")), &meta.id)
+                .await
+                .is_ok(),
+            "owner still reads their object"
+        );
         // Scoped list: owner 1 sees only their object.
-        let mine = s.list_objects(&db, &INVOICES, Some(&owner("1"))).await.unwrap();
-        assert_eq!(mine.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(), vec!["1/inv.pdf"]);
+        let mine = s
+            .list_objects(&db, &INVOICES, Some(&owner("1")))
+            .await
+            .unwrap();
+        assert_eq!(
+            mine.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(),
+            vec!["1/inv.pdf"]
+        );
     }
 
     #[tokio::test]
     async fn delete_removes_row_and_bytes() {
         let db = db().await;
         let s = Storage::memory().with_sign_secret(SECRET);
-        let meta = s.put_object(&db, &INVOICES, &owner("1"), "x.bin", "application/octet-stream", Bytes::from_static(b"x")).await.unwrap();
-        s.delete_object(&db, &INVOICES, &owner("1"), &meta.id).await.unwrap();
-        assert_eq!(s.get_object(&db, &INVOICES, Some(&owner("1")), &meta.id).await.unwrap_err().code(), "JC0404");
+        let meta = s
+            .put_object(
+                &db,
+                &INVOICES,
+                &owner("1"),
+                "x.bin",
+                "application/octet-stream",
+                Bytes::from_static(b"x"),
+            )
+            .await
+            .unwrap();
+        s.delete_object(&db, &INVOICES, &owner("1"), &meta.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_object(&db, &INVOICES, Some(&owner("1")), &meta.id)
+                .await
+                .unwrap_err()
+                .code(),
+            "JC0404"
+        );
     }
 
     #[test]
@@ -484,15 +633,28 @@ mod tests {
         // WHY: public GETs must be cache-friendly (spec: ETag + Cache-Control);
         // private responses must never be cached by shared caches.
         let meta = ObjectMeta {
-            id: "i".into(), bucket: "b".into(), key: "k".into(), owner_id: None, tenant_id: None,
-            size: 1, mime: "image/png".into(), checksum: "deadbeef".into(), created_at: 0,
+            id: "i".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            owner_id: None,
+            tenant_id: None,
+            size: 1,
+            mime: "image/png".into(),
+            checksum: "deadbeef".into(),
+            created_at: 0,
         };
         let public = object_response(&meta, Bytes::from_static(b"x"), true).unwrap();
         assert_eq!(public.headers().get("etag").unwrap(), "\"deadbeef\"");
         assert_eq!(public.headers().get("content-type").unwrap(), "image/png");
-        assert_eq!(public.headers().get("cache-control").unwrap(), "public, max-age=3600");
+        assert_eq!(
+            public.headers().get("cache-control").unwrap(),
+            "public, max-age=3600"
+        );
         let private = object_response(&meta, Bytes::from_static(b"x"), false).unwrap();
-        assert_eq!(private.headers().get("cache-control").unwrap(), "private, no-store");
+        assert_eq!(
+            private.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
     }
 
     #[tokio::test]
@@ -519,11 +681,28 @@ mod tests {
         // session (that is the whole point of a signed URL).
         let db = db().await;
         let s = Storage::memory().with_sign_secret(SECRET);
-        let meta = s.put_object(&db, &INVOICES, &owner("1"), "inv.pdf", "application/pdf", Bytes::from_static(b"pdf")).await.unwrap();
+        let meta = s
+            .put_object(
+                &db,
+                &INVOICES,
+                &owner("1"),
+                "inv.pdf",
+                "application/pdf",
+                Bytes::from_static(b"pdf"),
+            )
+            .await
+            .unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let signed = s.sign_object(&db, &INVOICES, &owner("1"), &meta.id, 300, now).await.unwrap();
+        let signed = s
+            .sign_object(&db, &INVOICES, &owner("1"), &meta.id, 300, now)
+            .await
+            .unwrap();
         assert_eq!(signed.expires_at, 1_300);
-        assert!(signed.url.starts_with("/invoices/"), "app-HMAC fallback URL: {}", signed.url);
+        assert!(
+            signed.url.starts_with("/invoices/"),
+            "app-HMAC fallback URL: {}",
+            signed.url
+        );
         // Parse exp/sig back out of the URL and redeem it.
         let query = signed.url.split_once('?').unwrap().1;
         let mut exp = 0u64;
@@ -535,13 +714,28 @@ mod tests {
                 _ => {}
             }
         }
-        let (got, bytes) = s.get_signed(&db, &INVOICES, &meta.id, exp, &sig, now).await.unwrap();
+        let (got, bytes) = s
+            .get_signed(&db, &INVOICES, &meta.id, exp, &sig, now)
+            .await
+            .unwrap();
         assert_eq!(got.id, meta.id);
         assert_eq!(bytes, Bytes::from_static(b"pdf"));
         // Tampered sig and expired URL are 401 — an invalid credential.
-        assert_eq!(s.get_signed(&db, &INVOICES, &meta.id, exp, "00aa", now).await.unwrap_err().code(), "JC0401");
+        assert_eq!(
+            s.get_signed(&db, &INVOICES, &meta.id, exp, "00aa", now)
+                .await
+                .unwrap_err()
+                .code(),
+            "JC0401"
+        );
         let later = now + Duration::from_secs(9_999);
-        assert_eq!(s.get_signed(&db, &INVOICES, &meta.id, exp, &sig, later).await.unwrap_err().code(), "JC0401");
+        assert_eq!(
+            s.get_signed(&db, &INVOICES, &meta.id, exp, &sig, later)
+                .await
+                .unwrap_err()
+                .code(),
+            "JC0401"
+        );
     }
 
     #[tokio::test]
@@ -550,11 +744,27 @@ mod tests {
         // a URL for a foreign object, nor stretch the TTL beyond the cap.
         let db = db().await;
         let s = Storage::memory().with_sign_secret(SECRET);
-        let meta = s.put_object(&db, &INVOICES, &owner("1"), "inv.pdf", "application/pdf", Bytes::from_static(b"p")).await.unwrap();
+        let meta = s
+            .put_object(
+                &db,
+                &INVOICES,
+                &owner("1"),
+                "inv.pdf",
+                "application/pdf",
+                Bytes::from_static(b"p"),
+            )
+            .await
+            .unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let err = s.sign_object(&db, &INVOICES, &owner("2"), &meta.id, 300, now).await.unwrap_err();
+        let err = s
+            .sign_object(&db, &INVOICES, &owner("2"), &meta.id, 300, now)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "JC0404", "cross-owner sign is a 404");
-        let capped = s.sign_object(&db, &INVOICES, &owner("1"), &meta.id, 999_999, now).await.unwrap();
+        let capped = s
+            .sign_object(&db, &INVOICES, &owner("1"), &meta.id, 999_999, now)
+            .await
+            .unwrap();
         assert_eq!(capped.expires_at, 1_000 + 86_400, "TTL clamps to 24h");
     }
 
@@ -562,9 +772,22 @@ mod tests {
     async fn sign_without_secret_fails_loud() {
         let db = db().await;
         let s = Storage::memory(); // no sign secret
-        let meta = s.put_object(&db, &INVOICES, &owner("1"), "a.bin", "application/octet-stream", Bytes::from_static(b"x")).await.unwrap();
+        let meta = s
+            .put_object(
+                &db,
+                &INVOICES,
+                &owner("1"),
+                "a.bin",
+                "application/octet-stream",
+                Bytes::from_static(b"x"),
+            )
+            .await
+            .unwrap();
         let now = SystemTime::now();
-        let err = s.sign_object(&db, &INVOICES, &owner("1"), &meta.id, 300, now).await.unwrap_err();
+        let err = s
+            .sign_object(&db, &INVOICES, &owner("1"), &meta.id, 300, now)
+            .await
+            .unwrap_err();
         assert!(err.message().contains("JERRYCAN_SECRET"), "{err}");
     }
 }

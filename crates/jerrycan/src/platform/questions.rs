@@ -432,7 +432,10 @@ pub fn validate(d: &Design) -> Vec<Question> {
             if !seen_buckets.insert(b.name.as_str()) {
                 qs.push(q(
                     format!("{bptr}/name"),
-                    format!("Bucket name `{}` is already used — bucket names must be unique.", b.name),
+                    format!(
+                        "Bucket name `{}` is already used — bucket names must be unique.",
+                        b.name
+                    ),
                 ));
             }
             if module_mounts.contains(&format!("/{}", b.name)) {
@@ -460,21 +463,29 @@ pub fn validate(d: &Design) -> Vec<Question> {
             {
                 qs.push(q(
                     format!("{bptr}/max_size"),
-                    format!("max_size `{max}` is not a size — use ^[0-9]+(B|KB|MB|GB)?$ (e.g. \"5MB\")."),
+                    format!(
+                        "max_size `{max}` is not a size — use ^[0-9]+(B|KB|MB|GB)?$ (e.g. \"5MB\")."
+                    ),
                 ));
             }
             for (j, m) in b.allowed_mime.iter().enumerate() {
                 let well_formed = m.split_once('/').is_some_and(|(t, sub)| {
                     let seg_ok = |s: &str| {
                         !s.is_empty()
-                            && s.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'+' | b'-'))
+                            && s.bytes().all(|c| {
+                                c.is_ascii_lowercase()
+                                    || c.is_ascii_digit()
+                                    || matches!(c, b'.' | b'+' | b'-')
+                            })
                     };
                     (seg_ok(t) || t == "*") && (seg_ok(sub) || sub == "*")
                 });
                 if !well_formed {
                     qs.push(q(
                         format!("{bptr}/allowed_mime/{j}"),
-                        format!("`{m}` is not a mime pattern — use type/subtype or type/* (lowercase)."),
+                        format!(
+                            "`{m}` is not a mime pattern — use type/subtype or type/* (lowercase)."
+                        ),
                     ));
                 }
             }

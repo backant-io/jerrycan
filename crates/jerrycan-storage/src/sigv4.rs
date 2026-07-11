@@ -39,7 +39,9 @@ pub(crate) fn uri_encode(s: &str, keep_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b'/' if keep_slash => out.push('/'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -82,7 +84,11 @@ pub(crate) fn authorization(
         .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
         .collect();
     hdrs.sort();
-    let signed_headers = hdrs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let signed_headers = hdrs
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
     let canonical_headers: String = hdrs.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
     let canonical_request = format!(
         "{method}\n{canonical_path}\n{}\n{canonical_headers}\n{signed_headers}\n{payload_sha256_hex}",
@@ -114,10 +120,16 @@ pub(crate) fn presign_url(
 ) -> String {
     let date = &datetime[..8];
     let scope = format!("{date}/{}/s3/aws4_request", creds.region);
-    let host = endpoint.split_once("://").map(|(_, rest)| rest).unwrap_or(endpoint);
+    let host = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
     let query: Vec<(String, String)> = vec![
         ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
-        ("X-Amz-Credential".into(), format!("{}/{scope}", creds.access_key)),
+        (
+            "X-Amz-Credential".into(),
+            format!("{}/{scope}", creds.access_key),
+        ),
         ("X-Amz-Date".into(), datetime.into()),
         ("X-Amz-Expires".into(), ttl_secs.to_string()),
         ("X-Amz-SignedHeaders".into(), "host".into()),
@@ -171,9 +183,15 @@ mod tests {
             "iam",
             "GET",
             "/",
-            &[("Action".into(), "ListUsers".into()), ("Version".into(), "2010-05-08".into())],
             &[
-                ("content-type".into(), "application/x-www-form-urlencoded; charset=utf-8".into()),
+                ("Action".into(), "ListUsers".into()),
+                ("Version".into(), "2010-05-08".into()),
+            ],
+            &[
+                (
+                    "content-type".into(),
+                    "application/x-www-form-urlencoded; charset=utf-8".into(),
+                ),
                 ("host".into(), "iam.amazonaws.com".into()),
                 ("x-amz-date".into(), "20150830T123600Z".into()),
             ],
@@ -184,7 +202,10 @@ mod tests {
         // this signs hashes to AWS's own documented value
         // f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59,
         // which pins this signature (and the signing key above) to the real vector.
-        assert_eq!(signature, "33f5dad2191de0cb4b7ab912f876876c2c4f72e2991a458f9499233c7b992438");
+        assert_eq!(
+            signature,
+            "33f5dad2191de0cb4b7ab912f876876c2c4f72e2991a458f9499233c7b992438"
+        );
         assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature="), "{auth}");
     }
 
@@ -201,8 +222,20 @@ mod tests {
             secret_key: SECRET.into(),
             region: "us-east-1".into(),
         };
-        let a = presign_url(&creds, "https://s3.us-east-1.amazonaws.com", "/bkt/app/k.png", 300, "20150830T123600Z");
-        let b = presign_url(&creds, "https://s3.us-east-1.amazonaws.com", "/bkt/app/k.png", 300, "20150830T123600Z");
+        let a = presign_url(
+            &creds,
+            "https://s3.us-east-1.amazonaws.com",
+            "/bkt/app/k.png",
+            300,
+            "20150830T123600Z",
+        );
+        let b = presign_url(
+            &creds,
+            "https://s3.us-east-1.amazonaws.com",
+            "/bkt/app/k.png",
+            300,
+            "20150830T123600Z",
+        );
         assert_eq!(a, b, "presigning is deterministic for a fixed instant");
         for needle in [
             "X-Amz-Algorithm=AWS4-HMAC-SHA256",

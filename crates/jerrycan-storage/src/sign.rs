@@ -41,7 +41,9 @@ fn mac_for(key: &[u8], bucket: &str, object_id: &str, exp_unix: u64) -> HmacSha2
 
 /// The hex signature for `/<bucket>/<object_id>?exp=<exp_unix>&sig=…`.
 pub(crate) fn sign(key: &[u8], bucket: &str, object_id: &str, exp_unix: u64) -> String {
-    hex(&mac_for(key, bucket, object_id, exp_unix).finalize().into_bytes())
+    hex(&mac_for(key, bucket, object_id, exp_unix)
+        .finalize()
+        .into_bytes())
 }
 
 /// Verify a presented signature: unexpired (`now < exp`) and a constant-time
@@ -60,7 +62,9 @@ pub(crate) fn verify(
     let Some(sig) = unhex(sig_hex) else {
         return false;
     };
-    mac_for(key, bucket, object_id, exp_unix).verify_slice(&sig).is_ok()
+    mac_for(key, bucket, object_id, exp_unix)
+        .verify_slice(&sig)
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -74,9 +78,18 @@ mod tests {
         // WHY: the signed URL is the ONLY credential a download carries — it
         // must verify before expiry and hard-fail after (no grace).
         let sig = sign(KEY, "avatars", "obj-1", 1_000);
-        assert!(verify(KEY, "avatars", "obj-1", 1_000, &sig, 999), "valid before expiry");
-        assert!(!verify(KEY, "avatars", "obj-1", 1_000, &sig, 1_000), "exp is exclusive");
-        assert!(!verify(KEY, "avatars", "obj-1", 1_000, &sig, 2_000), "expired");
+        assert!(
+            verify(KEY, "avatars", "obj-1", 1_000, &sig, 999),
+            "valid before expiry"
+        );
+        assert!(
+            !verify(KEY, "avatars", "obj-1", 1_000, &sig, 1_000),
+            "exp is exclusive"
+        );
+        assert!(
+            !verify(KEY, "avatars", "obj-1", 1_000, &sig, 2_000),
+            "expired"
+        );
     }
 
     #[test]
@@ -88,7 +101,10 @@ mod tests {
         assert!(!verify(KEY, "avatars", "obj-2", 1_000, &sig, 1));
         assert!(!verify(KEY, "avatars", "obj-1", 9_000, &sig, 1));
         assert!(!verify(b"other-key", "avatars", "obj-1", 1_000, &sig, 1));
-        assert!(!verify(KEY, "avatars", "obj-1", 1_000, "zz-not-hex", 1), "junk sig is false, not a panic");
+        assert!(
+            !verify(KEY, "avatars", "obj-1", 1_000, "zz-not-hex", 1),
+            "junk sig is false, not a panic"
+        );
         let truncated = &sig[..sig.len() - 2];
         assert!(!verify(KEY, "avatars", "obj-1", 1_000, truncated, 1));
     }

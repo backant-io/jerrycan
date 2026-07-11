@@ -398,7 +398,9 @@ mod tests {
         // URL — the handler needs optional extraction instead of a hard 401
         // from the extractor. Option<T> is None on ANY extraction failure.
         #[derive(serde::Deserialize)]
-        struct P { n: i64 }
+        struct P {
+            n: i64,
+        }
         async fn probe(q: Option<Query<P>>) -> Result<Json<Option<i64>>> {
             Ok(Json(q.map(|Query(p)| p.n)))
         }

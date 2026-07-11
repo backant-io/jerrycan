@@ -70,15 +70,27 @@ mod tests {
 <Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>a.png</Key><RequestId>ABC123</RequestId><HostId>host==</HostId></Error>"#;
         assert_eq!(
             parse_error(aws),
-            Some(("NoSuchKey".into(), "The specified key does not exist.".into()))
+            Some((
+                "NoSuchKey".into(),
+                "The specified key does not exist.".into()
+            ))
         );
         // MinIO (adds BucketName/Resource/Region).
         let minio = br#"<?xml version="1.0" encoding="UTF-8"?>
 <Error><Code>AccessDenied</Code><Message>Access Denied.</Message><BucketName>jc</BucketName><Resource>/jc/x</Resource><RequestId>17</RequestId><HostId>h</HostId></Error>"#;
-        assert_eq!(parse_error(minio), Some(("AccessDenied".into(), "Access Denied.".into())));
+        assert_eq!(
+            parse_error(minio),
+            Some(("AccessDenied".into(), "Access Denied.".into()))
+        );
         // R2 (minimal body, no xml declaration).
         let r2 = br#"<Error><Code>InternalError</Code><Message>We encountered an internal error.</Message></Error>"#;
-        assert_eq!(parse_error(r2), Some(("InternalError".into(), "We encountered an internal error.".into())));
+        assert_eq!(
+            parse_error(r2),
+            Some((
+                "InternalError".into(),
+                "We encountered an internal error.".into()
+            ))
+        );
         // Not an error document at all → None (caller falls back to status text).
         assert_eq!(parse_error(b"not xml"), None);
         assert_eq!(parse_error(b"<Ok/>"), None);
@@ -93,6 +105,9 @@ mod tests {
         let bare = br#"<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><UploadId>u-1</UploadId></InitiateMultipartUploadResult>"#;
         assert_eq!(parse_upload_id(bare).unwrap(), "u-1");
         // A body with no UploadId is a loud error, never an empty string.
-        assert!(parse_upload_id(b"<InitiateMultipartUploadResult></InitiateMultipartUploadResult>").is_err());
+        assert!(
+            parse_upload_id(b"<InitiateMultipartUploadResult></InitiateMultipartUploadResult>")
+                .is_err()
+        );
     }
 }
