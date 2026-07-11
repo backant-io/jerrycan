@@ -20,7 +20,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 /// Strict lowercase/uppercase hex decode; `None` on odd length or a non-hex char.
 pub(crate) fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let b = s.as_bytes();

@@ -64,6 +64,9 @@ fn canonical_query(query: &[(String, String)]) -> String {
 /// The Authorization header + raw signature for a header-signed request.
 /// `headers` must already contain `host` (and, for S3, `x-amz-date` +
 /// `x-amz-content-sha256`); names are lowercased and sorted here.
+// SigV4 is defined over exactly these request components; bundling them into a
+// struct would only hide the canonicalization contract this signature encodes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn authorization(
     creds: &Credentials,
     service: &str,
