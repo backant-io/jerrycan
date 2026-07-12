@@ -117,7 +117,9 @@ mod tests {
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Sess {
-        user_id: i64,
+        // Stringified pk (mirrors storage's TEXT owner_id): the identity round-trips
+        // whether the app's user pk is an integer or a uuid.
+        user_id: String,
         role: String,
     }
 
@@ -133,7 +135,7 @@ mod tests {
         let s = store();
         let token = s
             .encode(&Sess {
-                user_id: 7,
+                user_id: "7".into(),
                 role: "admin".into(),
             })
             .unwrap();
@@ -141,7 +143,7 @@ mod tests {
         assert_eq!(
             back,
             Sess {
-                user_id: 7,
+                user_id: "7".into(),
                 role: "admin".into()
             }
         );
@@ -152,13 +154,13 @@ mod tests {
         let s = store();
         let a = s
             .encode(&Sess {
-                user_id: 1,
+                user_id: "1".into(),
                 role: "u".into(),
             })
             .unwrap();
         let b = s
             .encode(&Sess {
-                user_id: 1,
+                user_id: "1".into(),
                 role: "u".into(),
             })
             .unwrap();
@@ -171,7 +173,7 @@ mod tests {
         let s = store();
         let mut token = s
             .encode(&Sess {
-                user_id: 1,
+                user_id: "1".into(),
                 role: "u".into(),
             })
             .unwrap();
@@ -190,7 +192,7 @@ mod tests {
         let a = store();
         let token = a
             .encode(&Sess {
-                user_id: 1,
+                user_id: "1".into(),
                 role: "u".into(),
             })
             .unwrap();
@@ -206,7 +208,7 @@ mod tests {
         let s = store();
         let set = s
             .set_cookie(&Sess {
-                user_id: 1,
+                user_id: "1".into(),
                 role: "u".into(),
             })
             .unwrap();
@@ -233,7 +235,7 @@ mod tests {
 
     fn sample() -> Sess {
         Sess {
-            user_id: 42,
+            user_id: "42".into(),
             role: "user".into(),
         }
     }

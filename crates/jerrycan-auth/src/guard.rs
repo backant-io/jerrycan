@@ -56,14 +56,15 @@ mod tests {
 
     #[derive(Serialize, Deserialize, Clone)]
     struct User {
-        id: i64,
+        // Stringified pk (mirrors storage's TEXT owner_id) so a uuid user id works.
+        id: String,
         role: String,
     }
 
     async fn login(auth: Dep<Auth>) -> Result<jerrycan_core::Response> {
         // Issue a session cookie for a fixed user (test login).
         let cookie = auth.sessions().set_cookie(&User {
-            id: 1,
+            id: "1".into(),
             role: "admin".into(),
         })?;
         let mut res = jerrycan_core::IntoResponse::into_response("ok");
@@ -74,7 +75,7 @@ mod tests {
         Ok(res)
     }
 
-    async fn whoami(Session(user): Session<User>) -> Json<i64> {
+    async fn whoami(Session(user): Session<User>) -> Json<String> {
         Json(user.id)
     }
 
@@ -102,7 +103,7 @@ mod tests {
         let cookie = set_cookie.split(';').next().unwrap().to_string(); // jerrycan_session=...
         let res = t.get_with("/me", &[("cookie", &cookie)]).await;
         assert_eq!(res.status(), jerrycan_core::http::StatusCode::OK);
-        assert_eq!(res.json::<i64>(), 1);
+        assert_eq!(res.json::<String>(), "1");
     }
 
     #[tokio::test]
