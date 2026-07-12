@@ -139,7 +139,7 @@ impl Storage {
         Self::from_config(&url, std::env::var("JERRYCAN_SECRET").ok().as_deref())
     }
 
-    /// The pure core of [`from_env`] (testable without touching the process env).
+    /// The pure core of [`Self::from_env`] (testable without touching the process env).
     pub fn from_config(url: &str, secret: Option<&str>) -> Result<Self> {
         let storage = if let Some(root) = url.strip_prefix("local:") {
             Self::local(root)
