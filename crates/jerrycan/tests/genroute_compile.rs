@@ -360,6 +360,148 @@ fn generated_jobs_crate_passes_strict_clippy() {
     }
 }
 
+/// A contract-v2 STORAGE design covering all four bucket scope variants:
+/// `avatars` = public + owner User (plain user scope), `invoices` = private +
+/// owner Org (the tenancy entity) + owner_prefix (tenant scope), `exports` =
+/// private + no owner (unowned), `reports` = private + owner Member where
+/// Member belongs_to Org (user-in-tenant scope).
+const STORAGE_MINIMAL: &str = r#"{
+    "name": "files-app", "contract_version": 2,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+    "storage": { "buckets": [
+        { "name": "avatars", "visibility": "public", "owner": "User",
+          "max_size": "1MB", "allowed_mime": ["image/*"] },
+        { "name": "invoices", "visibility": "private", "owner": "Org",
+          "owner_prefix": true, "max_size": "1MB" },
+        { "name": "exports", "visibility": "private" },
+        { "name": "reports", "visibility": "private", "owner": "Member" }
+    ]},
+    "modules": [
+        { "name": "orgs",
+          "entities": [
+              { "name": "Org", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "plan", "type": "string" } ] },
+              { "name": "User", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "email", "type": "string" } ] },
+              { "name": "Member", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "nick", "type": "string" } ],
+                "belongs_to": [{ "entity": "Org" }] }
+          ],
+          "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Org", "list": true } }] }
+    ]
+}"#;
+
+/// THE storage compile gate (review 2026-07-11 finding: nothing in-repo proved
+/// the generated storage code COMPILES — only substring unit tests existed).
+/// Scaffolds a real storage app via the jerrycan binary (all four bucket scope
+/// variants), then requires the generated `storage` crate to pass strict
+/// clippy AND its own generated acceptance + isolation test battery.
+#[test]
+#[ignore = "scaffolds a storage app and invokes cargo on it; run with --include-ignored"]
+fn generated_storage_crate_passes_strict_clippy_and_its_acceptance_tests() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("files-app");
+
+    let design: Design = serde_json::from_str(STORAGE_MINIMAL).expect("STORAGE_MINIMAL parses");
+    assert!(design.wants_storage(), "design must declare buckets");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, STORAGE_MINIMAL);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(
+        status.success(),
+        "jerrycan new must scaffold the storage app"
+    );
+
+    // Sanity: each scope variant emitted its distinguishing guard signature.
+    let read = |rel: &str| {
+        fs::read_to_string(app.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    };
+    let avatars = read("crates/storage/src/avatars.rs");
+    assert!(
+        avatars.contains("user: CurrentUser,") && !avatars.contains("Tenant"),
+        "avatars is the plain user scope:\n{avatars}"
+    );
+    let invoices = read("crates/storage/src/invoices.rs");
+    assert!(
+        invoices.contains("tenant: Dep<Tenant>,") && invoices.contains("owner_prefix: true"),
+        "invoices is the tenant + prefix scope:\n{invoices}"
+    );
+    let exports = read("crates/storage/src/exports.rs");
+    assert!(
+        exports.contains("_user: CurrentUser,") && exports.contains("Scope::default()"),
+        "exports is the unowned scope:\n{exports}"
+    );
+    let reports = read("crates/storage/src/reports.rs");
+    assert!(
+        reports.contains("user: CurrentUser, tenant: Dep<Tenant>,"),
+        "reports is the user-in-tenant scope:\n{reports}"
+    );
+    assert!(
+        app.join("crates/storage/tests/acceptance.rs").is_file(),
+        "the generated acceptance battery must exist"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // Gate 1: strict clippy over the generated storage crate — all targets,
+    // so the acceptance tests must COMPILE under -D warnings too.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "storage",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "generated storage crate failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    // Gate 2: the generated acceptance + isolation tests must PASS — they are
+    // the per-bucket security contract (cross-owner/tenant/prefix negative
+    // controls), generated as real tests, not stubs.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args(["test", "-p", "storage"])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo test");
+    if !output.status.success() {
+        panic!(
+            "generated storage acceptance tests failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");
