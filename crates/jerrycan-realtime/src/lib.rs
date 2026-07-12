@@ -654,3 +654,129 @@ mod tests {
         assert_eq!(Realtime::builder().mount, "/realtime");
     }
 }
+
+/// Socket-seam scope-filter tests: the sqlite loopback (`tests/ws_live.rs`)
+/// cannot exercise Changes (they require Postgres), so the security pillar at
+/// the actual delivery seam — `deliver_change` routing to real per-connection
+/// queues — is proven here in-process. A regression in the wiring that CALLS
+/// the pure filter (wrong principal, dropped filter, mis-routed delete) turns
+/// these red even though `channel.rs`'s pure-function controls stay green.
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use crate::changes::{ChangeEvent, ChangeOp};
+    use crate::channel::ChannelId;
+    use crate::protocol::ServerMsg;
+
+    fn hub_with_lead() -> Arc<Hub> {
+        let config = RealtimeConfig {
+            changes: vec![ChangeChannelSpec {
+                entity: "Lead".into(),
+                table: "lead".into(),
+                pk_column: "id".into(),
+                tenant_column: Some("workspace_id".into()),
+            }],
+            ..Default::default()
+        };
+        Arc::new(Hub {
+            config,
+            node_id: 1,
+            bus: bus::AnyBus::Local(bus::LocalBus::new()),
+            db: None,
+            conns: Mutex::new(HashMap::new()),
+            presence: Mutex::new(presence::PresenceMap::default()),
+            changes_unavailable: std::sync::atomic::AtomicBool::new(false),
+            next_conn: AtomicU64::new(1),
+        })
+    }
+
+    fn tenant(id: &str) -> Option<Principal> {
+        Some(Principal {
+            user_id: "u".into(),
+            tenant_id: Some(id.into()),
+            role: None,
+        })
+    }
+
+    fn join_changes(hub: &Arc<Hub>, conn: u64) {
+        hub.conns
+            .lock()
+            .unwrap()
+            .get_mut(&conn)
+            .unwrap()
+            .channels
+            .insert(ChannelId::Changes("Lead".into()));
+    }
+
+    /// THE socket-level negative control: an insert in tenant t2 reaches a t2
+    /// subscriber and NEVER a t1 subscriber joined to the same channel.
+    #[test]
+    fn deliver_change_delivers_only_to_the_owning_tenant() {
+        let hub = hub_with_lead();
+        let (c1, mut rx1) = hub.connect(tenant("t1"));
+        let (c2, mut rx2) = hub.connect(tenant("t2"));
+        join_changes(&hub, c1);
+        join_changes(&hub, c2);
+
+        hub.deliver_change(&ChangeEvent {
+            entity: "Lead".into(),
+            op: ChangeOp::Insert,
+            pk: "42".into(),
+            row: Some(serde_json::json!({"id":"42","workspace_id":"t2","secret":"x"})),
+            tenant_id: Some("t2".into()),
+            old_tenant_id: None,
+        });
+
+        match rx2.try_recv() {
+            Ok(ServerMsg::Event { channel, payload }) => {
+                assert_eq!(channel, "changes:Lead");
+                assert_eq!(payload["type"], "insert");
+                assert_eq!(payload["row"]["secret"], "x");
+            }
+            other => panic!("t2 must receive its own tenant's insert: {other:?}"),
+        }
+        assert!(
+            rx1.try_recv().is_err(),
+            "t1 (other tenant) must receive NOTHING — cross-tenant leak at the seam"
+        );
+    }
+
+    /// A tenant move t1→t2 at the seam: the old tenant gets a delete-shaped view
+    /// with NO row body; the new tenant gets the update WITH the body.
+    #[test]
+    fn deliver_change_tenant_move_splits_delete_to_old_update_to_new() {
+        let hub = hub_with_lead();
+        let (c1, mut rx1) = hub.connect(tenant("t1"));
+        let (c2, mut rx2) = hub.connect(tenant("t2"));
+        join_changes(&hub, c1);
+        join_changes(&hub, c2);
+
+        hub.deliver_change(&ChangeEvent {
+            entity: "Lead".into(),
+            op: ChangeOp::Update,
+            pk: "42".into(),
+            row: Some(serde_json::json!({"id":"42","workspace_id":"t2","secret":"s"})),
+            tenant_id: Some("t2".into()),
+            old_tenant_id: Some("t1".into()),
+        });
+
+        match rx1.try_recv() {
+            Ok(ServerMsg::Event { payload, .. }) => {
+                assert_eq!(payload["type"], "delete");
+                assert_eq!(payload["pk"], "42");
+                assert!(
+                    payload.get("row").is_none(),
+                    "old tenant must NOT receive the row body: {payload}"
+                );
+            }
+            other => panic!("old tenant gets a delete-shaped view: {other:?}"),
+        }
+        match rx2.try_recv() {
+            Ok(ServerMsg::Event { payload, .. }) => {
+                assert_eq!(payload["type"], "update");
+                assert_eq!(payload["row"]["secret"], "s");
+            }
+            other => panic!("new tenant gets the update with the body: {other:?}"),
+        }
+    }
+}
