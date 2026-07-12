@@ -147,6 +147,22 @@ impl LiveBuilder {
     }
 }
 
+/// information_schema reports enum (and other udt) columns as `USER-DEFINED`
+/// with the real type in udt_schema/udt_name — resolve to "schema.name" so the
+/// type map can match `db.enums` exactly like the offline parser does.
+/// `ARRAY` stays as-is (unmappable → gap, same as offline).
+pub fn column_pg_type(data_type: &str, udt_schema: &str, udt_name: &str) -> String {
+    if data_type.eq_ignore_ascii_case("USER-DEFINED") && !udt_name.is_empty() {
+        if udt_schema.is_empty() {
+            udt_name.to_lowercase()
+        } else {
+            format!("{}.{}", udt_schema.to_lowercase(), udt_name.to_lowercase())
+        }
+    } else {
+        data_type.to_lowercase()
+    }
+}
+
 /// Parse a catalog `qual`/`with_check` TEXT into an `Expr` with the same parser
 /// the offline path uses. Failure → `None` (the recognizer then gaps it).
 fn parse_expr_text(text: &str) -> Option<sqlparser::ast::Expr> {
@@ -180,7 +196,8 @@ pub async fn read_live(conn: &str) -> Result<LiveRead, String> {
     // Columns (public/auth/storage).
     let rows = c
         .query_all(q(
-            "select table_schema, table_name, column_name, data_type, is_nullable \
+            "select table_schema, table_name, column_name, data_type, \
+                      udt_schema, udt_name, is_nullable \
                       from information_schema.columns \
                       where table_schema in ('public','auth','storage') order by ordinal_position",
         ))
@@ -188,11 +205,12 @@ pub async fn read_live(conn: &str) -> Result<LiveRead, String> {
         .map_err(|e| e.to_string())?;
     for r in &rows {
         let g = |k: &str| r.try_get::<String>("", k).unwrap_or_default();
+        let pg_type = column_pg_type(&g("data_type"), &g("udt_schema"), &g("udt_name"));
         b.column(
             &g("table_schema"),
             &g("table_name"),
             &g("column_name"),
-            &g("data_type"),
+            &pg_type,
             g("is_nullable") == "NO",
         );
     }
@@ -437,6 +455,22 @@ mod tests {
         );
         assert!(db.policies[0].unreadable, "flagged so recognize() must gap");
         assert!(db.policies[0].original.contains("some_extension_fn"));
+    }
+
+    #[test]
+    fn user_defined_catalog_types_resolve_to_the_qualified_udt_name() {
+        // Enum columns come back as USER-DEFINED — they must resolve to
+        // "schema.name" so map_pg_type finds them in db.enums (offline parity).
+        assert_eq!(
+            column_pg_type("USER-DEFINED", "public", "customer_status"),
+            "public.customer_status"
+        );
+        assert_eq!(column_pg_type("text", "pg_catalog", "text"), "text");
+        assert_eq!(
+            column_pg_type("ARRAY", "pg_catalog", "_text"),
+            "array",
+            "arrays stay unmappable, same as offline"
+        );
     }
 
     #[test]

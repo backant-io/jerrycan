@@ -141,8 +141,29 @@ fn emit_from_db(
     if let Some(mt) = &det.membership_table {
         exclude.insert(mt.clone());
     }
-    let build = entities::build_entities_filtered(&db, &exclude);
+    let mut build = entities::build_entities_filtered(&db, &exclude);
     let mut gaps: Vec<GapItem> = build.gaps.clone();
+
+    // The auth mapping reserves the `User` entity (generated `users` module).
+    // A public table that would also produce it (public.users) can't be
+    // modeled mechanically — merging its columns into the auth-derived User is
+    // agent judgment. Blocking gap + skip, not a hard abort.
+    build.entities.retain(|(k, e)| {
+        if e.name == "User" {
+            gaps.push(GapItem {
+                kind: GapKind::UnmappedType,
+                source: k.clone(),
+                location: "schema.sql".into(),
+                reason: "table maps to the entity name `User`, which the auth mapping reserves for auth.users".into(),
+                original: String::new(),
+                suggested: "merge its extra columns into the users module's User entity by hand (and extend the seed mapping)".into(),
+                severity: Severity::Blocking,
+            });
+            false
+        } else {
+            true
+        }
+    });
 
     // Any public-table RLS policy the recognizer won't certify is agent work —
     // gap it (never guessed). The table still gets fully-guarded CRUD.
@@ -265,7 +286,18 @@ fn emit_from_db(
     if let Some(tt) = &det.tenant_table {
         hubs.insert(tt.clone());
     }
-    let groups = grouping::group_modules(&entity_tables, &edges, &hubs);
+    // `users` is taken by the generated auth module; a table-prefix group with
+    // that name (users_settings, …) gets a deterministic rename.
+    let groups: Vec<(String, Vec<String>)> = grouping::group_modules(&entity_tables, &edges, &hubs)
+        .into_iter()
+        .map(|(name, tables)| {
+            if name == "users" {
+                ("users-tables".to_string(), tables)
+            } else {
+                (name, tables)
+            }
+        })
+        .collect();
 
     let mut modules_by_table: BTreeMap<String, String> = BTreeMap::new();
     let mut endpoint_map: Vec<(String, String)> = Vec::new();
@@ -925,6 +957,44 @@ create publication supabase_realtime for table public.customers;
                 "{rel} deterministic"
             );
         }
+    }
+
+    #[test]
+    fn a_public_users_table_gaps_and_the_module_name_is_disambiguated() {
+        // Extremely common in the wild: a public.users profile table. Its
+        // entity name collides with the auth-reserved User, and its prefix
+        // group collides with the generated `users` module — previously the
+        // whole migration aborted with "translator bug".
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(
+            export_dir.join("schema.sql"),
+            r#"
+create table public.users (id uuid primary key, handle text not null);
+create table public.users_settings (id uuid primary key, theme text not null);
+"#,
+        )
+        .unwrap();
+        let out = run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: tmp.path().join("app"),
+            name: Some("acme".into()),
+            bulk_threshold: 5000,
+        })
+        .expect("public.users must not abort the migration");
+        assert!(
+            out.gaps.iter().any(|g| g.source == "public.users"
+                && g.severity == Severity::Blocking
+                && g.reason.contains("reserves")),
+            "blocking gap for the reserved-name table"
+        );
+        let names: Vec<&str> = out.design.modules.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"users"), "auth module keeps its name");
+        assert!(
+            names.contains(&"users-tables"),
+            "prefix group renamed: {names:?}"
+        );
     }
 
     #[test]
