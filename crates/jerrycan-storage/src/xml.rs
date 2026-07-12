@@ -22,9 +22,15 @@ fn texts_of(body: &[u8], wanted: &[&str]) -> Vec<(String, String)> {
                 current = wanted.contains(&name.as_str()).then_some(name);
             }
             Ok(Event::Text(t)) => {
-                // quick-xml 0.37 `BytesText` exposes `unescape()` (not `decode()`);
-                // it both decodes and resolves XML entities in `<Message>` text.
-                if let (Some(name), Ok(text)) = (current.take(), t.unescape()) {
+                // quick-xml 0.41 (RUSTSEC-2026-0194/0195 bump) removed
+                // `BytesText::unescape()` and split its two jobs: `decode()`
+                // turns the raw bytes into a still-escaped `str` (needs the
+                // `encoding` feature), then `escape::unescape` resolves
+                // `&amp;`/`&lt;`/… in `<Message>` text — together they preserve
+                // the old decode-and-unescape behavior.
+                if let (Some(name), Ok(decoded)) = (current.take(), t.decode())
+                    && let Ok(text) = quick_xml::escape::unescape(&decoded)
+                {
                     out.push((name, text.into_owned()));
                 }
             }

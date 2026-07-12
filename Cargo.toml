@@ -75,8 +75,10 @@ http = "1"
 http-body = "1"
 http-body-util = "0.1"
 # S3 XML parsing (error + multipart-initiate bodies only; listing is DB-backed
-# so object keys never round-trip through XML). Pure safe Rust, MIT.
-quick-xml = "0.37"
+# so object keys never round-trip through XML). Pure safe Rust, MIT. 0.41+ closes
+# RUSTSEC-2026-0194/0195 (attribute/namespace DoS). The `encoding` feature gates
+# `BytesText::decode()`, which replaced the removed `unescape()` in xml.rs.
+quick-xml = { version = "0.41", features = ["encoding"] }
 bytes = "1"
 futures-core = "0.3"
 # SinkExt/StreamExt over tokio-tungstenite's Sink/Stream impls (WebSocketStream
