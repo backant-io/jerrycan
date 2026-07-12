@@ -22,6 +22,8 @@ the cause + fix for any of them.
 | JC0510 | Database error (jerrycan-db) |
 | JC0520 | Schema contract is stale — schema.json drifted from the migrations |
 | JC0521 | Job failed — a background job returned an error and (after its retries) was dead-lettered, or failed irrecoverably (the jobs engine) |
+| JC0530 | Realtime requires Postgres — a realtime `changes` channel was joined on a sqlite deployment (broadcast/presence work without a database; changes need Postgres) |
+| JC0531 | Realtime replication unavailable — `wal_level` is not `logical` (or the role lacks REPLICATION), so changes run on the trigger + LISTEN/NOTIFY fallback (identical client behavior, weaker guarantee) |
 | JC1001 | Missing dependency provider |
 | JC1002 | Dependency cycle |
 | JC1003 | Dependency requires an HTTP request — an HTTP extractor was used in a task context (use only `Dep<T>` args, or resolve inside a request) |

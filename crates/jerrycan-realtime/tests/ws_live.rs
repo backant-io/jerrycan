@@ -182,6 +182,31 @@ async fn presence_join_sync_track_and_leave() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn changes_channel_on_sqlite_answers_jc0530() {
+    let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
+    let rt = Realtime::new(db)
+        .changes(jerrycan_realtime::ChangeChannelSpec {
+            entity: "Lead".into(),
+            table: "lead".into(),
+            pk_column: "id".into(),
+            tenant_column: Some("workspace_id".into()),
+        })
+        .principal(header_resolver());
+    let (port, shutdown, task) = serve(rt).await;
+    // Give the supervisor a beat to run detection and mark changes unavailable.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let mut ws = connect_as(port, "alice", "t1").await;
+    send_text(&mut ws, r#"{"op":"join","channel":"changes:Lead","ref":1}"#).await;
+    let err = recv_json(&mut ws).await;
+    assert_eq!(err["op"], "error");
+    assert_eq!(err["code"], "JC0530");
+
+    let _ = shutdown.send(());
+    let _ = task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn publish_requires_membership_of_the_channel() {
     let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
     let rt = Realtime::new(db).broadcast("lobby", TopicScope::None);

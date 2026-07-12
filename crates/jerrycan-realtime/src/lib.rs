@@ -409,7 +409,7 @@ async fn supervisor(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let _ = ctx;
-    start_change_source(&hub).await;
+    start_change_source(&hub, shutdown.clone()).await;
     presence_supervise(&hub, &mut shutdown).await;
 }
 
@@ -454,12 +454,131 @@ fn rand_node_id() -> u64 {
 // ---------------------------------------------------------------------------
 
 impl Hub {
-    // Task 17 fills this (scope-filtered change delivery).
-    pub(crate) fn deliver_change(&self, _ev: &crate::changes::ChangeEvent) {}
+    /// Scope-filtered change delivery (the security pillar, at the socket). For
+    /// each `changes:{entity}` subscriber: the new-row view when `change_visible`
+    /// (Supabase RLS parity — you only receive what you could GET), or a
+    /// delete-shaped view when the row moved out of the subscriber's tenant.
+    pub(crate) fn deliver_change(&self, ev: &crate::changes::ChangeEvent) {
+        use crate::channel::{ChangeEventView, ChannelId, change_visible, delete_view_for_old_tenant};
+        use crate::changes::ChangeOp;
+        use crate::protocol::ServerMsg;
+        let Some(spec) = self.config.changes.iter().find(|s| s.entity == ev.entity) else {
+            return;
+        };
+        let id = ChannelId::Changes(ev.entity.clone());
+        let channel = id.as_string();
+        let view = ChangeEventView {
+            tenant_id: ev.tenant_id.clone(),
+            old_tenant_id: ev.old_tenant_id.clone(),
+        };
+        let op_str = match ev.op {
+            ChangeOp::Insert => "insert",
+            ChangeOp::Update => "update",
+            ChangeOp::Delete => "delete",
+        };
+        let mut drop_list = Vec::new();
+        {
+            let conns = self.conns.lock().expect("hub mutex");
+            for (cid, sub) in conns.iter() {
+                if !sub.channels.contains(&id) {
+                    continue;
+                }
+                let p = sub.principal.as_ref();
+                let payload = if change_visible(spec, &view, p) {
+                    Some(serde_json::json!({ "type": op_str, "pk": ev.pk, "row": ev.row }))
+                } else if delete_view_for_old_tenant(spec, &view, p) {
+                    Some(serde_json::json!({ "type": "delete", "pk": ev.pk }))
+                } else {
+                    None
+                };
+                if let Some(payload) = payload {
+                    if sub
+                        .tx
+                        .try_send(ServerMsg::Event {
+                            channel: channel.clone(),
+                            payload,
+                        })
+                        .is_err()
+                    {
+                        drop_list.push(*cid);
+                    }
+                }
+            }
+        }
+        for cid in drop_list {
+            self.conns.lock().expect("hub mutex").remove(&cid);
+        }
+    }
 }
 
-/// Task 17 replaces this with detect-replication-else-triggers + adapter spawn.
-async fn start_change_source(_hub: &Arc<Hub>) {}
+/// Detect-replication-else-triggers at startup, then spawn the chosen adapter.
+/// Replication path: leader → bus (every node delivers uniformly). Trigger
+/// path: hub-local delivery (Postgres is the bus — no realtime bus, so
+/// realtime-redis never double-delivers changes).
+async fn start_change_source(hub: &Arc<Hub>, shutdown: tokio::sync::watch::Receiver<bool>) {
+    if hub.config.changes.is_empty() {
+        return;
+    }
+    let Some(db) = hub.db.clone() else {
+        eprintln!("jerrycan-realtime: JC0530 changes configured without a database");
+        hub.changes_unavailable.store(true, Ordering::Relaxed);
+        return;
+    };
+    match changes::detect(&db).await {
+        Err(e) => {
+            eprintln!("jerrycan-realtime: {e:?} — changes channels answer JC0530");
+            hub.changes_unavailable.store(true, Ordering::Relaxed);
+        }
+        Ok(changes::SourceKind::Replication) => {
+            eprintln!("jerrycan-realtime: changes source = logical replication (pgoutput)");
+            let specs = hub.config.changes.clone();
+            let (etx, mut erx) = tokio::sync::mpsc::channel::<changes::ChangeEvent>(1024);
+            let (rtx, mut rrx) = tokio::sync::mpsc::channel::<()>(16);
+            tokio::spawn(changes::replication::run_supervised(
+                db,
+                specs,
+                etx,
+                rtx,
+                shutdown.clone(),
+            ));
+            let hub2 = hub.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        ev = erx.recv() => match ev {
+                            Some(ev) => { let _ = hub2.bus.publish(bus::BusMessage::Change(ev)).await; }
+                            None => break,
+                        },
+                        Some(()) = rrx.recv() => {
+                            let _ = hub2.bus.publish(bus::BusMessage::Resync { entity: None }).await;
+                        }
+                    }
+                }
+            });
+        }
+        Ok(changes::SourceKind::Triggers) => {
+            eprintln!("jerrycan-realtime: changes source = triggers + LISTEN/NOTIFY");
+            let specs = hub.config.changes.clone();
+            if let Err(e) = changes::triggers::ensure_triggers(&db, &specs).await {
+                eprintln!("jerrycan-realtime: trigger DDL reconcile failed: {e}");
+            }
+            let (etx, mut erx) = tokio::sync::mpsc::channel::<changes::ChangeEvent>(1024);
+            let url = db.url().to_string();
+            let adapter = changes::triggers::TriggerAdapter {
+                db: db.clone(),
+                url,
+                specs,
+            };
+            tokio::spawn(adapter.run(etx, shutdown.clone()));
+            let hub2 = hub.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = erx.recv().await {
+                    hub2.deliver_change(&ev);
+                }
+            });
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

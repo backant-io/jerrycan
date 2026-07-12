@@ -187,6 +187,20 @@ pub const REGISTRY: &[CodeInfo] = &[
         fix: "use framework extensions for I/O; if genuinely intended, append `// jerrycan:allow JL0007` to the line",
         doc: "jerrycan docs errors",
     },
+    CodeInfo {
+        code: "JC0530",
+        title: "realtime requires postgres",
+        cause: "the design declares realtime changes but the app is running on sqlite",
+        fix: "point JERRYCAN_DATABASE_URL at a Postgres database (broadcast/presence channels work without it; changes channels need Postgres)",
+        doc: "jerrycan docs realtime",
+    },
+    CodeInfo {
+        code: "JC0531",
+        title: "realtime replication unavailable",
+        cause: "wal_level is not 'logical' or the role lacks REPLICATION, so changes run on the trigger + LISTEN/NOTIFY fallback (identical client behavior, weaker delivery guarantee)",
+        fix: "set wal_level=logical and grant REPLICATION to the app role, then restart Postgres — realtime upgrades itself on next start",
+        doc: "jerrycan docs realtime",
+    },
 ];
 
 /// Look up a code, case-insensitively.
@@ -207,6 +221,15 @@ mod tests {
         // completeness walk would mistake for an emitted code.
         let absent = format!("JC{}", 9999);
         assert!(lookup(&absent).is_none());
+    }
+
+    #[test]
+    fn realtime_codes_are_registered() {
+        assert_eq!(lookup("JC0530").unwrap().title, "realtime requires postgres");
+        assert_eq!(
+            lookup("JC0531").unwrap().title,
+            "realtime replication unavailable"
+        );
     }
 
     #[test]

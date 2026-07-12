@@ -144,15 +144,86 @@ pub(crate) const SHOW_MAX_SLOT_WAL_KEEP_SIZE: &str = "SHOW max_slot_wal_keep_siz
 pub(crate) const CAN_REPLICATE: &str =
     "SELECT rolreplication OR rolsuper AS ok FROM pg_roles WHERE rolname = current_user";
 
-/// One CDC source: runs until shutdown, emitting decoded events. Both adapters
-/// implement this; the hub treats them identically (spec: the client sees
-/// identical behavior — only the source differs).
-pub(crate) trait ChangeSource: Send + 'static {
-    fn run(
-        self: Box<Self>,
-        events: tokio::sync::mpsc::Sender<ChangeEvent>,
-        shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+/// Which change source runs (surfaced in startup logs; spec: detection outcome
+/// is loud).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceKind {
+    Replication,
+    Triggers,
+}
+
+/// Startup detection. sqlite ⇒ JC0530 (Changes need Postgres). On Postgres:
+/// wal_level=logical AND replication privilege ⇒ Replication, else Triggers
+/// with the JC0531 fix-naming diagnostic on stderr. Also warns when
+/// max_slot_wal_keep_size is -1 (unbounded WAL retention behind a dead slot).
+pub(crate) async fn detect(db: &jerrycan_db::Db) -> jerrycan_core::Result<SourceKind> {
+    use jerrycan_db::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    if db.backend() != jerrycan_db::Backend::Postgres {
+        return Err(jerrycan_core::Error::new(
+            jerrycan_core::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "JC0530",
+            "realtime changes require Postgres (JERRYCAN_DATABASE_URL is not postgres://)",
+        ));
+    }
+    let conn = db.conn();
+    let wal_level: String = conn
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            SHOW_WAL_LEVEL.to_string(),
+        ))
+        .await
+        .map_err(jerrycan_db::db_error)?
+        .and_then(|r| r.try_get::<String>("", "wal_level").ok())
+        .unwrap_or_default();
+    let can_replicate: bool = conn
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            CAN_REPLICATE.to_string(),
+        ))
+        .await
+        .map_err(jerrycan_db::db_error)?
+        .and_then(|r| r.try_get::<bool>("", "ok").ok())
+        .unwrap_or(false);
+
+    if wal_level == "logical" && can_replicate {
+        let keep: String = conn
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                SHOW_MAX_SLOT_WAL_KEEP_SIZE.to_string(),
+            ))
+            .await
+            .map_err(jerrycan_db::db_error)?
+            .and_then(|r| r.try_get::<String>("", "max_slot_wal_keep_size").ok())
+            .unwrap_or_default();
+        if keep == "-1" {
+            eprintln!(
+                "jerrycan-realtime: max_slot_wal_keep_size is -1 (unbounded) — set it \
+                 (e.g. 1GB) so a stalled replication slot can never fill the disk"
+            );
+        }
+        Ok(SourceKind::Replication)
+    } else {
+        eprintln!(
+            "jerrycan-realtime: JC0531 logical replication unavailable \
+             (wal_level={wal_level}, replication_role={can_replicate}) — falling back to \
+             triggers + LISTEN/NOTIFY. One-time host fix for full fidelity: set \
+             wal_level=logical (postgresql.conf or `ALTER SYSTEM SET wal_level = 'logical'`) \
+             and grant REPLICATION to the app role, then restart Postgres."
+        );
+        Ok(SourceKind::Triggers)
+    }
+}
+
+#[cfg(test)]
+mod detect_tests {
+    #[tokio::test]
+    async fn detect_rejects_sqlite_with_jc0530() {
+        let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
+        let err = super::detect(&db).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("JC0530"), "sqlite must be a coded diagnostic: {msg}");
+    }
 }
 
 #[cfg(test)]
