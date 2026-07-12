@@ -1,10 +1,15 @@
 {
   "name": "reference-slice",
-  "contract_version": 1,
-  "description": "The v2 north-star eval slice: a sales-engagement backend (workspaces, leads, api keys, billing webhooks) modeled on a real app. Tenant-scoped, JWT-guarded, with declared background jobs.",
+  "contract_version": 2,
+  "description": "The v2 north-star eval slice: a sales-engagement backend (workspaces, leads, api keys, billing webhooks) modeled on a real app. Tenant-scoped, JWT-guarded, with declared background jobs and realtime channels.",
   "auth": { "model": "jwt", "roles": ["owner", "member"] },
   "dependencies": ["db", "auth", "validate", "observe", "oauth"],
   "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+  "realtime": {
+    "changes": ["Lead"],
+    "broadcast": [{ "name": "deal_room", "scope": "tenant" }],
+    "presence": [{ "name": "editors", "scope": "tenant" }]
+  },
   "jobs": [
     { "name": "expire_trials", "schedule": "0 * * * *", "queue": "billing" },
     { "name": "overdue_callbacks", "schedule": "*/5 * * * *" }

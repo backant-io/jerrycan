@@ -195,10 +195,10 @@ fn tenancy_generates_the_tenant_guard_in_shared() {
 }
 
 #[test]
-fn reference_slice_design_is_valid_contract_v1() {
+fn reference_slice_design_is_valid_contract_v2() {
     let s = include_str!("../../../conformance/designs/reference-slice.design.json");
     let d: jerrycan::platform::design::Design = serde_json::from_str(s).unwrap();
-    assert_eq!(d.contract_version, 1);
+    assert_eq!(d.contract_version, 2);
     let qs = jerrycan::platform::questions::validate(&d);
     assert!(qs.is_empty(), "{qs:?}");
     assert_eq!(d.tenant_owned().len(), 2); // Lead, ApiKey

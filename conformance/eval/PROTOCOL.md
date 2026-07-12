@@ -127,6 +127,23 @@ A run passes when, on the scaffolded slice:
 5. `schema.json` alone answers the data-structure questions (FK targets +
    `on_delete`, unique/index, enums, enforcement state) — read via
    `jerrycan schema --json`, no source.
+6. **Realtime** (contract v2, requires a `wal_level=logical` Postgres):
+   1. serve the migrated slice against the eval's logical-replication Postgres;
+   2. log in two users in two different workspaces (tenants) over HTTP;
+   3. open two WebSocket clients (`?token=`), both `join` `changes:Lead`;
+   4. `POST` a lead as tenant A → tenant A's socket receives the `insert` event
+      with the row body within 10s;
+   5. **negative control** — tenant B's socket receives nothing for it
+      (a heartbeat round-trip proves silence); a leak turns the gate red;
+   6. broadcast round-trip on `deal_room` within tenant A, cross-tenant silence
+      on tenant B; presence `track` on `editors`, a second same-tenant client
+      sees the state + join/leave diffs;
+   7. repeat steps 4–5 once against a **stock** Postgres (the trigger fallback)
+      to prove identical client-visible behavior — only the source differs.
+   The generated `crates/realtime/tests/acceptance.rs` encodes the per-app
+   subscribe/receive tests and the `cross_tenant_change_never_arrives_*`
+   negative control; run them with
+   `JERRYCAN_TEST_DATABASE_URL=… cargo test -p realtime -- --ignored`.
 
 ## The automated gate
 
