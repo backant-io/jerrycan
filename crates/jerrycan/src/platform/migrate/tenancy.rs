@@ -155,6 +155,16 @@ fn classify_table(db: &PgDatabase, det: &TenancyDetection, key: &str) -> TableAc
                                 gap_reasons.push(format!(
                                     "membership predicate references `{membership_table}`, not the detected tenant membership table"
                                 ));
+                            } else if let Some(unknown) = required_roles
+                                .iter()
+                                .find(|r| !det.member_roles.contains(r))
+                            {
+                                // A role literal outside the membership role set
+                                // can't become required_roles (auth.roles wouldn't
+                                // declare it — questions.rs would reject the design).
+                                gap_reasons.push(format!(
+                                    "policy requires role `{unknown}` which is not among the membership table's declared roles"
+                                ));
                             } else {
                                 has_membership = true;
                                 roles_by_command
@@ -286,6 +296,62 @@ create policy own on public.todos using (user_id = auth.uid());
             access["public.customers"],
             TableAccess::Tenant { .. }
         ));
+    }
+
+    #[test]
+    fn a_membership_shaped_policy_on_a_foreign_table_gaps_never_guessed() {
+        // `group_id in (select group_id from public.team_links where user_id =
+        // auth.uid())` matches the membership SHAPE but names a table that is
+        // NOT the detected tenant membership table. Translating it to tenant
+        // scoping would swap the isolation boundary — the semantic validation
+        // in classify_table must gap it.
+        let schema = format!(
+            "{ORG_SCHEMA}\n\
+             create policy m2 on public.customers for delete using\n\
+                 (workspace_id in (select workspace_id from public.workspace_members where user_id = auth.uid()));\n\
+             create table public.team_links (group_id uuid not null, user_id uuid not null);\n\
+             create table public.docs (id uuid primary key, group_id uuid not null);\n\
+             alter table public.docs enable row level security;\n\
+             create policy d on public.docs using\n\
+                 (group_id in (select group_id from public.team_links where user_id = auth.uid()));"
+        );
+        let db = PgDatabase::fold(&parse::split_and_parse(&schema));
+        let det = detect(&db);
+        assert_eq!(
+            det.membership_table.as_deref(),
+            Some("public.workspace_members"),
+            "workspace_members outranks team_links"
+        );
+        let access = table_access(&db, &det);
+        match &access["public.docs"] {
+            TableAccess::Gap { reasons } => assert!(
+                reasons.iter().any(|r| r.contains("team_links")),
+                "{reasons:?}"
+            ),
+            other => panic!("docs must gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_role_literal_outside_the_membership_roles_gaps_instead_of_an_invalid_design() {
+        // The design's auth.roles come from the membership role CHECK; a policy
+        // requiring a role outside that set would emit required_roles that
+        // questions.rs rejects — the whole migration would abort. Gap instead.
+        let schema = format!(
+            "{ORG_SCHEMA}\n\
+             create policy su on public.customers for delete using\n\
+                 (workspace_id in (select workspace_id from public.workspace_members where user_id = auth.uid() and role = 'superadmin'));"
+        );
+        let db = PgDatabase::fold(&parse::split_and_parse(&schema));
+        let det = detect(&db);
+        let access = table_access(&db, &det);
+        match &access["public.customers"] {
+            TableAccess::Gap { reasons } => assert!(
+                reasons.iter().any(|r| r.contains("superadmin")),
+                "{reasons:?}"
+            ),
+            other => panic!("customers must gap, got {other:?}"),
+        }
     }
 
     #[test]

@@ -89,6 +89,7 @@ impl LiveBuilder {
         table: &str,
         name: &str,
         command: &str,
+        permissive: &str,
         roles: &[&str],
         qual: Option<&str>,
         with_check: Option<&str>,
@@ -104,13 +105,23 @@ impl LiveBuilder {
             .or(with_check)
             .map(|s| s.to_string())
             .unwrap_or_default();
+        let using = qual.and_then(parse_expr_text);
+        let with_check_expr = with_check.and_then(parse_expr_text);
+        // A predicate the catalog carries but we couldn't parse means the
+        // policy's meaning is unknown — flag it so the recognizer gaps it
+        // (an unreadable owner-scope must never degrade to plain `TO
+        // authenticated`).
+        let unreadable = (qual.is_some() && using.is_none())
+            || (with_check.is_some() && with_check_expr.is_none());
         self.db.policies.push(PgPolicy {
             table: key(schema, table),
             name: name.to_string(),
             command,
             to_roles: roles.iter().map(|r| r.to_lowercase()).collect(),
-            using: qual.and_then(parse_expr_text),
-            with_check: with_check.and_then(parse_expr_text),
+            using,
+            with_check: with_check_expr,
+            restrictive: permissive.eq_ignore_ascii_case("restrictive"),
+            unreadable,
             original,
             line: 0,
         });
@@ -243,8 +254,10 @@ pub async fn read_live(conn: &str) -> Result<LiveRead, String> {
 
     // Policies (qual/with_check as TEXT).
     let rows = c
-        .query_all(q("select schemaname, tablename, policyname, cmd, \
-                        array_to_string(roles, ',') as roles, qual, with_check from pg_policies"))
+        .query_all(q(
+            "select schemaname, tablename, policyname, cmd, permissive, \
+                        array_to_string(roles, ',') as roles, qual, with_check from pg_policies",
+        ))
         .await
         .map_err(|e| e.to_string())?;
     for r in &rows {
@@ -258,6 +271,7 @@ pub async fn read_live(conn: &str) -> Result<LiveRead, String> {
             &g("tablename"),
             &g("policyname"),
             &g("cmd"),
+            &g("permissive"),
             &roles,
             qual.as_deref(),
             wc.as_deref(),
@@ -367,6 +381,7 @@ mod tests {
             "customers",
             "m",
             "ALL",
+            "PERMISSIVE",
             &["public"],
             Some("(workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()))"),
             None,
@@ -410,6 +425,7 @@ mod tests {
             "t",
             "weird",
             "ALL",
+            "PERMISSIVE",
             &[],
             Some("some_extension_fn(id ==> 3)"),
             None,
@@ -419,6 +435,54 @@ mod tests {
             db.policies[0].using.is_none(),
             "kept with original text; recognizer will gap it"
         );
+        assert!(db.policies[0].unreadable, "flagged so recognize() must gap");
         assert!(db.policies[0].original.contains("some_extension_fn"));
+    }
+
+    #[test]
+    fn an_unreadable_predicate_to_authenticated_gaps_instead_of_degrading_to_auth_only() {
+        // The leak this pins: an owner-scope predicate the parser rejects, on a
+        // policy granted TO authenticated. Without the unreadable flag the
+        // recognizer saw "no USING + TO authenticated" and certified plain
+        // Authenticated — every logged-in user could read every row.
+        let mut b = LiveBuilder::default();
+        b.column("public", "t", "id", "uuid", true);
+        b.policy(
+            "public",
+            "t",
+            "owner_weird",
+            "SELECT",
+            "PERMISSIVE",
+            &["authenticated"],
+            Some("owner_check(id ==> auth.uid())"),
+            None,
+        );
+        let db = b.finish();
+        assert!(matches!(
+            crate::platform::migrate::rls::recognize(&db.policies[0]),
+            crate::platform::migrate::rls::Recognized::Gap { .. }
+        ));
+    }
+
+    #[test]
+    fn restrictive_catalog_policies_carry_the_flag_and_gap() {
+        let mut b = LiveBuilder::default();
+        b.column("public", "t", "id", "uuid", true);
+        b.policy(
+            "public",
+            "t",
+            "tenant_gate",
+            "SELECT",
+            "RESTRICTIVE",
+            &[],
+            Some("(user_id = auth.uid())"),
+            None,
+        );
+        let db = b.finish();
+        assert!(db.policies[0].restrictive);
+        assert!(matches!(
+            crate::platform::migrate::rls::recognize(&db.policies[0]),
+            crate::platform::migrate::rls::Recognized::Gap { .. }
+        ));
     }
 }

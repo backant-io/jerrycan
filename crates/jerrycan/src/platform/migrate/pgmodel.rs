@@ -80,6 +80,12 @@ pub struct PgPolicy {
     pub to_roles: Vec<String>,
     pub using: Option<ast::Expr>,
     pub with_check: Option<ast::Expr>,
+    /// `AS RESTRICTIVE` — composes by ANDing with the other policies, which the
+    /// per-policy scope model cannot express. The recognizer always gaps these.
+    pub restrictive: bool,
+    /// The policy statement (offline) or its predicate text (live) exists but
+    /// did not parse. The predicate is unknown → the recognizer always gaps.
+    pub unreadable: bool,
     pub original: String,
     pub line: usize,
 }
@@ -208,7 +214,7 @@ impl PgDatabase {
             match raw {
                 RawStatement::Parsed { stmt, sql, line } => db.fold_stmt(stmt, sql, *line),
                 RawStatement::Unparsed { sql, line } => {
-                    if !db.try_publication(sql) {
+                    if !db.try_publication(sql) && !db.try_unreadable_policy(sql, *line) {
                         db.unparsed.push((sql.clone(), *line));
                     }
                 }
@@ -289,6 +295,8 @@ impl PgDatabase {
                     to_roles,
                     using: p.using.clone(),
                     with_check: p.with_check.clone(),
+                    restrictive: matches!(p.policy_type, Some(ast::CreatePolicyType::Restrictive)),
+                    unreadable: false,
                     original: sql.to_string(),
                     line,
                 });
@@ -361,6 +369,55 @@ impl PgDatabase {
             apply_table_constraint(&mut table, constraint);
         }
         self.tables.insert(key, table);
+    }
+
+    /// A `CREATE POLICY` statement sqlparser rejected. The predicate is unknown,
+    /// so the policy must still reach the recognizer (which gaps it) — otherwise
+    /// an exotic-but-real policy would silently vanish and the table's other
+    /// policies would decide its access alone. Returns false when the target
+    /// table can't be extracted (the statement stays in `unparsed`).
+    fn try_unreadable_policy(&mut self, sql: &str, line: usize) -> bool {
+        let words: Vec<String> = sql.split_whitespace().map(|w| w.to_lowercase()).collect();
+        if words.first().map(String::as_str) != Some("create")
+            || words.get(1).map(String::as_str) != Some("policy")
+        {
+            return false;
+        }
+        // `create policy <name> on <table> …` — the name may be quoted; take the
+        // first bare `on` after it. A quoted name containing the word `on` would
+        // mis-extract, in which case the statement stays an unparsed gap.
+        let Some(on_at) = words.iter().skip(3).position(|w| w == "on") else {
+            return false;
+        };
+        let Some(table_raw) = words.get(3 + on_at + 1) else {
+            return false;
+        };
+        let table = table_raw.trim_end_matches(';').trim_matches('"');
+        if table.is_empty() {
+            return false;
+        }
+        let table = if table.contains('.') {
+            table.to_string()
+        } else {
+            format!("public.{table}")
+        };
+        let name = words
+            .get(2)
+            .map(|w| w.trim_matches('"').to_string())
+            .unwrap_or_default();
+        self.policies.push(PgPolicy {
+            table,
+            name,
+            command: PolicyCommand::All,
+            to_roles: Vec::new(),
+            using: None,
+            with_check: None,
+            restrictive: false,
+            unreadable: true,
+            original: sql.to_string(),
+            line,
+        });
+        true
     }
 
     /// The two-form publication recognizer (case-insensitive, whitespace-tolerant):

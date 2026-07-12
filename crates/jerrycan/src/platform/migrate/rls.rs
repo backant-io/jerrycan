@@ -38,6 +38,35 @@ pub enum Recognized {
 }
 
 pub fn recognize(policy: &PgPolicy) -> Recognized {
+    // AS RESTRICTIVE composes by ANDing with every other policy on the table —
+    // the per-policy scope model cannot express that, so translating any part
+    // of such a table mechanically could over-grant. Never guessed.
+    if policy.restrictive {
+        return Recognized::Gap {
+            reason:
+                "AS RESTRICTIVE policies AND with the table's other policies — not auto-translated"
+                    .into(),
+        };
+    }
+    // The predicate exists but did not parse: its meaning is unknown.
+    if policy.unreadable {
+        return Recognized::Gap {
+            reason: "policy predicate could not be parsed — not auto-translated".into(),
+        };
+    }
+    // `TO <role>` restricted to a database role we don't model (service_role,
+    // custom roles): the grant applies to a principal jerrycan doesn't have.
+    if let Some(role) = policy
+        .to_roles
+        .iter()
+        .find(|r| !matches!(r.as_str(), "public" | "anon" | "authenticated"))
+    {
+        return Recognized::Gap {
+            reason: format!(
+                "policy is granted TO database role `{role}` which has no jerrycan principal — not auto-translated"
+            ),
+        };
+    }
     let to_authenticated = policy.to_roles.iter().any(|r| r == "authenticated");
     let exprs: Vec<&Expr> = [policy.using.as_ref(), policy.with_check.as_ref()]
         .into_iter()
@@ -183,9 +212,14 @@ fn is_foldername_first(expr: &Expr) -> bool {
 }
 
 fn classify(expr: &Expr, policy: &PgPolicy, to_authenticated: bool) -> Option<Scope> {
+    // `TO authenticated` (with no anon/public grant) gates every predicate
+    // behind login — `USING (true)` under it is authenticated-read, NOT public.
+    let anon_visible =
+        policy.to_roles.is_empty() || policy.to_roles.iter().any(|r| r == "anon" || r == "public");
     match strip(expr) {
         Expr::Value(v) if matches!(&v.value, Value::Boolean(true)) => match policy.command {
-            PolicyCommand::Select => Some(Scope::PublicRead),
+            PolicyCommand::Select if anon_visible => Some(Scope::PublicRead),
+            PolicyCommand::Select if to_authenticated => Some(Scope::Authenticated),
             PolicyCommand::All if to_authenticated => Some(Scope::Authenticated),
             _ => None,
         },
@@ -289,8 +323,19 @@ fn single_from_table(select: &Select) -> Option<String> {
     }
 }
 
+/// The membership auth conjunct: `user_id = auth.uid()` (either order). The
+/// column must be literally `user_id` — jerrycan's membership convention and
+/// the column the generated Tenant guard queries. A different column
+/// (`invited_by`, `created_by`, …) means DIFFERENT semantics: translating it
+/// to plain membership would grant every member what the source scoped to a
+/// specific relationship. Never guessed.
+fn is_membership_auth_conjunct(left: &Expr, right: &Expr) -> bool {
+    (is_auth_uid(left) && as_column(right).as_deref() == Some("user_id"))
+        || (is_auth_uid(right) && as_column(left).as_deref() == Some("user_id"))
+}
+
 /// Fold a membership `WHERE` into required roles, requiring exactly one
-/// `<col> = auth.uid()` conjunct. Any other shape → None (gap).
+/// `user_id = auth.uid()` conjunct. Any other shape → None (gap).
 fn membership_roles(where_expr: &Expr) -> Option<Vec<String>> {
     let mut roles = Vec::new();
     let mut auth_seen = false;
@@ -301,9 +346,7 @@ fn membership_roles(where_expr: &Expr) -> Option<Vec<String>> {
                 left,
                 right,
             } => {
-                if (is_auth_uid(left) && as_column(right).is_some())
-                    || (is_auth_uid(right) && as_column(left).is_some())
-                {
+                if is_membership_auth_conjunct(left, right) {
                     if auth_seen {
                         return None;
                     }
@@ -368,10 +411,8 @@ fn match_exists_membership(subquery: &Query) -> Option<Scope> {
                 left,
                 right,
             } => {
-                // auth: <col> = auth.uid()
-                if (is_auth_uid(left) && as_column(right).is_some())
-                    || (is_auth_uid(right) && as_column(left).is_some())
-                {
+                // auth: user_id = auth.uid()
+                if is_membership_auth_conjunct(left, right) {
                     if auth_seen {
                         return None;
                     }
@@ -535,14 +576,102 @@ mod tests {
             (exists (select 1 from public.note_shares s where s.note_id = t.id and s.shared_with = auth.uid()));"#;
         // OR-composition is never mechanical. A `true` WRITE policy is never public-read.
         let ored = r#"create policy p on public.t using (user_id = auth.uid() or is_public);"#;
+        // OR of two INDIVIDUALLY-canonical shapes must also gap — splitting OR
+        // like AND would certify both scopes and silently change semantics.
+        let ored_canonical = r#"create policy p on public.t using
+            (user_id = auth.uid()
+             or workspace_id in (select workspace_id from public.workspace_members where user_id = auth.uid()));"#;
         let open_write = r#"create policy p on public.t for insert with check (true);"#;
         // Arbitrary jwt-claim condition.
         let claim = r#"create policy p on public.t using ((auth.jwt() ->> 'plan') = 'pro');"#;
-        for sql in [share, ored, open_write, claim] {
+        for sql in [share, ored, ored_canonical, open_write, claim] {
             assert!(
                 matches!(policy_scopes(sql), Recognized::Gap { .. }),
                 "{sql} MUST gap"
             );
         }
+    }
+
+    #[test]
+    fn restrictive_policies_always_gap_even_when_the_predicate_is_canonical() {
+        // AS RESTRICTIVE ANDs with the table's other policies. Recognizing its
+        // owner shape as a permissive scope would let a `USING (true)` sibling
+        // read publicly what the source restricts to the row owner.
+        let sql = r#"create policy p on public.t as restrictive for select using (user_id = auth.uid());"#;
+        assert!(
+            matches!(policy_scopes(sql), Recognized::Gap { .. }),
+            "restrictive MUST gap"
+        );
+        // …and the permissive form of the same predicate still recognizes.
+        let permissive =
+            r#"create policy p on public.t as permissive for select using (user_id = auth.uid());"#;
+        assert!(matches!(policy_scopes(permissive), Recognized::Scopes(_)));
+    }
+
+    #[test]
+    fn select_true_to_authenticated_is_authenticated_never_public_read() {
+        // The classic Supabase pattern: `for select to authenticated using (true)`.
+        // Anonymous users CANNOT read this in the source — PublicRead would leak.
+        match policy_scopes(
+            r#"create policy p on public.t for select to authenticated using (true);"#,
+        ) {
+            Recognized::Scopes(s) => assert_eq!(s, vec![Scope::Authenticated]),
+            Recognized::Gap { reason } => panic!("{reason}"),
+        }
+        // With an anon grant the read really is public.
+        match policy_scopes(
+            r#"create policy p on public.t for select to anon, authenticated using (true);"#,
+        ) {
+            Recognized::Scopes(s) => assert_eq!(s, vec![Scope::PublicRead]),
+            Recognized::Gap { reason } => panic!("{reason}"),
+        }
+    }
+
+    #[test]
+    fn policies_granted_to_unmodeled_database_roles_gap() {
+        // `TO service_role` (or any custom role) has no jerrycan principal;
+        // translating `USING (true)` to public-read would expose backend-only data.
+        for sql in [
+            r#"create policy p on public.t for select to service_role using (true);"#,
+            r#"create policy p on public.t to reporting_bot using (user_id = auth.uid());"#,
+        ] {
+            assert!(
+                matches!(policy_scopes(sql), Recognized::Gap { .. }),
+                "{sql} MUST gap"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_auth_column_must_be_user_id() {
+        // `invited_by = auth.uid()` scopes to a different relationship than
+        // membership; certifying it as TenantMembership would grant every
+        // member what the source granted only to inviters.
+        let sql = r#"create policy p on public.t using
+            (workspace_id in (select workspace_id from public.workspace_members where invited_by = auth.uid()));"#;
+        assert!(
+            matches!(policy_scopes(sql), Recognized::Gap { .. }),
+            "non-user_id auth column MUST gap"
+        );
+        let exists = r#"create policy p on public.t using
+            (exists (select 1 from public.workspace_members m
+                     where m.workspace_id = t.workspace_id and m.invited_by = auth.uid()));"#;
+        assert!(
+            matches!(policy_scopes(exists), Recognized::Gap { .. }),
+            "non-user_id auth column MUST gap (exists shape)"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_offline_policy_statement_still_reaches_the_recognizer_and_gaps() {
+        // sqlparser rejects the statement; the policy must NOT silently vanish
+        // (its table's other policies would then decide access alone).
+        let full = "create table public.t (id uuid primary key);\n\
+                    create policy weird on public.t using (%%%);";
+        let db = PgDatabase::fold(&parse::split_and_parse(full));
+        assert_eq!(db.policies.len(), 1, "unreadable policy is still a policy");
+        assert_eq!(db.policies[0].table, "public.t");
+        assert!(db.policies[0].unreadable);
+        assert!(matches!(recognize(&db.policies[0]), Recognized::Gap { .. }));
     }
 }
