@@ -17,7 +17,15 @@ fn plural_snake(entity: &str) -> String {
     }
 }
 
-pub fn endpoints_for(entity: &str, access: &TableAccess) -> Vec<Endpoint> {
+/// The CRUD five, filtered to `covered` commands (see
+/// `tenancy::covered_commands`): Postgres default-denies a command with no
+/// policy, so an uncovered command gets NO endpoint — emitting one would grant
+/// what the source denies.
+pub fn endpoints_for(
+    entity: &str,
+    access: &TableAccess,
+    covered: &std::collections::BTreeSet<PolicyCommand>,
+) -> Vec<Endpoint> {
     let (read_public, guarded) = match access {
         TableAccess::PublicRead { .. } => (true, true),
         TableAccess::NoRls
@@ -77,69 +85,101 @@ pub fn endpoints_for(entity: &str, access: &TableAccess) -> Vec<Endpoint> {
             errors,
         }
     };
-    vec![
-        ep(
-            format!("list_{plural}"),
-            HttpMethod::GET,
-            "/",
-            false,
-            200,
-            true,
-            vec![],
+    let five = vec![
+        (
             PolicyCommand::Select,
-            true,
-            true,
+            ep(
+                format!("list_{plural}"),
+                HttpMethod::GET,
+                "/",
+                false,
+                200,
+                true,
+                vec![],
+                PolicyCommand::Select,
+                true,
+                true,
+            ),
         ),
-        ep(
-            format!("create_{single}"),
-            HttpMethod::POST,
-            "/",
-            true,
-            201,
-            false,
-            vec![],
+        (
             PolicyCommand::Insert,
-            false,
-            true,
+            ep(
+                format!("create_{single}"),
+                HttpMethod::POST,
+                "/",
+                true,
+                201,
+                false,
+                vec![],
+                PolicyCommand::Insert,
+                false,
+                true,
+            ),
         ),
-        ep(
-            format!("get_{single}"),
-            HttpMethod::GET,
-            "/{id}",
-            false,
-            200,
-            false,
-            not_found(),
+        (
             PolicyCommand::Select,
-            true,
-            true,
+            ep(
+                format!("get_{single}"),
+                HttpMethod::GET,
+                "/{id}",
+                false,
+                200,
+                false,
+                not_found(),
+                PolicyCommand::Select,
+                true,
+                true,
+            ),
         ),
-        ep(
-            format!("update_{single}"),
-            HttpMethod::PATCH,
-            "/{id}",
-            true,
-            200,
-            false,
-            not_found(),
+        (
             PolicyCommand::Update,
-            false,
-            true,
+            ep(
+                format!("update_{single}"),
+                HttpMethod::PATCH,
+                "/{id}",
+                true,
+                200,
+                false,
+                not_found(),
+                PolicyCommand::Update,
+                false,
+                true,
+            ),
         ),
         // delete: 204, no entity body (matches how MINIMAL expresses 204).
-        ep(
-            format!("delete_{single}"),
-            HttpMethod::DELETE,
-            "/{id}",
-            false,
-            204,
-            false,
-            not_found(),
+        (
             PolicyCommand::Delete,
-            false,
-            false,
+            ep(
+                format!("delete_{single}"),
+                HttpMethod::DELETE,
+                "/{id}",
+                false,
+                204,
+                false,
+                not_found(),
+                PolicyCommand::Delete,
+                false,
+                false,
+            ),
         ),
+    ];
+    five.into_iter()
+        .filter(|(cmd, _)| covered.contains(cmd))
+        .map(|(_, e)| e)
+        .collect()
+}
+
+/// Full command coverage — for callers (tests, NoRls/Gap tables) that want the
+/// unfiltered CRUD five.
+pub fn all_commands() -> std::collections::BTreeSet<PolicyCommand> {
+    [
+        PolicyCommand::Select,
+        PolicyCommand::Insert,
+        PolicyCommand::Update,
+        PolicyCommand::Delete,
     ]
+    .into_iter()
+    .collect()
 }
 
 /// Prefix every endpoint's path so a second+ entity in a module doesn't collide
@@ -183,6 +223,7 @@ mod tests {
             &TableAccess::Tenant {
                 required_roles_by_command: BTreeMap::new(),
             },
+            &all_commands(),
         );
         let ops: Vec<(&str, HttpMethod, &str)> = eps
             .iter()
@@ -215,7 +256,7 @@ mod tests {
         let access = TableAccess::PublicRead {
             write: Box::new(TableAccess::AuthOnly),
         };
-        let eps = endpoints_for("Plan", &access);
+        let eps = endpoints_for("Plan", &access, &all_commands());
         assert!(
             eps.iter()
                 .find(|e| e.operation_id == "list_plans")
@@ -247,11 +288,30 @@ mod tests {
             &TableAccess::Tenant {
                 required_roles_by_command: roles,
             },
+            &all_commands(),
         );
         let del = eps
             .iter()
             .find(|e| e.operation_id == "delete_customer")
             .unwrap();
         assert_eq!(del.required_roles, vec!["owner"]);
+    }
+
+    #[test]
+    fn uncovered_commands_get_no_endpoint() {
+        // A SELECT-only policy set: Postgres denies writes for everyone, so the
+        // translation must not invent create/update/delete endpoints.
+        let covered = [crate::platform::migrate::pgmodel::PolicyCommand::Select]
+            .into_iter()
+            .collect();
+        let eps = endpoints_for(
+            "Plan",
+            &TableAccess::PublicRead {
+                write: Box::new(TableAccess::AuthOnly),
+            },
+            &covered,
+        );
+        let ops: Vec<&str> = eps.iter().map(|e| e.operation_id.as_str()).collect();
+        assert_eq!(ops, vec!["list_plans", "get_plan"], "reads only");
     }
 }

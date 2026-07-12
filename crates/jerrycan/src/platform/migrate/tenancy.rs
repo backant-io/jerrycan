@@ -110,6 +110,31 @@ fn has_tenant_fk(db: &PgDatabase, table: &str, det: &TenancyDetection) -> bool {
         .is_some_and(|t| t.fks.iter().any(|fk| fk.ref_table == tenant))
 }
 
+/// Which SQL commands the table's RLS policies actually cover. Postgres
+/// default-denies any command with no policy — a SELECT-only policy set means
+/// writes are denied for everyone, so the translation must not emit write
+/// endpoints (that would grant what the source denies). NoRls/Gap tables get
+/// the full set: their endpoints are fully guarded and the agent reviews them.
+pub fn covered_commands(
+    db: &PgDatabase,
+    table: &str,
+    access: &TableAccess,
+) -> std::collections::BTreeSet<PolicyCommand> {
+    if matches!(access, TableAccess::NoRls | TableAccess::Gap { .. }) {
+        return super::crud::all_commands();
+    }
+    let mut covered = std::collections::BTreeSet::new();
+    for p in policies_for(db, table) {
+        if matches!(recognize(p), Recognized::Scopes(_)) {
+            if p.command == PolicyCommand::All {
+                return super::crud::all_commands();
+            }
+            covered.insert(p.command);
+        }
+    }
+    covered
+}
+
 pub fn table_access(db: &PgDatabase, det: &TenancyDetection) -> BTreeMap<String, TableAccess> {
     let mut out = BTreeMap::new();
     for (key, table) in &db.tables {

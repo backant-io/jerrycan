@@ -220,7 +220,35 @@ fn emit_from_db(
                 format!("/{short}")
             };
             let access = access_map.get(tk).unwrap_or(&TableAccess::NoRls);
-            let mut eps = crud::endpoints_for(&entity.name, access);
+            // Postgres default-denies commands with no policy; the translation
+            // omits their endpoints (advisory below — never silent).
+            let covered = tenancy::covered_commands(&db, tk, access);
+            let omitted: Vec<&str> = crud::all_commands()
+                .difference(&covered)
+                .map(|c| match c {
+                    pgmodel::PolicyCommand::Select => "select",
+                    pgmodel::PolicyCommand::Insert => "insert",
+                    pgmodel::PolicyCommand::Update => "update",
+                    pgmodel::PolicyCommand::Delete => "delete",
+                    pgmodel::PolicyCommand::All => "all",
+                })
+                .collect();
+            if !omitted.is_empty() {
+                gaps.push(GapItem {
+                    kind: GapKind::RlsPolicy,
+                    source: format!("{tk} uncovered commands"),
+                    location: "schema.sql".into(),
+                    reason: format!(
+                        "no RLS policy covers [{}] — Postgres denies them, so no endpoint was emitted",
+                        omitted.join(", ")
+                    ),
+                    original: String::new(),
+                    suggested: "add the endpoint(s) by hand if the operation should exist"
+                        .into(),
+                    severity: Severity::Advisory,
+                });
+            }
+            let mut eps = crud::endpoints_for(&entity.name, access, &covered);
             // questions.rs forbids public on a tenant-owned entity: downgrade + advise.
             let tenant_owned = tenant_entity
                 .as_ref()
