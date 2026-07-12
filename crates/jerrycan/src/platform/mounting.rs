@@ -50,6 +50,13 @@ fn extension_block(design: &Design) -> String {
     if design.wants_jobs() {
         block.push_str("        .extend(jobs::jobs(db.clone()))\n");
     }
+    // Realtime needs the db (Changes + DDL reconcile): register the wired
+    // extension (the generated `crates/realtime` crate's `realtime(db)` fn) with
+    // a CLONE, before `.extend(db)` below moves it. wants_realtime implies
+    // wants_db (questions.rs enforces it).
+    if design.wants_realtime() {
+        block.push_str("        .extend(realtime::realtime(db.clone()))\n");
+    }
     if design.wants_db() {
         block.push_str("        .extend(db)\n");
     }
@@ -68,7 +75,7 @@ pub fn expected_main(design: &Design) -> String {
     for dep in design.dependencies.iter().filter(|d| {
         !matches!(
             d.as_str(),
-            "db" | "validate" | "auth" | "observe" | "storage"
+            "db" | "validate" | "auth" | "observe" | "storage" | "realtime"
         )
     }) {
         mounts.push_str(&format!(
@@ -328,6 +335,18 @@ pub fn regenerate(app_root: &Path, design: &Design) -> Result<Vec<String>, Strin
         modified.push("crates/storage".to_string());
     }
 
+    // 1f. The generated realtime crate (channel wiring + acceptance tests).
+    // Written when the design declares realtime; removed when a prior design
+    // declared it and no longer does (a stale crates/realtime would break the
+    // workspace build).
+    let realtime_dir = app_root.join("crates/realtime");
+    if design.wants_realtime() {
+        modified.extend(super::realtimegen::write_realtime(app_root, design)?);
+    } else if realtime_dir.exists() {
+        fs::remove_dir_all(&realtime_dir).map_err(|e| e.to_string())?;
+        modified.push("crates/realtime".to_string());
+    }
+
     // 2. workspace members + facade features (kept in sync with the mode). The
     // jobs crate joins the members list (after the route crates) when present.
     let ws_path = app_root.join("Cargo.toml");
@@ -342,6 +361,9 @@ pub fn regenerate(app_root: &Path, design: &Design) -> Result<Vec<String>, Strin
     }
     if design.wants_storage() {
         members.push_str("    \"crates/storage\",\n");
+    }
+    if design.wants_realtime() {
+        members.push_str("    \"crates/realtime\",\n");
     }
     let ws2 = splice(
         &ws,
@@ -370,6 +392,10 @@ pub fn regenerate(app_root: &Path, design: &Design) -> Result<Vec<String>, Strin
     if design.wants_storage() {
         // main.rs references `storage::<bucket>::module()`.
         deps.push_str("storage = { path = \"../storage\" }\n");
+    }
+    if design.wants_realtime() {
+        // main.rs references `realtime::realtime(db)`.
+        deps.push_str("realtime = { path = \"../realtime\" }\n");
     }
     let ac2 = splice(
         &ac,
@@ -444,6 +470,30 @@ mod tests {
             !main.contains("JOBS_MIGRATIONS"),
             "no jobs migrations: {main}"
         );
+    }
+
+    fn realtime_design() -> Design {
+        serde_json::from_str(crate::platform::design::tests::V2_REALTIME).unwrap()
+    }
+
+    #[test]
+    fn expected_main_wires_realtime_extension_before_db_move() {
+        let main = expected_main(&realtime_design());
+        let rt = main.find(".extend(realtime::realtime(db.clone()))").unwrap();
+        let db = main.find(".extend(db)\n").unwrap();
+        assert!(
+            rt < db,
+            "realtime registers with a db CLONE before .extend(db) moves it: {main}"
+        );
+        // No stub comment for the reserved name.
+        assert!(!main.contains("app dependency `realtime`"), "{main}");
+    }
+
+    #[test]
+    fn expected_main_without_realtime_has_no_realtime_wiring() {
+        let mut d = realtime_design();
+        d.realtime = None;
+        assert!(!expected_main(&d).contains("realtime::realtime"));
     }
 
     fn storage_design() -> Design {
