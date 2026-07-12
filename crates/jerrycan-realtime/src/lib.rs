@@ -3,6 +3,8 @@
 //! <https://jerrycan.cc>
 #![forbid(unsafe_code)]
 
+pub mod protocol;
+
 /// The authenticated identity a connection carries for every scope check.
 /// All keys are strings: tenant pks vary per design (i64/uuid/text), and both
 /// CDC paths extract scope columns as text, so string equality is the one
