@@ -105,6 +105,13 @@ impl RequestCtx {
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.parts.extensions.get::<ClientAddr>().map(|c| c.0)
     }
+
+    /// Remove a typed extension from the request parts. jerrycan-realtime takes
+    /// hyper's `OnUpgrade` handle this way to run a WebSocket after replying 101.
+    /// Remove-not-get: the handle is single-use and `!Clone`.
+    pub fn take_extension<T: Send + Sync + 'static>(&mut self) -> Option<T> {
+        self.parts.extensions.remove::<T>()
+    }
 }
 
 /// Map a stream-lane read failure onto the stable codes: the route's
