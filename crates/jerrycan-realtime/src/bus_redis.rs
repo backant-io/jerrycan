@@ -105,7 +105,9 @@ impl RedisBus {
                 Ok(bm) => {
                     let _ = self.fanin.send(bm);
                 }
-                Err(e) => eprintln!("jerrycan-realtime: redis pump skipped undecodable message: {e}"),
+                Err(e) => {
+                    eprintln!("jerrycan-realtime: redis pump skipped undecodable message: {e}")
+                }
             }
         }
     }

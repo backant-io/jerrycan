@@ -63,7 +63,10 @@ async fn handler_upgrades_and_speaks_raw_bytes() {
         assert!(head.len() < 4096, "response head too large");
     }
     let head = String::from_utf8_lossy(&head);
-    assert!(head.starts_with("HTTP/1.1 101"), "expected 101, got: {head}");
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "expected 101, got: {head}"
+    );
 
     // The socket now speaks the raw echo protocol.
     s.write_all(b"hello").await.unwrap();

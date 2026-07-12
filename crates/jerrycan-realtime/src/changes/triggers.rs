@@ -227,7 +227,9 @@ mod tests {
         assert!(ins.row.is_some(), "insert refetches the body");
 
         db.conn()
-            .execute_unprepared(&format!("UPDATE \"{table}\" SET workspace_id = 9 WHERE id = 1"))
+            .execute_unprepared(&format!(
+                "UPDATE \"{table}\" SET workspace_id = 9 WHERE id = 1"
+            ))
             .await
             .unwrap();
         let upd = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())

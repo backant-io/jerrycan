@@ -177,7 +177,9 @@ impl crate::Hub {
         };
         let (key, tenant_id) = {
             let mut conns = self.conns.lock().expect("hub mutex");
-            let Some(sub) = conns.get_mut(&conn) else { return };
+            let Some(sub) = conns.get_mut(&conn) else {
+                return;
+            };
             if !sub.channels.contains(&id) {
                 let _ = sub.tx.try_send(ServerMsg::Error {
                     code: "JC0403".into(),
@@ -214,7 +216,9 @@ impl crate::Hub {
         };
         let cleared = {
             let mut conns = self.conns.lock().expect("hub mutex");
-            let Some(sub) = conns.get_mut(&conn) else { return };
+            let Some(sub) = conns.get_mut(&conn) else {
+                return;
+            };
             let key = Self::presence_key(sub.principal.as_ref(), conn);
             let tenant_id = self.presence_tenant(&topic, sub.principal.as_ref());
             if sub.tracked.remove(&(id.clone(), key.clone())) {
@@ -306,11 +310,11 @@ impl crate::Hub {
             topic: topic.to_string(),
             tenant_id: tenant_id.clone(),
         };
-        let joins = self
-            .presence
-            .lock()
-            .expect("presence mutex")
-            .set(&part, key, node, meta, now_ms());
+        let joins =
+            self.presence
+                .lock()
+                .expect("presence mutex")
+                .set(&part, key, node, meta, now_ms());
         if let Some(joins) = joins {
             self.broadcast_presence_diff(&part, joins, serde_json::json!({}));
         }
@@ -444,10 +448,22 @@ mod tests {
     #[test]
     fn set_then_state_then_clear_produces_join_and_leave_diffs() {
         let mut map = PresenceMap::default();
-        let joins = map.set(&part("editors"), "u1", 1, serde_json::json!({"c": 3}), 1_000);
+        let joins = map.set(
+            &part("editors"),
+            "u1",
+            1,
+            serde_json::json!({"c": 3}),
+            1_000,
+        );
         assert_eq!(joins, Some(serde_json::json!({"u1": {"c": 3}})));
         // Same key, newer meta: last-writer-wins, still reported as a join diff.
-        let joins = map.set(&part("editors"), "u1", 1, serde_json::json!({"c": 4}), 2_000);
+        let joins = map.set(
+            &part("editors"),
+            "u1",
+            1,
+            serde_json::json!({"c": 4}),
+            2_000,
+        );
         assert_eq!(joins, Some(serde_json::json!({"u1": {"c": 4}})));
         assert_eq!(
             map.state(&part("editors")),

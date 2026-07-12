@@ -205,13 +205,11 @@ impl RowChange {
     /// None only if neither tuple carries the primary key (a decode we skip).
     pub(crate) fn into_event(self, spec: &ChangeChannelSpec) -> Option<ChangeEvent> {
         let get = |row: &Option<serde_json::Value>, col: &str| -> Option<String> {
-            row.as_ref()
-                .and_then(|v| v.get(col))
-                .and_then(|v| match v {
-                    serde_json::Value::String(s) => Some(s.clone()),
-                    serde_json::Value::Null => None,
-                    other => Some(other.to_string()),
-                })
+            row.as_ref().and_then(|v| v.get(col)).and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Null => None,
+                other => Some(other.to_string()),
+            })
         };
         let pk = get(&self.new, &spec.pk_column).or_else(|| get(&self.old, &spec.pk_column))?;
         let (tenant_id, old_tenant_id) = match &spec.tenant_column {
@@ -298,7 +296,11 @@ mod tests {
     fn relation_then_insert_yields_named_row() {
         let mut cache = RelationCache::default();
         assert!(matches!(
-            decode_logical(&relation_msg(1, "lead", &["id", "workspace_id"]), &mut cache).unwrap(),
+            decode_logical(
+                &relation_msg(1, "lead", &["id", "workspace_id"]),
+                &mut cache
+            )
+            .unwrap(),
             Logical::Meta
         ));
         let Logical::Row(row) =
@@ -316,7 +318,11 @@ mod tests {
     #[test]
     fn update_carries_old_and_new_tuples() {
         let mut cache = RelationCache::default();
-        decode_logical(&relation_msg(1, "lead", &["id", "workspace_id"]), &mut cache).unwrap();
+        decode_logical(
+            &relation_msg(1, "lead", &["id", "workspace_id"]),
+            &mut cache,
+        )
+        .unwrap();
         let Logical::Row(row) = decode_logical(
             &update_msg_with_old(1, &[Some("42"), Some("3")], &[Some("42"), Some("7")]),
             &mut cache,
@@ -331,7 +337,11 @@ mod tests {
     #[test]
     fn delete_carries_only_old() {
         let mut cache = RelationCache::default();
-        decode_logical(&relation_msg(1, "lead", &["id", "workspace_id"]), &mut cache).unwrap();
+        decode_logical(
+            &relation_msg(1, "lead", &["id", "workspace_id"]),
+            &mut cache,
+        )
+        .unwrap();
         let Logical::Row(row) =
             decode_logical(&delete_msg(1, &[Some("42"), Some("7")]), &mut cache).unwrap()
         else {

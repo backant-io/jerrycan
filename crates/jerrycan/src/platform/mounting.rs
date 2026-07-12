@@ -479,7 +479,9 @@ mod tests {
     #[test]
     fn expected_main_wires_realtime_extension_before_db_move() {
         let main = expected_main(&realtime_design());
-        let rt = main.find(".extend(realtime::realtime(db.clone()))").unwrap();
+        let rt = main
+            .find(".extend(realtime::realtime(db.clone()))")
+            .unwrap();
         let db = main.find(".extend(db)\n").unwrap();
         assert!(
             rt < db,

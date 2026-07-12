@@ -543,7 +543,10 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 if !is_snake(&t.name) {
                     qs.push(q(
                         format!("{tptr}/name"),
-                        format!("Realtime {kind} topic `{}` is not snake_case (^[a-z][a-z0-9_]*$).", t.name),
+                        format!(
+                            "Realtime {kind} topic `{}` is not snake_case (^[a-z][a-z0-9_]*$).",
+                            t.name
+                        ),
                     ));
                 }
                 if !seen.insert(t.name.as_str()) {

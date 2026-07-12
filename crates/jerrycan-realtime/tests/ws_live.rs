@@ -87,7 +87,8 @@ async fn connect_as(port: u16, user: &str, tenant: &str) -> WsClient {
         .into_client_request()
         .unwrap();
     req.headers_mut().insert("x-user", user.parse().unwrap());
-    req.headers_mut().insert("x-tenant", tenant.parse().unwrap());
+    req.headers_mut()
+        .insert("x-tenant", tenant.parse().unwrap());
     let (ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .expect("ws connect");
@@ -145,7 +146,11 @@ async fn presence_join_sync_track_and_leave() {
     let (port, shutdown, task) = serve(rt).await;
 
     let mut a = connect_as(port, "alice", "t1").await;
-    send_text(&mut a, r#"{"op":"join","channel":"presence:editors","ref":1}"#).await;
+    send_text(
+        &mut a,
+        r#"{"op":"join","channel":"presence:editors","ref":1}"#,
+    )
+    .await;
     assert_eq!(recv_json(&mut a).await["op"], "joined");
     // Initial sync: empty state.
     let state = recv_json(&mut a).await;
@@ -163,7 +168,11 @@ async fn presence_join_sync_track_and_leave() {
 
     // Bob joins late: his initial state already contains alice.
     let mut b = connect_as(port, "bob", "t1").await;
-    send_text(&mut b, r#"{"op":"join","channel":"presence:editors","ref":1}"#).await;
+    send_text(
+        &mut b,
+        r#"{"op":"join","channel":"presence:editors","ref":1}"#,
+    )
+    .await;
     assert_eq!(recv_json(&mut b).await["op"], "joined");
     let state = recv_json(&mut b).await;
     assert_eq!(state["state"]["alice"]["cursor"], 1);
@@ -232,7 +241,11 @@ async fn join_heartbeat_and_error_envelopes_round_trip() {
     let (port, shutdown, task) = serve(rt).await;
 
     let mut ws = connect(port).await;
-    send_text(&mut ws, r#"{"op":"join","channel":"broadcast:lobby","ref":1}"#).await;
+    send_text(
+        &mut ws,
+        r#"{"op":"join","channel":"broadcast:lobby","ref":1}"#,
+    )
+    .await;
     let joined = recv_json(&mut ws).await;
     assert_eq!(joined["op"], "joined");
     assert_eq!(joined["channel"], "broadcast:lobby");
@@ -243,7 +256,11 @@ async fn join_heartbeat_and_error_envelopes_round_trip() {
     assert_eq!(ack["op"], "heartbeat_ack");
 
     // Unknown channel ⇒ error envelope, connection stays up.
-    send_text(&mut ws, r#"{"op":"join","channel":"broadcast:ghost","ref":3}"#).await;
+    send_text(
+        &mut ws,
+        r#"{"op":"join","channel":"broadcast:ghost","ref":3}"#,
+    )
+    .await;
     let err = recv_json(&mut ws).await;
     assert_eq!(err["op"], "error");
     assert_eq!(err["ref"], 3);

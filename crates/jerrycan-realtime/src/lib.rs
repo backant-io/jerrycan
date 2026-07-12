@@ -3,14 +3,14 @@
 //! <https://jerrycan.cc>
 #![forbid(unsafe_code)]
 
-pub mod changes;
-pub mod protocol;
 pub(crate) mod broadcast;
 pub(crate) mod bus;
 #[cfg(feature = "realtime-redis")]
 pub(crate) mod bus_redis;
+pub mod changes;
 pub(crate) mod channel;
 pub(crate) mod presence;
+pub mod protocol;
 pub(crate) mod ws;
 
 /// The authenticated identity a connection carries for every scope check.
@@ -194,10 +194,10 @@ impl Hub {
     /// Send to one connection; a full/closed queue drops the connection.
     pub(crate) fn send_to(&self, conn: u64, msg: crate::protocol::ServerMsg) {
         let mut conns = self.conns.lock().expect("hub mutex");
-        if let Some(sub) = conns.get(&conn) {
-            if sub.tx.try_send(msg).is_err() {
-                conns.remove(&conn); // slow consumer: rx closes, loop ends
-            }
+        if let Some(sub) = conns.get(&conn)
+            && sub.tx.try_send(msg).is_err()
+        {
+            conns.remove(&conn); // slow consumer: rx closes, loop ends
         }
     }
 
@@ -219,9 +219,7 @@ impl Hub {
             }
         };
         match msg {
-            ClientMsg::Heartbeat { r#ref } => {
-                self.send_to(conn, ServerMsg::HeartbeatAck { r#ref })
-            }
+            ClientMsg::Heartbeat { r#ref } => self.send_to(conn, ServerMsg::HeartbeatAck { r#ref }),
             ClientMsg::Join { channel, r#ref } => self.join(conn, &channel, r#ref),
             ClientMsg::Leave { channel, r#ref } => self.leave(conn, &channel, r#ref),
             ClientMsg::Publish {
@@ -315,10 +313,10 @@ impl Hub {
 
     fn leave(self: &Arc<Self>, conn: u64, channel: &str, r#ref: Option<u64>) {
         use crate::protocol::ServerMsg;
-        if let Some(id) = crate::channel::ChannelId::parse(channel) {
-            if let Some(sub) = self.conns.lock().expect("hub mutex").get_mut(&conn) {
-                sub.channels.remove(&id);
-            }
+        if let Some(id) = crate::channel::ChannelId::parse(channel)
+            && let Some(sub) = self.conns.lock().expect("hub mutex").get_mut(&conn)
+        {
+            sub.channels.remove(&id);
         }
         self.send_to(
             conn,
@@ -366,12 +364,12 @@ impl Hub {
         let conns = self.conns.lock().expect("hub mutex");
         for sub in conns.values() {
             for id in &sub.channels {
-                if let crate::channel::ChannelId::Changes(e) = id {
-                    if entity.as_deref().is_none_or(|want| want == e) {
-                        let _ = sub.tx.try_send(ServerMsg::Resync {
-                            channel: id.as_string(),
-                        });
-                    }
+                if let crate::channel::ChannelId::Changes(e) = id
+                    && entity.as_deref().is_none_or(|want| want == e)
+                {
+                    let _ = sub.tx.try_send(ServerMsg::Resync {
+                        channel: id.as_string(),
+                    });
                 }
             }
         }
@@ -496,8 +494,10 @@ impl Hub {
     /// (Supabase RLS parity — you only receive what you could GET), or a
     /// delete-shaped view when the row moved out of the subscriber's tenant.
     pub(crate) fn deliver_change(&self, ev: &crate::changes::ChangeEvent) {
-        use crate::channel::{ChangeEventView, ChannelId, change_visible, delete_view_for_old_tenant};
         use crate::changes::ChangeOp;
+        use crate::channel::{
+            ChangeEventView, ChannelId, change_visible, delete_view_for_old_tenant,
+        };
         use crate::protocol::ServerMsg;
         let Some(spec) = self.config.changes.iter().find(|s| s.entity == ev.entity) else {
             return;
@@ -528,17 +528,16 @@ impl Hub {
                 } else {
                     None
                 };
-                if let Some(payload) = payload {
-                    if sub
+                if let Some(payload) = payload
+                    && sub
                         .tx
                         .try_send(ServerMsg::Event {
                             channel: channel.clone(),
                             payload,
                         })
                         .is_err()
-                    {
-                        drop_list.push(*cid);
-                    }
+                {
+                    drop_list.push(*cid);
                 }
             }
         }

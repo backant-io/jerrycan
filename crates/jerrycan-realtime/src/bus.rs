@@ -39,7 +39,9 @@ pub(crate) enum BusMessage {
         entries: Vec<(String, Option<String>, String)>, // (topic, tenant, key)
     },
     /// Replication gap (slot recreated): subscribers must refetch.
-    Resync { entity: Option<String> },
+    Resync {
+        entity: Option<String>,
+    },
 }
 
 const BUS_CAPACITY: usize = 1024;

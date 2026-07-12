@@ -222,7 +222,10 @@ mod detect_tests {
         let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
         let err = super::detect(&db).await.unwrap_err();
         let msg = format!("{err:?}");
-        assert!(msg.contains("JC0530"), "sqlite must be a coded diagnostic: {msg}");
+        assert!(
+            msg.contains("JC0530"),
+            "sqlite must be a coded diagnostic: {msg}"
+        );
     }
 }
 
@@ -278,7 +281,9 @@ mod tests {
             "{t}"
         );
         assert!(
-            t.contains(r#"CREATE TRIGGER jc_changes_lead AFTER INSERT OR UPDATE OR DELETE ON "lead""#),
+            t.contains(
+                r#"CREATE TRIGGER jc_changes_lead AFTER INSERT OR UPDATE OR DELETE ON "lead""#
+            ),
             "{t}"
         );
         assert!(

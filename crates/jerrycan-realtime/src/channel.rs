@@ -158,7 +158,9 @@ mod tests {
 
     #[test]
     fn channel_ids_parse_and_reject_unknown() {
-        assert!(matches!(ChannelId::parse("changes:Lead"), Some(ChannelId::Changes(e)) if e == "Lead"));
+        assert!(
+            matches!(ChannelId::parse("changes:Lead"), Some(ChannelId::Changes(e)) if e == "Lead")
+        );
         assert!(matches!(
             ChannelId::parse("broadcast:room"),
             Some(ChannelId::Broadcast(_))
@@ -211,8 +213,22 @@ mod tests {
             .is_ok()
         );
         // unknown channel names are rejected (not silently created).
-        assert!(may_join(&ChannelId::Broadcast("ghost".into()), &c, Some(&principal("t1"))).is_err());
-        assert!(may_join(&ChannelId::Changes("Ghost".into()), &c, Some(&principal("t1"))).is_err());
+        assert!(
+            may_join(
+                &ChannelId::Broadcast("ghost".into()),
+                &c,
+                Some(&principal("t1"))
+            )
+            .is_err()
+        );
+        assert!(
+            may_join(
+                &ChannelId::Changes("Ghost".into()),
+                &c,
+                Some(&principal("t1"))
+            )
+            .is_err()
+        );
     }
 
     /// THE negative control (spec: security pillar). A change in tenant t2

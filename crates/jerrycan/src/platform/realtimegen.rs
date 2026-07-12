@@ -278,7 +278,11 @@ mod tests {
     fn wiring_is_deterministic_and_derives_table_pk_and_tenant_column() {
         let d = rt_design();
         let a = wiring_rs(&d);
-        assert_eq!(a, wiring_rs(&d), "byte-identical across runs (JL0003 contract)");
+        assert_eq!(
+            a,
+            wiring_rs(&d),
+            "byte-identical across runs (JL0003 contract)"
+        );
         assert!(
             a.contains("pub fn realtime(db: jerrycan::db::Db) -> jerrycan::realtime::Realtime"),
             "{a}"
@@ -330,7 +334,10 @@ mod tests {
     #[test]
     fn acceptance_tests_are_ignored_live_pg_and_carry_the_negative_control() {
         let a = acceptance_rs(&rt_design());
-        assert!(a.contains("#[ignore]"), "realtime acceptance needs live Postgres: {a}");
+        assert!(
+            a.contains("#[ignore]"),
+            "realtime acceptance needs live Postgres: {a}"
+        );
         assert!(a.contains("JERRYCAN_TEST_DATABASE_URL"), "{a}");
         assert!(
             a.contains("cross_tenant"),

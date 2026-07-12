@@ -36,12 +36,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -267,10 +268,10 @@ pub(crate) async fn stream_once(
                 match decode_logical(&data, &mut cache) {
                     Ok(Logical::Row(row)) => {
                         for spec in specs.iter().filter(|s| s.table == row.table) {
-                            if let Some(event) = row.clone().into_event(spec) {
-                                if events.send(event).await.is_err() {
-                                    return Ok(()); // hub gone
-                                }
+                            if let Some(event) = row.clone().into_event(spec)
+                                && events.send(event).await.is_err()
+                            {
+                                return Ok(()); // hub gone
                             }
                         }
                     }
@@ -394,7 +395,9 @@ mod tests {
 
     #[test]
     fn slot_invalidation_heuristic_matches_the_expected_messages() {
-        assert!(is_slot_invalid("replication slot \"jc_realtime\" does not exist"));
+        assert!(is_slot_invalid(
+            "replication slot \"jc_realtime\" does not exist"
+        ));
         assert!(is_slot_invalid("slot has been invalidated"));
         assert!(!is_slot_invalid("connection reset by peer"));
     }

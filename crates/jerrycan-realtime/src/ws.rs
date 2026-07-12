@@ -10,7 +10,10 @@ pub(crate) fn handshake_accept(headers: &HeaderMap) -> Result<String> {
     let connection_ok = headers
         .get("connection")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")));
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        });
     let upgrade_ok = headers
         .get("upgrade")
         .and_then(|v| v.to_str().ok())
@@ -35,9 +38,7 @@ pub(crate) fn handshake_accept(headers: &HeaderMap) -> Result<String> {
         .get("sec-websocket-key")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| Error::bad_request("missing Sec-WebSocket-Key"))?;
-    Ok(tokio_tungstenite::tungstenite::handshake::derive_accept_key(
-        key.as_bytes(),
-    ))
+    Ok(tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes()))
 }
 
 /// Extractor: validate the WS handshake, authenticate, and claim the upgrade
@@ -213,7 +214,10 @@ mod tests {
 
         // Connection may be a list: "keep-alive, Upgrade" must pass.
         let mut list = ws_headers();
-        list.insert("connection", HeaderValue::from_static("keep-alive, Upgrade"));
+        list.insert(
+            "connection",
+            HeaderValue::from_static("keep-alive, Upgrade"),
+        );
         assert!(handshake_accept(&list).is_ok());
     }
 }

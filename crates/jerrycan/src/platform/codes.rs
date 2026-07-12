@@ -225,7 +225,10 @@ mod tests {
 
     #[test]
     fn realtime_codes_are_registered() {
-        assert_eq!(lookup("JC0530").unwrap().title, "realtime requires postgres");
+        assert_eq!(
+            lookup("JC0530").unwrap().title,
+            "realtime requires postgres"
+        );
         assert_eq!(
             lookup("JC0531").unwrap().title,
             "realtime replication unavailable"

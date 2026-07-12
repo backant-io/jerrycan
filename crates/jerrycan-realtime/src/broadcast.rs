@@ -99,10 +99,10 @@ impl crate::Hub {
                     continue; // no self-delivery
                 }
                 // Tenant partition: both sides must agree exactly.
-                if let Some(t) = tenant_id {
-                    if sub.principal.as_ref().and_then(|p| p.tenant_id.as_deref()) != Some(t) {
-                        continue;
-                    }
+                if let Some(t) = tenant_id
+                    && sub.principal.as_ref().and_then(|p| p.tenant_id.as_deref()) != Some(t)
+                {
+                    continue;
                 }
                 if sub
                     .tx

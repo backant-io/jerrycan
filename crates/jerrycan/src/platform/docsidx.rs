@@ -216,7 +216,11 @@ mod tests {
 
     #[test]
     fn realtime_page_is_served() {
-        assert!(PAGES.iter().any(|(t, body)| *t == "realtime" && body.contains("changes:")));
+        assert!(
+            PAGES
+                .iter()
+                .any(|(t, body)| *t == "realtime" && body.contains("changes:"))
+        );
     }
 
     #[test]
