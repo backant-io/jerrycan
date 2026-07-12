@@ -1482,6 +1482,7 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-util",
  "hyper",
  "hyper-util",
  "jerrycan-core",

@@ -20,6 +20,7 @@ bytes.workspace = true
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 futures-core.workspace = true
+futures-util = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "rt", "net", "io-util"] }
 tokio-tungstenite = { workspace = true }
 # The dedicated logical-replication client (WAL socket only — pgoutput, rustls
@@ -40,3 +41,4 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
 tokio-tungstenite = { workspace = true }
 futures-core.workspace = true
+futures-util = { workspace = true }

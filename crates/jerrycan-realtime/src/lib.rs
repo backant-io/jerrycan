@@ -7,6 +7,7 @@ pub mod changes;
 pub mod protocol;
 pub(crate) mod bus;
 pub(crate) mod channel;
+pub(crate) mod presence;
 pub(crate) mod ws;
 
 /// The authenticated identity a connection carries for every scope check.
@@ -57,6 +58,7 @@ pub struct Realtime {
     pub(crate) db: Option<jerrycan_db::Db>,
     pub(crate) mount: String,
     pub(crate) config: RealtimeConfig,
+    pub(crate) resolver: Option<PrincipalResolver>,
 }
 
 impl Realtime {
@@ -72,7 +74,17 @@ impl Realtime {
             db: None,
             mount: "/realtime".into(),
             config: RealtimeConfig::default(),
+            resolver: None,
         }
+    }
+
+    /// Install the principal resolver: it authenticates the connection at
+    /// upgrade time (session cookie / bearer / `?token=`). Generated wiring
+    /// supplies it; an absent resolver ⇒ anonymous connections (only scope-none
+    /// channels joinable).
+    pub fn principal(mut self, resolver: PrincipalResolver) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     pub fn mount(mut self, path: &str) -> Self {
@@ -95,6 +107,431 @@ impl Realtime {
         self
     }
 }
+
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Resolves the connection's principal at upgrade time from the request
+/// (session cookie / bearer / `?token=`). Generated wiring supplies it; an
+/// absent resolver ⇒ anonymous connections (only scope-none channels joinable).
+pub type PrincipalResolver = Arc<
+    dyn for<'a> Fn(
+            &'a mut jerrycan_core::RequestCtx,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = jerrycan_core::Result<Principal>> + Send + 'a>,
+        > + Send
+        + Sync,
+>;
+
+/// Per-connection outbound queue capacity; a full queue disconnects the client
+/// (at-most-once live-UI semantics — resolved decision #12).
+const CONN_QUEUE: usize = 128;
+
+pub(crate) struct Subscriber {
+    pub(crate) principal: Option<Principal>,
+    pub(crate) tx: tokio::sync::mpsc::Sender<crate::protocol::ServerMsg>,
+    pub(crate) channels: HashSet<crate::channel::ChannelId>,
+    /// Presence keys this connection owns (per presence channel), so a
+    /// disconnect can clear them. Filled in Task 10.
+    pub(crate) tracked: HashSet<(crate::channel::ChannelId, String)>,
+}
+
+/// The connection hub: registry + delivery. One per app.
+pub struct Hub {
+    pub(crate) config: RealtimeConfig,
+    pub(crate) node_id: u64,
+    pub(crate) bus: bus::AnyBus,
+    pub(crate) db: Option<jerrycan_db::Db>,
+    pub(crate) conns: Mutex<HashMap<u64, Subscriber>>,
+    pub(crate) presence: Mutex<presence::PresenceMap>,
+    /// Set when Changes detection failed (sqlite / no db): a join on a
+    /// `changes:` channel then answers JC0530. Wired in Task 17.
+    pub(crate) changes_unavailable: std::sync::atomic::AtomicBool,
+    next_conn: AtomicU64,
+}
+
+impl Hub {
+    pub(crate) fn connect(
+        self: &Arc<Self>,
+        principal: Option<Principal>,
+    ) -> (u64, tokio::sync::mpsc::Receiver<crate::protocol::ServerMsg>) {
+        let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::mpsc::channel(CONN_QUEUE);
+        self.conns.lock().expect("hub mutex").insert(
+            id,
+            Subscriber {
+                principal,
+                tx,
+                channels: Default::default(),
+                tracked: Default::default(),
+            },
+        );
+        (id, rx)
+    }
+
+    pub(crate) fn disconnect(self: &Arc<Self>, conn: u64) {
+        // Presence leaves are published in Task 10; for now just drop the entry.
+        self.presence_disconnect(conn);
+        self.conns.lock().expect("hub mutex").remove(&conn);
+    }
+
+    /// Send to one connection; a full/closed queue drops the connection.
+    pub(crate) fn send_to(&self, conn: u64, msg: crate::protocol::ServerMsg) {
+        let mut conns = self.conns.lock().expect("hub mutex");
+        if let Some(sub) = conns.get(&conn) {
+            if sub.tx.try_send(msg).is_err() {
+                conns.remove(&conn); // slow consumer: rx closes, loop ends
+            }
+        }
+    }
+
+    /// One client frame: parse, dispatch, reply via the conn's own queue.
+    pub(crate) async fn handle_client(self: &Arc<Self>, conn: u64, text: &str) {
+        use crate::protocol::{ClientMsg, ServerMsg};
+        let msg: ClientMsg = match serde_json::from_str(text) {
+            Ok(m) => m,
+            Err(e) => {
+                return self.send_to(
+                    conn,
+                    ServerMsg::Error {
+                        code: "JC0422".into(),
+                        message: format!("unparseable frame: {e}"),
+                        channel: None,
+                        r#ref: None,
+                    },
+                );
+            }
+        };
+        match msg {
+            ClientMsg::Heartbeat { r#ref } => {
+                self.send_to(conn, ServerMsg::HeartbeatAck { r#ref })
+            }
+            ClientMsg::Join { channel, r#ref } => self.join(conn, &channel, r#ref),
+            ClientMsg::Leave { channel, r#ref } => self.leave(conn, &channel, r#ref),
+            ClientMsg::Publish {
+                channel,
+                payload,
+                r#ref,
+            } => self.publish(conn, &channel, payload, r#ref).await,
+            ClientMsg::Track {
+                channel,
+                state,
+                r#ref,
+            } => self.track(conn, &channel, state, r#ref).await,
+            ClientMsg::Untrack { channel, r#ref } => self.untrack(conn, &channel, r#ref).await,
+        }
+    }
+
+    fn join(self: &Arc<Self>, conn: u64, channel: &str, r#ref: Option<u64>) {
+        use crate::protocol::ServerMsg;
+        let Some(id) = crate::channel::ChannelId::parse(channel) else {
+            return self.send_to(
+                conn,
+                ServerMsg::Error {
+                    code: "JC0404".into(),
+                    message: "unknown channel namespace".into(),
+                    channel: Some(channel.to_string()),
+                    r#ref,
+                },
+            );
+        };
+        // Changes on a deployment without a working source answer JC0530.
+        if matches!(id, crate::channel::ChannelId::Changes(_))
+            && self
+                .changes_unavailable
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return self.send_to(
+                conn,
+                ServerMsg::Error {
+                    code: "JC0530".into(),
+                    message: "realtime changes require Postgres".into(),
+                    channel: Some(channel.to_string()),
+                    r#ref,
+                },
+            );
+        }
+        let allowed = {
+            let conns = self.conns.lock().expect("hub mutex");
+            let Some(sub) = conns.get(&conn) else { return };
+            crate::channel::may_join(&id, &self.config, sub.principal.as_ref())
+        };
+        match allowed {
+            Err("unknown channel") => self.send_to(
+                conn,
+                ServerMsg::Error {
+                    code: "JC0404".into(),
+                    message: "unknown channel".into(),
+                    channel: Some(channel.to_string()),
+                    r#ref,
+                },
+            ),
+            Err(reason) => self.send_to(
+                conn,
+                ServerMsg::Error {
+                    code: if reason.contains("authentication") {
+                        "JC0401"
+                    } else {
+                        "JC0403"
+                    }
+                    .into(),
+                    message: reason.into(),
+                    channel: Some(channel.to_string()),
+                    r#ref,
+                },
+            ),
+            Ok(()) => {
+                if let Some(sub) = self.conns.lock().expect("hub mutex").get_mut(&conn) {
+                    sub.channels.insert(id.clone());
+                }
+                self.send_to(
+                    conn,
+                    ServerMsg::Joined {
+                        channel: channel.to_string(),
+                        r#ref,
+                    },
+                );
+                // Presence initial state (Task 10).
+                self.on_join_presence(conn, &id);
+            }
+        }
+    }
+
+    fn leave(self: &Arc<Self>, conn: u64, channel: &str, r#ref: Option<u64>) {
+        use crate::protocol::ServerMsg;
+        if let Some(id) = crate::channel::ChannelId::parse(channel) {
+            if let Some(sub) = self.conns.lock().expect("hub mutex").get_mut(&conn) {
+                sub.channels.remove(&id);
+            }
+        }
+        self.send_to(
+            conn,
+            ServerMsg::Left {
+                channel: channel.to_string(),
+                r#ref,
+            },
+        );
+    }
+
+    /// Bus fan-in: everything published on the bus is delivered here on every
+    /// node. Each arm's real delivery lands in its own task.
+    pub(crate) fn deliver(&self, msg: bus::BusMessage) {
+        match msg {
+            bus::BusMessage::Broadcast {
+                topic,
+                tenant_id,
+                payload,
+                origin,
+            } => self.deliver_broadcast(&topic, tenant_id.as_deref(), &payload, origin),
+            bus::BusMessage::Change(ev) => self.deliver_change(&ev), // Task 17
+            bus::BusMessage::PresenceSet {
+                topic,
+                tenant_id,
+                key,
+                node,
+                meta,
+            } => self.deliver_presence_set(&topic, tenant_id, &key, node, meta),
+            bus::BusMessage::PresenceClear {
+                topic,
+                tenant_id,
+                key,
+                node,
+            } => self.deliver_presence_clear(&topic, tenant_id, &key, node),
+            bus::BusMessage::PresenceSnapshot { node, entries } => {
+                self.deliver_presence_snapshot(node, entries)
+            }
+            bus::BusMessage::Resync { entity } => self.deliver_resync(entity),
+        }
+    }
+
+    /// Replication-gap resync: tell every changes subscriber to refetch.
+    pub(crate) fn deliver_resync(&self, entity: Option<String>) {
+        use crate::protocol::ServerMsg;
+        let conns = self.conns.lock().expect("hub mutex");
+        for sub in conns.values() {
+            for id in &sub.channels {
+                if let crate::channel::ChannelId::Changes(e) = id {
+                    if entity.as_deref().is_none_or(|want| want == e) {
+                        let _ = sub.tx.try_send(ServerMsg::Resync {
+                            channel: id.as_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The app-provided dependency: the ws extractor resolves this.
+#[derive(Clone)]
+pub struct RealtimeHandle {
+    pub(crate) hub: Arc<Hub>,
+    pub(crate) resolver: Option<PrincipalResolver>,
+}
+
+impl jerrycan_core::Extension for Realtime {
+    fn register(self, app: jerrycan_core::App) -> jerrycan_core::App {
+        let bus = build_bus(&self);
+        let hub = Arc::new(Hub {
+            config: self.config.clone(),
+            node_id: rand_node_id(),
+            bus,
+            db: self.db.clone(),
+            conns: Mutex::new(HashMap::new()),
+            presence: Mutex::new(presence::PresenceMap::default()),
+            changes_unavailable: std::sync::atomic::AtomicBool::new(false),
+            next_conn: AtomicU64::new(1),
+        });
+        let handle = RealtimeHandle {
+            hub: hub.clone(),
+            resolver: self.resolver,
+        };
+        let mount = self.mount.clone();
+        app.provide(handle)
+            .route(&mount, jerrycan_core::get(ws::ws_handler))
+            .on_serve("realtime", move |ctx, shutdown| {
+                supervisor(hub, ctx, shutdown)
+            })
+    }
+}
+
+/// Construct the fan-out bus. Redis selection lands in Task 18.
+fn build_bus(_rt: &Realtime) -> bus::AnyBus {
+    bus::AnyBus::Local(bus::LocalBus::new())
+}
+
+/// The serve-time supervisor: source selection (Task 17) + the bus pump.
+async fn supervisor(
+    hub: Arc<Hub>,
+    ctx: jerrycan_core::TaskContext,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let _ = ctx;
+    start_change_source(&hub).await;
+    presence_supervise(&hub, &mut shutdown).await;
+}
+
+/// Bus pump + presence sweep. Extended in Task 10 with the presence tick.
+async fn presence_supervise(hub: &Arc<Hub>, shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    let mut rx = hub.bus.subscribe();
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            msg = rx.recv() => match msg {
+                Ok(m) => hub.deliver(m),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("jerrycan-realtime: bus lagged, dropped {n} messages");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+        }
+    }
+}
+
+/// A random node id (presence/broadcast origin tagging across nodes). Uses the
+/// std hasher over the current time — no rand dep.
+fn rand_node_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    h.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Stubs replaced by later tasks: Broadcast (Task 9), Presence (Task 10),
+// Changes source + delivery (Task 17). They keep the crate compiling and the
+// bus/handle_client wiring honest while those tasks land.
+// ---------------------------------------------------------------------------
+
+impl Hub {
+    // Task 9 replaces this with the real broadcast gate + bus publish.
+    pub(crate) async fn publish(
+        self: &Arc<Self>,
+        conn: u64,
+        channel: &str,
+        _payload: serde_json::Value,
+        r#ref: Option<u64>,
+    ) {
+        self.not_implemented(conn, channel, r#ref);
+    }
+
+    // Task 10 replaces these two with real presence track/untrack.
+    pub(crate) async fn track(
+        self: &Arc<Self>,
+        conn: u64,
+        channel: &str,
+        _state: serde_json::Value,
+        r#ref: Option<u64>,
+    ) {
+        self.not_implemented(conn, channel, r#ref);
+    }
+
+    pub(crate) async fn untrack(self: &Arc<Self>, conn: u64, channel: &str, r#ref: Option<u64>) {
+        self.not_implemented(conn, channel, r#ref);
+    }
+
+    fn not_implemented(&self, conn: u64, channel: &str, r#ref: Option<u64>) {
+        self.send_to(
+            conn,
+            crate::protocol::ServerMsg::Error {
+                code: "JC0500".into(),
+                message: "not implemented yet".into(),
+                channel: Some(channel.to_string()),
+                r#ref,
+            },
+        );
+    }
+
+    // Task 9 fills this (bus → local broadcast subscribers).
+    pub(crate) fn deliver_broadcast(
+        &self,
+        _topic: &str,
+        _tenant_id: Option<&str>,
+        _payload: &serde_json::Value,
+        _origin: Option<(u64, u64)>,
+    ) {
+    }
+
+    // Task 17 fills this (scope-filtered change delivery).
+    pub(crate) fn deliver_change(&self, _ev: &crate::changes::ChangeEvent) {}
+
+    // Task 10 fills the presence delivery + lifecycle hooks.
+    pub(crate) fn deliver_presence_set(
+        &self,
+        _topic: &str,
+        _tenant_id: Option<String>,
+        _key: &str,
+        _node: u64,
+        _meta: serde_json::Value,
+    ) {
+    }
+    pub(crate) fn deliver_presence_clear(
+        &self,
+        _topic: &str,
+        _tenant_id: Option<String>,
+        _key: &str,
+        _node: u64,
+    ) {
+    }
+    pub(crate) fn deliver_presence_snapshot(
+        &self,
+        _node: u64,
+        _entries: Vec<(String, Option<String>, String)>,
+    ) {
+    }
+    fn on_join_presence(self: &Arc<Self>, _conn: u64, _id: &crate::channel::ChannelId) {}
+    fn presence_disconnect(self: &Arc<Self>, _conn: u64) {}
+}
+
+/// Task 17 replaces this with detect-replication-else-triggers + adapter spawn.
+async fn start_change_source(_hub: &Arc<Hub>) {}
 
 #[cfg(test)]
 mod tests {
