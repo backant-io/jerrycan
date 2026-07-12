@@ -44,6 +44,11 @@ storage = ["dep:jerrycan-storage", "db"]
 # Generated storage apps enable THIS one: JERRYCAN_STORAGE switches backends
 # by env at runtime, so the S3 code must be compiled into the packaged binary.
 storage-s3 = ["storage", "jerrycan-storage/storage-s3"]
+# Realtime channels (Postgres Changes + Broadcast + Presence over WebSockets).
+# Changes stream from the database, so `realtime` implies `db` (like jobs).
+realtime = ["dep:jerrycan-realtime", "db"]
+# Multi-node realtime fan-out over Redis (mirrors jobs-redis).
+realtime-redis = ["realtime", "jerrycan-realtime/realtime-redis"]
 
 [[bin]]
 name = "jerrycan"
@@ -59,6 +64,7 @@ jerrycan-observe = { workspace = true, optional = true }
 jerrycan-jobs = { workspace = true, optional = true }
 jerrycan-ratelimit = { workspace = true, optional = true }
 jerrycan-storage = { workspace = true, optional = true }
+jerrycan-realtime = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 sea-query = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

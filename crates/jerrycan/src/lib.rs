@@ -30,6 +30,9 @@ pub use jerrycan_jobs as jobs;
 #[cfg(feature = "storage")]
 pub use jerrycan_storage as storage;
 
+#[cfg(feature = "realtime")]
+pub use jerrycan_realtime as realtime;
+
 #[cfg(feature = "cli")]
 pub mod platform;
 
@@ -91,4 +94,17 @@ mod doc_tests {
     // the storage feature; run with `cargo test -p jerrycan --features storage --doc`.
     #[cfg(feature = "storage")]
     doc_page!(page_18_storage, "../../../docs/ai/18-storage.md");
+}
+
+/// The realtime facade surface: `jerrycan::realtime::{Realtime, Principal,
+/// TopicScope, ChangeChannelSpec}` must resolve when the feature is on —
+/// generated wiring (realtimegen) is compiled against exactly these paths.
+#[cfg(all(test, feature = "realtime"))]
+mod realtime_facade {
+    #[test]
+    fn facade_paths_resolve() {
+        fn _typecheck(rt: crate::realtime::Realtime) -> crate::realtime::Realtime {
+            rt.broadcast("room", crate::realtime::TopicScope::Tenant)
+        }
+    }
 }

@@ -1374,6 +1374,7 @@ dependencies = [
  "jerrycan-macros",
  "jerrycan-observe",
  "jerrycan-ratelimit",
+ "jerrycan-realtime",
  "jerrycan-storage",
  "jerrycan-validate",
  "sea-query",
