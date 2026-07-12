@@ -168,7 +168,7 @@ The checked-in **reference Supabase export** (used by the migrator eval) gains b
 ## Resolved decisions (review 2026-07-10)
 
 1. **HTTP client:** our own — `hyper-util` + `hyper-rustls`, matching `jerrycan-auth::oauth`. reqwest / object_store / aws-sdk-s3 rejected (second stack / dep weight / convention).
-2. **XML:** `quick-xml` (S3 error + multipart only; listing is DB-backed). The single new workspace crate.
+2. **XML:** `quick-xml` (S3 error + multipart only; listing is DB-backed). The single new workspace crate. *(Amended 2026-07-12: the migrator's lossless-login enhancement also added `bcrypt` — verify-only — to `jerrycan-auth`, so this feature set carries TWO new third-party crates, not one.)*
 3. **Signed URLs:** app-HMAC universal default + S3 native presign opt-in (same SigV4 signer).
 4. **Contract:** `design.json` contract_version 2 (v0/v1 remain valid).
 5. **Metadata:** rows in `jerrycan-db` (`storage_objects`), source of truth for access; `storage` implies `db`.
