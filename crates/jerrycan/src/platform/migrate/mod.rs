@@ -11,5 +11,6 @@ pub mod crud;
 pub mod entities;
 pub mod grouping;
 pub mod rls;
+pub mod storagemap;
 pub mod tenancy;
 pub mod typemap;

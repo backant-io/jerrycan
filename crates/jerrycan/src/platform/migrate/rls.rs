@@ -76,6 +76,20 @@ pub fn recognize(policy: &PgPolicy) -> Recognized {
     Recognized::Scopes(scopes)
 }
 
+/// The `bucket_id = '<name>'` a storage.objects policy targets, even when the
+/// rest of the policy doesn't recognize (so a gapped policy still names its
+/// bucket in the gap report). Independent of full recognition.
+pub fn find_bucket(policy: &PgPolicy) -> Option<String> {
+    [policy.using.as_ref(), policy.with_check.as_ref()]
+        .into_iter()
+        .flatten()
+        .flat_map(split_conjuncts)
+        .find_map(|c| match classify(c, policy, false) {
+            Some(Scope::BucketEq { bucket }) => Some(bucket),
+            _ => None,
+        })
+}
+
 /// Unwrap `Nested`/`Cast` (never `Subquery` — that's handled by `is_auth_uid`).
 fn strip(expr: &Expr) -> &Expr {
     match expr {
