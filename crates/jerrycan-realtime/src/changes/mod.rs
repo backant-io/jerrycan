@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod pgoutput;
 pub(crate) mod replication;
+pub(crate) mod triggers;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
