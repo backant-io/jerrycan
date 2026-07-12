@@ -487,6 +487,7 @@ fn emit_from_db(
             export,
             &db,
             &entity_by_table,
+            det.membership_table.as_deref(),
             opts.bulk_threshold,
             &mut gaps,
         )?
@@ -607,6 +608,7 @@ fn write_seed(
     export: &export::Export,
     db: &pgmodel::PgDatabase,
     entity_by_table: &BTreeMap<String, Entity>,
+    membership_table: Option<&str>,
     bulk_threshold: usize,
     gaps: &mut Vec<GapItem>,
 ) -> Result<SeedSummary, String> {
@@ -618,40 +620,106 @@ fn write_seed(
     for (schema, table, path) in &export.data_files {
         let key = format!("{schema}.{table}");
         // Determine target table + columns + optional projection.
-        let (target, columns, projection): (String, Vec<SeedColumn>, Option<Vec<usize>>) =
-            if schema == "public" && entity_by_table.contains_key(&key) {
-                let headers = read_headers(path)?;
-                let columns = headers
-                    .iter()
-                    .map(|h| SeedColumn {
+        let (target, columns, projection): (String, Vec<SeedColumn>, Option<Vec<usize>>) = if schema
+            == "public"
+            && entity_by_table.contains_key(&key)
+        {
+            let headers = read_headers(path)?;
+            // Only columns the generated schema will have: entity fields +
+            // belongs_to fk columns. A column the entity DROPPED (unmapped
+            // type) would make every INSERT in this file fail at
+            // `jerrycan db seed` time.
+            let entity = &entity_by_table[&key];
+            let allowed: BTreeSet<String> = entity
+                .fields
+                .iter()
+                .map(|f| f.name.clone())
+                .chain(
+                    entity
+                        .belongs_to
+                        .iter()
+                        .map(|b| Design::fk_column(&b.entity)),
+                )
+                .collect();
+            let mut cols = Vec::new();
+            let mut idxs = Vec::new();
+            let mut dropped = Vec::new();
+            for (i, h) in headers.iter().enumerate() {
+                if allowed.contains(h) {
+                    cols.push(SeedColumn {
                         name: h.clone(),
                         ty: seed_type_of(db, &key, h),
-                    })
-                    .collect();
-                (table.clone(), columns, None)
-            } else if schema == "auth" && table == "users" {
-                let headers = read_headers(path)?;
-                let mapping = authmap::user_seed_mapping();
-                let mut cols = Vec::new();
-                let mut idxs = Vec::new();
-                for (src, dst) in mapping {
-                    if let Some(i) = headers.iter().position(|h| h == src) {
-                        let ty = if *dst == "id" {
-                            SeedType::Uuid
-                        } else {
-                            SeedType::Text
-                        };
-                        cols.push(SeedColumn {
-                            name: (*dst).to_string(),
-                            ty,
-                        });
-                        idxs.push(i);
-                    }
+                    });
+                    idxs.push(i);
+                } else {
+                    dropped.push(h.clone());
                 }
-                ("users".to_string(), cols, Some(idxs))
-            } else {
+            }
+            if !dropped.is_empty() {
+                gaps.push(GapItem {
+                        kind: GapKind::SeedData,
+                        source: format!("{key} columns [{}]", dropped.join(", ")),
+                        location: path.display().to_string(),
+                        reason: "these CSV columns are not part of the modeled entity — their data is NOT seeded".into(),
+                        original: String::new(),
+                        suggested: "model the columns (see their unmapped_type gaps) and re-run, or carry the data by hand".into(),
+                        severity: Severity::Advisory,
+                    });
+            }
+            if cols.is_empty() {
                 continue;
-            };
+            }
+            let projection = (idxs.len() != headers.len()).then_some(idxs);
+            (table.clone(), cols, projection)
+        } else if schema == "auth" && table == "users" {
+            let headers = read_headers(path)?;
+            let mapping = authmap::user_seed_mapping();
+            let mut cols = Vec::new();
+            let mut idxs = Vec::new();
+            for (src, dst) in mapping {
+                if let Some(i) = headers.iter().position(|h| h == src) {
+                    let ty = if *dst == "id" {
+                        SeedType::Uuid
+                    } else {
+                        SeedType::Text
+                    };
+                    cols.push(SeedColumn {
+                        name: (*dst).to_string(),
+                        ty,
+                    });
+                    idxs.push(i);
+                }
+            }
+            ("users".to_string(), cols, Some(idxs))
+        } else if Some(key.as_str()) == membership_table {
+            // Tenant membership rows are represented by the generated
+            // `{tenant}_members` table, whose user-id mapping is agent
+            // work — dropping them silently would lock every user out of
+            // their tenant. Blocking, never silent.
+            gaps.push(GapItem {
+                    kind: GapKind::SeedData,
+                    source: format!("{key} rows"),
+                    location: path.display().to_string(),
+                    reason: "tenant membership rows are not auto-seeded — without them no migrated user belongs to any tenant".into(),
+                    original: String::new(),
+                    suggested: "insert these rows into the generated `<tenant>_members` table (user_id, tenant fk, role) as part of the seed hand-off".into(),
+                    severity: Severity::Blocking,
+                });
+            continue;
+        } else if schema == "storage" && table == "objects" {
+            gaps.push(GapItem {
+                    kind: GapKind::SeedData,
+                    source: "storage.objects rows".into(),
+                    location: path.display().to_string(),
+                    reason: "storage object metadata rows are not auto-seeded; exported object bytes are staged under seed/blobs/ but `jerrycan db seed` does not upload them".into(),
+                    original: String::new(),
+                    suggested: "upload seed/blobs/<bucket>/<key> files to the configured storage backend, then remove this gap".into(),
+                    severity: Severity::Blocking,
+                });
+            continue;
+        } else {
+            continue;
+        };
 
         // Pass 1: count rows + flag suspected secrets (advisory, never redacted).
         let mut count = 0usize;
@@ -702,12 +770,61 @@ fn write_seed(
         }
     }
 
+    // Spec §6: storage.objects → seed + byte copy. Stage every exported object
+    // byte-for-byte under seed/blobs/<bucket>/<key> and record it in the
+    // manifest, so the Supabase project can be decommissioned without losing
+    // the files (uploading them to the configured backend is the agent's step,
+    // gap-reported above when storage.objects rows exist).
+    for dir in &export.object_dirs {
+        let bucket = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if bucket.is_empty() {
+            continue;
+        }
+        let mut files = Vec::new();
+        collect_files(dir, &mut files)?;
+        files.sort();
+        for f in &files {
+            let key = f
+                .strip_prefix(dir)
+                .map_err(|e| e.to_string())?
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let rel = format!("seed/blobs/{bucket}/{key}");
+            let dest = out_dir.join(&rel);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::copy(f, &dest).map_err(|e| format!("copy {}: {e}", f.display()))?;
+            writer.add_blob(&bucket, &key, &rel);
+        }
+    }
+
     writer.finish()?;
     Ok(SeedSummary {
         tables,
         bulk_tables,
         rows: total_rows,
     })
+}
+
+/// Recursively collect regular files under `dir` (deterministic: caller sorts).
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn read_headers(path: &Path) -> Result<Vec<String>, String> {
@@ -795,6 +912,114 @@ create publication supabase_realtime for table public.customers;
                 "{rel} deterministic"
             );
         }
+    }
+
+    #[test]
+    fn seed_drops_columns_the_entity_dropped_and_says_so() {
+        // A `point` column gaps out of the entity; the CSV still carries it.
+        // Seeding it would make every INSERT fail against the generated schema.
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(export_dir.join("data")).unwrap();
+        std::fs::write(
+            export_dir.join("schema.sql"),
+            "create table public.stores (id uuid primary key, name text not null, location point);",
+        )
+        .unwrap();
+        std::fs::write(
+            export_dir.join("data/public.stores.csv"),
+            "id,name,location\naaaaaaaa-0000-0000-0000-000000000001,Alpha,\"(1,2)\"\n",
+        )
+        .unwrap();
+        let out_dir = tmp.path().join("app");
+        let out = run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: out_dir.clone(),
+            name: Some("acme".into()),
+            bulk_threshold: 5000,
+        })
+        .unwrap();
+        let inline = std::fs::read_to_string(out_dir.join("seed/inline/001_stores.sql")).unwrap();
+        assert!(
+            inline.contains("INSERT INTO stores (id, name)") && !inline.contains("location"),
+            "dropped column must not be seeded: {inline}"
+        );
+        assert!(inline.contains("Alpha"), "kept columns still seed");
+        assert!(
+            out.gaps.iter().any(|g| g.kind == GapKind::SeedData
+                && g.source.contains("location")
+                && g.severity == Severity::Advisory),
+            "dropping data is never silent"
+        );
+    }
+
+    #[test]
+    fn membership_rows_and_storage_objects_are_blocking_seed_gaps_not_silent_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(export_dir.join("data")).unwrap();
+        mini_export(&export_dir);
+        std::fs::write(
+            export_dir.join("data/public.workspace_members.csv"),
+            "workspace_id,user_id,role\naaaaaaaa-0000-0000-0000-000000000001,11111111-1111-1111-1111-111111111111,owner\n",
+        )
+        .unwrap();
+        std::fs::write(
+            export_dir.join("data/storage.objects.csv"),
+            "id,bucket_id,name,owner\no1,avatars,u/a.png,u\n",
+        )
+        .unwrap();
+        let out = run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: tmp.path().join("app"),
+            name: Some("acme".into()),
+            bulk_threshold: 5000,
+        })
+        .unwrap();
+        assert!(
+            out.gaps.iter().any(|g| g.kind == GapKind::SeedData
+                && g.source.contains("workspace_members")
+                && g.severity == Severity::Blocking),
+            "membership rows must be a blocking gap: {:?}",
+            out.gaps.iter().map(|g| &g.source).collect::<Vec<_>>()
+        );
+        assert!(
+            out.gaps.iter().any(|g| g.kind == GapKind::SeedData
+                && g.source.contains("storage.objects")
+                && g.severity == Severity::Blocking),
+            "storage object rows must be a blocking gap"
+        );
+    }
+
+    #[test]
+    fn exported_object_bytes_are_staged_into_seed_blobs_with_manifest_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        mini_export(&export_dir);
+        let obj_dir = export_dir.join("storage/objects/avatars/u1");
+        std::fs::create_dir_all(&obj_dir).unwrap();
+        std::fs::write(obj_dir.join("a.png"), b"png-bytes").unwrap();
+        let out_dir = tmp.path().join("app");
+        run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: out_dir.clone(),
+            name: Some("acme".into()),
+            bulk_threshold: 5000,
+        })
+        .unwrap();
+        let staged = out_dir.join("seed/blobs/avatars/u1/a.png");
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"png-bytes",
+            "bytes staged verbatim"
+        );
+        let manifest = std::fs::read_to_string(out_dir.join("seed/manifest.json")).unwrap();
+        assert!(
+            manifest.contains("\"bucket\": \"avatars\"")
+                && manifest.contains("\"key\": \"u1/a.png\""),
+            "manifest records the blob: {manifest}"
+        );
     }
 
     #[test]

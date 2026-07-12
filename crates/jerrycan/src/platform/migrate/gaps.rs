@@ -17,6 +17,9 @@ pub enum GapKind {
     Presence,
     CronJob,
     SuspectedSecret,
+    /// Export data that could not be carried into the generated seed
+    /// mechanically (membership rows, storage object rows, dropped columns).
+    SeedData,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
