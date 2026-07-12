@@ -31,12 +31,20 @@ fn is_bcrypt(phc: &str) -> bool {
 /// = mismatch; `Err` = the stored hash is malformed (operator/data problem,
 /// not a guess).
 pub fn verify_password(password: &str, phc: &str) -> Result<bool> {
+    // SECURITY: the error message is a client-visible 500 body on the login
+    // path, and bcrypt's InvalidHash Display embeds the FULL stored hash —
+    // detail goes to stderr for the operator, the client gets a generic
+    // message (the jerrycan-db db_error convention).
     if is_bcrypt(phc) {
-        return bcrypt::verify(password, phc)
-            .map_err(|e| Error::internal(format!("stored bcrypt hash is malformed: {e}")));
+        return bcrypt::verify(password, phc).map_err(|e| {
+            eprintln!("jerrycan-auth: stored bcrypt hash is malformed: {e}");
+            Error::internal("stored password hash is malformed")
+        });
     }
-    let parsed = PasswordHash::new(phc)
-        .map_err(|e| Error::internal(format!("stored hash is malformed: {e}")))?;
+    let parsed = PasswordHash::new(phc).map_err(|e| {
+        eprintln!("jerrycan-auth: stored hash is malformed: {e}");
+        Error::internal("stored password hash is malformed")
+    })?;
     Ok(Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok())
@@ -103,6 +111,28 @@ mod tests {
         // A $2-prefixed non-hash is an operator/data problem — surfaced, not
         // silently treated as a wrong password.
         assert!(verify_password("x", "$2b$not-a-real-hash").is_err());
+    }
+
+    #[test]
+    fn malformed_hash_errors_never_leak_the_stored_hash() {
+        // WHY (security): bcrypt's InvalidHash error Display embeds the FULL
+        // stored hash string, and verify_password's error message is a
+        // client-visible 500 body on the login path. Hash material (even
+        // malformed) must go to stderr only — the client gets a generic
+        // message (the jerrycan-db db_error convention).
+        let bcrypt_ish = "$2b$10$SECRET-HASH-MATERIAL-THAT-MUST-NOT-LEAK";
+        let err = verify_password("x", bcrypt_ish).unwrap_err();
+        assert!(
+            !err.message().contains("SECRET-HASH-MATERIAL"),
+            "stored hash leaked to the client: {}",
+            err.message()
+        );
+        let err = verify_password("x", "$argon2id$corrupt$SECRETSALTMATERIAL").unwrap_err();
+        assert!(
+            !err.message().contains("SECRETSALTMATERIAL"),
+            "stored hash leaked to the client: {}",
+            err.message()
+        );
     }
 
     #[test]
