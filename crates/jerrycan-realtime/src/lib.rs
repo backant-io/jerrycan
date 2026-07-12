@@ -7,6 +7,8 @@ pub mod changes;
 pub mod protocol;
 pub(crate) mod broadcast;
 pub(crate) mod bus;
+#[cfg(feature = "realtime-redis")]
+pub(crate) mod bus_redis;
 pub(crate) mod channel;
 pub(crate) mod presence;
 pub(crate) mod ws;
@@ -60,6 +62,9 @@ pub struct Realtime {
     pub(crate) mount: String,
     pub(crate) config: RealtimeConfig,
     pub(crate) resolver: Option<PrincipalResolver>,
+    /// Explicit Redis URL for the multi-node bus (else `JERRYCAN_REDIS_URL`).
+    /// Only consulted under the `realtime-redis` feature.
+    pub(crate) redis_url: Option<String>,
 }
 
 impl Realtime {
@@ -76,7 +81,16 @@ impl Realtime {
             mount: "/realtime".into(),
             config: RealtimeConfig::default(),
             resolver: None,
+            redis_url: None,
         }
+    }
+
+    /// Set the Redis URL for the multi-node fan-out bus (mirrors `jobs-redis`).
+    /// Takes precedence over `JERRYCAN_REDIS_URL`; only consulted with the
+    /// `realtime-redis` feature enabled.
+    pub fn redis_url(mut self, url: &str) -> Self {
+        self.redis_url = Some(url.to_string());
+        self
     }
 
     /// Install the principal resolver: it authenticates the connection at
@@ -397,8 +411,20 @@ impl jerrycan_core::Extension for Realtime {
     }
 }
 
-/// Construct the fan-out bus. Redis selection lands in Task 18.
-fn build_bus(_rt: &Realtime) -> bus::AnyBus {
+/// Construct the fan-out bus: Redis when `realtime-redis` is on and a URL is
+/// configured (explicit or `JERRYCAN_REDIS_URL`), else the in-process LocalBus.
+fn build_bus(rt: &Realtime) -> bus::AnyBus {
+    #[cfg(feature = "realtime-redis")]
+    {
+        if let Some(url) = rt
+            .redis_url
+            .clone()
+            .or_else(|| std::env::var("JERRYCAN_REDIS_URL").ok())
+        {
+            return bus::AnyBus::Redis(bus_redis::RedisBus::new(url));
+        }
+    }
+    let _ = rt;
     bus::AnyBus::Local(bus::LocalBus::new())
 }
 
@@ -409,6 +435,17 @@ async fn supervisor(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let _ = ctx;
+    // Multi-node bus pump: forward Redis pub/sub into the local fan-in.
+    #[cfg(feature = "realtime-redis")]
+    if let bus::AnyBus::Redis(_) = &hub.bus {
+        let hub_pump = hub.clone();
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            if let bus::AnyBus::Redis(b) = &hub_pump.bus {
+                b.run_pump(sd).await;
+            }
+        });
+    }
     start_change_source(&hub, shutdown.clone()).await;
     presence_supervise(&hub, &mut shutdown).await;
 }
