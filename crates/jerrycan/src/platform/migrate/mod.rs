@@ -10,6 +10,7 @@ pub mod authmap;
 pub mod crud;
 pub mod entities;
 pub mod grouping;
+pub mod live;
 pub mod cronmap;
 pub mod realtimemap;
 pub mod redact;
@@ -96,7 +97,44 @@ pub fn run_migrate(opts: &MigrateOptions) -> Result<MigrateOutput, String> {
     let export = export::Export::open(&opts.export_dir)?;
     let stmts = parse::split_and_parse(&export.schema_sql);
     let db = pgmodel::PgDatabase::fold(&stmts);
+    let providers = providers_from_export(&export);
+    let edge_names = export
+        .function_dirs
+        .iter()
+        .map(|d| {
+            d.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("edge")
+                .to_string()
+        })
+        .collect();
+    let fe = FrontendInputs {
+        providers,
+        buckets_json: export.buckets_json.clone(),
+        cron_sql: export.cron_sql.clone(),
+        edge_names,
+        seed: Some(&export),
+    };
+    emit_from_db(db, opts, fe)
+}
 
+/// Front-end-supplied inputs the shared translator/emit tail consumes. The
+/// offline path fills these from the export dir; `--live` fills them from
+/// catalog queries. `seed` is `None` for live (rows are not streamed in v1).
+pub(crate) struct FrontendInputs<'a> {
+    pub providers: Vec<String>,
+    pub buckets_json: Option<String>,
+    pub cron_sql: Option<String>,
+    pub edge_names: Vec<String>,
+    pub seed: Option<&'a export::Export>,
+}
+
+fn emit_from_db(
+    db: pgmodel::PgDatabase,
+    opts: &MigrateOptions,
+    fe: FrontendInputs,
+) -> Result<MigrateOutput, String> {
+    let providers = fe.providers.clone();
     let det = tenancy::detect(&db);
     let access_map = tenancy::table_access(&db, &det);
 
@@ -141,7 +179,6 @@ pub fn run_migrate(opts: &MigrateOptions) -> Result<MigrateOutput, String> {
     });
 
     // Auth.
-    let providers = providers_from_export(&export);
     let auth_out = authmap::build_auth(&det.member_roles, &providers);
 
     // Modules: users first, then FK-graph groups (hub = tenant table).
@@ -242,7 +279,7 @@ pub fn run_migrate(opts: &MigrateOptions) -> Result<MigrateOutput, String> {
     };
 
     // Storage.
-    let storage = if let Some(json) = &export.buckets_json {
+    let storage = if let Some(json) = &fe.buckets_json {
         let so = storagemap::build_storage(json, &db, "User")?;
         let design = so.to_design();
         gaps.extend(so.gaps);
@@ -253,7 +290,7 @@ pub fn run_migrate(opts: &MigrateOptions) -> Result<MigrateOutput, String> {
 
     // Jobs (cron).
     let mut jobs = Vec::new();
-    if let Some(cron) = &export.cron_sql {
+    if let Some(cron) = &fe.cron_sql {
         let jo = cronmap::build_jobs(cron);
         jobs = jo.jobs;
         gaps.extend(jo.gaps);
@@ -282,8 +319,7 @@ pub fn run_migrate(opts: &MigrateOptions) -> Result<MigrateOutput, String> {
             severity: Severity::Advisory,
         });
     }
-    for dir in &export.function_dirs {
-        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("edge");
+    for name in &fe.edge_names {
         gaps.push(GapItem {
             kind: GapKind::EdgeFunction,
             source: format!("edge function `{name}`"),
@@ -306,10 +342,14 @@ pub fn run_migrate(opts: &MigrateOptions) -> Result<MigrateOutput, String> {
         });
     }
 
-    let name = opts
-        .name
-        .clone()
-        .unwrap_or_else(|| kebab(opts.export_dir.file_name().and_then(|n| n.to_str()).unwrap_or("app")));
+    let name = opts.name.clone().unwrap_or_else(|| {
+        kebab(
+            opts.out_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("app"),
+        )
+    });
 
     let design = Design {
         name,
@@ -341,8 +381,35 @@ pub fn run_migrate(opts: &MigrateOptions) -> Result<MigrateOutput, String> {
         created.push(rel);
     }
 
-    // Seed pass (streamed).
-    let seed_summary = write_seed(&opts.out_dir, &export, &db, &entity_by_table, opts.bulk_threshold, &mut gaps)?;
+    // Seed pass (streamed). Offline streams the export CSVs; live (v1) does not
+    // stream rows — it emits an empty seed + a blocking gap directing the offline
+    // export for data (resolved ambiguity #9: bytes/rows are an offline step).
+    let seed_summary = if let Some(export) = fe.seed {
+        write_seed(
+            &opts.out_dir,
+            export,
+            &db,
+            &entity_by_table,
+            opts.bulk_threshold,
+            &mut gaps,
+        )?
+    } else {
+        SeedWriter::new(&opts.out_dir, opts.bulk_threshold, 500).finish()?;
+        gaps.push(GapItem {
+            kind: GapKind::UnmappedType,
+            source: "live-mode data seed".into(),
+            location: "(--live)".into(),
+            reason: "`--live` translates the schema only; table rows and object bytes are not streamed".into(),
+            original: String::new(),
+            suggested: "produce an offline export and run the offline migration to generate seed/".into(),
+            severity: Severity::Blocking,
+        });
+        SeedSummary {
+            tables: 0,
+            bulk_tables: 0,
+            rows: 0,
+        }
+    };
 
     // Gap report + MIGRATION.md.
     let mut sorted_gaps = gaps.clone();
@@ -369,6 +436,20 @@ pub fn run_migrate(opts: &MigrateOptions) -> Result<MigrateOutput, String> {
         created,
         seed: seed_summary,
     })
+}
+
+/// `--live`: read Postgres catalogs into the shared IR, then translate + emit.
+/// Never streams table rows (the seed is an offline step). Never used in CI.
+pub async fn run_migrate_live(conn: &str, opts: &MigrateOptions) -> Result<MigrateOutput, String> {
+    let read = live::read_live(conn).await?;
+    let fe = FrontendInputs {
+        providers: read.providers,
+        buckets_json: read.buckets_json,
+        cron_sql: None,
+        edge_names: vec![],
+        seed: None,
+    };
+    emit_from_db(read.db, opts, fe)
 }
 
 fn providers_from_export(export: &export::Export) -> Vec<String> {

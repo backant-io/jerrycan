@@ -786,16 +786,9 @@ fn cmd_migrate(
             "unknown migration source `{from}` — supported: supabase"
         )));
     }
-    if live.is_some() {
-        return Err(Failure::usage(
-            "--live lands after the offline path — export the project and use the export directory for now",
-        ));
-    }
-    let dir = export_dir
-        .ok_or_else(|| Failure::usage("provide the export directory (or --live <conn>)"))?;
-    // Derive the default app name (and thus out dir) from the export dir name.
-    let default_name = dir
-        .file_name()
+    // Default app name/out dir from the export dir (offline) or a required --name (live).
+    let default_name = export_dir
+        .and_then(|d| d.file_name())
         .and_then(|n| n.to_str())
         .unwrap_or("app")
         .to_string();
@@ -804,13 +797,36 @@ fn cmd_migrate(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(&app_name));
 
-    let output = migrate::run_migrate(&MigrateOptions {
-        export_dir: dir.to_path_buf(),
-        out_dir: out_dir.clone(),
-        name: name.map(str::to_string),
-        bulk_threshold,
-    })
-    .map_err(Failure::gate)?;
+    let output = if let Some(conn) = live {
+        eprintln!(
+            "warning: --live reads a production database — offline export is the supported CI path"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| Failure::environment(e.to_string()))?;
+        runtime
+            .block_on(migrate::run_migrate_live(
+                conn,
+                &MigrateOptions {
+                    export_dir: PathBuf::new(),
+                    out_dir: out_dir.clone(),
+                    name: name.map(str::to_string),
+                    bulk_threshold,
+                },
+            ))
+            .map_err(Failure::gate)?
+    } else {
+        let dir = export_dir
+            .ok_or_else(|| Failure::usage("provide the export directory (or --live <conn>)"))?;
+        migrate::run_migrate(&MigrateOptions {
+            export_dir: dir.to_path_buf(),
+            out_dir: out_dir.clone(),
+            name: name.map(str::to_string),
+            bulk_threshold,
+        })
+        .map_err(Failure::gate)?
+    };
 
     let blocking = output
         .gaps
