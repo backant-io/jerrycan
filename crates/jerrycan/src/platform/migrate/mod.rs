@@ -9,4 +9,5 @@ pub mod pgmodel;
 pub mod entities;
 pub mod grouping;
 pub mod rls;
+pub mod tenancy;
 pub mod typemap;
