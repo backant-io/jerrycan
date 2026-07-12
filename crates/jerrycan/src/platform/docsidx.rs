@@ -55,6 +55,10 @@ pub const PAGES: &[(&str, &str)] = &[
     ),
     ("storage", include_str!("../../embedded/ai/18-storage.md")),
     ("realtime", include_str!("../../embedded/ai/18-realtime.md")),
+    (
+        "migrate-supabase",
+        include_str!("../../embedded/ai/19-migrate-supabase.md"),
+    ),
 ];
 
 fn slug(heading: &str) -> String {

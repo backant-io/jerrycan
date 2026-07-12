@@ -773,11 +773,14 @@ fn cmd_migrate(
     from: &str,
     export_dir: Option<&Path>,
     live: Option<&str>,
-    _out: Option<&Path>,
-    _name: Option<&str>,
-    _bulk_threshold: usize,
-    _json_mode: bool,
+    out: Option<&Path>,
+    name: Option<&str>,
+    bulk_threshold: usize,
+    json_mode: bool,
 ) -> Result<(), Failure> {
+    use jerrycan::platform::migrate::{self, MigrateOptions};
+    use jerrycan::platform::migrate::gaps::Severity;
+
     if from != "supabase" {
         return Err(Failure::usage(format!(
             "unknown migration source `{from}` — supported: supabase"
@@ -790,10 +793,67 @@ fn cmd_migrate(
     }
     let dir = export_dir
         .ok_or_else(|| Failure::usage("provide the export directory (or --live <conn>)"))?;
-    let _export = jerrycan::platform::migrate::export::Export::open(dir).map_err(Failure::usage)?;
-    Err(Failure::usage(
-        "migration pipeline not wired yet — implemented across this plan's tasks",
-    ))
+    // Derive the default app name (and thus out dir) from the export dir name.
+    let default_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("app")
+        .to_string();
+    let app_name = name.unwrap_or(&default_name).to_string();
+    let out_dir = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(&app_name));
+
+    let output = migrate::run_migrate(&MigrateOptions {
+        export_dir: dir.to_path_buf(),
+        out_dir: out_dir.clone(),
+        name: name.map(str::to_string),
+        bulk_threshold,
+    })
+    .map_err(Failure::gate)?;
+
+    let blocking = output
+        .gaps
+        .iter()
+        .filter(|g| g.severity == Severity::Blocking)
+        .count();
+    let advisory = output.gaps.len() - blocking;
+    let first_module = output
+        .design
+        .modules
+        .first()
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| "app".into());
+    let bucket_count = output
+        .design
+        .storage
+        .as_ref()
+        .map(|s| s.buckets.len())
+        .unwrap_or(0);
+    let realtime_count = output
+        .design
+        .realtime
+        .as_ref()
+        .map(|r| r.changes.len())
+        .unwrap_or(0);
+    let entity_count: usize = output.design.modules.iter().map(|m| m.entities.len()).sum();
+    let out_disp = out_dir.display().to_string();
+    let payload = serde_json::json!({
+        "created": output.created,
+        "design": format!("{out_disp}/design.json"),
+        "gap_report": { "path": format!("{out_disp}/gap-report.json"), "blocking": blocking, "advisory": advisory },
+        "seed": { "tables": output.seed.tables, "bulk_tables": output.seed.bulk_tables, "rows": output.seed.rows },
+        "next_step": format!("cd {out_disp} && jerrycan db migrate && jerrycan db seed && jerrycan gen-tests --module {first_module} && jerrycan check — then work gap-report.json top-down"),
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!(
+            "migrated {entity_count} entities, {bucket_count} buckets, {realtime_count} realtime channels — {} gap items ({blocking} blocking)",
+            output.gaps.len()
+        ),
+    );
+    Ok(())
 }
 
 fn cmd_list_routes(json_mode: bool) -> Result<(), Failure> {

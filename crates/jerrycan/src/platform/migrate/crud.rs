@@ -142,6 +142,21 @@ pub fn endpoints_for(entity: &str, access: &TableAccess) -> Vec<Endpoint> {
     ]
 }
 
+/// Prefix every endpoint's path so a second+ entity in a module doesn't collide
+/// with the primary entity's `/` and `/{id}` routes. Empty prefix = no change.
+pub fn prefix_paths(eps: &mut [Endpoint], prefix: &str) {
+    if prefix.is_empty() {
+        return;
+    }
+    for ep in eps {
+        ep.path = if ep.path == "/" {
+            prefix.to_string()
+        } else {
+            format!("{prefix}{}", ep.path)
+        };
+    }
+}
+
 /// Fully guard a set of endpoints: public reads are downgraded to auth-required.
 /// The orchestrator calls this when the entity is tenant-owned (questions.rs
 /// forbids public on tenant-owned) + emits an advisory gap.

@@ -57,10 +57,19 @@ pub fn entity_name(table: &str) -> String {
 }
 
 pub fn build_entities(db: &PgDatabase) -> BuildResult {
+    build_entities_filtered(db, &std::collections::BTreeSet::new())
+}
+
+/// Build entities for every `public.*` table except those in `exclude` (the
+/// membership table is represented by tenancy, so it's excluded by the orchestrator).
+pub fn build_entities_filtered(
+    db: &PgDatabase,
+    exclude: &std::collections::BTreeSet<String>,
+) -> BuildResult {
     let mut entities = Vec::new();
     let mut gaps = Vec::new();
     for (key, table) in &db.tables {
-        if !key.starts_with("public.") {
+        if !key.starts_with("public.") || exclude.contains(key) {
             continue;
         }
         if let Some(entity) = build_one(key, table, db, &mut gaps) {
