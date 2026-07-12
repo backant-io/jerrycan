@@ -3,7 +3,9 @@
 //! <https://jerrycan.cc>
 #![forbid(unsafe_code)]
 
+pub mod changes;
 pub mod protocol;
+pub(crate) mod bus;
 pub(crate) mod channel;
 
 /// The authenticated identity a connection carries for every scope check.
