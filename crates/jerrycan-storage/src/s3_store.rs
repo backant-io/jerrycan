@@ -607,7 +607,10 @@ mod tests {
             "credentials must never print: {dbg}"
         );
         assert!(dbg.contains("<redacted>"), "{dbg}");
-        assert!(dbg.contains("eu-central-1"), "routing fields do print: {dbg}");
+        assert!(
+            dbg.contains("eu-central-1"),
+            "routing fields do print: {dbg}"
+        );
     }
 
     #[test]
