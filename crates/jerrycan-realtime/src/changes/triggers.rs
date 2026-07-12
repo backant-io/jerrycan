@@ -96,7 +96,9 @@ impl TriggerAdapter {
             };
             let mut event = payload.clone().into_event(&spec.entity);
             if matches!(event.op, ChangeOp::Insert | ChangeOp::Update) {
-                event.row = self.refetch(spec, &payload.pk).await;
+                event.row = self
+                    .refetch(spec, &payload.pk, payload.tenant_id.as_deref())
+                    .await;
             }
             if events.send(event).await.is_err() {
                 return Ok(()); // hub gone
@@ -107,25 +109,54 @@ impl TriggerAdapter {
     /// Refetch the row body as JSON; None if the row is already gone (fail-open
     /// on the body — the scope keys came from the NOTIFY payload, so delivery
     /// stays scope-correct even without the body).
-    async fn refetch(&self, spec: &ChangeChannelSpec, pk: &str) -> Option<serde_json::Value> {
-        let sql = format!(
-            "SELECT row_to_json(t)::text AS j FROM \
-             (SELECT * FROM \"{}\" WHERE \"{}\"::text = $1) t",
-            spec.table, spec.pk_column
-        );
+    ///
+    /// SECURITY: a tenant-scoped entity is re-selected under BOTH the pk AND the
+    /// NOTIFY tenant key. Refetch reads *current* state, so if the row moved to
+    /// another tenant between the NOTIFY firing and this query, an unscoped
+    /// refetch would return the NEW tenant's row body while delivery is routed by
+    /// the OLD NOTIFY key — leaking one tenant's row into another's partition.
+    /// Binding the tenant key makes a moved row return no body (the subscriber
+    /// refetches current state), never another tenant's row. The replication path
+    /// has no such window (pgoutput carries the point-in-time tuple).
+    async fn refetch(
+        &self,
+        spec: &ChangeChannelSpec,
+        pk: &str,
+        tenant_id: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        let scoped = tenant_id.is_some() && spec.tenant_column.is_some();
+        let sql = refetch_sql(spec, scoped);
+        let mut values: Vec<jerrycan_db::sea_orm::Value> = vec![pk.into()];
+        if scoped {
+            values.push(tenant_id.expect("scoped implies Some").into());
+        }
         let row = self
             .db
             .conn()
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 sql,
-                [pk.into()],
+                values,
             ))
             .await
             .ok()??;
         let json: String = row.try_get("", "j").ok()?;
         serde_json::from_str(&json).ok()
     }
+}
+
+/// Build the refetch query. When `scoped_by_tenant`, the row is re-selected under
+/// the tenant key as `$2` (closing the tenant-move race — see `refetch`).
+fn refetch_sql(spec: &ChangeChannelSpec, scoped_by_tenant: bool) -> String {
+    let tenant_pred = match (scoped_by_tenant, &spec.tenant_column) {
+        (true, Some(col)) => format!(" AND \"{col}\"::text = $2"),
+        _ => String::new(),
+    };
+    format!(
+        "SELECT row_to_json(t)::text AS j FROM \
+         (SELECT * FROM \"{}\" WHERE \"{}\"::text = $1{tenant_pred}) t",
+        spec.table, spec.pk_column
+    )
 }
 
 fn sqlx_error(e: sqlx::Error) -> jerrycan_core::Error {
@@ -148,6 +179,25 @@ mod tests {
             pk_column: "id".into(),
             tenant_column: Some("workspace_id".into()),
         }
+    }
+
+    #[test]
+    fn refetch_sql_binds_the_tenant_key_to_close_the_move_race() {
+        // Tenant-scoped: the body is re-selected under BOTH pk and tenant key so
+        // a row that moved tenants between NOTIFY and refetch yields no body —
+        // never another tenant's row delivered into the old tenant's partition.
+        let scoped = refetch_sql(&lead(), true);
+        assert!(scoped.contains(r#""id"::text = $1"#), "{scoped}");
+        assert!(scoped.contains(r#""workspace_id"::text = $2"#), "{scoped}");
+        // Unscoped selection (tenant key absent) carries no second predicate.
+        let unscoped = refetch_sql(&lead(), false);
+        assert!(!unscoped.contains("$2"), "{unscoped}");
+        // A global (non-tenant) entity is never tenant-scoped.
+        let global = ChangeChannelSpec {
+            tenant_column: None,
+            ..lead()
+        };
+        assert!(!refetch_sql(&global, true).contains("$2"));
     }
 
     #[test]
