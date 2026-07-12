@@ -26,7 +26,7 @@ Same extension-crate shape as the rest:
 - Reserved `realtime` dependency recognized in `design.rs` (`has_realtime()`), surfaced in `facade_features()`, added to the reserved-name filter in `mounting.rs`.
 - New generator module `realtimegen.rs` emits the publication DDL, `REPLICA IDENTITY` DDL, the NOTIFY triggers (fallback path), channel wiring, and tests.
 
-**New third-party crates (honest count):** two — **`tokio-tungstenite`** (WS transport) and **`tokio-postgres`** (+rustls; the WAL replication socket only — sqlx stays the sole data-layer client, see Resolved #7). `redis` is already in the workspace.
+**New third-party crates (honest count):** two — **`tokio-tungstenite`** (WS transport) and **`pgwire-replication`** (the dedicated logical-replication client — pgoutput, rustls TLS, SCRAM; the WAL socket only — sqlx stays the sole data-layer client, see Resolved #7). `redis` is already in the workspace.
 
 ## `design.json` contract (v2 addition): the `realtime` block
 
@@ -56,7 +56,7 @@ Two source adapters behind one `ChangeSource` trait; both feed the same scope-fi
 
 ### Primary: logical replication (self-maintaining)
 
-Exact Supabase-style mechanism — logical decoding of the WAL via the **built-in `pgoutput` plugin** (no server-side plugin install, unlike `wal2json`). The WAL socket is opened with **`tokio-postgres`** (+rustls) — the one place sqlx can't reach; it carries only the replication stream, never the app's queries (sqlx stays the data-layer client, see Resolved #7).
+Exact Supabase-style mechanism — logical decoding of the WAL via the **built-in `pgoutput` plugin** (no server-side plugin install, unlike `wal2json`). The WAL socket is opened with the **`pgwire-replication`** client (`ReplicationClient`, rustls TLS + SCRAM) — the one place sqlx can't reach; it carries only the replication stream, never the app's queries (sqlx stays the data-layer client, see Resolved #7).
 
 - **Detection:** at startup, `SHOW wal_level`. If `logical` and the role can replicate → use this adapter. Else → fall back to triggers.
 - **Self-maintaining, by construction:**
@@ -131,7 +131,7 @@ The reference Supabase export gains realtime channels. The eval drives a real WS
 4. **Transport:** hyper-native WS upgrade; no new HTTP stack.
 5. **Multi-node:** `realtime-redis` bus; free on the trigger path (Postgres is the bus).
 6. **Security:** scope-filtered delivery is mandatory and negative-control eval-gated.
-7. **Replication client:** `tokio-postgres` (+rustls), confined to the replication adapter. **We keep sqlx** as the sole data-layer client — switching off sqlx would drop SQLite (`tokio-postgres` is Postgres-only), abandon the sea-orm/sea-query-binder layer, and break the generated-code contract (`jerrycan::db::sqlx::…`); not worth it to avoid one narrow dependency.
+7. **Replication client:** the dedicated **`pgwire-replication`** crate (`ReplicationClient`/`ReplicationConfig`, pgoutput, rustls TLS + SCRAM, `recv()`→`ReplicationEvent`, `update_applied_lsn()` for LSN confirmation; v0.3.2, MSRV 1.88, PG15+), confined to the replication adapter. A *dedicated* replication client is used because mainline `tokio-postgres` lacks logical-replication support — but the architecture is unchanged: a separate client owns the WAL socket, never sqlx. **We keep sqlx** as the sole data-layer client (SQLite + sea-orm + the generated `jerrycan::db::sqlx` contract untouched); sqlx is never used for replication because it cannot stream the WAL.
 8. **Transport lib:** `tokio-tungstenite`.
 9. **Channel protocol:** jerrycan-native; Supabase wire-compat adapter deferred to a fast-follow.
 10. **Delivery:** match Supabase — no replay in v1 (at-most-once; client refetches on reconnect). Replay / guaranteed at-least-once is the first fast-follow.
