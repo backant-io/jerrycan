@@ -38,7 +38,7 @@ impl RedisBus {
                     .map_err(redis_err)
             })
             .await
-            .map(Clone::clone)
+            .cloned()
     }
 
     pub(crate) async fn publish(&self, msg: BusMessage) -> jerrycan_core::Result<()> {
