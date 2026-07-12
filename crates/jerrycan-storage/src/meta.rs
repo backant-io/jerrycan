@@ -149,6 +149,23 @@ pub(crate) async fn insert(db: &Db, m: &ObjectMeta) -> Result<()> {
     Ok(())
 }
 
+/// Does a row with this `(bucket, key)` already exist? put_object's pre-check:
+/// a duplicate upload must 409 BEFORE any blob bytes are touched, because the
+/// blob write lands at the SAME bucket/key path and would overwrite the
+/// existing object's bytes. (The unique index still backstops racers.)
+pub(crate) async fn key_exists(db: &Db, bucket: &str, key: &str) -> Result<bool> {
+    let row = db
+        .conn()
+        .query_one(stmt(
+            db,
+            "SELECT id FROM storage_objects WHERE bucket = ? AND \"key\" = ?",
+            vec![bucket.into(), key.into()],
+        ))
+        .await
+        .map_err(db_error)?;
+    Ok(row.is_some())
+}
+
 /// One object by id within a bucket, filtered by whatever the scope sets —
 /// a scoped read of a foreign row is None (the caller's 404).
 pub(crate) async fn get_scoped(

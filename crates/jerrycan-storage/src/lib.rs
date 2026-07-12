@@ -172,9 +172,11 @@ impl Storage {
             .ok_or_else(|| Error::internal("storage: JERRYCAN_SECRET is required for signed URLs"))
     }
 
-    /// Upload: validate key/size/mime, prepend the owner prefix, reserve the
-    /// metadata row (unique(bucket,key) → 409), then write bytes. A failed blob
-    /// write compensates by removing the reserved row — no orphan metadata.
+    /// Upload: validate key/size/mime, prepend the owner prefix, 409 on a
+    /// duplicate key, then write the BLOB FIRST and the metadata row second —
+    /// a crash between the two leaves an unlisted orphan blob (invisible,
+    /// harmless, overwritten on retry), never a listed row whose GET 404s.
+    /// A failed row insert compensates by removing the just-written blob.
     pub async fn put_object(
         &self,
         db: &jerrycan_db::Db,
@@ -222,10 +224,23 @@ impl Storage {
             checksum: sign::hex(&sha2::Sha256::digest(&body)),
             created_at: now_millis(),
         };
-        meta::insert(db, &m).await?;
-        if let Err(e) = self.store.put(bucket.name, &m.key, body, &m.mime).await {
-            // Compensate: the reservation must not outlive a failed byte write.
-            let _ = meta::delete_row(db, &m.bucket, &m.id).await;
+        // Duplicate check BEFORE the blob write: bytes land at the SAME
+        // bucket/key path, so writing first would OVERWRITE the existing
+        // object's blob and only then discover the 409.
+        if meta::key_exists(db, &m.bucket, &m.key).await? {
+            return Err(Error::conflict(
+                "conflict: a row with this key already exists",
+            ));
+        }
+        self.store.put(bucket.name, &m.key, body, &m.mime).await?;
+        if let Err(e) = meta::insert(db, &m).await {
+            // Compensate: the bytes must not outlive a failed row insert —
+            // EXCEPT on a concurrent duplicate (409), where the racing
+            // winner's row now owns this path and deleting would destroy the
+            // object it points to.
+            if e.code() != "JC0409" {
+                let _ = self.store.delete(bucket.name, &m.key).await;
+            }
             return Err(e);
         }
         Ok(m)
@@ -612,6 +627,103 @@ mod tests {
         assert_eq!(
             mine.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(),
             vec!["1/inv.pdf"]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_key_is_409_and_never_touches_the_existing_blob() {
+        // WHY: blob bytes land at bucket/key — an upload that wrote bytes
+        // before discovering the duplicate would OVERWRITE (then compensate-
+        // DELETE) the existing object's blob. The 409 must fire with zero
+        // byte side effects.
+        let db = db().await;
+        let s = Storage::memory().with_sign_secret(SECRET);
+        let first = s
+            .put_object(
+                &db,
+                &INVOICES,
+                &owner("1"),
+                "same.bin",
+                "application/octet-stream",
+                Bytes::from_static(b"first"),
+            )
+            .await
+            .unwrap();
+        let err = s
+            .put_object(
+                &db,
+                &INVOICES,
+                &owner("1"),
+                "same.bin",
+                "application/octet-stream",
+                Bytes::from_static(b"second"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "JC0409");
+        let (_, bytes) = s
+            .get_object(&db, &INVOICES, Some(&owner("1")), &first.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes,
+            Bytes::from_static(b"first"),
+            "the original object's bytes survive the duplicate upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_blob_write_leaves_no_listed_row() {
+        // WHY: a metadata row without bytes is a LISTED object whose GET
+        // 404s — the write order (blob first, row second) exists precisely so
+        // no failure mode can produce that state.
+        struct FailingStore;
+        impl store::BlobStore for FailingStore {
+            fn put<'a>(
+                &'a self,
+                _b: &'a str,
+                _k: &'a str,
+                _body: Bytes,
+                _m: &'a str,
+            ) -> store::BlobFuture<'a, ()> {
+                Box::pin(async { Err(Error::internal("storage error")) })
+            }
+            fn get<'a>(&'a self, _b: &'a str, _k: &'a str) -> store::BlobFuture<'a, Bytes> {
+                Box::pin(async { Err(Error::not_found()) })
+            }
+            fn delete<'a>(&'a self, _b: &'a str, _k: &'a str) -> store::BlobFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn presign_get<'a>(
+                &'a self,
+                _b: &'a str,
+                _k: &'a str,
+                _ttl: Duration,
+            ) -> store::BlobFuture<'a, Option<String>> {
+                Box::pin(async { Ok(None) })
+            }
+        }
+        let db = db().await;
+        let s = Storage::with_store(Arc::new(FailingStore));
+        let err = s
+            .put_object(
+                &db,
+                &INVOICES,
+                &owner("1"),
+                "doomed.bin",
+                "application/octet-stream",
+                Bytes::from_static(b"x"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "JC0500");
+        let listed = s
+            .list_objects(&db, &INVOICES, Some(&owner("1")))
+            .await
+            .unwrap();
+        assert!(
+            listed.is_empty(),
+            "a failed upload must not leave a listed row: {listed:?}"
         );
     }
 
