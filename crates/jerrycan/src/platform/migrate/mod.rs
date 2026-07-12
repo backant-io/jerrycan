@@ -3,3 +3,4 @@
 //! one PgDatabase IR; pure stages translate what is safe and gap-report the rest.
 
 pub mod export;
+pub mod gaps;
