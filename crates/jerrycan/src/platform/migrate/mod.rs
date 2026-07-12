@@ -819,9 +819,10 @@ fn write_seed(
 
     // Deferred: seed tenant membership into the generated `{tenant}_members` table
     // now that the tenant table's rows exist. Columns are mapped by the generated
-    // names (user_id, the tenant fk, role); user_id/fk are the source (uuid) type,
-    // rendered as quoted text into the TEXT columns. A source missing one of those
-    // columns falls back to a blocking gap so no user is silently un-membered.
+    // names (user_id, the tenant fk, role); user_id/role render as quoted text
+    // (their generated columns are TEXT), the fk follows the tenant key type. A
+    // source missing one of those columns falls back to a blocking gap so no user
+    // is silently un-membered.
     if let Some(path) = membership_seed {
         let key = membership_table.expect("membership_seed implies a membership table");
         match tenant_entity {
@@ -835,10 +836,15 @@ fn write_seed(
                 let mut missing = Vec::new();
                 for w in wanted {
                     if let Some(i) = headers.iter().position(|h| h == w) {
-                        let ty = if w == "role" {
-                            SeedType::Text
-                        } else {
+                        // The generated members table types user_id and role as
+                        // TEXT unconditionally — render them as quoted text even
+                        // if the source column was numeric (an unquoted integer
+                        // literal would be rejected by a Postgres TEXT column).
+                        // Only the tenant fk follows the source/design key type.
+                        let ty = if w == fk.as_str() {
                             seed_type_of(db, key, w)
+                        } else {
+                            SeedType::Text
                         };
                         cols.push(SeedColumn {
                             name: w.to_string(),
@@ -1212,6 +1218,171 @@ create table public.users_settings (id uuid primary key, theme text not null);
                 && g.source.contains("storage.objects")
                 && g.severity == Severity::Blocking),
             "storage object rows must remain a blocking gap"
+        );
+    }
+
+    /// SECURITY: membership CSV cells (user_id/role) are attacker-shaped text
+    /// rendered into the generated seed SQL. A cell carrying a statement
+    /// breakout (`'); DROP TABLE …;--`), quotes, and newlines must land INSIDE
+    /// one SQL string literal: applying the emitted seed against a live db (the
+    /// exact `execute_unprepared` path `jerrycan db seed` uses) must not execute
+    /// the smuggled statement, and the hostile value must round-trip verbatim
+    /// (lossless — it IS the user's id, however ugly).
+    #[test]
+    fn hostile_membership_csv_cannot_break_out_of_the_seed_sql() {
+        use jerrycan_db::sea_orm::{ConnectionTrait, Statement};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(export_dir.join("data")).unwrap();
+        mini_export(&export_dir);
+        let evil_uid = "'); DROP TABLE workspaces;--\nx'x";
+        std::fs::write(
+            export_dir.join("data/public.workspace_members.csv"),
+            format!(
+                "workspace_id,user_id,role\naaaaaaaa-0000-0000-0000-000000000001,\"{evil_uid}\",own'er\n"
+            ),
+        )
+        .unwrap();
+        let out_dir = tmp.path().join("app");
+        run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: out_dir.clone(),
+            name: Some("acme".into()),
+            bulk_threshold: 5000,
+        })
+        .unwrap();
+
+        // The GENERATED sqlite migration owning workspaces + workspace_members.
+        let members_ddl = std::fs::read_dir(out_dir.join("crates/routes"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().join("migrations/sqlite/0001_create_tables.sql"))
+            .filter(|p| p.exists())
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .find(|s| s.contains("workspace_members"))
+            .expect("a generated migration creates workspace_members");
+        let members_sql = std::fs::read_dir(out_dir.join("seed/inline"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("workspace_members.sql"))
+            })
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .expect("a workspace_members inline seed file exists");
+
+        // `run_migrate` drove its own runtime (block_on) above, so open a fresh
+        // one HERE for the apply — proving the emitted seed is safe on the exact
+        // `execute_unprepared` path `jerrycan db seed` uses against a live db.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
+            db.conn().execute_unprepared(&members_ddl).await.unwrap();
+            // The membership FK requires its workspace row (seeded first in the
+            // real flow — the deferral exists precisely for this ordering).
+            db.conn()
+                .execute_unprepared(
+                    "INSERT INTO workspaces (id, name) VALUES ('aaaaaaaa-0000-0000-0000-000000000001', 'Acme')",
+                )
+                .await
+                .unwrap();
+            db.conn()
+                .execute_unprepared(&members_sql)
+                .await
+                .expect("the hostile seed applies as plain data");
+
+            // The DROP did not execute: workspaces still exists (the query
+            // succeeds) and its seeded row is intact (the table was not dropped
+            // and re-created, which would have lost the row).
+            let backend = db.conn().get_database_backend();
+            let n = db
+                .conn()
+                .query_one(Statement::from_string(
+                    backend,
+                    "SELECT COUNT(*) AS n FROM workspaces".to_owned(),
+                ))
+                .await
+                .expect("workspaces table must survive the breakout attempt")
+                .unwrap();
+            assert_eq!(n.try_get::<i64>("", "n").unwrap(), 1);
+
+            // Exactly one membership row, hostile cells verbatim (lossless).
+            let rows = db
+                .conn()
+                .query_all(Statement::from_string(
+                    backend,
+                    "SELECT user_id, role FROM workspace_members".to_owned(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1, "one membership row, no smuggled inserts");
+            assert_eq!(rows[0].try_get::<String>("", "user_id").unwrap(), evil_uid);
+            assert_eq!(rows[0].try_get::<String>("", "role").unwrap(), "own'er");
+        });
+    }
+
+    /// The generated members table types user_id as TEXT unconditionally, so a
+    /// source whose membership user_id is NUMERIC must still seed a quoted text
+    /// literal — Postgres rejects `INSERT … VALUES (7, …)` into a TEXT column
+    /// (sqlite would silently coerce, hiding the mismatch until pg).
+    #[test]
+    fn a_numeric_membership_user_id_still_seeds_as_quoted_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(export_dir.join("data")).unwrap();
+        std::fs::write(
+            export_dir.join("schema.sql"),
+            r#"
+create table public.workspaces (id uuid primary key, name text not null);
+create table public.workspace_members (
+    workspace_id uuid not null references public.workspaces(id) on delete cascade,
+    user_id bigint not null, role text not null check (role in ('owner','member')),
+    primary key (workspace_id, user_id));
+create table public.customers (
+    id uuid primary key,
+    workspace_id uuid not null references public.workspaces(id) on delete cascade,
+    email text not null unique);
+alter table public.customers enable row level security;
+create policy m on public.customers using
+    (workspace_id in (select workspace_id from public.workspace_members where user_id = auth.uid()));
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            export_dir.join("data/public.customers.csv"),
+            "id,workspace_id,email\n",
+        )
+        .unwrap();
+        std::fs::write(
+            export_dir.join("data/public.workspace_members.csv"),
+            "workspace_id,user_id,role\naaaaaaaa-0000-0000-0000-000000000001,7,owner\n",
+        )
+        .unwrap();
+        let out_dir = tmp.path().join("app");
+        run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: out_dir.clone(),
+            name: Some("acme".into()),
+            bulk_threshold: 5000,
+        })
+        .unwrap();
+        let members_sql = std::fs::read_dir(out_dir.join("seed/inline"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("workspace_members.sql"))
+            })
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .expect("a workspace_members inline seed file exists");
+        assert!(
+            members_sql.contains("'7'"),
+            "numeric user_id renders as a quoted TEXT literal: {members_sql}"
         );
     }
 
