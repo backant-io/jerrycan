@@ -108,6 +108,22 @@ pub fn run_migrate(opts: &MigrateOptions) -> Result<MigrateOutput, String> {
     let build = entities::build_entities_filtered(&db, &exclude);
     let mut gaps: Vec<GapItem> = build.gaps.clone();
 
+    // Any public-table RLS policy the recognizer won't certify is agent work —
+    // gap it (never guessed). The table still gets fully-guarded CRUD.
+    for policy in db.policies.iter().filter(|p| p.table.starts_with("public.")) {
+        if let rls::Recognized::Gap { reason } = rls::recognize(policy) {
+            gaps.push(GapItem {
+                kind: GapKind::RlsPolicy,
+                source: format!("{} policy \"{}\"", policy.table, policy.name),
+                location: format!("schema.sql:{}", policy.line),
+                reason,
+                original: policy.original.clone(),
+                suggested: "implement as a handler guard on the owning module".into(),
+                severity: Severity::Blocking,
+            });
+        }
+    }
+
     let entity_by_table: BTreeMap<String, Entity> = build
         .entities
         .iter()

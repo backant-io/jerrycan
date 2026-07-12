@@ -1,0 +1,4 @@
+[
+  {"id":"avatars","name":"avatars","public":true,"file_size_limit":5242880,"allowed_mime_types":["image/*"]},
+  {"id":"invoices","name":"invoices","public":false,"file_size_limit":null,"allowed_mime_types":null}
+]
