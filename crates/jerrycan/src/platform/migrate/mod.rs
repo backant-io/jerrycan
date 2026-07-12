@@ -593,12 +593,16 @@ fn emit_from_db(
     std::fs::write(opts.out_dir.join("MIGRATION.md"), &md).map_err(|e| e.to_string())?;
     created.push("MIGRATION.md".into());
 
-    // Hard gate: no secret survives into config/design/report/migration doc.
+    // Hard gate: no secret survives into config/design/report/migration doc,
+    // or the seed manifest (its table/column names and blob keys come from the
+    // export). Seed DATA files are exempt by design — a secret-looking cell is
+    // user data, flagged as a suspected_secret advisory above, never gated.
     let clean_targets: Vec<PathBuf> = [
         "design.json",
         "gap-report.json",
         "MIGRATION.md",
         "jerrycan.toml",
+        "seed/manifest.json",
     ]
     .iter()
     .map(|r| opts.out_dir.join(r))
