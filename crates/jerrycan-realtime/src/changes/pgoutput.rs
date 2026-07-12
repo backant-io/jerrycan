@@ -54,12 +54,17 @@ fn read_i32(b: &[u8], at: usize) -> Result<i32, String> {
 }
 
 /// Read a NUL-terminated C string; returns (value, offset past the NUL).
+/// Bounds-checked start: a truncated frame errors (like every other reader) —
+/// never an out-of-range slice panic that would kill the replication task.
 fn read_cstr(b: &[u8], at: usize) -> Result<(String, usize), String> {
-    let end = b[at..]
+    let slice = b
+        .get(at..)
+        .ok_or_else(|| format!("pgoutput truncated (cstring start at {at})"))?;
+    let end = slice
         .iter()
         .position(|&c| c == 0)
         .ok_or("pgoutput truncated (unterminated cstring)")?;
-    let s = String::from_utf8_lossy(&b[at..at + end]).into_owned();
+    let s = String::from_utf8_lossy(&slice[..end]).into_owned();
     Ok((s, at + end + 1))
 }
 
@@ -350,6 +355,22 @@ mod tests {
         assert_eq!(row.op, ChangeOp::Delete);
         assert!(row.new.is_none());
         assert_eq!(row.old.as_ref().unwrap()["id"], "42");
+    }
+
+    #[test]
+    fn truncated_relation_message_errors_instead_of_panicking() {
+        // A Relation header cut off before its namespace cstring used to index
+        // `b[at..]` out of range and panic — killing the whole replication
+        // task. It must be a clean decode error instead.
+        let mut cache = RelationCache::default();
+        assert!(decode_logical(&[b'R', 0, 0, 0, 1], &mut cache).is_err());
+        // Cut off mid column list (claims 2 columns, supplies none).
+        let mut b = vec![b'R'];
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(b"public\0lead\0");
+        b.push(b'f');
+        b.extend_from_slice(&2u16.to_be_bytes());
+        assert!(decode_logical(&b, &mut cache).is_err());
     }
 
     #[test]
