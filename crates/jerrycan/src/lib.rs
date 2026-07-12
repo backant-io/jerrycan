@@ -94,6 +94,10 @@ mod doc_tests {
     // the storage feature; run with `cargo test -p jerrycan --features storage --doc`.
     #[cfg(feature = "storage")]
     doc_page!(page_18_storage, "../../../docs/ai/18-storage.md");
+    // Realtime examples resolve jerrycan::realtime + db, so the page is gated on
+    // the realtime feature; run with `cargo test -p jerrycan --features realtime,auth --doc`.
+    #[cfg(all(feature = "realtime", feature = "auth"))]
+    doc_page!(page_18_realtime, "../../../docs/ai/18-realtime.md");
 }
 
 /// The realtime facade surface: `jerrycan::realtime::{Realtime, Principal,
