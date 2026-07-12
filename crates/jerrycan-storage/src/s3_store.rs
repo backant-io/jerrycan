@@ -184,6 +184,12 @@ impl S3Store {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        Self::amz_datetime_at(secs)
+    }
+
+    /// The pure core of [`Self::amz_datetime`], testable at fixed instants —
+    /// a regression here breaks EVERY SigV4 signature.
+    fn amz_datetime_at(secs: u64) -> String {
         // Civil-from-days (Howard Hinnant's algorithm) — correct for all dates
         // the process will ever see; leap seconds are not S3's concern.
         let days = (secs / 86_400) as i64;
@@ -565,6 +571,23 @@ mod tests {
         assert_eq!(
             c.object_path("avatars", "u 1/pic.png"),
             "/my-bucket/avatars/u%201/pic.png"
+        );
+    }
+
+    #[test]
+    fn amz_datetime_formats_known_instants() {
+        // WHY: this string is signed into EVERY SigV4 request — a formatting
+        // or calendar regression invalidates all S3 auth, and only the
+        // env-gated MinIO suite would otherwise notice.
+        assert_eq!(S3Store::amz_datetime_at(0), "19700101T000000Z");
+        // Leap day (2000 IS a leap year despite the century rule).
+        assert_eq!(S3Store::amz_datetime_at(951_782_400), "20000229T000000Z");
+        // An arbitrary modern instant with a non-midnight time component.
+        assert_eq!(S3Store::amz_datetime_at(1_700_000_000), "20231114T221320Z");
+        // 2100 is NOT a leap year: Feb 28 + 1 day must be Mar 1.
+        assert_eq!(
+            S3Store::amz_datetime_at(4_102_444_800 + 59 * 86_400),
+            "21000301T000000Z"
         );
     }
 
