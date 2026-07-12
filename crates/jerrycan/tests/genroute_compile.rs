@@ -595,6 +595,120 @@ fn generated_uuid_tenant_storage_crate_passes_its_acceptance_tests() {
     }
 }
 
+/// A contract-v2 REALTIME design: jwt auth + tenancy + a `realtime` block with a
+/// tenant-scoped changes entity (`Lead` belongs_to the tenancy entity), a
+/// broadcast topic, and a presence topic. This is the exact shape a migrated
+/// Supabase project produces, and the shape whose generated wiring crate did NOT
+/// compile (the resolver called `user.id()`/`tenant.role()` and `CurrentUser::from`
+/// on a `SessionUser`, none of which exist on the real API).
+const REALTIME_MINIMAL: &str = r#"{
+    "name": "rt-app", "contract_version": 2,
+    "auth": { "model": "jwt", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+    "realtime": {
+        "changes": ["Lead"],
+        "broadcast": [{ "name": "deal_room", "scope": "tenant" }],
+        "presence": [{ "name": "editors", "scope": "tenant" }]
+    },
+    "modules": [
+        { "name": "workspaces",
+          "entities": [{ "name": "Workspace", "fields": [
+              { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+          "endpoints": [{ "operation_id": "list_workspaces", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Workspace", "list": true } }] },
+        { "name": "leads",
+          "entities": [{ "name": "Lead",
+              "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+              "fields": [{ "name": "id", "type": "integer" },
+                         { "name": "phone", "type": "string" }] }],
+          "endpoints": [{ "operation_id": "list_leads", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Lead", "list": true } }] }
+    ]
+}"#;
+
+/// THE realtime compile gate (review 2026-07-12 finding: a real Supabase
+/// migration produced a `crates/realtime/` wiring crate that DID NOT COMPILE —
+/// the resolver emitted `user.id()`, `tenant.role()`, and `CurrentUser::from(claims)`,
+/// none of which match the real auth API, yet every existing test only asserted on
+/// the emitted STRING). Scaffolds a real realtime app via the jerrycan binary
+/// (jwt + tenancy resolver, all three channel kinds), then requires the generated
+/// `realtime` crate to pass strict clippy over ALL targets — which compiles the
+/// tool-owned `src/lib.rs` resolver AND the (live-Postgres, `#[ignore]`d)
+/// acceptance battery. Had this existed, the broken wiring would have been red.
+#[test]
+#[ignore = "scaffolds a realtime app and invokes cargo on it; run with --include-ignored"]
+fn generated_realtime_crate_passes_strict_clippy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("rt-app");
+
+    let design: Design = serde_json::from_str(REALTIME_MINIMAL).expect("REALTIME_MINIMAL parses");
+    assert!(
+        design.wants_realtime(),
+        "design must declare a realtime block"
+    );
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, REALTIME_MINIMAL);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(
+        status.success(),
+        "jerrycan new must scaffold the realtime app"
+    );
+
+    // Sanity: the tool-owned resolver wires all three channel kinds and resolves a
+    // jwt principal from a tenant-scoped connection (the exact code path that broke).
+    let lib =
+        fs::read_to_string(app.join("crates/realtime/src/lib.rs")).expect("read realtime lib.rs");
+    assert!(
+        lib.contains(".changes(jerrycan::realtime::ChangeChannelSpec")
+            && lib.contains(".broadcast(\"deal_room\"")
+            && lib.contains(".presence(\"editors\""),
+        "realtime lib must wire changes + broadcast + presence:\n{lib}"
+    );
+    assert!(
+        lib.contains(".principal(") && lib.contains("shared::Tenant"),
+        "jwt + tenancy design must emit a tenant-resolving principal:\n{lib}"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // The gate: strict clippy over the generated realtime crate — all targets, so
+    // the resolver in src/lib.rs AND the acceptance battery must COMPILE under
+    // -D warnings. This is what no test did before: compile the emitted crate.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "realtime",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "generated realtime crate failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");
