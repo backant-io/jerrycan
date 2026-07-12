@@ -79,7 +79,7 @@ pub fn resolver_rs(design: &Design) -> String {
              \x20                   let auth = ctx.resolve::<jerrycan::auth::Auth>().await?;\n\
              \x20                   let claims = jerrycan::auth::jwt::decode::<shared::SessionUser>(&token, auth.jwt_key())\n\
              \x20                       .map_err(|_| jerrycan::Error::unauthorized())?;\n\
-             \x20                   shared::CurrentUser::from(claims)\n\
+             \x20                   jerrycan::auth::Session(claims)\n\
              \x20               }\n\
              \x20           };\n"
         }
@@ -93,7 +93,7 @@ pub fn resolver_rs(design: &Design) -> String {
         (
             "            let tenant = ctx.resolve::<shared::Tenant>().await?;\n",
             "Some(tenant.id().to_string())",
-            "Some(tenant.role().to_string())",
+            "Some(tenant.role.clone())",
         )
     } else {
         ("", "None", "None")
@@ -104,7 +104,7 @@ pub fn resolver_rs(design: &Design) -> String {
          \x20           Box::pin(async move {{\n\
          {user_block}{tenant_block}\
          \x20               Ok(jerrycan::realtime::Principal {{\n\
-         \x20                   user_id: user.id().to_string(),\n\
+         \x20                   user_id: user.0.id.clone(),\n\
          \x20                   tenant_id: {tenant_id_expr},\n\
          \x20                   role: {role_expr},\n\
          \x20               }})\n\
@@ -317,6 +317,22 @@ mod tests {
             "jwt designs accept ?token= (browsers can't set WS headers): {a}"
         );
         assert!(a.contains("jerrycan::auth::jwt::decode"), "{a}");
+        // The emitted wiring must use the REAL API (proven by the realtime
+        // compile-smoke, pinned cheaply here): CurrentUser is Session<SessionUser>,
+        // so the JWT fallback wraps claims in `Session(..)`; the user id is the
+        // `user.0.id` String field; and Tenant.role is a FIELD, not a method.
+        assert!(
+            a.contains("jerrycan::auth::Session(claims)"),
+            "JWT fallback wraps claims in Session (CurrentUser = Session<SessionUser>): {a}"
+        );
+        assert!(
+            a.contains("user_id: user.0.id.clone()"),
+            "user id is the SessionUser.id String field via user.0.id, not user.id(): {a}"
+        );
+        assert!(
+            a.contains("role: Some(tenant.role.clone())"),
+            "Tenant.role is a field, not a method: {a}"
+        );
     }
 
     #[test]
