@@ -172,10 +172,9 @@ impl Hub {
         (id, rx)
     }
 
-    pub(crate) fn disconnect(self: &Arc<Self>, conn: u64) {
-        // Presence leaves are published in Task 10; for now just drop the entry.
-        self.presence_disconnect(conn);
-        self.conns.lock().expect("hub mutex").remove(&conn);
+    pub(crate) async fn disconnect(self: &Arc<Self>, conn: u64) {
+        // Publish presence leaves for everything this conn tracked, then drop it.
+        self.presence_disconnect(conn).await;
     }
 
     /// Send to one connection; a full/closed queue drops the connection.
@@ -417,9 +416,12 @@ async fn supervisor(
 /// Bus pump + presence sweep. Extended in Task 10 with the presence tick.
 async fn presence_supervise(hub: &Arc<Hub>, shutdown: &mut tokio::sync::watch::Receiver<bool>) {
     let mut rx = hub.bus.subscribe();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
+            _ = tick.tick() => hub.presence_tick().await,
             msg = rx.recv() => match msg {
                 Ok(m) => hub.deliver(m),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -452,62 +454,8 @@ fn rand_node_id() -> u64 {
 // ---------------------------------------------------------------------------
 
 impl Hub {
-    // Task 10 replaces these two with real presence track/untrack.
-    pub(crate) async fn track(
-        self: &Arc<Self>,
-        conn: u64,
-        channel: &str,
-        _state: serde_json::Value,
-        r#ref: Option<u64>,
-    ) {
-        self.not_implemented(conn, channel, r#ref);
-    }
-
-    pub(crate) async fn untrack(self: &Arc<Self>, conn: u64, channel: &str, r#ref: Option<u64>) {
-        self.not_implemented(conn, channel, r#ref);
-    }
-
-    fn not_implemented(&self, conn: u64, channel: &str, r#ref: Option<u64>) {
-        self.send_to(
-            conn,
-            crate::protocol::ServerMsg::Error {
-                code: "JC0500".into(),
-                message: "not implemented yet".into(),
-                channel: Some(channel.to_string()),
-                r#ref,
-            },
-        );
-    }
-
     // Task 17 fills this (scope-filtered change delivery).
     pub(crate) fn deliver_change(&self, _ev: &crate::changes::ChangeEvent) {}
-
-    // Task 10 fills the presence delivery + lifecycle hooks.
-    pub(crate) fn deliver_presence_set(
-        &self,
-        _topic: &str,
-        _tenant_id: Option<String>,
-        _key: &str,
-        _node: u64,
-        _meta: serde_json::Value,
-    ) {
-    }
-    pub(crate) fn deliver_presence_clear(
-        &self,
-        _topic: &str,
-        _tenant_id: Option<String>,
-        _key: &str,
-        _node: u64,
-    ) {
-    }
-    pub(crate) fn deliver_presence_snapshot(
-        &self,
-        _node: u64,
-        _entries: Vec<(String, Option<String>, String)>,
-    ) {
-    }
-    fn on_join_presence(self: &Arc<Self>, _conn: u64, _id: &crate::channel::ChannelId) {}
-    fn presence_disconnect(self: &Arc<Self>, _conn: u64) {}
 }
 
 /// Task 17 replaces this with detect-replication-else-triggers + adapter spawn.

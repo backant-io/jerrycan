@@ -167,7 +167,7 @@ pub(crate) async fn run_connection<S>(
             Step::Idle => break,
         }
     }
-    hub.disconnect(conn);
+    hub.disconnect(conn).await;
     let _ = ws.close(None).await;
 }
 

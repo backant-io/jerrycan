@@ -137,6 +137,51 @@ async fn broadcast_reaches_subscribers_but_not_publisher_or_other_tenants() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn presence_join_sync_track_and_leave() {
+    let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
+    let rt = Realtime::new(db)
+        .presence("editors", TopicScope::Auth)
+        .principal(header_resolver());
+    let (port, shutdown, task) = serve(rt).await;
+
+    let mut a = connect_as(port, "alice", "t1").await;
+    send_text(&mut a, r#"{"op":"join","channel":"presence:editors","ref":1}"#).await;
+    assert_eq!(recv_json(&mut a).await["op"], "joined");
+    // Initial sync: empty state.
+    let state = recv_json(&mut a).await;
+    assert_eq!(state["op"], "presence_state");
+    assert_eq!(state["state"], serde_json::json!({}));
+
+    send_text(
+        &mut a,
+        r#"{"op":"track","channel":"presence:editors","state":{"cursor":1}}"#,
+    )
+    .await;
+    let diff = recv_json(&mut a).await;
+    assert_eq!(diff["op"], "presence_diff");
+    assert_eq!(diff["joins"]["alice"]["cursor"], 1);
+
+    // Bob joins late: his initial state already contains alice.
+    let mut b = connect_as(port, "bob", "t1").await;
+    send_text(&mut b, r#"{"op":"join","channel":"presence:editors","ref":1}"#).await;
+    assert_eq!(recv_json(&mut b).await["op"], "joined");
+    let state = recv_json(&mut b).await;
+    assert_eq!(state["state"]["alice"]["cursor"], 1);
+
+    // Alice disconnects: bob sees the leave diff.
+    drop(a);
+    let diff = recv_json(&mut b).await;
+    assert_eq!(diff["op"], "presence_diff");
+    assert!(
+        diff["leaves"]["alice"].is_object(),
+        "leave diff for alice: {diff}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn publish_requires_membership_of_the_channel() {
     let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
     let rt = Realtime::new(db).broadcast("lobby", TopicScope::None);
