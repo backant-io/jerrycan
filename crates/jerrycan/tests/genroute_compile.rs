@@ -501,6 +501,100 @@ fn generated_storage_crate_passes_strict_clippy_and_its_acceptance_tests() {
     }
 }
 
+/// The same four-scope storage design, but the tenant (`Org`) and its owner
+/// entities key on a `uuid` pk — the shape a migrated Supabase project produces
+/// (auth.users + tenant rows are uuid). Proves the stringified-pk identity end to
+/// end: the generated acceptance battery seeds uuid-keyed memberships, mints
+/// session cookies, and runs the cross-owner/tenant/prefix isolation controls.
+const STORAGE_UUID: &str = r#"{
+    "name": "files-app", "contract_version": 2,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+    "storage": { "buckets": [
+        { "name": "avatars", "visibility": "public", "owner": "User",
+          "max_size": "1MB", "allowed_mime": ["image/*"] },
+        { "name": "invoices", "visibility": "private", "owner": "Org",
+          "owner_prefix": true, "max_size": "1MB" },
+        { "name": "exports", "visibility": "private" },
+        { "name": "reports", "visibility": "private", "owner": "Member" }
+    ]},
+    "modules": [
+        { "name": "orgs",
+          "entities": [
+              { "name": "Org", "fields": [
+                  { "name": "id", "type": "uuid" },
+                  { "name": "plan", "type": "string" } ] },
+              { "name": "User", "fields": [
+                  { "name": "id", "type": "uuid" },
+                  { "name": "email", "type": "string" } ] },
+              { "name": "Member", "fields": [
+                  { "name": "id", "type": "uuid" },
+                  { "name": "nick", "type": "string" } ],
+                "belongs_to": [{ "entity": "Org" }] }
+          ],
+          "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Org", "list": true } }] }
+    ]
+}"#;
+
+/// Runtime proof of the uuid identity fix: a storage app whose tenant/owner pks
+/// are uuid must scaffold, compile under strict clippy, AND pass its generated
+/// acceptance + cross-tenant isolation battery — real (non-stub) handlers, so a
+/// broken identity (i64 session id, bigint membership user_id) would turn it red.
+#[test]
+#[ignore = "scaffolds a uuid-tenant storage app and invokes cargo on it; run with --include-ignored"]
+fn generated_uuid_tenant_storage_crate_passes_its_acceptance_tests() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("files-app");
+
+    let design: Design = serde_json::from_str(STORAGE_UUID).expect("STORAGE_UUID parses");
+    assert!(design.wants_storage(), "design must declare buckets");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, STORAGE_UUID);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(status.success(), "jerrycan new must scaffold the uuid app");
+
+    // The membership DDL types user_id + the uuid tenant fk as TEXT.
+    let members_ddl =
+        fs::read_to_string(app.join("crates/routes/orgs/migrations/sqlite/0001_create_tables.sql"))
+            .expect("read members DDL")
+            .to_lowercase();
+    assert!(
+        members_ddl.contains("\"user_id\" text") && members_ddl.contains("\"org_id\" text"),
+        "membership user_id + uuid tenant fk are TEXT:\n{members_ddl}"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // The generated storage acceptance + isolation tests must PASS (real handlers,
+    // uuid-keyed memberships seeded, cross-owner/tenant/prefix negative controls).
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args(["test", "-p", "storage"])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo test");
+    if !output.status.success() {
+        panic!(
+            "uuid-tenant storage acceptance tests failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");

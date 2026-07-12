@@ -1459,6 +1459,12 @@ mod tests {
             ws.contains("\"user_id\"") && ws.contains("\"role\""),
             "{ws}"
         );
+        // user_id is TEXT (the stringified user pk, mirroring storage_objects.owner_id)
+        // so a uuid auth.users id fits — NOT bigint, which a uuid could not hold.
+        assert!(
+            ws.contains("\"user_id\" text"),
+            "membership user_id must be TEXT for uuid/string user pks: {ws}"
+        );
         assert!(
             ws.contains("on delete cascade"),
             "member rows die with the tenant: {ws}"

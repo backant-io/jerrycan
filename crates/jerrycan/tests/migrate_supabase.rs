@@ -75,6 +75,69 @@ fn no_secret_survives_into_any_emitted_artifact() {
 }
 
 #[test]
+fn uuid_membership_rows_seed_losslessly_and_are_not_gapped() {
+    // The reference auth.users are uuid, and workspace_members carries uuid
+    // user_ids. The migration must SEED those membership rows into the generated
+    // `workspace_members` table (so migrated users keep their tenancy — login +
+    // membership work) rather than emitting the old blocking "not auto-seeded" gap.
+    use jerrycan::platform::migrate::gaps::{GapKind, Severity};
+    let tmp = tempfile::tempdir().unwrap();
+    let out = migrate_into(tmp.path());
+
+    // No blocking seed gap for the membership table.
+    assert!(
+        !out.gaps.iter().any(|g| g.kind == GapKind::SeedData
+            && g.source.contains("workspace_members")
+            && g.severity == Severity::Blocking),
+        "membership rows must be seeded, not gapped: {:?}",
+        out.gaps.iter().map(|g| &g.source).collect::<Vec<_>>()
+    );
+
+    // The seed manifest lists the members table with all 3 exported rows.
+    let manifest = std::fs::read_to_string(tmp.path().join("seed/manifest.json")).unwrap();
+    let m: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    let members = m["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["table"] == "workspace_members")
+        .expect("workspace_members is seeded");
+    assert_eq!(members["rows"], 3, "all three membership rows seeded");
+
+    // The inline seed maps the columns to the generated table and carries every
+    // uuid user id verbatim (lossless) — the FK workspace id and role too.
+    let sql = std::fs::read_dir(tmp.path().join("seed/inline"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("workspace_members.sql"))
+        })
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .expect("a workspace_members inline seed file exists");
+    assert!(
+        sql.contains("INSERT INTO workspace_members (user_id, workspace_id, role) VALUES"),
+        "columns mapped to the generated members table: {sql}"
+    );
+    for uid in [
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+        "33333333-3333-3333-3333-333333333333",
+    ] {
+        assert!(
+            sql.contains(&format!("'{uid}'")),
+            "uuid user id {uid} seeded verbatim: {sql}"
+        );
+    }
+    assert!(
+        sql.contains("'aaaaaaaa-0000-0000-0000-000000000001'") && sql.contains("'member'"),
+        "workspace fk + role seeded: {sql}"
+    );
+}
+
+#[test]
 fn the_bulk_table_took_the_resumable_path() {
     let tmp = tempfile::tempdir().unwrap();
     migrate_into(tmp.path());
