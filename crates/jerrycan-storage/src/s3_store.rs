@@ -265,15 +265,19 @@ impl S3Store {
         Ok((status, headers, bytes))
     }
 
-    /// Map a non-2xx S3 response to a jerrycan error.
+    /// Map a non-2xx S3 response to a jerrycan error. The parsed `<Code>` /
+    /// `<Message>` go to STDERR for the operator; the CLIENT gets a generic
+    /// "storage error" — provider error taxonomy must not leak in 5xx bodies.
     fn s3_error(status: http::StatusCode, body: &[u8]) -> Error {
         match xml::parse_error(body) {
             Some((code, _)) if code == "NoSuchKey" || status == http::StatusCode::NOT_FOUND => {
                 Error::not_found()
             }
-            Some((code, message)) => Error::internal(format!("s3: {code}: {message}")),
+            Some((code, message)) => {
+                crate::store::internal_storage_error(format!("s3: {code}: {message}"))
+            }
             None if status == http::StatusCode::NOT_FOUND => Error::not_found(),
-            None => Error::internal(format!("s3: unexpected status {status}")),
+            None => crate::store::internal_storage_error(format!("s3: unexpected status {status}")),
         }
     }
 
@@ -539,6 +543,23 @@ mod tests {
             c.object_path("avatars", "u 1/pic.png"),
             "/my-bucket/avatars/u%201/pic.png"
         );
+    }
+
+    #[test]
+    fn s3_error_bodies_are_generic_to_the_client() {
+        // WHY (security): the message is the client-visible 5xx body — the
+        // provider's error taxonomy (<Code>/<Message>, which can carry ARNs,
+        // hostnames, request ids) stays on stderr for the operator.
+        let body = b"<Error><Code>AccessDenied</Code><Message>arn:aws:s3:::prod-secrets denied</Message></Error>";
+        let err = S3Store::s3_error(http::StatusCode::FORBIDDEN, body);
+        assert_eq!(err.code(), "JC0500");
+        assert_eq!(err.message(), "storage error");
+        // NotFound mapping is untouched: a missing KEY is the caller's 404.
+        let nf = S3Store::s3_error(
+            http::StatusCode::NOT_FOUND,
+            b"<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>",
+        );
+        assert_eq!(nf.code(), "JC0404");
     }
 
     #[test]

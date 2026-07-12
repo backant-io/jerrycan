@@ -40,6 +40,15 @@ pub trait BlobStore: Send + Sync + 'static {
     ) -> BlobFuture<'a, Option<String>>;
 }
 
+/// An internal storage failure: the full detail goes to STDERR for the
+/// operator; the client gets a GENERIC message (the same shape as
+/// jerrycan-db's `db_error`). 5xx bodies must never leak filesystem paths,
+/// backend hosts, or provider error taxonomy.
+pub(crate) fn internal_storage_error(detail: impl std::fmt::Display) -> Error {
+    eprintln!("jerrycan-storage: {detail}");
+    Error::internal("storage error")
+}
+
 /// Validate an object key: 1..=1024 chars of `[A-Za-z0-9._/-]`, no leading or
 /// trailing `/`, and no empty/`.`/`..` segments. Keys become filesystem paths
 /// (LocalStore) and S3 object paths, so traversal must be impossible by
@@ -92,12 +101,12 @@ impl BlobStore for LocalStore {
         Box::pin(async move {
             let path = self.path_for(bucket, key)?;
             let parent = path.parent().expect("bucket/key path has a parent");
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                Error::internal(format!("storage: create {}: {e}", parent.display()))
-            })?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| internal_storage_error(format!("create {}: {e}", parent.display())))?;
             tokio::fs::write(&path, &body)
                 .await
-                .map_err(|e| Error::internal(format!("storage: write {}: {e}", path.display())))
+                .map_err(|e| internal_storage_error(format!("write {}: {e}", path.display())))
         })
     }
 
@@ -107,8 +116,8 @@ impl BlobStore for LocalStore {
             match tokio::fs::read(&path).await {
                 Ok(bytes) => Ok(Bytes::from(bytes)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::not_found()),
-                Err(e) => Err(Error::internal(format!(
-                    "storage: read {}: {e}",
+                Err(e) => Err(internal_storage_error(format!(
+                    "read {}: {e}",
                     path.display()
                 ))),
             }
@@ -121,8 +130,8 @@ impl BlobStore for LocalStore {
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(Error::internal(format!(
-                    "storage: delete {}: {e}",
+                Err(e) => Err(internal_storage_error(format!(
+                    "delete {}: {e}",
                     path.display()
                 ))),
             }
@@ -276,6 +285,28 @@ mod tests {
         );
         // Delete of a missing key is idempotent (the metadata row is the truth).
         s.delete("avatars", "u/1.png").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_store_internal_errors_leak_no_filesystem_paths() {
+        // WHY (security): the error message IS the client-visible 5xx body —
+        // an absolute filesystem path in it hands an attacker the server's
+        // directory layout. The detail belongs on stderr, not in the response.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        // Root is a regular FILE, so create_dir_all under it must fail.
+        let s = LocalStore::new(file.path());
+        let err = s
+            .put("b", "k.txt", Bytes::from_static(b"x"), "text/plain")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "JC0500");
+        assert_eq!(err.message(), "storage error", "generic client message");
+        assert!(
+            !err.message().contains(&file.path().display().to_string())
+                && !err.message().contains('/'),
+            "no path fragment may reach the client: {}",
+            err.message()
+        );
     }
 
     #[tokio::test]
