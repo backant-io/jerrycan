@@ -533,6 +533,7 @@ fn emit_from_db(
             &db,
             &entity_by_table,
             det.membership_table.as_deref(),
+            tenant_entity.as_deref(),
             opts.bulk_threshold,
             &mut gaps,
         )?
@@ -658,6 +659,7 @@ fn write_seed(
     db: &pgmodel::PgDatabase,
     entity_by_table: &BTreeMap<String, Entity>,
     membership_table: Option<&str>,
+    tenant_entity: Option<&str>,
     bulk_threshold: usize,
     gaps: &mut Vec<GapItem>,
 ) -> Result<SeedSummary, String> {
@@ -665,6 +667,10 @@ fn write_seed(
     let mut tables = 0usize;
     let mut bulk_tables = 0usize;
     let mut total_rows = 0usize;
+    // The membership CSV is seeded LAST (after its tenant table exists), because
+    // `data_files` is sorted and `{tenant}_members` sorts before the tenant table
+    // whose row the membership FK requires. Deferred until after the main loop.
+    let mut membership_seed: Option<&Path> = None;
 
     for (schema, table, path) in &export.data_files {
         let key = format!("{schema}.{table}");
@@ -741,19 +747,11 @@ fn write_seed(
             }
             ("users".to_string(), cols, Some(idxs))
         } else if Some(key.as_str()) == membership_table {
-            // Tenant membership rows are represented by the generated
-            // `{tenant}_members` table, whose user-id mapping is agent
-            // work — dropping them silently would lock every user out of
-            // their tenant. Blocking, never silent.
-            gaps.push(GapItem {
-                    kind: GapKind::SeedData,
-                    source: format!("{key} rows"),
-                    location: path.display().to_string(),
-                    reason: "tenant membership rows are not auto-seeded — without them no migrated user belongs to any tenant".into(),
-                    original: String::new(),
-                    suggested: "insert these rows into the generated `<tenant>_members` table (user_id, tenant fk, role) as part of the seed hand-off".into(),
-                    severity: Severity::Blocking,
-                });
+            // Tenant membership rows seed the generated `{tenant}_members` table so
+            // migrated users keep their tenant membership (login + tenancy work).
+            // Deferred to after the loop: the membership FK needs the tenant table's
+            // rows, which sort AFTER `{tenant}_members` in `data_files`.
+            membership_seed = Some(path.as_path());
             continue;
         } else if schema == "storage" && table == "objects" {
             gaps.push(GapItem {
@@ -816,6 +814,111 @@ fn write_seed(
         total_rows += count;
         if count > bulk_threshold {
             bulk_tables += 1;
+        }
+    }
+
+    // Deferred: seed tenant membership into the generated `{tenant}_members` table
+    // now that the tenant table's rows exist. Columns are mapped by the generated
+    // names (user_id, the tenant fk, role); user_id/fk are the source (uuid) type,
+    // rendered as quoted text into the TEXT columns. A source missing one of those
+    // columns falls back to a blocking gap so no user is silently un-membered.
+    if let Some(path) = membership_seed {
+        let key = membership_table.expect("membership_seed implies a membership table");
+        match tenant_entity {
+            Some(tenant) => {
+                let target = format!("{}_members", Design::to_snake(tenant));
+                let fk = Design::fk_column(tenant);
+                let headers = read_headers(path)?;
+                let wanted = ["user_id", fk.as_str(), "role"];
+                let mut cols = Vec::new();
+                let mut idxs = Vec::new();
+                let mut missing = Vec::new();
+                for w in wanted {
+                    if let Some(i) = headers.iter().position(|h| h == w) {
+                        let ty = if w == "role" {
+                            SeedType::Text
+                        } else {
+                            seed_type_of(db, key, w)
+                        };
+                        cols.push(SeedColumn {
+                            name: w.to_string(),
+                            ty,
+                        });
+                        idxs.push(i);
+                    } else {
+                        missing.push(w.to_string());
+                    }
+                }
+                if missing.is_empty() {
+                    // Pass 1: count + suspected-secret scan (mirrors the main loop).
+                    let mut count = 0usize;
+                    let mut flagged: BTreeSet<usize> = BTreeSet::new();
+                    for row in
+                        seed::CsvReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?)
+                    {
+                        let row = row?;
+                        count += 1;
+                        for (ci, cell) in row.iter().enumerate() {
+                            if flagged.contains(&ci) {
+                                continue;
+                            }
+                            if let Some(v) = cell
+                                && let Some(hit) = redact::scan(v).into_iter().next()
+                            {
+                                flagged.insert(ci);
+                                gaps.push(GapItem {
+                                    kind: GapKind::SuspectedSecret,
+                                    source: format!("{key} column #{ci}"),
+                                    location: path.display().to_string(),
+                                    reason: "a data cell looks like a secret (jwt/key/conn string) — verify before exposing".into(),
+                                    original: hit.preview,
+                                    suggested: "confirm it is legitimate user data; rotate if it is a leaked key".into(),
+                                    severity: Severity::Advisory,
+                                });
+                            }
+                        }
+                    }
+                    // Pass 2: stream the projected columns into the members table.
+                    let reader =
+                        seed::CsvReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+                    let rows = reader.filter_map(|r| r.ok()).map(move |row| {
+                        idxs.iter()
+                            .map(|&i| row.get(i).cloned().flatten())
+                            .collect::<Vec<_>>()
+                    });
+                    writer.write_table(&target, &cols, rows, count)?;
+                    tables += 1;
+                    total_rows += count;
+                    if count > bulk_threshold {
+                        bulk_tables += 1;
+                    }
+                } else {
+                    gaps.push(GapItem {
+                        kind: GapKind::SeedData,
+                        source: format!("{key} rows"),
+                        location: path.display().to_string(),
+                        reason: format!(
+                            "membership columns [{}] were not found in the export — rows not auto-seeded",
+                            missing.join(", ")
+                        ),
+                        original: String::new(),
+                        suggested: format!(
+                            "insert these rows into the generated `{target}` table (user_id, {fk}, role) by hand"
+                        ),
+                        severity: Severity::Blocking,
+                    });
+                }
+            }
+            None => gaps.push(GapItem {
+                kind: GapKind::SeedData,
+                source: format!("{key} rows"),
+                location: path.display().to_string(),
+                reason: "tenant membership rows have no resolved tenant entity to seed into".into(),
+                original: String::new(),
+                suggested: "insert these rows into the generated `<tenant>_members` table by hand"
+                    .into(),
+                severity: Severity::Blocking,
+            }),
         }
     }
 
@@ -1041,7 +1144,7 @@ create table public.users_settings (id uuid primary key, theme text not null);
     }
 
     #[test]
-    fn membership_rows_and_storage_objects_are_blocking_seed_gaps_not_silent_drops() {
+    fn membership_rows_are_seeded_uuid_users_and_storage_objects_stay_a_blocking_gap() {
         let tmp = tempfile::tempdir().unwrap();
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(export_dir.join("data")).unwrap();
@@ -1056,25 +1159,59 @@ create table public.users_settings (id uuid primary key, theme text not null);
             "id,bucket_id,name,owner\no1,avatars,u/a.png,u\n",
         )
         .unwrap();
+        let out_dir = tmp.path().join("app");
         let out = run_migrate(&MigrateOptions {
             export_dir,
-            out_dir: tmp.path().join("app"),
+            out_dir: out_dir.clone(),
             name: Some("acme".into()),
             bulk_threshold: 5000,
         })
         .unwrap();
+        // Membership rows are now SEEDED (uuid user_id lands in the TEXT user_id
+        // column), never a blocking gap — a migrated user keeps their tenancy.
         assert!(
-            out.gaps.iter().any(|g| g.kind == GapKind::SeedData
+            !out.gaps.iter().any(|g| g.kind == GapKind::SeedData
                 && g.source.contains("workspace_members")
                 && g.severity == Severity::Blocking),
-            "membership rows must be a blocking gap: {:?}",
+            "membership rows must NOT be a blocking gap anymore: {:?}",
             out.gaps.iter().map(|g| &g.source).collect::<Vec<_>>()
         );
+        // The generated seed carries an INSERT into the members table with the uuid
+        // user id (mapped user_id, workspace fk, role — in that column order).
+        let manifest = std::fs::read_to_string(out_dir.join("seed/manifest.json")).unwrap();
+        assert!(
+            manifest.contains("\"table\": \"workspace_members\""),
+            "membership table is in the seed manifest: {manifest}"
+        );
+        let members_sql = std::fs::read_dir(out_dir.join("seed/inline"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("workspace_members.sql"))
+            })
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .expect("a workspace_members inline seed file exists");
+        assert!(
+            members_sql
+                .contains("INSERT INTO workspace_members (user_id, workspace_id, role) VALUES"),
+            "membership seed maps columns to the generated table: {members_sql}"
+        );
+        assert!(
+            members_sql.contains("'11111111-1111-1111-1111-111111111111'")
+                && members_sql.contains("'aaaaaaaa-0000-0000-0000-000000000001'")
+                && members_sql.contains("'owner'"),
+            "membership seed carries the uuid user id, workspace fk, and role: {members_sql}"
+        );
+        // Storage object metadata rows still require the agent (bytes are staged,
+        // not uploaded) — a blocking gap, unchanged.
         assert!(
             out.gaps.iter().any(|g| g.kind == GapKind::SeedData
                 && g.source.contains("storage.objects")
                 && g.severity == Severity::Blocking),
-            "storage object rows must be a blocking gap"
+            "storage object rows must remain a blocking gap"
         );
     }
 
