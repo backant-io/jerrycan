@@ -774,12 +774,8 @@ mod tests {
             created_at: 0,
         };
         for public in [true, false] {
-            let res = object_response(
-                &meta,
-                Bytes::from_static(b"<svg onload=alert(1)/>"),
-                public,
-            )
-            .unwrap();
+            let res = object_response(&meta, Bytes::from_static(b"<svg onload=alert(1)/>"), public)
+                .unwrap();
             assert_eq!(
                 res.headers().get("x-content-type-options").unwrap(),
                 "nosniff",

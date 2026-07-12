@@ -429,9 +429,8 @@ fn generated_storage_crate_passes_strict_clippy_and_its_acceptance_tests() {
     );
 
     // Sanity: each scope variant emitted its distinguishing guard signature.
-    let read = |rel: &str| {
-        fs::read_to_string(app.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
-    };
+    let read =
+        |rel: &str| fs::read_to_string(app.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
     let avatars = read("crates/storage/src/avatars.rs");
     assert!(
         avatars.contains("user: CurrentUser,") && !avatars.contains("Tenant"),
