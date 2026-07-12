@@ -89,11 +89,32 @@ fn cron_schedule_args(stmt: &Statement) -> Option<(String, String, String)> {
 pub fn build_jobs(cron_sql: &str) -> JobsOutput {
     let mut jobs = Vec::new();
     let mut gaps = Vec::new();
+    // Anything in cron.sql that is not a recognized 3-arg cron.schedule call
+    // (2-arg form, INSERT INTO cron.job dumps, unparseable statements) is a
+    // scheduled job we could not read — losing it silently would drop the job.
+    let unrecognized = |sql: &str, line: usize| GapItem {
+        kind: GapKind::CronJob,
+        source: "cron.sql statement".into(),
+        location: format!("cron.sql:{line}"),
+        reason:
+            "statement is not a cron.schedule('name','schedule',$$body$$) call the translator reads"
+                .into(),
+        original: sql.to_string(),
+        suggested:
+            "re-express as jobs[] entries (name + 5-field schedule) and port the body by hand"
+                .into(),
+        severity: Severity::Blocking,
+    };
     for raw in parse::split_and_parse(cron_sql) {
-        let RawStatement::Parsed { stmt, line, .. } = &raw else {
+        let RawStatement::Parsed { stmt, sql, line } = &raw else {
+            let RawStatement::Unparsed { sql, line } = &raw else {
+                continue;
+            };
+            gaps.push(unrecognized(sql, *line));
             continue;
         };
         let Some((name, sched, body)) = cron_schedule_args(stmt) else {
+            gaps.push(unrecognized(sql, *line));
             continue;
         };
         if cron_shaped(&sched) {
@@ -159,5 +180,28 @@ select cron.schedule('hourly-sync', '@hourly', $$select public.sync()$$);
         assert!(out.gaps.iter().any(|g| g.kind
             == crate::platform::migrate::gaps::GapKind::CronJob
             && g.source.contains("hourly-sync")));
+    }
+
+    #[test]
+    fn unrecognized_cron_statements_gap_instead_of_silently_dropping_the_job() {
+        // The 2-arg cron.schedule form and raw cron.job INSERT dumps were
+        // silently skipped — a scheduled job simply vanished from the app.
+        let sql = r#"
+select cron.schedule('*/5 * * * *', $$select public.tick()$$);
+insert into cron.job (schedule, command) values ('0 4 * * *', 'select public.rotate()');
+"#;
+        let out = build_jobs(sql);
+        assert!(out.jobs.is_empty());
+        let cron_gaps: Vec<_> = out
+            .gaps
+            .iter()
+            .filter(|g| g.kind == crate::platform::migrate::gaps::GapKind::CronJob)
+            .collect();
+        assert_eq!(cron_gaps.len(), 2, "{:?}", out.gaps);
+        assert!(
+            cron_gaps
+                .iter()
+                .all(|g| g.severity == crate::platform::migrate::gaps::Severity::Blocking)
+        );
     }
 }

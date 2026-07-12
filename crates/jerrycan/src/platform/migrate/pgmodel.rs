@@ -18,6 +18,9 @@ pub struct PgDatabase {
     pub policies: Vec<PgPolicy>,
     /// Publication name → sorted table names.
     pub publications: BTreeMap<String, Vec<String>>,
+    /// Publications declared `FOR ALL TABLES` (membership resolved by the
+    /// caller once every table has folded).
+    pub publications_for_all_tables: std::collections::BTreeSet<String>,
     pub functions: Vec<PgRawObject>,
     pub triggers: Vec<PgRawObject>,
     /// Statements neither parsed nor recognized (candidate gap items).
@@ -435,6 +438,19 @@ impl PgDatabase {
             return false;
         };
         let name = name_raw.trim_matches('"').to_string();
+        // `CREATE PUBLICATION <name> FOR ALL TABLES` — every table, resolved by
+        // the caller once all tables have folded.
+        if is_create
+            && lower.get(3) == Some(&"for")
+            && lower.get(4) == Some(&"all")
+            && lower
+                .get(5)
+                .map(|w| w.trim_end_matches(';') == "tables")
+                .unwrap_or(false)
+        {
+            self.publications_for_all_tables.insert(name);
+            return true;
+        }
         // Find "TABLE" after FOR (create) or ADD (alter); collect the rest.
         let table_kw = lower.iter().position(|w| *w == "table");
         let Some(idx) = table_kw else {
@@ -448,13 +464,13 @@ impl PgDatabase {
             .join(" ");
         let mut tables: Vec<String> = self.publications.get(&name).cloned().unwrap_or_default();
         for raw in rest.split(',') {
-            let tok = raw
-                .trim()
-                .trim_end_matches(';')
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_matches('"');
+            let mut item = raw.split_whitespace();
+            let mut tok = item.next().unwrap_or("");
+            // pg_dump emits `ADD TABLE ONLY public.todos` — skip the ONLY keyword.
+            if tok.eq_ignore_ascii_case("only") {
+                tok = item.next().unwrap_or("");
+            }
+            let tok = tok.trim_end_matches(';').trim_matches('"');
             if tok.is_empty() {
                 continue;
             }
@@ -579,6 +595,24 @@ alter publication supabase_realtime add table public.workspaces;
             db.enums["public.customer_status"],
             vec!["lead", "active", "churned"]
         );
+    }
+
+    #[test]
+    fn pg_dump_only_keyword_and_for_all_tables_publications_fold() {
+        // pg_dump emits `ADD TABLE ONLY <t>` — the ONLY must not become a table.
+        let sql = r#"
+create table public.todos (id uuid primary key);
+alter publication supabase_realtime add table only public.todos;
+create publication everything for all tables;
+"#;
+        let db = PgDatabase::fold(&crate::platform::migrate::parse::split_and_parse(sql));
+        assert_eq!(
+            db.publications["supabase_realtime"],
+            vec!["public.todos"],
+            "ONLY is a keyword, not a table"
+        );
+        assert!(db.publications_for_all_tables.contains("everything"));
+        assert!(db.unparsed.is_empty(), "{:?}", db.unparsed);
     }
 
     #[test]

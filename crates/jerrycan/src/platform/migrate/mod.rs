@@ -360,9 +360,22 @@ fn emit_from_db(
         member_roles: det.member_roles.clone(),
     });
 
-    // Realtime.
-    let realtime = if db.publications.contains_key("supabase_realtime") {
-        let rt = realtimemap::build_realtime(&db.publications, &table_to_entity);
+    // Realtime. A `FOR ALL TABLES` publication resolves to every public table
+    // now that the whole schema has folded.
+    let mut publications = db.publications.clone();
+    if db.publications_for_all_tables.contains("supabase_realtime") {
+        let entry = publications.entry("supabase_realtime".into()).or_default();
+        entry.extend(
+            db.tables
+                .keys()
+                .filter(|k| k.starts_with("public."))
+                .cloned(),
+        );
+        entry.sort();
+        entry.dedup();
+    }
+    let realtime = if publications.contains_key("supabase_realtime") {
+        let rt = realtimemap::build_realtime(&publications, &table_to_entity);
         gaps.extend(rt.gaps);
         (!rt.changes.is_empty()).then_some(RealtimeDesign {
             changes: rt.changes,
