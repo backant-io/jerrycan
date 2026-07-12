@@ -366,6 +366,15 @@ fn unix_secs(t: SystemTime) -> u64 {
 /// Build the download response: Content-Type from the metadata, `ETag` = the
 /// sha256 checksum (quoted), and a Cache-Control that is cache-friendly for
 /// public buckets and cache-hostile for private ones.
+///
+/// SECURITY: the Content-Type is uploader-controlled and the bytes are served
+/// from the app's own origin, so every download carries
+/// `X-Content-Type-Options: nosniff` (no MIME guessing) and
+/// `Content-Disposition: attachment` (never rendered as the app — an uploaded
+/// SVG/HTML would otherwise execute script, a stored XSS). The filename is the
+/// object id (a UUID — always header-safe, never uploader-controlled).
+/// Subresource loads (`<img src=…>`) ignore Content-Disposition, so embedding
+/// public images keeps working.
 pub fn object_response(
     meta: &ObjectMeta,
     bytes: Bytes,
@@ -381,6 +390,11 @@ pub fn object_response(
         .header("content-type", &meta.mime)
         .header("etag", format!("\"{}\"", meta.checksum))
         .header("cache-control", cache)
+        .header("x-content-type-options", "nosniff")
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{}\"", meta.id),
+        )
         .body(jerrycan_core::JcBody::full(bytes))
         .map_err(|e| Error::internal(format!("storage: building object response: {e}")))
 }
@@ -626,6 +640,45 @@ mod tests {
                 .code(),
             "JC0404"
         );
+    }
+
+    #[test]
+    fn object_response_neutralizes_stored_xss_with_nosniff_and_attachment() {
+        // WHY (security): the served Content-Type is UPLOADER-controlled and
+        // the bytes come from the app's own origin — without nosniff +
+        // attachment an uploaded SVG/HTML executes as the app (stored XSS).
+        // A PUBLIC bucket is the worst case: the payload is one
+        // unauthenticated GET away. `attachment` only affects navigations, so
+        // `<img src=…>` embedding of public images keeps working.
+        let meta = ObjectMeta {
+            id: "0b1e0b1e-0b1e-40b1-8b1e-0b1e0b1e0b1e".into(),
+            bucket: "avatars".into(),
+            key: "evil.svg".into(),
+            owner_id: None,
+            tenant_id: None,
+            size: 1,
+            mime: "image/svg+xml".into(),
+            checksum: "deadbeef".into(),
+            created_at: 0,
+        };
+        for public in [true, false] {
+            let res = object_response(
+                &meta,
+                Bytes::from_static(b"<svg onload=alert(1)/>"),
+                public,
+            )
+            .unwrap();
+            assert_eq!(
+                res.headers().get("x-content-type-options").unwrap(),
+                "nosniff",
+                "public={public}: anti-sniff is mandatory on every download"
+            );
+            assert_eq!(
+                res.headers().get("content-disposition").unwrap(),
+                "attachment; filename=\"0b1e0b1e-0b1e-40b1-8b1e-0b1e0b1e0b1e\"",
+                "public={public}: downloads never render on the app origin"
+            );
+        }
     }
 
     #[test]
