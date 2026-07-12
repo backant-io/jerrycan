@@ -12,6 +12,7 @@ pub mod jobsgen;
 pub mod lints;
 pub mod mcp;
 pub mod mcp_dispatch;
+pub mod migrate;
 pub mod mounting;
 pub mod openapi;
 pub mod package;

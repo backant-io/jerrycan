@@ -109,6 +109,26 @@ enum Cmd {
         /// Deploy target (currently: render)
         target: String,
     },
+    /// Migrate a Supabase project into a jerrycan backend
+    Migrate {
+        /// Source platform (currently: supabase)
+        #[arg(long)]
+        from: String,
+        /// Offline export directory (layout: `jerrycan docs migrate-supabase`)
+        export_dir: Option<PathBuf>,
+        /// Opt-in: read a live Supabase Postgres instead of an export. Never in CI.
+        #[arg(long, conflicts_with = "export_dir")]
+        live: Option<String>,
+        /// Target project directory (default: ./<app-name>)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// App name override (default: kebab-case of the export directory name)
+        #[arg(long)]
+        name: Option<String>,
+        /// Tables with more rows than this become resumable bulk-COPY seed steps
+        #[arg(long, default_value_t = 5000)]
+        bulk_threshold: usize,
+    },
     /// Serve MCP over stdio
     Mcp,
 }
@@ -208,6 +228,22 @@ fn run(cli: Cli) -> Result<(), Failure> {
             systemd,
         } => cmd_package(docker, binary, k8s, systemd, cli.json),
         Cmd::Deploy { target } => cmd_deploy(&target, cli.json),
+        Cmd::Migrate {
+            from,
+            export_dir,
+            live,
+            out,
+            name,
+            bulk_threshold,
+        } => cmd_migrate(
+            &from,
+            export_dir.as_deref(),
+            live.as_deref(),
+            out.as_deref(),
+            name.as_deref(),
+            bulk_threshold,
+            cli.json,
+        ),
         Cmd::Mcp => jerrycan::platform::mcp::serve_stdio().map_err(Failure::environment),
     }
 }
@@ -685,6 +721,34 @@ fn cmd_deploy(target: &str, json_mode: bool) -> Result<(), Failure> {
         &format!("deploy kit for `{target}` written"),
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_migrate(
+    from: &str,
+    export_dir: Option<&Path>,
+    live: Option<&str>,
+    _out: Option<&Path>,
+    _name: Option<&str>,
+    _bulk_threshold: usize,
+    _json_mode: bool,
+) -> Result<(), Failure> {
+    if from != "supabase" {
+        return Err(Failure::usage(format!(
+            "unknown migration source `{from}` — supported: supabase"
+        )));
+    }
+    if live.is_some() {
+        return Err(Failure::usage(
+            "--live lands after the offline path — export the project and use the export directory for now",
+        ));
+    }
+    let dir = export_dir
+        .ok_or_else(|| Failure::usage("provide the export directory (or --live <conn>)"))?;
+    let _export = jerrycan::platform::migrate::export::Export::open(dir).map_err(Failure::usage)?;
+    Err(Failure::usage(
+        "migration pipeline not wired yet — implemented across this plan's tasks",
+    ))
 }
 
 fn cmd_list_routes(json_mode: bool) -> Result<(), Failure> {
