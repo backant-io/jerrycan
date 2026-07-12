@@ -11,6 +11,7 @@ members = [
     "crates/jerrycan-ratelimit",
     "crates/jerrycan-jobs",
     "crates/jerrycan-storage",
+    "crates/jerrycan-realtime",
 ]
 exclude = ["fuzz"]
 
@@ -33,6 +34,16 @@ jerrycan-observe = { path = "crates/jerrycan-observe", version = "0.2.0" }
 jerrycan-ratelimit = { path = "crates/jerrycan-ratelimit", version = "0.2.0" }
 jerrycan-jobs = { path = "crates/jerrycan-jobs", version = "0.2.0" }
 jerrycan-storage = { path = "crates/jerrycan-storage", version = "0.2.0" }
+jerrycan-realtime = { path = "crates/jerrycan-realtime", version = "0.2.0" }
+# Realtime WS transport. No TLS features: server-side it rides hyper's already-
+# accepted socket; the test client connects plain ws:// on loopback. Verified
+# 0.30.0 current on docs.rs (from_raw_socket + inherent send +
+# handshake::derive_accept_key are the APIs we use).
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake", "connect"] }
+# The dedicated logical-replication client (pgoutput, rustls TLS via the `ring`
+# provider, SCRAM). It owns the WAL socket / startup / auth / framing / standby
+# status; sqlx stays the sole data-layer client. Verified 0.3.2 on crates.io.
+pgwire-replication = { version = "0.3.2", default-features = false, features = ["tls-rustls", "scram"] }
 argon2 = "0.5"
 bcrypt = "0.17"
 chacha20poly1305 = "0.10"
