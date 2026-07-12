@@ -1,0 +1,25 @@
+name: "jerrycan CodeQL config"
+
+# Referenced by .github/workflows/codeql.yml (github/codeql-action/init
+# `config-file:`). Narrows which alerts CodeQL reports over the Rust workspace.
+
+paths-ignore:
+  - "fuzz/**" # fuzz harnesses, not shipped code
+  - "**/tests/**" # dedicated integration-test crates
+  - "**/benches/**" # criterion benchmarks
+  - "flask/**" # vendored Python reference material (not Rust)
+  - "werkzeug/**"
+
+query-filters:
+  # rust/hard-coded-cryptographic-value fires ONLY on the argon2/bcrypt test
+  # vectors in jerrycan-auth/src/password.rs — e.g. "correct horse", the
+  # published bcrypt hash of "password", and the "must-not-leak" assertion
+  # strings — every one of them inside an inline `#[cfg(test)] mod tests`. They
+  # are fixtures, never production secrets. `paths-ignore` operates on file
+  # paths and so cannot target an inline test module without also blinding the
+  # production hashing code in the same file, so the query is excluded
+  # workspace-wide instead. jerrycan mints no key material from string literals
+  # in production — the argon2/bcrypt KDFs own all key handling. Re-enable this
+  # query if that ever stops being true.
+  - exclude:
+      id: rust/hard-coded-cryptographic-value

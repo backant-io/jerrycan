@@ -1,0 +1,36 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly re-scan so advisories in unchanged code still surface.
+    - cron: "27 4 * * 1"
+
+# Least privilege by default; the analyze job elevates only what CodeQL needs.
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (rust)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload the SARIF results
+      actions: read # read workflow run metadata (private repos)
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+          # Rust is analyzed without a build; source extraction is enough.
+          build-mode: none
+          config-file: ./.github/codeql/codeql-config.yml
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:rust"
