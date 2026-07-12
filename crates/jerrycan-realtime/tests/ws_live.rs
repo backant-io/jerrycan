@@ -58,6 +58,103 @@ async fn send_text(ws: &mut WsClient, text: &str) {
     ws.send(Message::Text(text.into())).await.unwrap();
 }
 
+fn header_resolver() -> jerrycan_realtime::PrincipalResolver {
+    std::sync::Arc::new(|ctx: &mut jerrycan_core::RequestCtx| {
+        Box::pin(async move {
+            let user = ctx
+                .headers()
+                .get("x-user")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(jerrycan_core::Error::unauthorized)?
+                .to_string();
+            let tenant = ctx
+                .headers()
+                .get("x-tenant")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            Ok(jerrycan_realtime::Principal {
+                user_id: user,
+                tenant_id: tenant,
+                role: None,
+            })
+        })
+    })
+}
+
+async fn connect_as(port: u16, user: &str, tenant: &str) -> WsClient {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://127.0.0.1:{port}/realtime")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert("x-user", user.parse().unwrap());
+    req.headers_mut().insert("x-tenant", tenant.parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect");
+    ws
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broadcast_reaches_subscribers_but_not_publisher_or_other_tenants() {
+    let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
+    let rt = Realtime::new(db)
+        .broadcast("room", TopicScope::Tenant)
+        .principal(header_resolver());
+    let (port, shutdown, task) = serve(rt).await;
+
+    let mut a = connect_as(port, "alice", "t1").await; // publisher
+    let mut b = connect_as(port, "bob", "t1").await; // same tenant — receives
+    let mut c = connect_as(port, "carol", "t2").await; // OTHER tenant — must not
+
+    for ws in [&mut a, &mut b, &mut c] {
+        send_text(ws, r#"{"op":"join","channel":"broadcast:room","ref":1}"#).await;
+        assert_eq!(recv_json(ws).await["op"], "joined");
+    }
+
+    send_text(
+        &mut a,
+        r#"{"op":"publish","channel":"broadcast:room","payload":{"msg":"hi"},"ref":2}"#,
+    )
+    .await;
+
+    // Bob gets the event.
+    let ev = recv_json(&mut b).await;
+    assert_eq!(ev["op"], "event");
+    assert_eq!(ev["channel"], "broadcast:room");
+    assert_eq!(ev["payload"]["msg"], "hi");
+
+    // NEGATIVE CONTROLS: carol (cross-tenant) and alice (self) get NOTHING.
+    // Prove it by round-tripping a heartbeat on each — the next frame must be
+    // the ack, not a leaked event.
+    for ws in [&mut c, &mut a] {
+        send_text(ws, r#"{"op":"heartbeat","ref":9}"#).await;
+        let next = recv_json(ws).await;
+        assert_eq!(next["op"], "heartbeat_ack", "leaked broadcast: {next}");
+    }
+
+    let _ = shutdown.send(());
+    let _ = task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_requires_membership_of_the_channel() {
+    let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
+    let rt = Realtime::new(db).broadcast("lobby", TopicScope::None);
+    let (port, shutdown, task) = serve(rt).await;
+    let mut ws = connect(port).await;
+    // Publish WITHOUT joining ⇒ 403-coded error envelope.
+    send_text(
+        &mut ws,
+        r#"{"op":"publish","channel":"broadcast:lobby","payload":{},"ref":1}"#,
+    )
+    .await;
+    let err = recv_json(&mut ws).await;
+    assert_eq!(err["op"], "error");
+    assert_eq!(err["code"], "JC0403");
+    let _ = shutdown.send(());
+    let _ = task.await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn join_heartbeat_and_error_envelopes_round_trip() {
     let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();

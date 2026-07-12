@@ -5,6 +5,7 @@
 
 pub mod changes;
 pub mod protocol;
+pub(crate) mod broadcast;
 pub(crate) mod bus;
 pub(crate) mod channel;
 pub(crate) mod presence;
@@ -451,17 +452,6 @@ fn rand_node_id() -> u64 {
 // ---------------------------------------------------------------------------
 
 impl Hub {
-    // Task 9 replaces this with the real broadcast gate + bus publish.
-    pub(crate) async fn publish(
-        self: &Arc<Self>,
-        conn: u64,
-        channel: &str,
-        _payload: serde_json::Value,
-        r#ref: Option<u64>,
-    ) {
-        self.not_implemented(conn, channel, r#ref);
-    }
-
     // Task 10 replaces these two with real presence track/untrack.
     pub(crate) async fn track(
         self: &Arc<Self>,
@@ -487,16 +477,6 @@ impl Hub {
                 r#ref,
             },
         );
-    }
-
-    // Task 9 fills this (bus → local broadcast subscribers).
-    pub(crate) fn deliver_broadcast(
-        &self,
-        _topic: &str,
-        _tenant_id: Option<&str>,
-        _payload: &serde_json::Value,
-        _origin: Option<(u64, u64)>,
-    ) {
     }
 
     // Task 17 fills this (scope-filtered change delivery).
