@@ -12,6 +12,7 @@ pub mod entities;
 pub mod grouping;
 pub mod cronmap;
 pub mod realtimemap;
+pub mod redact;
 pub mod rls;
 pub mod seed;
 pub mod storagemap;
