@@ -9,6 +9,7 @@ pub mod design;
 pub mod docsidx;
 pub mod genroute;
 pub mod jobsgen;
+pub mod realtimegen;
 pub mod lints;
 pub mod mcp;
 pub mod mcp_dispatch;
