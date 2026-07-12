@@ -511,6 +511,26 @@ fn emit_from_db(
         }
     };
 
+    // Gap items carry verbatim source snippets (policies, function/cron
+    // bodies) which routinely embed service keys — e.g. the pg_net +
+    // Authorization-Bearer cron pattern. Redact every text field to
+    // placeholders so the report stays useful, the migration proceeds, and
+    // the assert_clean gate below stays a translator-bug detector instead of
+    // failing on real-world exports.
+    for g in &mut gaps {
+        for field in [
+            &mut g.source,
+            &mut g.reason,
+            &mut g.original,
+            &mut g.suggested,
+        ] {
+            let (clean, n) = redact::redact_text(field);
+            if n > 0 {
+                *field = clean;
+            }
+        }
+    }
+
     // Gap report + MIGRATION.md.
     let mut sorted_gaps = gaps.clone();
     let report = gaps::render_gap_report(&mut sorted_gaps);
@@ -774,6 +794,63 @@ create publication supabase_realtime for table public.customers;
                 std::fs::read(out_dir2.join(rel)).unwrap(),
                 "{rel} deterministic"
             );
+        }
+    }
+
+    #[test]
+    fn a_service_key_inside_a_function_or_cron_body_is_redacted_not_fatal() {
+        // The canonical Supabase pattern: a cron job calling net.http_post with
+        // an Authorization: Bearer <service-role JWT> header, and a plpgsql
+        // function doing the same. Their bodies land in gap-report `original`
+        // fields — the secret must be redacted to a placeholder (migration
+        // proceeds), never emitted and never a hard failure.
+        const JWT: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJub3RlIjoiamVycnljYW4gdGVzdCBmaXh0dXJlLCBub3QgYSByZWFsIHNlY3JldCJ9.amVycnljYW4tZml4dHVyZS1zaWduYXR1cmUtcGxhY2Vob2xkZXItMDAw";
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(
+            export_dir.join("schema.sql"),
+            format!(
+                r#"
+create table public.todos (id uuid primary key, title text not null);
+create function public.notify() returns void as $$
+begin
+  perform net.http_post('https://x.functions.supabase.co/digest',
+    headers := '{{"Authorization": "Bearer {JWT}"}}'::jsonb);
+end;
+$$ language plpgsql;
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            export_dir.join("cron.sql"),
+            format!(
+                "select cron.schedule('digest', '0 3 * * *', $$select net.http_post('https://x', headers := '{{\"Authorization\": \"Bearer {JWT}\"}}'::jsonb)$$);\n"
+            ),
+        )
+        .unwrap();
+        let out_dir = tmp.path().join("app");
+        let out = run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: out_dir.clone(),
+            name: Some("acme".into()),
+            bulk_threshold: 5000,
+        })
+        .expect("a secret in a source body must not abort the migration");
+        assert!(
+            out.gaps
+                .iter()
+                .any(|g| g.original.contains("<REDACTED:jwt>")),
+            "placeholder marks the redaction"
+        );
+        for rel in ["design.json", "gap-report.json", "MIGRATION.md"] {
+            let text = std::fs::read_to_string(out_dir.join(rel)).unwrap();
+            assert!(
+                redact::scan(&text).is_empty(),
+                "{rel} must scan clean after redaction"
+            );
+            assert!(!text.contains(JWT), "{rel} must not carry the secret");
         }
     }
 

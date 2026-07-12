@@ -29,6 +29,8 @@ pub struct SecretHit {
     /// First 8 chars + "…" — safe to print, never the secret.
     pub preview: String,
     pub offset: usize,
+    /// Byte length of the secret span starting at `offset` (for redact_text).
+    pub len: usize,
 }
 
 fn is_b64url(c: char) -> bool {
@@ -78,6 +80,7 @@ pub fn scan(text: &str) -> Vec<SecretHit> {
                 kind: SecretKind::Jwt,
                 preview: preview(&text[start..end]),
                 offset: start,
+                len: end - start,
             });
             i = end;
         } else {
@@ -95,6 +98,7 @@ pub fn scan(text: &str) -> Vec<SecretHit> {
                 kind: SecretKind::SupabaseKey,
                 preview: preview(&text[start..end]),
                 offset: start,
+                len: end - start,
             });
         }
         i = start + "sb_secret_".len();
@@ -112,6 +116,7 @@ pub fn scan(text: &str) -> Vec<SecretHit> {
                 kind: SecretKind::SupabaseKey,
                 preview: preview(&text[start..end]),
                 offset: start,
+                len: end - start,
             });
         }
         i = start + 4;
@@ -135,6 +140,7 @@ pub fn scan(text: &str) -> Vec<SecretHit> {
                     kind: SecretKind::PasswordUrl,
                     preview: preview(&text[start..userinfo_start]),
                     offset: start,
+                    len: userinfo_start + at + 1 - start,
                 });
             }
             i = start + scheme.len();
@@ -170,6 +176,34 @@ pub fn redact_env(text: &str) -> (String, Vec<SecretHit>) {
         out.push('\n');
     }
     (out, all_hits)
+}
+
+/// Replace every detected secret span with a `<REDACTED:kind>` placeholder.
+/// Used on gap-item text (policy/function/cron `original` snippets) so a
+/// secret embedded in source SQL never reaches an emitted artifact — the
+/// migration proceeds and the placeholder marks the rotation work. Returns
+/// the redacted text and the number of spans replaced.
+pub fn redact_text(text: &str) -> (String, usize) {
+    let hits = scan(text);
+    if hits.is_empty() {
+        return (text.to_string(), 0);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0usize;
+    let mut count = 0usize;
+    for h in &hits {
+        if h.offset < pos {
+            continue; // nested in an already-redacted span (e.g. jwt inside a url)
+        }
+        out.push_str(&text[pos..h.offset]);
+        out.push_str("<REDACTED:");
+        out.push_str(h.kind.placeholder());
+        out.push('>');
+        pos = h.offset + h.len;
+        count += 1;
+    }
+    out.push_str(&text[pos..]);
+    (out, count)
 }
 
 /// Hard gate: error if any emitted artifact still carries a secret. A leak is a
@@ -226,6 +260,22 @@ mod tests {
         assert!(redacted.contains("SUPABASE_SERVICE_ROLE_KEY=<ROTATE-ME:jwt>"));
         assert!(redacted.contains("OTHER=fine"));
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn redact_text_replaces_every_secret_span_with_a_placeholder() {
+        let text = format!(
+            "select net.http_post('https://x', headers := '{{\"Authorization\": \"Bearer {JWT}\"}}');\nconn = postgresql://postgres:s3cret@db.example.com:5432/x"
+        );
+        let (out, n) = redact_text(&text);
+        assert_eq!(n, 2, "{out}");
+        assert!(out.contains("<REDACTED:jwt>"), "{out}");
+        assert!(out.contains("<REDACTED:password>db.example.com"), "{out}");
+        assert!(
+            scan(&out).is_empty(),
+            "redacted text must scan clean: {out}"
+        );
+        assert!(out.contains("net.http_post"), "non-secret text survives");
     }
 
     #[test]
