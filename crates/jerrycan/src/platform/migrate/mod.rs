@@ -8,4 +8,5 @@ pub mod parse;
 pub mod pgmodel;
 pub mod entities;
 pub mod grouping;
+pub mod rls;
 pub mod typemap;

@@ -1,5 +1,5 @@
 //! Spec §Deterministic translator (2): cluster tables into modules by FK graph
-//! + shared name prefix. Hub tables (tenant, users) anchor their own modules —
+//! and shared name prefix. Hub tables (tenant, users) anchor their own modules;
 //! edges INTO a hub are ignored so tenancy doesn't collapse the app into one
 //! module. The agent refines grouping afterwards (spec §Agent-judgment layer).
 
