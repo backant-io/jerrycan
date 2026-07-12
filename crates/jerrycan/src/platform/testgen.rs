@@ -299,7 +299,7 @@ const TEST_SECRET: &str = "a-very-long-development-secret-string!!";
 /// `test_cookie()` keeps minting user 1's for back-compat with the success tests.
 fn auth_preamble_login() -> String {
     format!(
-        "fn test_cookie_for(user_id: i64) -> String {{\n    let auth = jerrycan::auth::Auth::with_secret(\"{TEST_SECRET}\");\n    let token = auth.sessions().encode(&shared::SessionUser {{ id: user_id, role: \"admin\".into() }}).expect(\"encode\");\n    format!(\"jerrycan_session={{token}}\")\n}}\n\nfn test_cookie() -> String {{\n    test_cookie_for(1)\n}}\n\n"
+        "fn test_cookie_for(user_id: i64) -> String {{\n    let auth = jerrycan::auth::Auth::with_secret(\"{TEST_SECRET}\");\n    let token = auth.sessions().encode(&shared::SessionUser {{ id: user_id.to_string(), role: \"admin\".into() }}).expect(\"encode\");\n    format!(\"jerrycan_session={{token}}\")\n}}\n\nfn test_cookie() -> String {{\n    test_cookie_for(1)\n}}\n\n"
     )
 }
 

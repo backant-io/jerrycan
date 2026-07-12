@@ -385,7 +385,7 @@ pub fn acceptance_rs(design: &Design) -> String {
          const TEST_SECRET: &str = \"a-very-long-development-secret-string!!\";\n\n\
          fn test_cookie_for(user_id: i64) -> String {{\n\
          \x20   let auth = jerrycan::auth::Auth::with_secret(TEST_SECRET);\n\
-         \x20   let token = auth.sessions().encode(&shared::SessionUser {{ id: user_id, role: \"admin\".into() }}).expect(\"encode\");\n\
+         \x20   let token = auth.sessions().encode(&shared::SessionUser {{ id: user_id.to_string(), role: \"admin\".into() }}).expect(\"encode\");\n\
          \x20   format!(\"jerrycan_session={{token}}\")\n\
          }}\n\n\
          async fn app() -> TestApp {{\n\

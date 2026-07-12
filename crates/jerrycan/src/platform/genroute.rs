@@ -813,11 +813,10 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
         let mut pk = ColumnDef::new(Alias::new("id"));
         pk.big_integer().not_null().auto_increment().primary_key();
         table.col(&mut pk);
-        table.col(
-            ColumnDef::new(Alias::new("user_id"))
-                .big_integer()
-                .not_null(),
-        );
+        // user_id is TEXT (the stringified user pk), matching SessionUser.id and
+        // storage_objects.owner_id: one shape holds an integer OR a uuid user id,
+        // so a migrated Supabase app whose auth.users are uuid can seed membership.
+        table.col(ColumnDef::new(Alias::new("user_id")).text().not_null());
         let mut fk_col = ColumnDef::new(Alias::new(fk.clone()));
         match design.target_key_rust_type(&tenancy.entity) {
             "String" => ddl_typed(&mut fk_col, FieldType::String, backend_is_pg),
