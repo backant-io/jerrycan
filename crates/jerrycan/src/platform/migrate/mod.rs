@@ -10,6 +10,8 @@ pub mod authmap;
 pub mod crud;
 pub mod entities;
 pub mod grouping;
+pub mod cronmap;
+pub mod realtimemap;
 pub mod rls;
 pub mod storagemap;
 pub mod tenancy;
