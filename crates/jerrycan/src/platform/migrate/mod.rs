@@ -7,4 +7,5 @@ pub mod gaps;
 pub mod parse;
 pub mod pgmodel;
 pub mod entities;
+pub mod grouping;
 pub mod typemap;
