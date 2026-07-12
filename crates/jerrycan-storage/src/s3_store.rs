@@ -16,13 +16,28 @@ use std::time::Duration;
 /// Multipart threshold AND part size: bodies above this upload in 8 MiB parts.
 const PART_SIZE: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct S3Config {
     pub bucket: String,
     pub region: String,
     pub endpoint: String, // scheme://host[:port], no trailing slash
     pub access_key: String,
     pub secret_key: String,
+}
+
+// Manual, key-material-safe Debug (mirrors `Storage`'s manual Debug in
+// lib.rs): the AWS credentials must never reach logs — only the non-secret
+// routing fields print.
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl S3Config {
@@ -543,6 +558,25 @@ mod tests {
             c.object_path("avatars", "u 1/pic.png"),
             "/my-bucket/avatars/u%201/pic.png"
         );
+    }
+
+    #[test]
+    fn config_debug_redacts_both_credentials() {
+        // WHY (security): S3Config reaches error/trace contexts — a derived
+        // Debug would print live AWS keys into logs.
+        let c = S3Config::from_url(
+            "s3://b?region=eu-central-1",
+            Some("AKIA-PLAINTEXT-ACCESS".into()),
+            Some("PLAINTEXT-SECRET-KEY".into()),
+        )
+        .unwrap();
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("AKIA-PLAINTEXT-ACCESS") && !dbg.contains("PLAINTEXT-SECRET-KEY"),
+            "credentials must never print: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        assert!(dbg.contains("eu-central-1"), "routing fields do print: {dbg}");
     }
 
     #[test]
