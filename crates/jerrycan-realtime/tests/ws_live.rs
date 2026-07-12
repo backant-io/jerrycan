@@ -276,6 +276,49 @@ async fn join_heartbeat_and_error_envelopes_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn oversized_inbound_frame_is_rejected_and_closes_the_connection() {
+    // WHY (security, #70): the server caps inbound frames at 256 KiB. Without a
+    // cap tungstenite would buffer up to 64 MiB per authenticated frame — a
+    // memory-amplification DoS on a single-tenant broadcast. An over-cap frame
+    // must be a hard protocol error that tears the connection down, NOT silently
+    // buffered.
+    use futures_util::{SinkExt, StreamExt};
+    let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
+    let rt = Realtime::new(db).broadcast("lobby", TopicScope::None);
+    let (port, shutdown, task) = serve(rt).await;
+
+    // Control: a large-but-under-cap frame (200 KiB) is delivered and answered
+    // (unparseable JSON ⇒ JC0422), proving the connection tolerates big frames
+    // and that it is the SIZE, not mere bulk, that trips the guard below.
+    let mut ok = connect(port).await;
+    ok.send(Message::Text("x".repeat(200 * 1024).into()))
+        .await
+        .unwrap();
+    let err = recv_json(&mut ok).await;
+    assert_eq!(err["code"], "JC0422", "under-cap frame should parse: {err}");
+
+    // Over the cap (300 KiB): the server rejects the frame on read and drops the
+    // connection. The send may itself error once the peer resets; either way the
+    // client's stream must terminate rather than the frame being accepted.
+    let mut ws = connect(port).await;
+    let _ = ws.send(Message::Text("x".repeat(300 * 1024).into())).await;
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break true,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .expect("connection did not close after an oversized frame");
+    assert!(closed);
+
+    let _ = shutdown.send(());
+    let _ = task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn non_websocket_get_is_rejected_without_upgrade() {
     let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
     let rt = Realtime::new(db).broadcast("lobby", TopicScope::None);
