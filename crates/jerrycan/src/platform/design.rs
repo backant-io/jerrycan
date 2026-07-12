@@ -344,7 +344,9 @@ impl Design {
         } else {
             (s, 1)
         };
-        num.parse::<u64>().ok().map(|n| n * mult)
+        // checked_mul: overflow reads as unparseable (a validation question),
+        // never a debug panic or a silently wrapped size.
+        num.parse::<u64>().ok().and_then(|n| n.checked_mul(mult))
     }
 
     /// Reserved dependency name `oauth` enables the facade `oauth` feature, so a
@@ -603,6 +605,17 @@ pub(crate) mod tests {
             "suffixes are uppercase (schema-validated)"
         );
         assert_eq!(Design::parse_size("lots"), None);
+    }
+
+    #[test]
+    fn parse_size_refuses_overflow_instead_of_panicking_or_wrapping() {
+        // WHY: parse_size runs on agent-authored design.json during validation.
+        // An unchecked `n * mult` panics in debug and silently WRAPS in release
+        // (a huge max_size becoming a small one) — overflow must read as
+        // unparseable, which validation turns into a question.
+        assert_eq!(Design::parse_size("99999999999999GB"), None, "overflow");
+        assert_eq!(Design::parse_size("18446744073709551615B"), Some(u64::MAX));
+        assert_eq!(Design::parse_size("18446744073709551616B"), None);
     }
 
     #[test]
