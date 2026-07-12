@@ -2,21 +2,21 @@
 //! 2026-07-10). Two front-ends (offline export dir, live catalogs) fold into
 //! one PgDatabase IR; pure stages translate what is safe and gap-report the rest.
 
-pub mod export;
-pub mod gaps;
-pub mod parse;
-pub mod pgmodel;
 pub mod authmap;
+pub mod cronmap;
 pub mod crud;
 pub mod entities;
+pub mod export;
+pub mod gaps;
 pub mod grouping;
 pub mod live;
-pub mod cronmap;
+pub mod migrationmd;
+pub mod parse;
+pub mod pgmodel;
 pub mod realtimemap;
 pub mod redact;
 pub mod rls;
 pub mod seed;
-pub mod migrationmd;
 pub mod storagemap;
 pub mod tenancy;
 pub mod typemap;
@@ -29,9 +29,7 @@ use std::path::{Path, PathBuf};
 use tenancy::TableAccess;
 use typemap::{MappedType, map_pg_type};
 
-use crate::platform::design::{
-    Design, Entity, FieldType, ModuleDesign, RealtimeDesign, Tenancy,
-};
+use crate::platform::design::{Design, Entity, FieldType, ModuleDesign, RealtimeDesign, Tenancy};
 
 pub struct MigrateOptions {
     pub export_dir: PathBuf,
@@ -148,7 +146,11 @@ fn emit_from_db(
 
     // Any public-table RLS policy the recognizer won't certify is agent work —
     // gap it (never guessed). The table still gets fully-guarded CRUD.
-    for policy in db.policies.iter().filter(|p| p.table.starts_with("public.")) {
+    for policy in db
+        .policies
+        .iter()
+        .filter(|p| p.table.starts_with("public."))
+    {
         if let rls::Recognized::Gap { reason } = rls::recognize(policy) {
             gaps.push(GapItem {
                 kind: GapKind::RlsPolicy,
@@ -372,7 +374,9 @@ fn emit_from_db(
             .map(|q| format!("{} — {}", q.id, q.question))
             .collect::<Vec<_>>()
             .join("; ");
-        return Err(format!("translator bug — produced an invalid design: {list}"));
+        return Err(format!(
+            "translator bug — produced an invalid design: {list}"
+        ));
     }
 
     // Scaffold + derived schema (the normal generate handoff).
@@ -399,9 +403,12 @@ fn emit_from_db(
             kind: GapKind::UnmappedType,
             source: "live-mode data seed".into(),
             location: "(--live)".into(),
-            reason: "`--live` translates the schema only; table rows and object bytes are not streamed".into(),
+            reason:
+                "`--live` translates the schema only; table rows and object bytes are not streamed"
+                    .into(),
             original: String::new(),
-            suggested: "produce an offline export and run the offline migration to generate seed/".into(),
+            suggested: "produce an offline export and run the offline migration to generate seed/"
+                .into(),
             severity: Severity::Blocking,
         });
         SeedSummary {
@@ -417,15 +424,26 @@ fn emit_from_db(
     std::fs::write(opts.out_dir.join("gap-report.json"), &report).map_err(|e| e.to_string())?;
     created.push("gap-report.json".into());
 
-    let md = migrationmd::render(&design, &sorted_gaps, &seed_summary, &providers, &endpoint_map);
+    let md = migrationmd::render(
+        &design,
+        &sorted_gaps,
+        &seed_summary,
+        &providers,
+        &endpoint_map,
+    );
     std::fs::write(opts.out_dir.join("MIGRATION.md"), &md).map_err(|e| e.to_string())?;
     created.push("MIGRATION.md".into());
 
     // Hard gate: no secret survives into config/design/report/migration doc.
-    let clean_targets: Vec<PathBuf> = ["design.json", "gap-report.json", "MIGRATION.md", "jerrycan.toml"]
-        .iter()
-        .map(|r| opts.out_dir.join(r))
-        .collect();
+    let clean_targets: Vec<PathBuf> = [
+        "design.json",
+        "gap-report.json",
+        "MIGRATION.md",
+        "jerrycan.toml",
+    ]
+    .iter()
+    .map(|r| opts.out_dir.join(r))
+    .collect();
     redact::assert_clean(&clean_targets)?;
 
     created.sort();
@@ -610,7 +628,11 @@ create publication supabase_realtime for table public.customers;
         )
         .unwrap();
         std::fs::create_dir_all(root.join("data")).unwrap();
-        std::fs::write(root.join("data/public.customers.csv"), "id,workspace_id,email\n").unwrap();
+        std::fs::write(
+            root.join("data/public.customers.csv"),
+            "id,workspace_id,email\n",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -634,7 +656,12 @@ create publication supabase_realtime for table public.customers;
             crate::platform::questions::validate(&out.design)
         );
         assert_eq!(out.design.tenancy.as_ref().unwrap().entity, "Workspace");
-        for rel in ["design.json", "gap-report.json", "MIGRATION.md", "seed/manifest.json"] {
+        for rel in [
+            "design.json",
+            "gap-report.json",
+            "MIGRATION.md",
+            "seed/manifest.json",
+        ] {
             assert!(out_dir.join(rel).exists(), "{rel}");
         }
         let gaps = std::fs::read_to_string(out_dir.join("gap-report.json")).unwrap();
@@ -672,7 +699,10 @@ create publication supabase_realtime for table public.customers;
         })
         .unwrap();
         let md = std::fs::read_to_string(out_dir.join("MIGRATION.md")).unwrap();
-        assert!(md.contains("## Secret rotation"), "rotation checklist present");
+        assert!(
+            md.contains("## Secret rotation"),
+            "rotation checklist present"
+        );
         assert!(
             md.contains("/rest/v1/customers") && md.contains("/customers"),
             "endpoint mapping present"

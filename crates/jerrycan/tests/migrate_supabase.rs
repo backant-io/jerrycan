@@ -3,7 +3,8 @@ use jerrycan::platform::migrate::{MigrateOptions, run_migrate};
 use jerrycan::platform::questions;
 
 fn fixture() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance/fixtures/supabase-export")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/fixtures/supabase-export")
 }
 
 fn migrate_into(dir: &std::path::Path) -> jerrycan::platform::migrate::MigrateOutput {
@@ -27,7 +28,11 @@ fn the_reference_export_yields_a_green_v2_design() {
     );
     assert_eq!(out.design.tenancy.as_ref().unwrap().entity, "Workspace");
     assert!(out.design.storage.is_some() && out.design.realtime.is_some());
-    assert_eq!(out.design.jobs.len(), 1, "5-field cron mapped; @hourly gapped");
+    assert_eq!(
+        out.design.jobs.len(),
+        1,
+        "5-field cron mapped; @hourly gapped"
+    );
 }
 
 #[test]

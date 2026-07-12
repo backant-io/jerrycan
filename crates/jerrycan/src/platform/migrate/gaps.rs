@@ -40,7 +40,9 @@ pub struct GapItem {
 /// Sort (blocking first, then location, then source) and render pretty JSON —
 /// stable bytes for identical inputs (eval-gated determinism).
 pub fn render_gap_report(items: &mut [GapItem]) -> String {
-    items.sort_by(|a, b| (a.severity, &a.location, &a.source).cmp(&(b.severity, &b.location, &b.source)));
+    items.sort_by(|a, b| {
+        (a.severity, &a.location, &a.source).cmp(&(b.severity, &b.location, &b.source))
+    });
     let mut out = serde_json::to_string_pretty(&items).expect("gap items serialize");
     out.push('\n');
     out

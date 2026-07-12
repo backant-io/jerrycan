@@ -12,9 +12,7 @@ use sqlparser::ast::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// `<column> = auth.uid()`
-    Owner {
-        column: String,
-    },
+    Owner { column: String },
     /// `<outer_column> IN (SELECT <outer_column> FROM <m> WHERE <user_col> = auth.uid() [AND role …])`
     /// or the equivalent EXISTS join. Validated against the detected membership
     /// table in tenancy.rs — the recognizer only certifies the SHAPE.
@@ -30,9 +28,7 @@ pub enum Scope {
     /// `auth.uid() IS NOT NULL`, or `TO authenticated`, or `auth.role() = 'authenticated'`.
     Authenticated,
     /// `bucket_id = '<name>'` — meaningful only on storage.objects policies.
-    BucketEq {
-        bucket: String,
-    },
+    BucketEq { bucket: String },
 }
 
 #[derive(Debug)]

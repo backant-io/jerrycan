@@ -219,7 +219,10 @@ mod tests {
     fn env_files_redact_to_placeholders_and_feed_the_rotation_checklist() {
         let env = format!("SUPABASE_SERVICE_ROLE_KEY={JWT}\nOTHER=fine\n");
         let (redacted, hits) = redact_env(&env);
-        assert!(!redacted.contains("eyJ"), "secret bytes never survive: {redacted}");
+        assert!(
+            !redacted.contains("eyJ"),
+            "secret bytes never survive: {redacted}"
+        );
         assert!(redacted.contains("SUPABASE_SERVICE_ROLE_KEY=<ROTATE-ME:jwt>"));
         assert!(redacted.contains("OTHER=fine"));
         assert_eq!(hits.len(), 1);

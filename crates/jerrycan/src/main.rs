@@ -778,8 +778,8 @@ fn cmd_migrate(
     bulk_threshold: usize,
     json_mode: bool,
 ) -> Result<(), Failure> {
-    use jerrycan::platform::migrate::{self, MigrateOptions};
     use jerrycan::platform::migrate::gaps::Severity;
+    use jerrycan::platform::migrate::{self, MigrateOptions};
 
     if from != "supabase" {
         return Err(Failure::usage(format!(

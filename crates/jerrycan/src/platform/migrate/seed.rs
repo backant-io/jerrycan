@@ -331,7 +331,10 @@ impl SeedWriter {
         for row in rows {
             let line = format!(
                 "{}\n",
-                row.iter().map(render_csv_field).collect::<Vec<_>>().join(",")
+                row.iter()
+                    .map(render_csv_field)
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
             file.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
             hasher.update(line.as_bytes());
@@ -458,9 +461,15 @@ pub async fn apply(root: &Path, db: &jerrycan_db::Db) -> Result<AppliedSummary, 
         .unwrap_or_default();
     let resumed = !state.done_files.is_empty() || !state.bulk_progress.is_empty();
 
-    let plan = ApplyPlan::from(&manifest_json, Some(&serde_json::to_string(&state).unwrap()))?;
-    let by_table: BTreeMap<&str, &ManifestTable> =
-        manifest.tables.iter().map(|t| (t.table.as_str(), t)).collect();
+    let plan = ApplyPlan::from(
+        &manifest_json,
+        Some(&serde_json::to_string(&state).unwrap()),
+    )?;
+    let by_table: BTreeMap<&str, &ManifestTable> = manifest
+        .tables
+        .iter()
+        .map(|t| (t.table.as_str(), t))
+        .collect();
     let mut applied_tables = Vec::new();
 
     for step in &plan.steps {
@@ -534,7 +543,10 @@ async fn flush_bulk_batch(
         }
         tuples.push(format!("({})", tuple.join(", ")));
     }
-    let sql = format!("INSERT INTO {table} ({col_list}) VALUES {};", tuples.join(", "));
+    let sql = format!(
+        "INSERT INTO {table} ({col_list}) VALUES {};",
+        tuples.join(", ")
+    );
     conn.execute_unprepared(&sql)
         .await
         .map_err(|e| e.to_string())?;
@@ -630,7 +642,10 @@ mod tests {
         let manifest = writer.finish().unwrap();
         let inline = std::fs::read_to_string(tmp.path().join("seed/inline/001_todos.sql")).unwrap();
         assert!(inline.contains("INSERT INTO todos (id, title) VALUES"));
-        assert!(inline.contains("(2, 'it''s')"), "SQL string escaping: {inline}");
+        assert!(
+            inline.contains("(2, 'it''s')"),
+            "SQL string escaping: {inline}"
+        );
         assert!(tmp.path().join("seed/bulk/events.csv").exists());
         let m: serde_json::Value = serde_json::from_str(&manifest).unwrap();
         assert_eq!(m["tables"][1]["mode"], "bulk");
@@ -641,7 +656,8 @@ mod tests {
     #[test]
     fn the_applier_checkpoints_and_resumes_at_batch_boundaries() {
         let manifest = manifest_fixture();
-        let state = r#"{ "done_files": ["seed/inline/001_todos.sql"], "bulk_progress": { "events": 1 } }"#;
+        let state =
+            r#"{ "done_files": ["seed/inline/001_todos.sql"], "bulk_progress": { "events": 1 } }"#;
         let plan = ApplyPlan::from(&manifest, Some(state)).unwrap();
         assert_eq!(
             plan.steps,

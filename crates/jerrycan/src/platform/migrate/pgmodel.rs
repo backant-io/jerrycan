@@ -268,21 +268,20 @@ impl PgDatabase {
                     Some(CreatePolicyCommand::Delete) => PolicyCommand::Delete,
                     _ => PolicyCommand::All,
                 };
-                let to_roles = p
-                    .to
-                    .as_ref()
-                    .map(|owners| {
-                        owners
-                            .iter()
-                            .map(|o| match o {
-                                Owner::Ident(i) => i.value.to_lowercase(),
-                                Owner::CurrentRole => "current_role".into(),
-                                Owner::CurrentUser => "current_user".into(),
-                                Owner::SessionUser => "session_user".into(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let to_roles =
+                    p.to.as_ref()
+                        .map(|owners| {
+                            owners
+                                .iter()
+                                .map(|o| match o {
+                                    Owner::Ident(i) => i.value.to_lowercase(),
+                                    Owner::CurrentRole => "current_role".into(),
+                                    Owner::CurrentUser => "current_user".into(),
+                                    Owner::SessionUser => "session_user".into(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                 self.policies.push(PgPolicy {
                     table: object_name(&p.table_name),
                     name: p.name.value.clone(),
@@ -531,7 +530,11 @@ alter publication supabase_realtime add table public.workspaces;
         assert_eq!(db.policies.len(), 1);
         assert_eq!(db.policies[0].table, "public.customers");
         assert!(db.policies[0].using.is_some());
-        assert_eq!(db.functions.len(), 1, "raw function captured for the gap report");
+        assert_eq!(
+            db.functions.len(),
+            1,
+            "raw function captured for the gap report"
+        );
         assert_eq!(
             db.publications["supabase_realtime"],
             vec!["public.customers", "public.workspaces"],

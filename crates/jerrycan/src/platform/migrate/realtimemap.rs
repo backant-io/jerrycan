@@ -43,7 +43,8 @@ pub fn build_realtime(
         location: "(client code)".into(),
         reason: "Broadcast topics live in client code, not the database".into(),
         original: String::new(),
-        suggested: "recreate used topics as realtime.broadcast[] entries from frontend usage".into(),
+        suggested: "recreate used topics as realtime.broadcast[] entries from frontend usage"
+            .into(),
         severity: Severity::Advisory,
     });
     gaps.push(GapItem {

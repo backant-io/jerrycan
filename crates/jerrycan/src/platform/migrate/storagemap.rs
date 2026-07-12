@@ -139,11 +139,7 @@ pub fn build_storage(
     Ok(StorageOutput { buckets, gaps })
 }
 
-fn policy_gap(
-    policy: &super::pgmodel::PgPolicy,
-    bucket: Option<String>,
-    reason: &str,
-) -> GapItem {
+fn policy_gap(policy: &super::pgmodel::PgPolicy, bucket: Option<String>, reason: &str) -> GapItem {
     let target = bucket
         .map(|b| format!("{b} bucket"))
         .unwrap_or_else(|| "bucket".to_string());

@@ -148,10 +148,9 @@ fn classify_table(db: &PgDatabase, det: &TenancyDetection, key: &str) -> TableAc
                             // table certifies semantics (a share-list that matched the
                             // shape names a different table → gap, never guessed).
                             if det.membership_table.as_deref() != Some(membership_table.as_str())
-                                || !db
-                                    .tables
-                                    .get(key)
-                                    .is_some_and(|t| t.fks.iter().any(|fk| fk.columns == [outer_column.clone()]))
+                                || !db.tables.get(key).is_some_and(|t| {
+                                    t.fks.iter().any(|fk| fk.columns == [outer_column.clone()])
+                                })
                             {
                                 gap_reasons.push(format!(
                                     "membership predicate references `{membership_table}`, not the detected tenant membership table"
@@ -283,7 +282,10 @@ create policy own on public.todos using (user_id = auth.uid());
         // todos has user_id = auth.uid() but no workspace_id → R3(a): gap, never guessed.
         let access = table_access(&db, &det);
         assert!(matches!(access["public.todos"], TableAccess::Gap { .. }));
-        assert!(matches!(access["public.customers"], TableAccess::Tenant { .. }));
+        assert!(matches!(
+            access["public.customers"],
+            TableAccess::Tenant { .. }
+        ));
     }
 
     #[test]

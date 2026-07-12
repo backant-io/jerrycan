@@ -6,7 +6,9 @@
 use super::gaps::{GapItem, GapKind, Severity};
 use super::parse::{self, RawStatement};
 use crate::platform::design::JobDesign;
-use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, Statement, Value};
+use sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, Statement, Value,
+};
 
 pub struct JobsOutput {
     pub jobs: Vec<JobDesign>,
@@ -104,9 +106,13 @@ pub fn build_jobs(cron_sql: &str) -> JobsOutput {
                 kind: GapKind::PgFunction,
                 source: format!("cron job `{name}`"),
                 location: format!("cron.sql:{line}"),
-                reason: "the scheduled SQL body is agent work — the generated task fn is a stub".into(),
+                reason: "the scheduled SQL body is agent work — the generated task fn is a stub"
+                    .into(),
                 original: body,
-                suggested: format!("implement crates/jobs task `{}` with this SQL's behavior", snake(&name)),
+                suggested: format!(
+                    "implement crates/jobs task `{}` with this SQL's behavior",
+                    snake(&name)
+                ),
                 severity: Severity::Advisory,
             });
         } else {
@@ -114,9 +120,12 @@ pub fn build_jobs(cron_sql: &str) -> JobsOutput {
                 kind: GapKind::CronJob,
                 source: format!("cron job `{name}`"),
                 location: format!("cron.sql:{line}"),
-                reason: format!("schedule `{sched}` is not a 5-field cron expression questions.rs accepts"),
+                reason: format!(
+                    "schedule `{sched}` is not a 5-field cron expression questions.rs accepts"
+                ),
                 original: sched,
-                suggested: "translate to a 5-field cron expression (minute hour day month weekday)".into(),
+                suggested: "translate to a 5-field cron expression (minute hour day month weekday)"
+                    .into(),
                 severity: Severity::Blocking,
             });
         }

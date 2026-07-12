@@ -4,9 +4,7 @@
 //! parse with the same sqlparser expression parser; unparseable text degrades
 //! to a gap (never guessed). Object bytes and table rows are NOT fetched live.
 
-use super::pgmodel::{
-    FkAction, PgColumn, PgDatabase, PgFk, PgPolicy, PgTable, PolicyCommand,
-};
+use super::pgmodel::{FkAction, PgColumn, PgDatabase, PgFk, PgPolicy, PgTable, PolicyCommand};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -170,14 +168,22 @@ pub async fn read_live(conn: &str) -> Result<LiveRead, String> {
 
     // Columns (public/auth/storage).
     let rows = c
-        .query_all(q("select table_schema, table_name, column_name, data_type, is_nullable \
+        .query_all(q(
+            "select table_schema, table_name, column_name, data_type, is_nullable \
                       from information_schema.columns \
-                      where table_schema in ('public','auth','storage') order by ordinal_position"))
+                      where table_schema in ('public','auth','storage') order by ordinal_position",
+        ))
         .await
         .map_err(|e| e.to_string())?;
     for r in &rows {
         let g = |k: &str| r.try_get::<String>("", k).unwrap_or_default();
-        b.column(&g("table_schema"), &g("table_name"), &g("column_name"), &g("data_type"), g("is_nullable") == "NO");
+        b.column(
+            &g("table_schema"),
+            &g("table_name"),
+            &g("column_name"),
+            &g("data_type"),
+            g("is_nullable") == "NO",
+        );
     }
 
     // Primary keys.
@@ -208,14 +214,24 @@ pub async fn read_live(conn: &str) -> Result<LiveRead, String> {
         .map_err(|e| e.to_string())?;
     for r in &rows {
         let g = |k: &str| r.try_get::<String>("", k).unwrap_or_default();
-        b.fk(&g("table_schema"), &g("table_name"), &g("column_name"), &g("ref_schema"), &g("ref_table"), &g("ref_col"), &g("delete_rule"));
+        b.fk(
+            &g("table_schema"),
+            &g("table_name"),
+            &g("column_name"),
+            &g("ref_schema"),
+            &g("ref_table"),
+            &g("ref_col"),
+            &g("delete_rule"),
+        );
     }
 
     // Row-level security flag.
     let rows = c
-        .query_all(q("select n.nspname as s, c.relname as t, c.relrowsecurity as e \
+        .query_all(q(
+            "select n.nspname as s, c.relname as t, c.relrowsecurity as e \
                       from pg_class c join pg_namespace n on n.oid=c.relnamespace \
-                      where n.nspname='public' and c.relkind='r'"))
+                      where n.nspname='public' and c.relkind='r'",
+        ))
         .await
         .map_err(|e| e.to_string())?;
     for r in &rows {
@@ -237,12 +253,22 @@ pub async fn read_live(conn: &str) -> Result<LiveRead, String> {
         let roles: Vec<&str> = roles_csv.split(',').filter(|s| !s.is_empty()).collect();
         let qual = r.try_get::<String>("", "qual").ok();
         let wc = r.try_get::<String>("", "with_check").ok();
-        b.policy(&g("schemaname"), &g("tablename"), &g("policyname"), &g("cmd"), &roles, qual.as_deref(), wc.as_deref());
+        b.policy(
+            &g("schemaname"),
+            &g("tablename"),
+            &g("policyname"),
+            &g("cmd"),
+            &roles,
+            qual.as_deref(),
+            wc.as_deref(),
+        );
     }
 
     // Publications.
     if let Ok(rows) = c
-        .query_all(q("select pubname, schemaname, tablename from pg_publication_tables"))
+        .query_all(q(
+            "select pubname, schemaname, tablename from pg_publication_tables",
+        ))
         .await
     {
         let mut by_pub: std::collections::BTreeMap<String, Vec<(String, String)>> =
@@ -255,16 +281,21 @@ pub async fn read_live(conn: &str) -> Result<LiveRead, String> {
                 .push((g("schemaname"), g("tablename")));
         }
         for (name, tables) in &by_pub {
-            let refs: Vec<(&str, &str)> = tables.iter().map(|(s, t)| (s.as_str(), t.as_str())).collect();
+            let refs: Vec<(&str, &str)> = tables
+                .iter()
+                .map(|(s, t)| (s.as_str(), t.as_str()))
+                .collect();
             b.publication(name, &refs);
         }
     }
 
     // Enums.
     if let Ok(rows) = c
-        .query_all(q("select n.nspname as s, t.typname as name, e.enumlabel as label \
+        .query_all(q(
+            "select n.nspname as s, t.typname as name, e.enumlabel as label \
                       from pg_enum e join pg_type t on t.oid=e.enumtypid \
-                      join pg_namespace n on n.oid=t.typnamespace order by e.enumsortorder"))
+                      join pg_namespace n on n.oid=t.typnamespace order by e.enumsortorder",
+        ))
         .await
     {
         for r in &rows {
@@ -290,7 +321,9 @@ pub async fn read_live(conn: &str) -> Result<LiveRead, String> {
 
     // Buckets (storage may be absent).
     let buckets_json = c
-        .query_one(q("select coalesce(json_agg(x), '[]'::json)::text as j from storage.buckets x"))
+        .query_one(q(
+            "select coalesce(json_agg(x), '[]'::json)::text as j from storage.buckets x",
+        ))
         .await
         .ok()
         .flatten()
@@ -310,11 +343,23 @@ mod tests {
     #[test]
     fn catalog_rows_fold_into_the_same_ir_as_the_offline_parser() {
         let mut b = LiveBuilder::default();
-        b.column("public", "customers", "email", "text", /*not_null*/ true);
+        b.column(
+            "public",
+            "customers",
+            "email",
+            "text",
+            /*not_null*/ true,
+        );
         b.column("public", "customers", "id", "uuid", true);
         b.pk("public", "customers", "id");
         b.fk(
-            "public", "customers", "workspace_id", "public", "workspaces", "id", "CASCADE",
+            "public",
+            "customers",
+            "workspace_id",
+            "public",
+            "workspaces",
+            "id",
+            "CASCADE",
         );
         b.rls("public", "customers", true);
         b.policy(
@@ -333,7 +378,10 @@ mod tests {
             t.fks[0].on_delete,
             crate::platform::migrate::pgmodel::FkAction::Cascade
         );
-        assert!(db.policies[0].using.is_some(), "qual text parsed into an Expr");
+        assert!(
+            db.policies[0].using.is_some(),
+            "qual text parsed into an Expr"
+        );
     }
 
     #[test]

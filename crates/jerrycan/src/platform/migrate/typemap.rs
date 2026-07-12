@@ -40,8 +40,11 @@ pub fn map_pg_type(pg: &str, enums: &BTreeMap<String, Vec<String>>) -> MappedTyp
             FieldType::Float
         }
         "boolean" | "bool" => FieldType::Boolean,
-        "timestamp" | "timestamptz" | "timestamp with time zone"
-        | "timestamp without time zone" | "date" => FieldType::Datetime,
+        "timestamp"
+        | "timestamptz"
+        | "timestamp with time zone"
+        | "timestamp without time zone"
+        | "date" => FieldType::Datetime,
         "uuid" => FieldType::Uuid,
         "json" | "jsonb" => FieldType::Json,
         _ => {
@@ -119,7 +122,14 @@ mod tests {
     #[test]
     fn arrays_composites_domains_geometry_are_unmappable_never_guessed() {
         let enums = BTreeMap::new();
-        for pg in ["text[]", "public.address", "geometry", "tsvector", "bytea", "inet"] {
+        for pg in [
+            "text[]",
+            "public.address",
+            "geometry",
+            "tsvector",
+            "bytea",
+            "inet",
+        ] {
             assert!(
                 matches!(map_pg_type(pg, &enums), MappedType::Unmappable { .. }),
                 "{pg} must gap"

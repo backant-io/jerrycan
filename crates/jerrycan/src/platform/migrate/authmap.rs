@@ -127,7 +127,7 @@ mod tests {
     fn auth_users_produce_the_jwt_auth_block_and_a_users_module() {
         let out = build_auth(
             &["owner".to_string(), "member".to_string()], // member_roles from tenancy
-            &["google".to_string()],                       // providers from auth.identities
+            &["google".to_string()],                      // providers from auth.identities
         );
         assert_eq!(out.auth.model, AuthModel::Jwt, "Supabase auth is JWT");
         assert_eq!(out.auth.roles, vec!["member", "owner"], "sorted, deduped");

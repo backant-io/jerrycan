@@ -26,23 +26,29 @@ pub fn render(
     ));
 
     // What migrated.
-    let entity_count: usize = design
-        .modules
-        .iter()
-        .map(|m| m.entities.len())
-        .sum();
-    let bucket_count = design.storage.as_ref().map(|s| s.buckets.len()).unwrap_or(0);
+    let entity_count: usize = design.modules.iter().map(|m| m.entities.len()).sum();
+    let bucket_count = design
+        .storage
+        .as_ref()
+        .map(|s| s.buckets.len())
+        .unwrap_or(0);
     let realtime_count = design
         .realtime
         .as_ref()
         .map(|r| r.changes.len())
         .unwrap_or(0);
     md.push_str("## What migrated\n\n");
-    md.push_str(&format!("- {entity_count} entities across {} modules\n", design.modules.len()));
+    md.push_str(&format!(
+        "- {entity_count} entities across {} modules\n",
+        design.modules.len()
+    ));
     md.push_str(&format!("- {bucket_count} storage buckets\n"));
     md.push_str(&format!("- {realtime_count} realtime change channels\n"));
     md.push_str(&format!("- {} scheduled jobs\n", design.jobs.len()));
-    md.push_str(&format!("- {} seed tables ({} bulk, {} rows)\n\n", seed.tables, seed.bulk_tables, seed.rows));
+    md.push_str(&format!(
+        "- {} seed tables ({} bulk, {} rows)\n\n",
+        seed.tables, seed.bulk_tables, seed.rows
+    ));
 
     // Endpoint mapping (old PostgREST path → new jerrycan path).
     md.push_str("## Endpoint mapping\n\n");
@@ -51,18 +57,24 @@ pub fn render(
     for (old, new) in endpoint_map {
         md.push_str(&format!("| GET {old} | GET {new} |\n"));
     }
-    md.push_str("\nStorage objects: `GET /storage/v1/object/<bucket>/<key>` → `GET /<bucket>/{id}`.\n");
+    md.push_str(
+        "\nStorage objects: `GET /storage/v1/object/<bucket>/<key>` → `GET /<bucket>/{id}`.\n",
+    );
     md.push_str("Realtime: `supabase.channel('<table>-db-changes')` → the jerrycan realtime client at `/realtime`.\n\n");
 
     // Apply the data seed.
     md.push_str("## Apply the data seed\n\n");
-    md.push_str("Bring the schema up, then apply the streamed seed (resumable — safe to re-run):\n\n");
+    md.push_str(
+        "Bring the schema up, then apply the streamed seed (resumable — safe to re-run):\n\n",
+    );
     md.push_str("```sh\njerrycan db migrate\njerrycan db seed\n```\n\n");
     md.push_str("Large tables ride as bulk CSV and checkpoint per batch into `seed/.state.json`, so an interrupted `jerrycan db seed` resumes where it stopped.\n\n");
 
     // Secret rotation.
     md.push_str("## Secret rotation (do this now)\n\n");
-    md.push_str("None of your Supabase secrets were copied. Set fresh values and revoke the old ones:\n\n");
+    md.push_str(
+        "None of your Supabase secrets were copied. Set fresh values and revoke the old ones:\n\n",
+    );
     md.push_str("- [ ] `JERRYCAN_SECRET` — generate a new signing secret for the jerrycan app.\n");
     md.push_str("- [ ] Supabase JWT secret — rotate it; tokens minted by the old backend must stop working.\n");
     md.push_str("- [ ] Supabase anon key — revoke.\n");
@@ -76,7 +88,10 @@ pub fn render(
     md.push_str("- [ ] Storage backend keys (`JERRYCAN_STORAGE` credentials) — set new ones.\n\n");
 
     // Gap report.
-    let blocking = gaps.iter().filter(|g| g.severity == Severity::Blocking).count();
+    let blocking = gaps
+        .iter()
+        .filter(|g| g.severity == Severity::Blocking)
+        .count();
     let advisory = gaps.len() - blocking;
     md.push_str("## Gap report\n\n");
     md.push_str(&format!(
@@ -87,7 +102,9 @@ pub fn render(
     md.push_str("## What was NOT migrated\n\n");
     md.push_str("- The frontend (repoint it using the endpoint mapping above).\n");
     md.push_str("- plpgsql function/trigger and Edge Function bodies (ported by hand — see the gap report).\n");
-    md.push_str("- Realtime Broadcast and Presence topics (they live in client code, not the database).\n");
+    md.push_str(
+        "- Realtime Broadcast and Presence topics (they live in client code, not the database).\n",
+    );
 
     md
 }

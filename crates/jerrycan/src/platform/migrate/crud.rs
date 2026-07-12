@@ -228,7 +228,10 @@ mod tests {
                 .unwrap()
                 .public
         );
-        let create = eps.iter().find(|e| e.operation_id == "create_plan").unwrap();
+        let create = eps
+            .iter()
+            .find(|e| e.operation_id == "create_plan")
+            .unwrap();
         assert!(create.auth_required && !create.public);
     }
 
