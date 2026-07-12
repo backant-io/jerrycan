@@ -171,19 +171,19 @@ pub(crate) fn bucket_rs(design: &Design, b: &BucketDesign) -> String {
     // Public reads: open list + a plain cacheable download. Private reads:
     // scoped list + a download that accepts a session OR a signed URL.
     let read_handlers = if public {
-        format!(
+        String::from(
             r#"/// GET / — list (open: public bucket), ordered by key.
-pub(crate) async fn list(storage: Dep<Storage>, db: Dep<Db>) -> Result<Json<Vec<ObjectMeta>>> {{
+pub(crate) async fn list(storage: Dep<Storage>, db: Dep<Db>) -> Result<Json<Vec<ObjectMeta>>> {
     Ok(Json(storage.list_objects(&db, &BUCKET, None).await?))
-}}
+}
 
-/// GET /{{id}} — download (open: public bucket). Emits `ETag` (the sha256
+/// GET /{id} — download (open: public bucket). Emits `ETag` (the sha256
 /// checksum) + a cache-friendly `Cache-Control`.
-pub(crate) async fn download(storage: Dep<Storage>, db: Dep<Db>, Path(id): Path<String>) -> Result<Response> {{
+pub(crate) async fn download(storage: Dep<Storage>, db: Dep<Db>, Path(id): Path<String>) -> Result<Response> {
     let (meta, bytes) = storage.get_object(&db, &BUCKET, None, &id).await?;
     jerrycan::storage::object_response(&meta, bytes, true)
-}}
-"#
+}
+"#,
         )
     } else {
         format!(
@@ -286,7 +286,7 @@ pub(crate) async fn sign(storage: Dep<Storage>, db: Dep<Db>, {guard}Path(id): Pa
 
 /// The module owning the design's tenancy entity (its migration carries the
 /// `{tenant}_members` table the Tenant guard queries).
-fn tenant_module<'a>(design: &'a Design) -> Option<&'a ModuleDesign> {
+fn tenant_module(design: &Design) -> Option<&ModuleDesign> {
     let tenancy = design.tenancy.as_ref()?;
     design
         .modules
