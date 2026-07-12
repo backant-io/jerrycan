@@ -60,7 +60,7 @@
       "items": {
         "type": "string"
       },
-      "description": "App-scoped dependency names. Reserved names: 'db' (SQL storage via jerrycan-db: SQL repos, migrations, Db dependency), 'validate' (OpenAPI document served at /openapi.json), 'auth' (session/JWT guards + the Auth extension; also implied by a non-'none' auth.model), 'observe' (access-log middleware + /healthz and Prometheus /metrics), and 'oauth' (enables the facade 'oauth' feature so handlers can use jerrycan::auth::oauth::{OAuthClient, Provider}; implies 'auth'). Other names are stubs the generator reminds you to provide."
+      "description": "App-scoped dependency names. Reserved names: 'db' (SQL storage via jerrycan-db: SQL repos, migrations, Db dependency), 'validate' (OpenAPI document served at /openapi.json), 'auth' (session/JWT guards + the Auth extension; also implied by a non-'none' auth.model), 'observe' (access-log middleware + /healthz and Prometheus /metrics), and 'oauth' (enables the facade 'oauth' feature so handlers can use jerrycan::auth::oauth::{OAuthClient, Provider}; implies 'auth'), and 'storage' (reserved for the storage extension; buckets are declared in the top-level 'storage' block, not here). Other names are stubs the generator reminds you to provide."
     },
     "tenancy": {
       "type": "object",

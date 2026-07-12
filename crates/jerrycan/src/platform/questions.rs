@@ -469,6 +469,10 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 ));
             }
             for (j, m) in b.allowed_mime.iter().enumerate() {
+                // The runtime matcher understands exactly type/subtype, type/*
+                // and */*. A wildcard TYPE with a concrete subtype (`*/png`)
+                // would parse here but can never match — every upload would
+                // 415 — so it is rejected as malformed too.
                 let well_formed = m.split_once('/').is_some_and(|(t, sub)| {
                     let seg_ok = |s: &str| {
                         !s.is_empty()
@@ -478,13 +482,13 @@ pub fn validate(d: &Design) -> Vec<Question> {
                                     || matches!(c, b'.' | b'+' | b'-')
                             })
                     };
-                    (seg_ok(t) || t == "*") && (seg_ok(sub) || sub == "*")
+                    (seg_ok(t) && (seg_ok(sub) || sub == "*")) || (t == "*" && sub == "*")
                 });
                 if !well_formed {
                     qs.push(q(
                         format!("{bptr}/allowed_mime/{j}"),
                         format!(
-                            "`{m}` is not a mime pattern — use type/subtype or type/* (lowercase)."
+                            "`{m}` is not a supported mime pattern — use type/subtype, type/* or */* (lowercase)."
                         ),
                     ));
                 }
@@ -833,6 +837,27 @@ mod tests {
             validate(&d)
                 .iter()
                 .any(|q| q.id == "/storage/buckets/0/allowed_mime/0")
+        );
+        // A wildcard TYPE with a concrete subtype (`*/png`) is dead: the
+        // runtime matcher only understands `type/subtype`, `type/*` and `*/*`,
+        // so `*/png` would silently 415 every upload — reject at design time.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[0].allowed_mime = vec!["*/png".into()];
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/allowed_mime/0"),
+            "*/png must be rejected — it can never match"
+        );
+        // The supported wildcard shapes stay valid.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[0].allowed_mime =
+            vec!["*/*".into(), "image/*".into(), "application/pdf".into()];
+        assert!(
+            !validate(&d)
+                .iter()
+                .any(|q| q.id.starts_with("/storage/buckets/0/allowed_mime")),
+            "*/*, type/* and type/subtype are all valid"
         );
     }
 
