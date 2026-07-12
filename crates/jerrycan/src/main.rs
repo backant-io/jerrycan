@@ -140,6 +140,11 @@ enum DbCmd {
         #[arg(long)]
         url: Option<String>,
     },
+    /// Apply the migrated data seed (resumable)
+    Seed {
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -220,6 +225,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Db {
             what: DbCmd::Migrate { url },
         } => cmd_db_migrate(url.as_deref(), cli.json),
+        Cmd::Db {
+            what: DbCmd::Seed { url },
+        } => cmd_db_seed(url.as_deref(), cli.json),
         Cmd::Schema { write } => cmd_schema(write, cli.json),
         Cmd::Package {
             docker,
@@ -582,6 +590,43 @@ fn cmd_db_migrate(url: Option<&str>, json_mode: bool) -> Result<(), Failure> {
             "applied {} migration(s)",
             payload["applied"].as_array().map(Vec::len).unwrap_or(0)
         ),
+    );
+    Ok(())
+}
+
+fn cmd_db_seed(url: Option<&str>, json_mode: bool) -> Result<(), Failure> {
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+    if !design.wants_db() {
+        return Err(Failure::usage(
+            "this app has no `db` dependency — the seed applier needs a database",
+        ));
+    }
+    let url = url
+        .map(str::to_string)
+        .or_else(|| std::env::var("JERRYCAN_DATABASE_URL").ok())
+        .ok_or_else(|| Failure::usage("provide --url or set JERRYCAN_DATABASE_URL"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Failure::environment(e.to_string()))?;
+    let summary = runtime
+        .block_on(async {
+            let db = jerrycan::db::Db::connect(&url)
+                .await
+                .map_err(|e| e.message().to_string())?;
+            jerrycan::platform::migrate::seed::apply(&root, &db).await
+        })
+        .map_err(Failure::gate)?;
+    let payload = serde_json::json!({
+        "applied_tables": summary.applied_tables,
+        "resumed": summary.resumed,
+        "next_step": "jerrycan check",
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!("seeded {} file(s)/table(s)", summary.applied_tables.len()),
     );
     Ok(())
 }

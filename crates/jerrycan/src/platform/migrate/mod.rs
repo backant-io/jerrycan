@@ -13,6 +13,7 @@ pub mod grouping;
 pub mod cronmap;
 pub mod realtimemap;
 pub mod rls;
+pub mod seed;
 pub mod storagemap;
 pub mod tenancy;
 pub mod typemap;

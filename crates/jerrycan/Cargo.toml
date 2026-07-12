@@ -18,7 +18,7 @@ readme = "README.md"
 default = ["cli"]
 # The CLI always carries db (for `jerrycan db migrate`) + tokio (to run the
 # async migrator); generated apps still choose their own features freely.
-cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tokio", "dep:sea-query", "dep:sqlparser", "db"]
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tokio", "dep:sea-query", "dep:sqlparser", "dep:sha2", "db"]
 db = ["dep:jerrycan-db"]
 validate = ["dep:jerrycan-validate"]
 auth = ["dep:jerrycan-auth"]
@@ -68,6 +68,7 @@ jerrycan-realtime = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 sea-query = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
