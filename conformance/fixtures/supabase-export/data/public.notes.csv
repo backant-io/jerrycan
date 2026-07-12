@@ -1,0 +1,3 @@
+id,workspace_id,body
+d0000001-0000-0000-0000-000000000001,aaaaaaaa-0000-0000-0000-000000000001,"a normal note"
+d0000002-0000-0000-0000-000000000002,aaaaaaaa-0000-0000-0000-000000000001,"leaked token eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJub3RlIjoiamVycnljYW4gdGVzdCBmaXh0dXJlLCBub3QgYSByZWFsIHNlY3JldCJ9.amVycnljYW4tZml4dHVyZS1zaWduYXR1cmUtcGxhY2Vob2xkZXItMDAw here"

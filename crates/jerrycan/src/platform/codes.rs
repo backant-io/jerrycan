@@ -71,8 +71,8 @@ pub const REGISTRY: &[CodeInfo] = &[
     CodeInfo {
         code: "JC0415",
         title: "unsupported media type",
-        cause: "the request's content type is not what the endpoint consumes (e.g. Multipart requires multipart/form-data with a boundary)",
-        fix: "send the content type the endpoint declares; for uploads, multipart/form-data with a valid boundary parameter",
+        cause: "the request's content type is not what the endpoint consumes: Multipart requires multipart/form-data with a boundary, and a storage bucket upload must match the bucket's allowed_mime allowlist",
+        fix: "send the content type the endpoint declares; for uploads, multipart/form-data with a valid boundary parameter, or a Content-Type inside the bucket's allowed_mime list",
         doc: "jerrycan docs extractors",
     },
     CodeInfo {
@@ -187,6 +187,20 @@ pub const REGISTRY: &[CodeInfo] = &[
         fix: "use framework extensions for I/O; if genuinely intended, append `// jerrycan:allow JL0007` to the line",
         doc: "jerrycan docs errors",
     },
+    CodeInfo {
+        code: "JC0530",
+        title: "realtime requires postgres",
+        cause: "the design declares realtime changes but the app is running on sqlite",
+        fix: "point JERRYCAN_DATABASE_URL at a Postgres database (broadcast/presence channels work without it; changes channels need Postgres)",
+        doc: "jerrycan docs realtime",
+    },
+    CodeInfo {
+        code: "JC0531",
+        title: "realtime replication unavailable",
+        cause: "wal_level is not 'logical' or the role lacks REPLICATION, so changes run on the trigger + LISTEN/NOTIFY fallback (identical client behavior, weaker delivery guarantee)",
+        fix: "set wal_level=logical and grant REPLICATION to the app role, then restart Postgres — realtime upgrades itself on next start",
+        doc: "jerrycan docs realtime",
+    },
 ];
 
 /// Look up a code, case-insensitively.
@@ -207,6 +221,27 @@ mod tests {
         // completeness walk would mistake for an emitted code.
         let absent = format!("JC{}", 9999);
         assert!(lookup(&absent).is_none());
+    }
+
+    #[test]
+    fn realtime_codes_are_registered() {
+        assert_eq!(
+            lookup("JC0530").unwrap().title,
+            "realtime requires postgres"
+        );
+        assert_eq!(
+            lookup("JC0531").unwrap().title,
+            "realtime replication unavailable"
+        );
+    }
+
+    #[test]
+    fn jc0415_covers_bucket_mime_allowlists() {
+        // WHY: `jerrycan explain JC0415` is the agent's first stop when a
+        // generated bucket rejects an upload — the registry must name the
+        // allowlist cause, not just the Multipart boundary case.
+        let info = lookup("JC0415").unwrap();
+        assert!(info.cause.contains("allowed_mime"), "cause: {}", info.cause);
     }
 
     #[test]

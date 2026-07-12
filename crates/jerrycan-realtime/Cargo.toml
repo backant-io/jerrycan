@@ -1,0 +1,44 @@
+[package]
+name = "jerrycan-realtime"
+description = "Realtime extension for the jerrycan framework: WebSocket channels for Postgres Changes (logical replication with trigger fallback), Broadcast, and Presence, with scope-filtered delivery. https://jerrycan.cc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["realtime", "websocket", "cdc", "pubsub", "presence"]
+categories = ["web-programming", "asynchronous"]
+
+[dependencies]
+jerrycan-core = { workspace = true }
+jerrycan-db = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+futures-core.workspace = true
+futures-util = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync", "rt", "net", "io-util"] }
+tokio-tungstenite = { workspace = true }
+# The dedicated logical-replication client (WAL socket only — pgoutput, rustls
+# TLS, SCRAM). sqlx/sea-orm stays the sole data-layer client.
+pgwire-replication = { workspace = true }
+# PgListener (trigger fallback) + the dedicated advisory-lock leader session.
+sqlx = { workspace = true }
+# The multi-node fan-out bus (behind `realtime-redis`, like jobs-redis).
+redis = { workspace = true, optional = true }
+
+[features]
+realtime-redis = ["dep:redis"]
+
+[dev-dependencies]
+jerrycan-core = { workspace = true }
+jerrycan-db = { workspace = true }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
+tokio-tungstenite = { workspace = true }
+futures-core.workspace = true
+futures-util = { workspace = true }

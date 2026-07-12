@@ -53,6 +53,12 @@ pub const PAGES: &[(&str, &str)] = &[
         "response-types",
         include_str!("../../embedded/ai/17-response-types.md"),
     ),
+    ("storage", include_str!("../../embedded/ai/18-storage.md")),
+    ("realtime", include_str!("../../embedded/ai/18-realtime.md")),
+    (
+        "migrate-supabase",
+        include_str!("../../embedded/ai/19-migrate-supabase.md"),
+    ),
 ];
 
 fn slug(heading: &str) -> String {
@@ -211,6 +217,15 @@ pub fn search(query: &str, limit: usize) -> Vec<SearchHit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realtime_page_is_served() {
+        assert!(
+            PAGES
+                .iter()
+                .any(|(t, body)| *t == "realtime" && body.contains("changes:"))
+        );
+    }
 
     #[test]
     fn get_returns_whole_pages_and_anchored_sections() {

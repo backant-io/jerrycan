@@ -11,7 +11,7 @@ use std::path::Path;
 /// auth mode. `CurrentUser` is what handler stubs extract, so every module's
 /// guard agrees on one app-wide session payload.
 fn shared_auth_types() -> &'static str {
-    "\n/// The session payload (app-wide). Generated because the design declares auth.\n#[derive(serde::Serialize, serde::Deserialize, Clone)]\npub struct SessionUser {\n    pub id: i64,\n    pub role: String,\n}\n\n/// The guard extractor handlers use: a decrypted session.\npub type CurrentUser = jerrycan::auth::Session<SessionUser>;\n"
+    "\n/// The session payload (app-wide). Generated because the design declares auth.\n/// `id` is the stringified user pk (mirrors storage's TEXT `owner_id`), so both\n/// integer and uuid/string user identities — e.g. a migrated Supabase\n/// `auth.users` uuid — round-trip through the session, JWT, and tenant guard.\n#[derive(serde::Serialize, serde::Deserialize, Clone)]\npub struct SessionUser {\n    pub id: String,\n    pub role: String,\n}\n\n/// The guard extractor handlers use: a decrypted session.\npub type CurrentUser = jerrycan::auth::Session<SessionUser>;\n"
 }
 
 /// The membership-checked `Tenant` guard appended to shared/src/lib.rs when the

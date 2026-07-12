@@ -36,7 +36,7 @@ pub use oauth::{
     HttpTransport, OAuthClient, PkceVerifier, Provider, Secret, TokenFuture, TokenResponse,
     TokenTransport, parse_token_body,
 };
-pub use password::{hash_password, verify_password};
+pub use password::{hash_password, needs_rehash, verify_password};
 pub use session::SessionStore;
 
 /// Minimum entropy for `JERRYCAN_SECRET`. Shorter secrets are rejected in prod.

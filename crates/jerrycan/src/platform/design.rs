@@ -19,7 +19,42 @@ pub struct Design {
     pub tenancy: Option<Tenancy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobDesign>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageDesign>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime: Option<RealtimeDesign>,
     pub modules: Vec<ModuleDesign>,
+}
+
+/// The `realtime` block (contract v2): row-change subscriptions (scope-filtered
+/// by owner/tenant), ephemeral broadcast topics, and presence topics, served
+/// over one WebSocket endpoint at `/realtime`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealtimeDesign {
+    /// Entity names whose row changes are subscribable (published +
+    /// REPLICA IDENTITY FULL + scope-filtered delivery).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broadcast: Vec<RealtimeTopic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub presence: Vec<RealtimeTopic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealtimeTopic {
+    pub name: String,
+    pub scope: RealtimeScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RealtimeScope {
+    None,
+    Tenant,
+    Auth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +180,43 @@ pub struct JobDesign {
     pub schedule: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
+}
+
+/// Contract v2: the top-level `storage` block — design-modeled object buckets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageDesign {
+    pub buckets: Vec<BucketDesign>,
+}
+
+/// One bucket: mounts at `/<name>` with generated guarded endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketDesign {
+    /// `^[a-z][a-z0-9-]*$` — becomes the mount and the generated module ident.
+    pub name: String,
+    pub visibility: Visibility,
+    /// Owning entity: the tenancy entity (tenant-owned bucket) or any other
+    /// declared entity (the authenticated user id stamps owner_id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Keys stored under `{owner_id}/…` with a prefix assertion on every
+    /// access (Supabase folder-per-user parity). Requires `owner`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_prefix: bool,
+    /// Per-object cap, e.g. "5MB" (^[0-9]+(B|KB|MB|GB)?$). Default 50MB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<String>,
+    /// Content-type allowlist (globs like "image/*"). Empty = allow all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_mime: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    Public,
+    Private,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +354,43 @@ impl Design {
         !self.jobs.is_empty()
     }
 
+    /// A declared storage block (with buckets) switches on the generated
+    /// `crates/storage/` crate, the Storage extension + STORAGE_MIGRATIONS
+    /// wiring in main.rs, and the `storage-s3` facade feature. Storage requires
+    /// `db` (metadata table) and an active auth model (mutations are always
+    /// guarded); validation rejects designs missing either.
+    pub fn wants_storage(&self) -> bool {
+        self.storage.as_ref().is_some_and(|s| !s.buckets.is_empty())
+    }
+
+    /// The `realtime` block switches on the realtime crate wiring + the facade
+    /// `realtime` feature. Like jobs, the block itself is the declaration (any
+    /// of changes/broadcast/presence populated).
+    pub fn wants_realtime(&self) -> bool {
+        self.realtime.as_ref().is_some_and(|r| {
+            !r.changes.is_empty() || !r.broadcast.is_empty() || !r.presence.is_empty()
+        })
+    }
+
+    /// "5MB" → bytes. Uppercase B/KB/MB/GB suffixes (binary multiples); a bare
+    /// number is bytes. None = unparseable (a validation question).
+    pub fn parse_size(s: &str) -> Option<u64> {
+        let (num, mult) = if let Some(n) = s.strip_suffix("GB") {
+            (n, 1024 * 1024 * 1024)
+        } else if let Some(n) = s.strip_suffix("MB") {
+            (n, 1024 * 1024)
+        } else if let Some(n) = s.strip_suffix("KB") {
+            (n, 1024)
+        } else if let Some(n) = s.strip_suffix('B') {
+            (n, 1)
+        } else {
+            (s, 1)
+        };
+        // checked_mul: overflow reads as unparseable (a validation question),
+        // never a debug panic or a silently wrapped size.
+        num.parse::<u64>().ok().and_then(|n| n.checked_mul(mult))
+    }
+
     /// Reserved dependency name `oauth` enables the facade `oauth` feature, so a
     /// generated handler can use `jerrycan::auth::oauth::{OAuthClient, Provider}`
     /// (the OAuth2 authorization-code client). The facade `oauth` feature implies
@@ -314,6 +423,17 @@ impl Design {
         // Appended last so existing designs' feature order is unchanged.
         if self.wants_oauth() {
             features.push("oauth");
+        }
+        // Appended after oauth so existing designs' feature order is unchanged.
+        // storage-s3 (implies storage): the S3 backend must be compiled into
+        // every storage app so JERRYCAN_STORAGE switches backends by env alone.
+        if self.wants_storage() {
+            features.push("storage-s3");
+        }
+        // Appended last (after storage) so existing designs' feature order is
+        // unchanged. Realtime channels over WebSockets; changes imply db.
+        if self.wants_realtime() {
+            features.push("realtime");
         }
         features
     }
@@ -454,6 +574,155 @@ pub(crate) mod tests {
                   "path": "/", "success": { "status": 200, "entity": "Lead", "list": true } }] }
         ]
     }"#;
+
+    pub(crate) const V2_STORAGE: &str = r#"{
+        "name": "files-app", "contract_version": 2,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+        "storage": { "buckets": [
+            { "name": "avatars", "visibility": "public", "owner": "User",
+              "max_size": "5MB", "allowed_mime": ["image/*"] },
+            { "name": "invoices", "visibility": "private", "owner": "Org",
+              "owner_prefix": true, "max_size": "20MB" }
+        ]},
+        "modules": [
+            { "name": "orgs",
+              "entities": [
+                  { "name": "Org", "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "plan", "type": "string" } ] },
+                  { "name": "User", "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "email", "type": "string" } ] }
+              ],
+              "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Org", "list": true } }] }
+        ]
+    }"#;
+
+    pub(crate) const V2_REALTIME: &str = r#"{
+        "name": "rt-app", "contract_version": 2,
+        "auth": { "model": "jwt", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+        "realtime": {
+            "changes": ["Lead"],
+            "broadcast": [{ "name": "deal_room", "scope": "tenant" }],
+            "presence": [{ "name": "editors", "scope": "tenant" }]
+        },
+        "modules": [
+            { "name": "workspaces",
+              "entities": [{ "name": "Workspace", "fields": [
+                  { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_workspaces", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Workspace", "list": true } }] },
+            { "name": "leads",
+              "entities": [{ "name": "Lead",
+                  "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "phone", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_leads", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Lead", "list": true } }] }
+        ]
+    }"#;
+
+    #[test]
+    fn realtime_block_round_trips_and_gates_the_facade_feature() {
+        let d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        assert!(d.wants_realtime());
+        let rt = d.realtime.as_ref().unwrap();
+        assert_eq!(rt.changes, vec!["Lead"]);
+        assert_eq!(rt.broadcast[0].name, "deal_room");
+        assert_eq!(rt.broadcast[0].scope, RealtimeScope::Tenant);
+        let feats = d.facade_features();
+        assert!(feats.contains(&"realtime"), "{feats:?}");
+        assert_eq!(
+            feats.last(),
+            Some(&"realtime"),
+            "realtime is appended last (after storage): {feats:?}"
+        );
+        // Round trip.
+        let back = serde_json::to_string(&d).unwrap();
+        let re: Design = serde_json::from_str(&back).unwrap();
+        assert!(re.wants_realtime());
+        // Absent block ⇒ no feature (v0/v1 designs untouched).
+        let plain: Design = serde_json::from_str(MINIMAL).unwrap();
+        assert!(!plain.wants_realtime());
+        assert!(!plain.facade_features().contains(&"realtime"));
+    }
+
+    #[test]
+    fn published_schema_accepts_the_realtime_block() {
+        let s = include_str!("../../../../docs/contracts/design-schema.json");
+        assert!(
+            s.contains("\"realtime\"") && s.contains("\"broadcast\"") && s.contains("\"presence\"")
+        );
+    }
+
+    #[test]
+    fn v2_storage_block_round_trips_and_gates_wants_storage() {
+        let d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        assert_eq!(d.contract_version, 2);
+        let s = d.storage.as_ref().unwrap();
+        assert_eq!(s.buckets.len(), 2);
+        assert_eq!(s.buckets[0].name, "avatars");
+        assert_eq!(s.buckets[0].visibility, Visibility::Public);
+        assert_eq!(s.buckets[0].owner.as_deref(), Some("User"));
+        assert!(!s.buckets[0].owner_prefix, "owner_prefix defaults false");
+        assert!(s.buckets[1].owner_prefix);
+        assert!(d.wants_storage());
+        let back = serde_json::to_string(&d).unwrap();
+        let re: Design = serde_json::from_str(&back).unwrap();
+        assert!(re.wants_storage(), "storage survives a round trip");
+        // v0/v1 designs stay valid and storage-free.
+        let v0: Design = serde_json::from_str(MINIMAL).unwrap();
+        assert!(v0.storage.is_none() && !v0.wants_storage());
+    }
+
+    #[test]
+    fn wants_storage_appends_the_storage_s3_facade_feature_last() {
+        // Generated apps get storage-s3 (S3 compiled in) so JERRYCAN_STORAGE
+        // can switch backends by env WITHOUT recompiling (zero-touch config).
+        let d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        let feats = d.facade_features();
+        assert_eq!(
+            feats.last(),
+            Some(&"storage-s3"),
+            "storage-s3 appended last: {feats:?}"
+        );
+        assert!(feats.contains(&"db") && feats.contains(&"auth"));
+        // No storage block → no storage feature (order of the rest unchanged).
+        let no: Design = serde_json::from_str(V1_FULL).unwrap();
+        assert!(!no.facade_features().contains(&"storage-s3"));
+    }
+
+    #[test]
+    fn parse_size_handles_the_documented_suffixes() {
+        assert_eq!(Design::parse_size("5MB"), Some(5 * 1024 * 1024));
+        assert_eq!(Design::parse_size("20MB"), Some(20 * 1024 * 1024));
+        assert_eq!(Design::parse_size("512KB"), Some(512 * 1024));
+        assert_eq!(Design::parse_size("1GB"), Some(1024 * 1024 * 1024));
+        assert_eq!(Design::parse_size("123B"), Some(123));
+        assert_eq!(Design::parse_size("123"), Some(123), "bare number = bytes");
+        assert_eq!(
+            Design::parse_size("5mb"),
+            None,
+            "suffixes are uppercase (schema-validated)"
+        );
+        assert_eq!(Design::parse_size("lots"), None);
+    }
+
+    #[test]
+    fn parse_size_refuses_overflow_instead_of_panicking_or_wrapping() {
+        // WHY: parse_size runs on agent-authored design.json during validation.
+        // An unchecked `n * mult` panics in debug and silently WRAPS in release
+        // (a huge max_size becoming a small one) — overflow must read as
+        // unparseable, which validation turns into a question.
+        assert_eq!(Design::parse_size("99999999999999GB"), None, "overflow");
+        assert_eq!(Design::parse_size("18446744073709551615B"), Some(u64::MAX));
+        assert_eq!(Design::parse_size("18446744073709551616B"), None);
+    }
 
     #[test]
     fn v1_design_round_trips_with_new_constructs() {
@@ -637,7 +906,7 @@ pub(crate) mod tests {
         let v: serde_json::Value = serde_json::from_str(s).unwrap();
         assert_eq!(
             v["properties"]["contract_version"]["enum"],
-            serde_json::json!([0, 1])
+            serde_json::json!([0, 1, 2])
         );
         assert!(
             s.contains("\"belongs_to\"")
@@ -646,6 +915,11 @@ pub(crate) mod tests {
                 && s.contains("\"on_delete\"")
                 && s.contains("\"unique\"")
                 && s.contains("\"values\"")
+        );
+        assert!(
+            s.contains("\"storage\"")
+                && s.contains("\"buckets\"")
+                && s.contains("\"owner_prefix\"")
         );
     }
 }

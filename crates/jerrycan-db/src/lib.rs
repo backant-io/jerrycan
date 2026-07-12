@@ -38,6 +38,7 @@ pub enum Backend {
 pub struct Db {
     conn: DatabaseConnection,
     backend: Backend,
+    url: String,
 }
 
 impl Db {
@@ -61,7 +62,11 @@ impl Db {
         let mut opts = sea_orm::ConnectOptions::new(url.to_string());
         opts.max_connections(max);
         let conn = Database::connect(opts).await.map_err(db_error)?;
-        Ok(Self { conn, backend })
+        Ok(Self {
+            conn,
+            backend,
+            url: url.to_string(),
+        })
     }
 
     /// `JERRYCAN_DATABASE_URL`, defaulting to `sqlite::memory:` for dev.
@@ -79,6 +84,13 @@ impl Db {
 
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// The URL this handle connected with. Extension crates (jerrycan-realtime)
+    /// use it to open sessions the pool cannot serve: LISTEN connections, the
+    /// replication socket, and long-held advisory-lock sessions.
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     /// Backend-correct placeholders for a `?`-style query string.
@@ -277,6 +289,12 @@ pub use sqlx;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn db_exposes_its_connection_url() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        assert_eq!(db.url(), "sqlite::memory:");
+    }
 
     #[tokio::test]
     async fn connects_and_executes_via_sea_orm() {

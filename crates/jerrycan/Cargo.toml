@@ -18,7 +18,7 @@ readme = "README.md"
 default = ["cli"]
 # The CLI always carries db (for `jerrycan db migrate`) + tokio (to run the
 # async migrator); generated apps still choose their own features freely.
-cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tokio", "dep:sea-query", "db"]
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tokio", "dep:sea-query", "dep:sqlparser", "dep:sha2", "db"]
 db = ["dep:jerrycan-db"]
 validate = ["dep:jerrycan-validate"]
 auth = ["dep:jerrycan-auth"]
@@ -37,6 +37,18 @@ jobs = ["dep:jerrycan-jobs", "db"]
 jobs-redis = ["jobs", "jerrycan-jobs/jobs-redis"]
 rate-limit = ["dep:jerrycan-ratelimit"]
 rate-limit-redis = ["rate-limit", "jerrycan-ratelimit/rate-limit-redis"]
+# Object storage: design-modeled buckets + blob backends. Metadata lives in a
+# jerrycan-db table, so `storage` implies `db` (like `jobs`).
+storage = ["dep:jerrycan-storage", "db"]
+# The S3-compatible backend (AWS/R2/MinIO/Supabase-S3) as a facade feature.
+# Generated storage apps enable THIS one: JERRYCAN_STORAGE switches backends
+# by env at runtime, so the S3 code must be compiled into the packaged binary.
+storage-s3 = ["storage", "jerrycan-storage/storage-s3"]
+# Realtime channels (Postgres Changes + Broadcast + Presence over WebSockets).
+# Changes stream from the database, so `realtime` implies `db` (like jobs).
+realtime = ["dep:jerrycan-realtime", "db"]
+# Multi-node realtime fan-out over Redis (mirrors jobs-redis).
+realtime-redis = ["realtime", "jerrycan-realtime/realtime-redis"]
 
 [[bin]]
 name = "jerrycan"
@@ -51,8 +63,12 @@ jerrycan-auth = { workspace = true, optional = true }
 jerrycan-observe = { workspace = true, optional = true }
 jerrycan-jobs = { workspace = true, optional = true }
 jerrycan-ratelimit = { workspace = true, optional = true }
+jerrycan-storage = { workspace = true, optional = true }
+jerrycan-realtime = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 sea-query = { workspace = true, optional = true }
+sqlparser = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }

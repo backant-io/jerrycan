@@ -12,13 +12,16 @@ pub mod jobsgen;
 pub mod lints;
 pub mod mcp;
 pub mod mcp_dispatch;
+pub mod migrate;
 pub mod mounting;
 pub mod openapi;
 pub mod package;
 pub mod questions;
+pub mod realtimegen;
 pub mod sbom;
 pub mod scaffold;
 pub mod schema;
+pub mod storagegen;
 pub mod templates;
 pub mod testgen;
 

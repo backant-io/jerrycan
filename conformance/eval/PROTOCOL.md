@@ -127,6 +127,23 @@ A run passes when, on the scaffolded slice:
 5. `schema.json` alone answers the data-structure questions (FK targets +
    `on_delete`, unique/index, enums, enforcement state) — read via
    `jerrycan schema --json`, no source.
+6. **Realtime** (contract v2, requires a `wal_level=logical` Postgres):
+   1. serve the migrated slice against the eval's logical-replication Postgres;
+   2. log in two users in two different workspaces (tenants) over HTTP;
+   3. open two WebSocket clients (`?token=`), both `join` `changes:Lead`;
+   4. `POST` a lead as tenant A → tenant A's socket receives the `insert` event
+      with the row body within 10s;
+   5. **negative control** — tenant B's socket receives nothing for it
+      (a heartbeat round-trip proves silence); a leak turns the gate red;
+   6. broadcast round-trip on `deal_room` within tenant A, cross-tenant silence
+      on tenant B; presence `track` on `editors`, a second same-tenant client
+      sees the state + join/leave diffs;
+   7. repeat steps 4–5 once against a **stock** Postgres (the trigger fallback)
+      to prove identical client-visible behavior — only the source differs.
+   The generated `crates/realtime/tests/acceptance.rs` encodes the per-app
+   subscribe/receive tests and the `cross_tenant_change_never_arrives_*`
+   negative control; run them with
+   `JERRYCAN_TEST_DATABASE_URL=… cargo test -p realtime -- --ignored`.
 
 ## The automated gate
 
@@ -139,3 +156,13 @@ applies the reference handlers, and runs the whole battery end-to-end. It is the
 `SKIP_EVAL_GATE=1` emergency escape). A fresh **docs-only LLM rebuild** of the
 slice under the isolation rules above is the periodic manual eval, recorded in
 `results.md`.
+
+## Migrator eval (capstone — un-skippable)
+
+`cargo test -p jerrycan --test migrate_supabase` (always on) and
+`JERRYCAN_TEST_PG_URL=… cargo test -p jerrycan --test migrate_e2e -- --ignored`
+(CI eval job + pre-publish) must both pass. The e2e migrates
+`conformance/fixtures/supabase-export`, generates, seeds, and requires
+`jerrycan check` green **plus** cross-tenant negative controls in REST,
+storage, and realtime (enforced by the generated isolation tests that
+`jerrycan check` runs). A red migrator eval blocks publish — no exceptions.

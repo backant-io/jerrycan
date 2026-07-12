@@ -122,13 +122,14 @@ impl<'a> DesignIndex<'a> {
 /// SQLite-declared type. `entity` is the table's owning entity (None for the
 /// membership table, handled by the caller).
 fn overlay_type(index: &DesignIndex, table: &str, column: &str) -> Option<String> {
-    // Membership table: id integer, user_id integer, role string, fk per tenant key.
+    // Membership table: id integer, user_id string (TEXT — the stringified user
+    // pk), role string, fk per tenant key.
     if let Some((members, _)) = &index.membership
         && members == table
     {
         return Some(match column {
-            "id" | "user_id" => "integer".to_string(),
-            "role" => "string".to_string(),
+            "id" => "integer".to_string(),
+            "user_id" | "role" => "string".to_string(),
             _ => {
                 // the tenant fk column
                 if index.tenant_key_string {

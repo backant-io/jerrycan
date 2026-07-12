@@ -176,3 +176,14 @@ Gaps surfaced (real, fixable, non-blocking — the eval's purpose is to find the
    `pk:true` + `type:integer` + `nullable:false`.
 4. `indexes` lists index *names*, not the covered columns (column is inferable by
    convention only).
+
+## Realtime (contract v2 addition)
+
+The reference slice gained a `realtime` block — `changes: ["Lead"]` (tenant-
+filtered), `broadcast: deal_room` and `presence: editors` (both tenant-scoped).
+The generator emits the tool-owned `crates/realtime` wiring + acceptance tests,
+including the cross-tenant negative control. The live WebSocket battery (Changes
+over both replication and the trigger fallback, Broadcast and Presence round
+trips, and the cross-tenant silence control) runs against the eval's Postgres
+containers via the steps in PROTOCOL.md §6; it is gated behind `#[ignore]` /
+`JERRYCAN_TEST_DATABASE_URL` so the service-free suite stays green without them.

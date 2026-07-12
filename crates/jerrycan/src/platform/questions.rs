@@ -75,10 +75,10 @@ pub fn validate(d: &Design) -> Vec<Question> {
             ),
         ));
     }
-    if d.contract_version > 1 {
+    if d.contract_version > 2 {
         qs.push(q(
             "/contract_version",
-            "contract_version must be 0 or 1 for this platform version.",
+            "contract_version must be 0, 1, or 2 for this platform version.",
         ));
     }
     if d.modules.is_empty() {
@@ -382,6 +382,197 @@ pub fn validate(d: &Design) -> Vec<Question> {
         }
     }
 
+    // Storage (contract v2). Bucket names/mime patterns are interpolated into
+    // generated Rust literals and mounts, so everything is validated up front
+    // (the job-queue precedent: reject at design time, not at generated-crate
+    // build time). NOTE: `visibility: public` + a tenant-scoped owner is
+    // deliberately allowed (public read, scoped write) — no question.
+    if let Some(ref storage) = d.storage {
+        if d.contract_version < 2 {
+            qs.push(q(
+                "/storage",
+                "The storage block requires contract_version 2 — bump contract_version (v0/v1 designs stay valid without storage).",
+            ));
+        }
+        if !d.wants_db() {
+            qs.push(q(
+                "/storage",
+                "Storage requires a database dependency — add `db` to `dependencies` (object metadata lives in the storage_objects table).",
+            ));
+        }
+        let active_auth_model = d
+            .auth
+            .as_ref()
+            .map(|a| a.model != AuthModel::None)
+            .unwrap_or(false);
+        if !active_auth_model {
+            qs.push(q(
+                "/storage",
+                "Storage requires an active auth model — bucket mutations (upload/delete/sign) are always guarded; set auth.model to `session` or `jwt`.",
+            ));
+        }
+        let module_mounts: std::collections::HashSet<String> =
+            d.modules.iter().map(|m| m.effective_mount()).collect();
+        let mut seen_buckets = std::collections::HashSet::new();
+        for (i, b) in storage.buckets.iter().enumerate() {
+            let bptr = format!("/storage/buckets/{i}");
+            if !is_kebab(&b.name) {
+                qs.push(q(
+                    format!("{bptr}/name"),
+                    format!("Bucket `{}` is not kebab-case (^[a-z][a-z0-9-]*$).", b.name),
+                ));
+            }
+            let ident = b.name.replace('-', "_");
+            if RUST_KEYWORDS.contains(&ident.as_str()) {
+                qs.push(q(
+                    format!("{bptr}/name"),
+                    format!("Bucket `{}` becomes the Rust module `{ident}`, which is a keyword — rename it.", b.name),
+                ));
+            }
+            if !seen_buckets.insert(b.name.as_str()) {
+                qs.push(q(
+                    format!("{bptr}/name"),
+                    format!(
+                        "Bucket name `{}` is already used — bucket names must be unique.",
+                        b.name
+                    ),
+                ));
+            }
+            if module_mounts.contains(&format!("/{}", b.name)) {
+                qs.push(q(
+                    format!("{bptr}/name"),
+                    format!("Bucket `{}` mounts at /{} which collides with a module mount — rename the bucket or remount the module.", b.name, b.name),
+                ));
+            }
+            if let Some(ref owner) = b.owner
+                && !entity_names.contains(owner.as_str())
+            {
+                qs.push(q(
+                    format!("{bptr}/owner"),
+                    format!("Bucket owner `{owner}` is not a declared entity anywhere in the design — define it or fix the reference."),
+                ));
+            }
+            if b.owner_prefix && b.owner.is_none() {
+                qs.push(q(
+                    format!("{bptr}/owner_prefix"),
+                    format!("Bucket `{}` sets owner_prefix without an owner — owner_prefix stores keys under {{owner_id}}/… and needs `owner`.", b.name),
+                ));
+            }
+            if let Some(ref max) = b.max_size
+                && Design::parse_size(max).is_none()
+            {
+                qs.push(q(
+                    format!("{bptr}/max_size"),
+                    format!(
+                        "max_size `{max}` is not a size — use ^[0-9]+(B|KB|MB|GB)?$ (e.g. \"5MB\")."
+                    ),
+                ));
+            }
+            for (j, m) in b.allowed_mime.iter().enumerate() {
+                // The runtime matcher understands exactly type/subtype, type/*
+                // and */*. A wildcard TYPE with a concrete subtype (`*/png`)
+                // would parse here but can never match — every upload would
+                // 415 — so it is rejected as malformed too.
+                let well_formed = m.split_once('/').is_some_and(|(t, sub)| {
+                    let seg_ok = |s: &str| {
+                        !s.is_empty()
+                            && s.bytes().all(|c| {
+                                c.is_ascii_lowercase()
+                                    || c.is_ascii_digit()
+                                    || matches!(c, b'.' | b'+' | b'-')
+                            })
+                    };
+                    (seg_ok(t) && (seg_ok(sub) || sub == "*")) || (t == "*" && sub == "*")
+                });
+                if !well_formed {
+                    qs.push(q(
+                        format!("{bptr}/allowed_mime/{j}"),
+                        format!(
+                            "`{m}` is not a supported mime pattern — use type/subtype, type/* or */* (lowercase)."
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Realtime (contract v2). Channel names/entities are interpolated into
+    // generated wiring, so everything is validated up front. Scope-filtered
+    // delivery of changes is the security pillar, so changes require an active
+    // auth model; tenant-scoped topics require tenancy.
+    if let Some(ref rt) = d.realtime {
+        let active_auth_model = d
+            .auth
+            .as_ref()
+            .map(|a| a.model != AuthModel::None)
+            .unwrap_or(false);
+        if d.contract_version < 2 {
+            qs.push(q(
+                "/realtime",
+                "The realtime block requires contract_version 2 — bump contract_version (v0/v1 designs stay valid without realtime).",
+            ));
+        }
+        if !d.wants_db() {
+            qs.push(q(
+                "/realtime",
+                "Realtime requires a database dependency — add `db` to `dependencies` (Changes stream from Postgres).",
+            ));
+        }
+        // Changes entities must exist and require an active auth model (delivery
+        // is scope-filtered by the authenticated principal).
+        if !rt.changes.is_empty() && !active_auth_model {
+            qs.push(q(
+                "/realtime/changes",
+                "Realtime changes delivery is scope-filtered by the authenticated principal — set auth.model to `session` or `jwt`.",
+            ));
+        }
+        for (i, entity) in rt.changes.iter().enumerate() {
+            if !entity_names.contains(entity.as_str()) {
+                qs.push(q(
+                    format!("/realtime/changes/{i}"),
+                    format!("Realtime changes entity `{entity}` is not a declared entity anywhere in the design — define it or fix the reference."),
+                ));
+            }
+        }
+        // Broadcast + presence topics: snake_case, unique within their list,
+        // tenant scope needs tenancy, and any non-none scope needs auth.
+        let mut check_topics = |topics: &[RealtimeTopic], kind: &str| {
+            let mut seen = std::collections::HashSet::new();
+            for (i, t) in topics.iter().enumerate() {
+                let tptr = format!("/realtime/{kind}/{i}");
+                if !is_snake(&t.name) {
+                    qs.push(q(
+                        format!("{tptr}/name"),
+                        format!(
+                            "Realtime {kind} topic `{}` is not snake_case (^[a-z][a-z0-9_]*$).",
+                            t.name
+                        ),
+                    ));
+                }
+                if !seen.insert(t.name.as_str()) {
+                    qs.push(q(
+                        format!("{tptr}/name"),
+                        format!("Realtime {kind} topic name `{}` is already used — topic names must be unique.", t.name),
+                    ));
+                }
+                if t.scope == RealtimeScope::Tenant && d.tenancy.is_none() {
+                    qs.push(q(
+                        tptr.clone(),
+                        format!("Realtime {kind} topic `{}` is tenant-scoped but the design has no tenancy — declare `tenancy` or use scope `auth`/`none`.", t.name),
+                    ));
+                }
+                if t.scope != RealtimeScope::None && !active_auth_model {
+                    qs.push(q(
+                        tptr,
+                        format!("Realtime {kind} topic `{}` needs an active auth model for its scope — set auth.model to `session` or `jwt` (or use scope `none`).", t.name),
+                    ));
+                }
+            }
+        };
+        check_topics(&rt.broadcast, "broadcast");
+        check_topics(&rt.presence, "presence");
+    }
+
     qs
 }
 
@@ -612,10 +803,230 @@ fn validate_module(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::design::tests::{MINIMAL, V1_FULL};
+    use crate::platform::design::tests::{MINIMAL, V1_FULL, V2_REALTIME, V2_STORAGE};
 
     fn design(json: &str) -> Design {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn valid_realtime_design_is_question_free() {
+        let d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        assert!(validate(&d).is_empty(), "{:?}", validate(&d));
+    }
+
+    #[test]
+    fn realtime_requires_contract_v2() {
+        let mut d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d.contract_version = 1;
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/realtime" && q.question.contains("contract_version"))
+        );
+    }
+
+    #[test]
+    fn realtime_changes_entities_must_exist() {
+        let mut d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d.realtime.as_mut().unwrap().changes[0] = "Ghost".into();
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/realtime/changes/0" && q.question.contains("Ghost"))
+        );
+    }
+
+    #[test]
+    fn realtime_requires_db_and_changes_require_active_auth() {
+        let mut d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d.dependencies.retain(|x| x != "db");
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/realtime" && q.question.contains("db"))
+        );
+
+        let mut d2: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d2.auth = None;
+        assert!(
+            validate(&d2)
+                .iter()
+                .any(|q| q.id == "/realtime/changes" && q.question.contains("auth"))
+        );
+    }
+
+    #[test]
+    fn tenant_scoped_topics_require_tenancy_and_snake_case_unique_names() {
+        let mut d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d.tenancy = None;
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/realtime/broadcast/0" && q.question.contains("tenancy"))
+        );
+
+        let mut d2: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d2.realtime.as_mut().unwrap().broadcast.push(RealtimeTopic {
+            name: "Deal-Room".into(),
+            scope: RealtimeScope::None,
+        });
+        assert!(
+            validate(&d2)
+                .iter()
+                .any(|q| q.id == "/realtime/broadcast/1/name" && q.question.contains("snake_case"))
+        );
+
+        let mut d3: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        let dup = d3.realtime.as_ref().unwrap().broadcast[0].clone();
+        d3.realtime.as_mut().unwrap().broadcast.push(dup);
+        assert!(
+            validate(&d3)
+                .iter()
+                .any(|q| q.id == "/realtime/broadcast/1/name" && q.question.contains("unique"))
+        );
+    }
+
+    #[test]
+    fn contract_version_2_is_now_valid_and_3_is_not() {
+        let ok: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        assert!(
+            !validate(&ok).iter().any(|q| q.id == "/contract_version"),
+            "{:?}",
+            validate(&ok)
+        );
+        let mut bad: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        bad.contract_version = 3;
+        assert!(validate(&bad).iter().any(|q| q.id == "/contract_version"));
+    }
+
+    #[test]
+    fn v2_storage_fixture_is_question_free() {
+        let d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        assert!(validate(&d).is_empty(), "{:?}", validate(&d));
+    }
+
+    #[test]
+    fn storage_requires_contract_v2_db_and_an_active_auth_model() {
+        // v1 + storage: rejected (v2 owns the block).
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.contract_version = 1;
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage" && q.question.contains("contract_version 2"))
+        );
+        // storage without db: rejected (metadata table).
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.dependencies.retain(|dep| dep != "db");
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage" && q.question.contains("db"))
+        );
+        // storage without an active auth model: rejected (mutations are always guarded).
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.auth = None;
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage" && q.question.contains("auth"))
+        );
+    }
+
+    #[test]
+    fn bucket_names_owners_and_rules_are_validated() {
+        // Bad kebab name.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[0].name = "Avatars".into();
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/name")
+        );
+        // A name whose snake ident is a Rust keyword breaks the generated crate.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[0].name = "match".into();
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/name" && q.question.contains("keyword"))
+        );
+        // Duplicate bucket names.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        let dup = d.storage.as_ref().unwrap().buckets[0].clone();
+        d.storage.as_mut().unwrap().buckets.push(dup);
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/2/name" && q.question.contains("unique"))
+        );
+        // Unknown owner entity.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[0].owner = Some("Ghost".into());
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/owner" && q.question.contains("Ghost"))
+        );
+        // owner_prefix without owner.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[1].owner = None;
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/1/owner_prefix")
+        );
+        // Unparseable max_size.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[0].max_size = Some("lots".into());
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/max_size")
+        );
+        // A mime entry that could break generated string literals.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[0].allowed_mime = vec!["image/\"png".into()];
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/allowed_mime/0")
+        );
+        // A wildcard TYPE with a concrete subtype (`*/png`) is dead: the
+        // runtime matcher only understands `type/subtype`, `type/*` and `*/*`,
+        // so `*/png` would silently 415 every upload — reject at design time.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[0].allowed_mime = vec!["*/png".into()];
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/allowed_mime/0"),
+            "*/png must be rejected — it can never match"
+        );
+        // The supported wildcard shapes stay valid.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[0].allowed_mime =
+            vec!["*/*".into(), "image/*".into(), "application/pdf".into()];
+        assert!(
+            !validate(&d)
+                .iter()
+                .any(|q| q.id.starts_with("/storage/buckets/0/allowed_mime")),
+            "*/*, type/* and type/subtype are all valid"
+        );
+    }
+
+    #[test]
+    fn bucket_mounts_must_not_collide_with_module_mounts() {
+        // WHY: buckets mount at /<name> beside the modules — a collision would
+        // shadow routes silently at serve time.
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[0].name = "orgs".into();
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/name" && q.question.contains("mount"))
+        );
     }
 
     #[test]

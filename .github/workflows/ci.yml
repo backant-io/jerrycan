@@ -34,6 +34,17 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # Service containers cannot pass container args, and minio/minio's
+      # entrypoint requires `server /data` — edge-cicd is MinIO's CI image
+      # whose default command starts the server. Readiness is checked by the
+      # explicit wait in the storage-s3 step (the image bundles no health tool).
+      minio:
+        image: minio/minio:edge-cicd
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -88,6 +99,19 @@ jobs:
           cargo test -p jerrycan-jobs --test postgres_store -- --ignored
           cargo test -p jerrycan-jobs --features jobs-redis --test redis_store -- --ignored
           cargo test -p jerrycan-ratelimit --features rate-limit-redis --test redis_store -- --ignored
+      - name: "Storage S3 behavioral tests (real MinIO: single-shot, multipart, presign)"
+        # s3_minio.rs is env-gated (it silently no-ops without JERRYCAN_TEST_S3),
+        # so the env MUST be set here or the suite never runs anywhere. The
+        # loopback http endpoint is the one plaintext exception the S3 store
+        # allows. Credentials are read by S3Store::from_url via the standard
+        # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY vars.
+        env:
+          JERRYCAN_TEST_S3: s3://jerrycan-test?region=us-east-1&endpoint=http://127.0.0.1:9000
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+        run: |
+          timeout 60 bash -c 'until curl -sf http://127.0.0.1:9000/minio/health/live; do sleep 1; done'
+          cargo test -p jerrycan-storage --features storage-s3 --test s3_minio
       - name: Docs build (broken intra-doc links are errors)
         run: cargo doc --workspace --no-deps --all-features
 

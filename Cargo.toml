@@ -10,6 +10,8 @@ members = [
     "crates/jerrycan-observe",
     "crates/jerrycan-ratelimit",
     "crates/jerrycan-jobs",
+    "crates/jerrycan-storage",
+    "crates/jerrycan-realtime",
 ]
 exclude = ["fuzz"]
 
@@ -31,7 +33,19 @@ jerrycan-auth = { path = "crates/jerrycan-auth", version = "0.2.0" }
 jerrycan-observe = { path = "crates/jerrycan-observe", version = "0.2.0" }
 jerrycan-ratelimit = { path = "crates/jerrycan-ratelimit", version = "0.2.0" }
 jerrycan-jobs = { path = "crates/jerrycan-jobs", version = "0.2.0" }
+jerrycan-storage = { path = "crates/jerrycan-storage", version = "0.2.0" }
+jerrycan-realtime = { path = "crates/jerrycan-realtime", version = "0.2.0" }
+# Realtime WS transport. No TLS features: server-side it rides hyper's already-
+# accepted socket; the test client connects plain ws:// on loopback. Verified
+# 0.30.0 current on docs.rs (from_raw_socket + inherent send +
+# handshake::derive_accept_key are the APIs we use).
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake", "connect"] }
+# The dedicated logical-replication client (pgoutput, rustls TLS via the `ring`
+# provider, SCRAM). It owns the WAL socket / startup / auth / framing / standby
+# status; sqlx stays the sole data-layer client. Verified 0.3.2 on crates.io.
+pgwire-replication = { version = "0.3.2", default-features = false, features = ["tls-rustls", "scram"] }
 argon2 = "0.5"
+bcrypt = "0.17"
 chacha20poly1305 = "0.10"
 hmac = "0.12"
 sha1 = "0.10"
@@ -44,6 +58,8 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 sea-orm = { version = "1", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "macros", "with-json"] }
 sea-query = { version = "0.32", default-features = false, features = ["backend-sqlite", "backend-postgres"] }
 sea-query-binder = { version = "0.7", default-features = false, features = ["sqlx-any"] }
+# Supabase-dump SQL parsing for `jerrycan migrate` (pure Rust, MIT OR Apache-2.0).
+sqlparser = "0.62"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
@@ -58,8 +74,14 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
+# S3 XML parsing (error + multipart-initiate bodies only; listing is DB-backed
+# so object keys never round-trip through XML). Pure safe Rust, MIT.
+quick-xml = "0.37"
 bytes = "1"
 futures-core = "0.3"
+# SinkExt/StreamExt over tokio-tungstenite's Sink/Stream impls (WebSocketStream
+# has no inherent send/next in 0.30). `sink` adds SinkExt on top of the default std set.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"

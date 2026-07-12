@@ -1,0 +1,50 @@
+[package]
+name = "jerrycan-storage"
+description = "Object-storage extension for the jerrycan framework: design-modeled buckets, local + S3-compatible blob stores, signed URLs, owner/tenant-scoped metadata. https://jerrycan.cc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["storage", "s3", "blob", "web"]
+categories = ["web-programming"]
+
+[dependencies]
+jerrycan-core = { workspace = true }
+jerrycan-db = { workspace = true }
+bytes.workspace = true
+http.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+
+# --- storage-s3 only: outbound HTTPS client on jerrycan's own stack (mirrors
+# jerrycan-auth's `oauth` feature: hyper + hyper-rustls, rustls/ring only) and
+# quick-xml for S3 error + multipart-initiate bodies. No reqwest, no aws-sdk.
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, features = ["client", "client-legacy"], optional = true }
+hyper-rustls = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
+
+[features]
+storage-s3 = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:hyper-rustls",
+    "dep:http-body-util",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "dep:quick-xml",
+]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

@@ -360,6 +360,355 @@ fn generated_jobs_crate_passes_strict_clippy() {
     }
 }
 
+/// A contract-v2 STORAGE design covering all four bucket scope variants:
+/// `avatars` = public + owner User (plain user scope), `invoices` = private +
+/// owner Org (the tenancy entity) + owner_prefix (tenant scope), `exports` =
+/// private + no owner (unowned), `reports` = private + owner Member where
+/// Member belongs_to Org (user-in-tenant scope).
+const STORAGE_MINIMAL: &str = r#"{
+    "name": "files-app", "contract_version": 2,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+    "storage": { "buckets": [
+        { "name": "avatars", "visibility": "public", "owner": "User",
+          "max_size": "1MB", "allowed_mime": ["image/*"] },
+        { "name": "invoices", "visibility": "private", "owner": "Org",
+          "owner_prefix": true, "max_size": "1MB" },
+        { "name": "exports", "visibility": "private" },
+        { "name": "reports", "visibility": "private", "owner": "Member" }
+    ]},
+    "modules": [
+        { "name": "orgs",
+          "entities": [
+              { "name": "Org", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "plan", "type": "string" } ] },
+              { "name": "User", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "email", "type": "string" } ] },
+              { "name": "Member", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "nick", "type": "string" } ],
+                "belongs_to": [{ "entity": "Org" }] }
+          ],
+          "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Org", "list": true } }] }
+    ]
+}"#;
+
+/// THE storage compile gate (review 2026-07-11 finding: nothing in-repo proved
+/// the generated storage code COMPILES — only substring unit tests existed).
+/// Scaffolds a real storage app via the jerrycan binary (all four bucket scope
+/// variants), then requires the generated `storage` crate to pass strict
+/// clippy AND its own generated acceptance + isolation test battery.
+#[test]
+#[ignore = "scaffolds a storage app and invokes cargo on it; run with --include-ignored"]
+fn generated_storage_crate_passes_strict_clippy_and_its_acceptance_tests() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("files-app");
+
+    let design: Design = serde_json::from_str(STORAGE_MINIMAL).expect("STORAGE_MINIMAL parses");
+    assert!(design.wants_storage(), "design must declare buckets");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, STORAGE_MINIMAL);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(
+        status.success(),
+        "jerrycan new must scaffold the storage app"
+    );
+
+    // Sanity: each scope variant emitted its distinguishing guard signature.
+    let read =
+        |rel: &str| fs::read_to_string(app.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    let avatars = read("crates/storage/src/avatars.rs");
+    assert!(
+        avatars.contains("user: CurrentUser,") && !avatars.contains("Tenant"),
+        "avatars is the plain user scope:\n{avatars}"
+    );
+    let invoices = read("crates/storage/src/invoices.rs");
+    assert!(
+        invoices.contains("tenant: Dep<Tenant>,") && invoices.contains("owner_prefix: true"),
+        "invoices is the tenant + prefix scope:\n{invoices}"
+    );
+    let exports = read("crates/storage/src/exports.rs");
+    assert!(
+        exports.contains("_user: CurrentUser,") && exports.contains("Scope::default()"),
+        "exports is the unowned scope:\n{exports}"
+    );
+    let reports = read("crates/storage/src/reports.rs");
+    assert!(
+        reports.contains("user: CurrentUser, tenant: Dep<Tenant>,"),
+        "reports is the user-in-tenant scope:\n{reports}"
+    );
+    assert!(
+        app.join("crates/storage/tests/acceptance.rs").is_file(),
+        "the generated acceptance battery must exist"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // Gate 1: strict clippy over the generated storage crate — all targets,
+    // so the acceptance tests must COMPILE under -D warnings too.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "storage",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "generated storage crate failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    // Gate 2: the generated acceptance + isolation tests must PASS — they are
+    // the per-bucket security contract (cross-owner/tenant/prefix negative
+    // controls), generated as real tests, not stubs.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args(["test", "-p", "storage"])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo test");
+    if !output.status.success() {
+        panic!(
+            "generated storage acceptance tests failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+/// The same four-scope storage design, but the tenant (`Org`) and its owner
+/// entities key on a `uuid` pk — the shape a migrated Supabase project produces
+/// (auth.users + tenant rows are uuid). Proves the stringified-pk identity end to
+/// end: the generated acceptance battery seeds uuid-keyed memberships, mints
+/// session cookies, and runs the cross-owner/tenant/prefix isolation controls.
+const STORAGE_UUID: &str = r#"{
+    "name": "files-app", "contract_version": 2,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+    "storage": { "buckets": [
+        { "name": "avatars", "visibility": "public", "owner": "User",
+          "max_size": "1MB", "allowed_mime": ["image/*"] },
+        { "name": "invoices", "visibility": "private", "owner": "Org",
+          "owner_prefix": true, "max_size": "1MB" },
+        { "name": "exports", "visibility": "private" },
+        { "name": "reports", "visibility": "private", "owner": "Member" }
+    ]},
+    "modules": [
+        { "name": "orgs",
+          "entities": [
+              { "name": "Org", "fields": [
+                  { "name": "id", "type": "uuid" },
+                  { "name": "plan", "type": "string" } ] },
+              { "name": "User", "fields": [
+                  { "name": "id", "type": "uuid" },
+                  { "name": "email", "type": "string" } ] },
+              { "name": "Member", "fields": [
+                  { "name": "id", "type": "uuid" },
+                  { "name": "nick", "type": "string" } ],
+                "belongs_to": [{ "entity": "Org" }] }
+          ],
+          "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Org", "list": true } }] }
+    ]
+}"#;
+
+/// Runtime proof of the uuid identity fix: a storage app whose tenant/owner pks
+/// are uuid must scaffold, compile under strict clippy, AND pass its generated
+/// acceptance + cross-tenant isolation battery — real (non-stub) handlers, so a
+/// broken identity (i64 session id, bigint membership user_id) would turn it red.
+#[test]
+#[ignore = "scaffolds a uuid-tenant storage app and invokes cargo on it; run with --include-ignored"]
+fn generated_uuid_tenant_storage_crate_passes_its_acceptance_tests() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("files-app");
+
+    let design: Design = serde_json::from_str(STORAGE_UUID).expect("STORAGE_UUID parses");
+    assert!(design.wants_storage(), "design must declare buckets");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, STORAGE_UUID);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(status.success(), "jerrycan new must scaffold the uuid app");
+
+    // The membership DDL types user_id + the uuid tenant fk as TEXT.
+    let members_ddl =
+        fs::read_to_string(app.join("crates/routes/orgs/migrations/sqlite/0001_create_tables.sql"))
+            .expect("read members DDL")
+            .to_lowercase();
+    assert!(
+        members_ddl.contains("\"user_id\" text") && members_ddl.contains("\"org_id\" text"),
+        "membership user_id + uuid tenant fk are TEXT:\n{members_ddl}"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // The generated storage acceptance + isolation tests must PASS (real handlers,
+    // uuid-keyed memberships seeded, cross-owner/tenant/prefix negative controls).
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args(["test", "-p", "storage"])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo test");
+    if !output.status.success() {
+        panic!(
+            "uuid-tenant storage acceptance tests failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+/// A contract-v2 REALTIME design: jwt auth + tenancy + a `realtime` block with a
+/// tenant-scoped changes entity (`Lead` belongs_to the tenancy entity), a
+/// broadcast topic, and a presence topic. This is the exact shape a migrated
+/// Supabase project produces, and the shape whose generated wiring crate did NOT
+/// compile (the resolver called `user.id()`/`tenant.role()` and `CurrentUser::from`
+/// on a `SessionUser`, none of which exist on the real API).
+const REALTIME_MINIMAL: &str = r#"{
+    "name": "rt-app", "contract_version": 2,
+    "auth": { "model": "jwt", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+    "realtime": {
+        "changes": ["Lead"],
+        "broadcast": [{ "name": "deal_room", "scope": "tenant" }],
+        "presence": [{ "name": "editors", "scope": "tenant" }]
+    },
+    "modules": [
+        { "name": "workspaces",
+          "entities": [{ "name": "Workspace", "fields": [
+              { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+          "endpoints": [{ "operation_id": "list_workspaces", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Workspace", "list": true } }] },
+        { "name": "leads",
+          "entities": [{ "name": "Lead",
+              "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+              "fields": [{ "name": "id", "type": "integer" },
+                         { "name": "phone", "type": "string" }] }],
+          "endpoints": [{ "operation_id": "list_leads", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Lead", "list": true } }] }
+    ]
+}"#;
+
+/// THE realtime compile gate (review 2026-07-12 finding: a real Supabase
+/// migration produced a `crates/realtime/` wiring crate that DID NOT COMPILE —
+/// the resolver emitted `user.id()`, `tenant.role()`, and `CurrentUser::from(claims)`,
+/// none of which match the real auth API, yet every existing test only asserted on
+/// the emitted STRING). Scaffolds a real realtime app via the jerrycan binary
+/// (jwt + tenancy resolver, all three channel kinds), then requires the generated
+/// `realtime` crate to pass strict clippy over ALL targets — which compiles the
+/// tool-owned `src/lib.rs` resolver AND the (live-Postgres, `#[ignore]`d)
+/// acceptance battery. Had this existed, the broken wiring would have been red.
+#[test]
+#[ignore = "scaffolds a realtime app and invokes cargo on it; run with --include-ignored"]
+fn generated_realtime_crate_passes_strict_clippy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("rt-app");
+
+    let design: Design = serde_json::from_str(REALTIME_MINIMAL).expect("REALTIME_MINIMAL parses");
+    assert!(
+        design.wants_realtime(),
+        "design must declare a realtime block"
+    );
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, REALTIME_MINIMAL);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(
+        status.success(),
+        "jerrycan new must scaffold the realtime app"
+    );
+
+    // Sanity: the tool-owned resolver wires all three channel kinds and resolves a
+    // jwt principal from a tenant-scoped connection (the exact code path that broke).
+    let lib =
+        fs::read_to_string(app.join("crates/realtime/src/lib.rs")).expect("read realtime lib.rs");
+    assert!(
+        lib.contains(".changes(jerrycan::realtime::ChangeChannelSpec")
+            && lib.contains(".broadcast(\"deal_room\"")
+            && lib.contains(".presence(\"editors\""),
+        "realtime lib must wire changes + broadcast + presence:\n{lib}"
+    );
+    assert!(
+        lib.contains(".principal(") && lib.contains("shared::Tenant"),
+        "jwt + tenancy design must emit a tenant-resolving principal:\n{lib}"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // The gate: strict clippy over the generated realtime crate — all targets, so
+    // the resolver in src/lib.rs AND the acceptance battery must COMPILE under
+    // -D warnings. This is what no test did before: compile the emitted crate.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "realtime",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "generated realtime crate failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");

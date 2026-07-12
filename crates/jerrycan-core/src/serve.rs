@@ -121,7 +121,13 @@ pub(crate) async fn run_with_shutdown(
                     let conn = hyper::server::conn::http1::Builder::new()
                         .timer(hyper_util::rt::TokioTimer::new())
                         .header_read_timeout(HEADER_READ_TIMEOUT)
-                        .serve_connection(io, service);
+                        .serve_connection(io, service)
+                        // Perform the HTTP/1 101 protocol switch when a handler
+                        // replies with an Upgrade: hyper only surfaces the
+                        // OnUpgrade handle on an UpgradeableConnection. Its
+                        // graceful_shutdown signature is unchanged, so the drain
+                        // loop below stays as-is. jerrycan-realtime rides this seam.
+                        .with_upgrades();
                     tokio::pin!(conn);
                     loop {
                         tokio::select! {

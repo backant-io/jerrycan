@@ -109,6 +109,26 @@ enum Cmd {
         /// Deploy target (currently: render)
         target: String,
     },
+    /// Migrate a Supabase project into a jerrycan backend
+    Migrate {
+        /// Source platform (currently: supabase)
+        #[arg(long)]
+        from: String,
+        /// Offline export directory (layout: `jerrycan docs migrate-supabase`)
+        export_dir: Option<PathBuf>,
+        /// Opt-in: read a live Supabase Postgres instead of an export. Never in CI.
+        #[arg(long, conflicts_with = "export_dir")]
+        live: Option<String>,
+        /// Target project directory (default: ./<app-name>)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// App name override (default: kebab-case of the export directory name)
+        #[arg(long)]
+        name: Option<String>,
+        /// Tables with more rows than this become resumable bulk-COPY seed steps
+        #[arg(long, default_value_t = 5000)]
+        bulk_threshold: usize,
+    },
     /// Serve MCP over stdio
     Mcp,
 }
@@ -117,6 +137,11 @@ enum Cmd {
 enum DbCmd {
     /// Apply module-owned migrations (env JERRYCAN_DATABASE_URL or --url)
     Migrate {
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Apply the migrated data seed (resumable)
+    Seed {
         #[arg(long)]
         url: Option<String>,
     },
@@ -200,6 +225,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Cmd::Db {
             what: DbCmd::Migrate { url },
         } => cmd_db_migrate(url.as_deref(), cli.json),
+        Cmd::Db {
+            what: DbCmd::Seed { url },
+        } => cmd_db_seed(url.as_deref(), cli.json),
         Cmd::Schema { write } => cmd_schema(write, cli.json),
         Cmd::Package {
             docker,
@@ -208,6 +236,22 @@ fn run(cli: Cli) -> Result<(), Failure> {
             systemd,
         } => cmd_package(docker, binary, k8s, systemd, cli.json),
         Cmd::Deploy { target } => cmd_deploy(&target, cli.json),
+        Cmd::Migrate {
+            from,
+            export_dir,
+            live,
+            out,
+            name,
+            bulk_threshold,
+        } => cmd_migrate(
+            &from,
+            export_dir.as_deref(),
+            live.as_deref(),
+            out.as_deref(),
+            name.as_deref(),
+            bulk_threshold,
+            cli.json,
+        ),
         Cmd::Mcp => jerrycan::platform::mcp::serve_stdio().map_err(Failure::environment),
     }
 }
@@ -550,6 +594,43 @@ fn cmd_db_migrate(url: Option<&str>, json_mode: bool) -> Result<(), Failure> {
     Ok(())
 }
 
+fn cmd_db_seed(url: Option<&str>, json_mode: bool) -> Result<(), Failure> {
+    let root = app_root()?;
+    let design = load_design(&root.join("design.json"))?;
+    if !design.wants_db() {
+        return Err(Failure::usage(
+            "this app has no `db` dependency — the seed applier needs a database",
+        ));
+    }
+    let url = url
+        .map(str::to_string)
+        .or_else(|| std::env::var("JERRYCAN_DATABASE_URL").ok())
+        .ok_or_else(|| Failure::usage("provide --url or set JERRYCAN_DATABASE_URL"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Failure::environment(e.to_string()))?;
+    let summary = runtime
+        .block_on(async {
+            let db = jerrycan::db::Db::connect(&url)
+                .await
+                .map_err(|e| e.message().to_string())?;
+            jerrycan::platform::migrate::seed::apply(&root, &db).await
+        })
+        .map_err(Failure::gate)?;
+    let payload = serde_json::json!({
+        "applied_tables": summary.applied_tables,
+        "resumed": summary.resumed,
+        "next_step": "jerrycan check",
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!("seeded {} file(s)/table(s)", summary.applied_tables.len()),
+    );
+    Ok(())
+}
+
 fn cmd_schema(write: bool, json_mode: bool) -> Result<(), Failure> {
     use jerrycan::platform::schema;
     let root = app_root()?;
@@ -683,6 +764,110 @@ fn cmd_deploy(target: &str, json_mode: bool) -> Result<(), Failure> {
         json_mode,
         &payload,
         &format!("deploy kit for `{target}` written"),
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_migrate(
+    from: &str,
+    export_dir: Option<&Path>,
+    live: Option<&str>,
+    out: Option<&Path>,
+    name: Option<&str>,
+    bulk_threshold: usize,
+    json_mode: bool,
+) -> Result<(), Failure> {
+    use jerrycan::platform::migrate::gaps::Severity;
+    use jerrycan::platform::migrate::{self, MigrateOptions};
+
+    if from != "supabase" {
+        return Err(Failure::usage(format!(
+            "unknown migration source `{from}` — supported: supabase"
+        )));
+    }
+    // Default app name/out dir from the export dir (offline) or a required --name (live).
+    let default_name = export_dir
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("app")
+        .to_string();
+    let app_name = name.unwrap_or(&default_name).to_string();
+    let out_dir = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(&app_name));
+
+    let output = if let Some(conn) = live {
+        eprintln!(
+            "warning: --live reads a production database — offline export is the supported CI path"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| Failure::environment(e.to_string()))?;
+        runtime
+            .block_on(migrate::run_migrate_live(
+                conn,
+                &MigrateOptions {
+                    export_dir: PathBuf::new(),
+                    out_dir: out_dir.clone(),
+                    name: name.map(str::to_string),
+                    bulk_threshold,
+                },
+            ))
+            .map_err(Failure::gate)?
+    } else {
+        let dir = export_dir
+            .ok_or_else(|| Failure::usage("provide the export directory (or --live <conn>)"))?;
+        migrate::run_migrate(&MigrateOptions {
+            export_dir: dir.to_path_buf(),
+            out_dir: out_dir.clone(),
+            name: name.map(str::to_string),
+            bulk_threshold,
+        })
+        .map_err(Failure::gate)?
+    };
+
+    let blocking = output
+        .gaps
+        .iter()
+        .filter(|g| g.severity == Severity::Blocking)
+        .count();
+    let advisory = output.gaps.len() - blocking;
+    let first_module = output
+        .design
+        .modules
+        .first()
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| "app".into());
+    let bucket_count = output
+        .design
+        .storage
+        .as_ref()
+        .map(|s| s.buckets.len())
+        .unwrap_or(0);
+    let realtime_count = output
+        .design
+        .realtime
+        .as_ref()
+        .map(|r| r.changes.len())
+        .unwrap_or(0);
+    let entity_count: usize = output.design.modules.iter().map(|m| m.entities.len()).sum();
+    let out_disp = out_dir.display().to_string();
+    let payload = serde_json::json!({
+        "created": output.created,
+        "design": format!("{out_disp}/design.json"),
+        "gap_report": { "path": format!("{out_disp}/gap-report.json"), "blocking": blocking, "advisory": advisory },
+        "seed": { "tables": output.seed.tables, "bulk_tables": output.seed.bulk_tables, "rows": output.seed.rows },
+        "next_step": format!("cd {out_disp} && jerrycan db migrate && jerrycan db seed && jerrycan gen-tests --module {first_module} && jerrycan check — then work gap-report.json top-down"),
+    });
+    emit(
+        json_mode,
+        &payload,
+        &format!(
+            "migrated {entity_count} entities, {bucket_count} buckets, {realtime_count} realtime channels — {} gap items ({blocking} blocking)",
+            output.gaps.len()
+        ),
     );
     Ok(())
 }

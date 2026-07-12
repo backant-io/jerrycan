@@ -14,7 +14,7 @@ the cause + fix for any of them.
 | JC0408 | Request body read timeout — on a `stream_body()` route this is the per-frame deadline (a stalled client between chunks) |
 | JC0409 | Conflict — the write violates a unique key (jerrycan-db) |
 | JC0413 | Payload too large — body over the route limit (default 1 MiB), or a multipart part over the per-part cap (8 MiB), >256 parts, or part headers over 8 KiB |
-| JC0415 | Unsupported media type — content type is not what the endpoint consumes (e.g. `Multipart` needs `multipart/form-data` with a boundary) |
+| JC0415 | Unsupported media type — content type is not what the endpoint consumes (e.g. `Multipart` needs `multipart/form-data` with a boundary; a storage bucket upload must match the bucket's `allowed_mime` allowlist) |
 | JC0422 | Unprocessable — bad JSON or validation violations |
 | JC0429 | Too many requests — the client exceeded its rate limit for the current window (the rate-limit extension); the response carries a `Retry-After` header |
 | JC0500 | Internal error (or handler panic) |
@@ -22,6 +22,8 @@ the cause + fix for any of them.
 | JC0510 | Database error (jerrycan-db) |
 | JC0520 | Schema contract is stale — schema.json drifted from the migrations |
 | JC0521 | Job failed — a background job returned an error and (after its retries) was dead-lettered, or failed irrecoverably (the jobs engine) |
+| JC0530 | Realtime requires Postgres — a realtime `changes` channel was joined on a sqlite deployment (broadcast/presence work without a database; changes need Postgres) |
+| JC0531 | Realtime replication unavailable — `wal_level` is not `logical` (or the role lacks REPLICATION), so changes run on the trigger + LISTEN/NOTIFY fallback (identical client behavior, weaker guarantee) |
 | JC1001 | Missing dependency provider |
 | JC1002 | Dependency cycle |
 | JC1003 | Dependency requires an HTTP request — an HTTP extractor was used in a task context (use only `Dep<T>` args, or resolve inside a request) |
