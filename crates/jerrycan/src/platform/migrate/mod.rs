@@ -6,4 +6,5 @@ pub mod export;
 pub mod gaps;
 pub mod parse;
 pub mod pgmodel;
+pub mod entities;
 pub mod typemap;
