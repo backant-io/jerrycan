@@ -496,6 +496,80 @@ pub fn validate(d: &Design) -> Vec<Question> {
         }
     }
 
+    // Realtime (contract v2). Channel names/entities are interpolated into
+    // generated wiring, so everything is validated up front. Scope-filtered
+    // delivery of changes is the security pillar, so changes require an active
+    // auth model; tenant-scoped topics require tenancy.
+    if let Some(ref rt) = d.realtime {
+        let active_auth_model = d
+            .auth
+            .as_ref()
+            .map(|a| a.model != AuthModel::None)
+            .unwrap_or(false);
+        if d.contract_version < 2 {
+            qs.push(q(
+                "/realtime",
+                "The realtime block requires contract_version 2 — bump contract_version (v0/v1 designs stay valid without realtime).",
+            ));
+        }
+        if !d.wants_db() {
+            qs.push(q(
+                "/realtime",
+                "Realtime requires a database dependency — add `db` to `dependencies` (Changes stream from Postgres).",
+            ));
+        }
+        // Changes entities must exist and require an active auth model (delivery
+        // is scope-filtered by the authenticated principal).
+        if !rt.changes.is_empty() && !active_auth_model {
+            qs.push(q(
+                "/realtime/changes",
+                "Realtime changes delivery is scope-filtered by the authenticated principal — set auth.model to `session` or `jwt`.",
+            ));
+        }
+        for (i, entity) in rt.changes.iter().enumerate() {
+            if !entity_names.contains(entity.as_str()) {
+                qs.push(q(
+                    format!("/realtime/changes/{i}"),
+                    format!("Realtime changes entity `{entity}` is not a declared entity anywhere in the design — define it or fix the reference."),
+                ));
+            }
+        }
+        // Broadcast + presence topics: snake_case, unique within their list,
+        // tenant scope needs tenancy, and any non-none scope needs auth.
+        let mut check_topics = |topics: &[RealtimeTopic], kind: &str| {
+            let mut seen = std::collections::HashSet::new();
+            for (i, t) in topics.iter().enumerate() {
+                let tptr = format!("/realtime/{kind}/{i}");
+                if !is_snake(&t.name) {
+                    qs.push(q(
+                        format!("{tptr}/name"),
+                        format!("Realtime {kind} topic `{}` is not snake_case (^[a-z][a-z0-9_]*$).", t.name),
+                    ));
+                }
+                if !seen.insert(t.name.as_str()) {
+                    qs.push(q(
+                        format!("{tptr}/name"),
+                        format!("Realtime {kind} topic name `{}` is already used — topic names must be unique.", t.name),
+                    ));
+                }
+                if t.scope == RealtimeScope::Tenant && d.tenancy.is_none() {
+                    qs.push(q(
+                        tptr.clone(),
+                        format!("Realtime {kind} topic `{}` is tenant-scoped but the design has no tenancy — declare `tenancy` or use scope `auth`/`none`.", t.name),
+                    ));
+                }
+                if t.scope != RealtimeScope::None && !active_auth_model {
+                    qs.push(q(
+                        tptr,
+                        format!("Realtime {kind} topic `{}` needs an active auth model for its scope — set auth.model to `session` or `jwt` (or use scope `none`).", t.name),
+                    ));
+                }
+            }
+        };
+        check_topics(&rt.broadcast, "broadcast");
+        check_topics(&rt.presence, "presence");
+    }
+
     qs
 }
 
@@ -726,10 +800,88 @@ fn validate_module(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::design::tests::{MINIMAL, V1_FULL, V2_STORAGE};
+    use crate::platform::design::tests::{MINIMAL, V1_FULL, V2_REALTIME, V2_STORAGE};
 
     fn design(json: &str) -> Design {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn valid_realtime_design_is_question_free() {
+        let d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        assert!(validate(&d).is_empty(), "{:?}", validate(&d));
+    }
+
+    #[test]
+    fn realtime_requires_contract_v2() {
+        let mut d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d.contract_version = 1;
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/realtime" && q.question.contains("contract_version"))
+        );
+    }
+
+    #[test]
+    fn realtime_changes_entities_must_exist() {
+        let mut d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d.realtime.as_mut().unwrap().changes[0] = "Ghost".into();
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/realtime/changes/0" && q.question.contains("Ghost"))
+        );
+    }
+
+    #[test]
+    fn realtime_requires_db_and_changes_require_active_auth() {
+        let mut d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d.dependencies.retain(|x| x != "db");
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/realtime" && q.question.contains("db"))
+        );
+
+        let mut d2: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d2.auth = None;
+        assert!(
+            validate(&d2)
+                .iter()
+                .any(|q| q.id == "/realtime/changes" && q.question.contains("auth"))
+        );
+    }
+
+    #[test]
+    fn tenant_scoped_topics_require_tenancy_and_snake_case_unique_names() {
+        let mut d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d.tenancy = None;
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/realtime/broadcast/0" && q.question.contains("tenancy"))
+        );
+
+        let mut d2: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        d2.realtime.as_mut().unwrap().broadcast.push(RealtimeTopic {
+            name: "Deal-Room".into(),
+            scope: RealtimeScope::None,
+        });
+        assert!(
+            validate(&d2)
+                .iter()
+                .any(|q| q.id == "/realtime/broadcast/1/name" && q.question.contains("snake_case"))
+        );
+
+        let mut d3: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        let dup = d3.realtime.as_ref().unwrap().broadcast[0].clone();
+        d3.realtime.as_mut().unwrap().broadcast.push(dup);
+        assert!(
+            validate(&d3)
+                .iter()
+                .any(|q| q.id == "/realtime/broadcast/1/name" && q.question.contains("unique"))
+        );
     }
 
     #[test]
