@@ -175,6 +175,71 @@ fn emit_from_db(
         .map(|(k, e)| (k.clone(), e.name.clone()))
         .collect();
 
+    // Access-level honesty gaps (the translation must never silently change
+    // the source's row visibility).
+    for (tk, access) in &access_map {
+        if !entity_by_table.contains_key(tk) {
+            continue;
+        }
+        match access {
+            // R3(b): the design contract has no per-user row scope and the
+            // platform cannot yet generate User-as-tenant machinery — the
+            // endpoints stay auth-guarded but are NOT row-scoped. Without a
+            // hand-written guard every logged-in user could read every row,
+            // so this is blocking agent work, never a silent translation.
+            TableAccess::OwnerAsUserTenant { owner_column } => gaps.push(GapItem {
+                kind: GapKind::RlsPolicy,
+                source: format!("{tk} owner scope"),
+                location: "schema.sql".into(),
+                reason: format!(
+                    "owner scoping (`{owner_column} = auth.uid()`) has no design representation without org tenancy — endpoints are auth-guarded but not row-scoped"
+                ),
+                original: String::new(),
+                suggested: format!(
+                    "add a handler guard filtering rows by `{owner_column}` = current user before exposing this module"
+                ),
+                severity: Severity::Blocking,
+            }),
+            // R3(a): an owner filter folded into tenant scoping widens row
+            // visibility from the row owner to every tenant member — advisory.
+            TableAccess::Tenant { .. } => {
+                let owner_relaxed = db
+                    .policies
+                    .iter()
+                    .filter(|p| &p.table == tk)
+                    .any(|p| match rls::recognize(p) {
+                        rls::Recognized::Scopes(scopes) => {
+                            scopes.iter().any(|s| matches!(s, rls::Scope::Owner { .. }))
+                        }
+                        rls::Recognized::Gap { .. } => false,
+                    });
+                if owner_relaxed {
+                    gaps.push(GapItem {
+                        kind: GapKind::RlsPolicy,
+                        source: format!("{tk} owner filter"),
+                        location: "schema.sql".into(),
+                        reason: "an owner-only filter was subsumed by tenant scoping — every tenant member can now reach rows the source limited to the row owner".into(),
+                        original: String::new(),
+                        suggested: "add a per-user handler filter if owner-only visibility must be preserved".into(),
+                        severity: Severity::Advisory,
+                    });
+                }
+            }
+            // Resolved ambiguity #6: RLS disabled in the source → endpoints are
+            // guarded by default here, which is STRICTER than the source.
+            TableAccess::NoRls => gaps.push(GapItem {
+                kind: GapKind::RlsPolicy,
+                source: format!("{tk} (no RLS)"),
+                location: "schema.sql".into(),
+                reason: "the source table has row-level security disabled; the migrated endpoints require auth by default (stricter than the source)".into(),
+                original: String::new(),
+                suggested: "mark reads public in the design if this data really is open".into(),
+                severity: Severity::Advisory,
+            }),
+            _ => {}
+        }
+    }
+
     let tenant_entity: Option<String> = det.tenant_table.as_ref().map(|tt| {
         let short = tt.strip_prefix("public.").unwrap_or(tt);
         entities::entity_name(short)
@@ -710,6 +775,103 @@ create publication supabase_realtime for table public.customers;
                 "{rel} deterministic"
             );
         }
+    }
+
+    #[test]
+    fn owner_only_apps_get_a_blocking_owner_scope_gap_not_a_silent_unscoped_app() {
+        // R3(b): without org tenancy the design cannot express per-user row
+        // scoping. Migrating must succeed BUT flag every owner-scoped table as
+        // blocking agent work — otherwise each logged-in user reads all rows.
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(
+            export_dir.join("schema.sql"),
+            r#"
+create table public.todos (id uuid primary key, user_id uuid not null, title text not null);
+alter table public.todos enable row level security;
+create policy own on public.todos using (user_id = auth.uid());
+"#,
+        )
+        .unwrap();
+        let out = run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: tmp.path().join("app"),
+            name: Some("todos".into()),
+            bulk_threshold: 5000,
+        })
+        .expect("owner-only export migrates");
+        assert!(out.design.tenancy.is_none());
+        let gap = out
+            .gaps
+            .iter()
+            .find(|g| g.source.contains("public.todos") && g.reason.contains("owner scoping"))
+            .expect("blocking owner-scope gap");
+        assert_eq!(gap.severity, Severity::Blocking);
+        // The endpoints exist and are guarded (auth), never public.
+        let todos_module = out
+            .design
+            .modules
+            .iter()
+            .find(|m| m.name == "todos")
+            .unwrap();
+        assert!(
+            todos_module
+                .endpoints
+                .iter()
+                .all(|e| e.auth_required && !e.public)
+        );
+    }
+
+    #[test]
+    fn an_owner_filter_folded_into_tenant_scope_is_an_advisory_gap() {
+        // R3(a): owner-scoped table carrying the tenant fk translates to tenant
+        // scoping — visibility widens from row owner to tenant members, and the
+        // plan requires an advisory saying so.
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(
+            export_dir.join("schema.sql"),
+            r#"
+create table public.workspaces (id uuid primary key, name text not null);
+create table public.workspace_members (
+    workspace_id uuid not null references public.workspaces(id) on delete cascade,
+    user_id uuid not null, role text not null check (role in ('owner','member')),
+    primary key (workspace_id, user_id));
+create table public.customers (
+    id uuid primary key,
+    workspace_id uuid not null references public.workspaces(id) on delete cascade,
+    email text not null);
+alter table public.customers enable row level security;
+create policy m on public.customers using
+    (workspace_id in (select workspace_id from public.workspace_members where user_id = auth.uid()));
+create table public.drafts (
+    id uuid primary key,
+    workspace_id uuid not null references public.workspaces(id) on delete cascade,
+    user_id uuid not null, body text not null);
+alter table public.drafts enable row level security;
+create policy own on public.drafts using (user_id = auth.uid());
+"#,
+        )
+        .unwrap();
+        let out = run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: tmp.path().join("app"),
+            name: Some("acme".into()),
+            bulk_threshold: 5000,
+        })
+        .expect("migrates");
+        assert!(
+            out.gaps.iter().any(|g| g.source.contains("public.drafts")
+                && g.reason.contains("subsumed by tenant scoping")
+                && g.severity == Severity::Advisory),
+            "owner→tenant relaxation must be advised: {:?}",
+            out.gaps
+                .iter()
+                .map(|g| (&g.source, &g.reason))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
