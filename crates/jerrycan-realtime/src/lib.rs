@@ -7,6 +7,7 @@ pub mod changes;
 pub mod protocol;
 pub(crate) mod bus;
 pub(crate) mod channel;
+pub(crate) mod ws;
 
 /// The authenticated identity a connection carries for every scope check.
 /// All keys are strings: tenant pks vary per design (i64/uuid/text), and both
