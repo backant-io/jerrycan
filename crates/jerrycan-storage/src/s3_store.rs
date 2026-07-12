@@ -285,6 +285,14 @@ impl S3Store {
     /// "storage error" — provider error taxonomy must not leak in 5xx bodies.
     fn s3_error(status: http::StatusCode, body: &[u8]) -> Error {
         match xml::parse_error(body) {
+            // A missing BUCKET is an operator misconfiguration, not a missing
+            // object: fail LOUD (500) — it must never read as an empty
+            // bucket / plausible 404 while every object silently vanishes.
+            Some((code, message)) if code == "NoSuchBucket" => {
+                crate::store::internal_storage_error(format!(
+                    "s3: {code}: {message} — the configured S3 bucket does not exist"
+                ))
+            }
             Some((code, _)) if code == "NoSuchKey" || status == http::StatusCode::NOT_FOUND => {
                 Error::not_found()
             }
@@ -594,6 +602,19 @@ mod tests {
             b"<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>",
         );
         assert_eq!(nf.code(), "JC0404");
+    }
+
+    #[test]
+    fn missing_bucket_fails_loud_instead_of_reading_as_404() {
+        // WHY: NoSuchBucket arrives with HTTP 404 — mapping it to not_found
+        // makes a misconfigured JERRYCAN_STORAGE bucket look like empty
+        // results/missing objects forever. It is an operator fault: 500.
+        let err = S3Store::s3_error(
+            http::StatusCode::NOT_FOUND,
+            b"<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>",
+        );
+        assert_eq!(err.code(), "JC0500", "{err}");
+        assert_eq!(err.message(), "storage error", "still generic to clients");
     }
 
     #[test]
