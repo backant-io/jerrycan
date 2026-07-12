@@ -3,6 +3,7 @@ use crate::ChangeChannelSpec;
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod pgoutput;
+pub(crate) mod replication;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
