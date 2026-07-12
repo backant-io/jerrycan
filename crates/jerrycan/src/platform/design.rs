@@ -21,7 +21,40 @@ pub struct Design {
     pub jobs: Vec<JobDesign>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageDesign>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime: Option<RealtimeDesign>,
     pub modules: Vec<ModuleDesign>,
+}
+
+/// The `realtime` block (contract v2): row-change subscriptions (scope-filtered
+/// by owner/tenant), ephemeral broadcast topics, and presence topics, served
+/// over one WebSocket endpoint at `/realtime`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealtimeDesign {
+    /// Entity names whose row changes are subscribable (published +
+    /// REPLICA IDENTITY FULL + scope-filtered delivery).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broadcast: Vec<RealtimeTopic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub presence: Vec<RealtimeTopic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealtimeTopic {
+    pub name: String,
+    pub scope: RealtimeScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RealtimeScope {
+    None,
+    Tenant,
+    Auth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +363,15 @@ impl Design {
         self.storage.as_ref().is_some_and(|s| !s.buckets.is_empty())
     }
 
+    /// The `realtime` block switches on the realtime crate wiring + the facade
+    /// `realtime` feature. Like jobs, the block itself is the declaration (any
+    /// of changes/broadcast/presence populated).
+    pub fn wants_realtime(&self) -> bool {
+        self.realtime.as_ref().is_some_and(|r| {
+            !r.changes.is_empty() || !r.broadcast.is_empty() || !r.presence.is_empty()
+        })
+    }
+
     /// "5MB" → bytes. Uppercase B/KB/MB/GB suffixes (binary multiples); a bare
     /// number is bytes. None = unparseable (a validation question).
     pub fn parse_size(s: &str) -> Option<u64> {
@@ -387,6 +429,11 @@ impl Design {
         // every storage app so JERRYCAN_STORAGE switches backends by env alone.
         if self.wants_storage() {
             features.push("storage-s3");
+        }
+        // Appended last (after storage) so existing designs' feature order is
+        // unchanged. Realtime channels over WebSockets; changes imply db.
+        if self.wants_realtime() {
+            features.push("realtime");
         }
         features
     }
@@ -553,6 +600,65 @@ pub(crate) mod tests {
                   "success": { "status": 200, "entity": "Org", "list": true } }] }
         ]
     }"#;
+
+    pub(crate) const V2_REALTIME: &str = r#"{
+        "name": "rt-app", "contract_version": 2,
+        "auth": { "model": "jwt", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+        "realtime": {
+            "changes": ["Lead"],
+            "broadcast": [{ "name": "deal_room", "scope": "tenant" }],
+            "presence": [{ "name": "editors", "scope": "tenant" }]
+        },
+        "modules": [
+            { "name": "workspaces",
+              "entities": [{ "name": "Workspace", "fields": [
+                  { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_workspaces", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Workspace", "list": true } }] },
+            { "name": "leads",
+              "entities": [{ "name": "Lead",
+                  "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "phone", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_leads", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Lead", "list": true } }] }
+        ]
+    }"#;
+
+    #[test]
+    fn realtime_block_round_trips_and_gates_the_facade_feature() {
+        let d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        assert!(d.wants_realtime());
+        let rt = d.realtime.as_ref().unwrap();
+        assert_eq!(rt.changes, vec!["Lead"]);
+        assert_eq!(rt.broadcast[0].name, "deal_room");
+        assert_eq!(rt.broadcast[0].scope, RealtimeScope::Tenant);
+        let feats = d.facade_features();
+        assert!(feats.contains(&"realtime"), "{feats:?}");
+        assert_eq!(
+            feats.last(),
+            Some(&"realtime"),
+            "realtime is appended last (after storage): {feats:?}"
+        );
+        // Round trip.
+        let back = serde_json::to_string(&d).unwrap();
+        let re: Design = serde_json::from_str(&back).unwrap();
+        assert!(re.wants_realtime());
+        // Absent block ⇒ no feature (v0/v1 designs untouched).
+        let plain: Design = serde_json::from_str(MINIMAL).unwrap();
+        assert!(!plain.wants_realtime());
+        assert!(!plain.facade_features().contains(&"realtime"));
+    }
+
+    #[test]
+    fn published_schema_accepts_the_realtime_block() {
+        let s = include_str!("../../../../docs/contracts/design-schema.json");
+        assert!(
+            s.contains("\"realtime\"") && s.contains("\"broadcast\"") && s.contains("\"presence\"")
+        );
+    }
 
     #[test]
     fn v2_storage_block_round_trips_and_gates_wants_storage() {

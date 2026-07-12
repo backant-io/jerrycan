@@ -159,9 +159,35 @@
           }
         }
       }
+    },
+    "realtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Realtime channels (contract v2): row-change subscriptions (scope-filtered by owner/tenant), ephemeral broadcast topics, and presence topics, served over one WebSocket endpoint at /realtime.",
+      "properties": {
+        "changes": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Z][A-Za-z0-9]*$" },
+          "description": "Entity names whose row changes are subscribable. Requires db + an active auth model; delivery is tenant-filtered when the entity is tenant-owned."
+        },
+        "broadcast": { "type": "array", "items": { "$ref": "#/$defs/realtime_topic" } },
+        "presence": { "type": "array", "items": { "$ref": "#/$defs/realtime_topic" } }
+      }
     }
   },
   "$defs": {
+    "realtime_topic": {
+      "type": "object",
+      "required": ["name", "scope"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "scope": {
+          "enum": ["none", "tenant", "auth"],
+          "description": "Who may join/publish: none = public, auth = any authenticated principal, tenant = tenant members (delivery partitioned per tenant)."
+        }
+      }
+    },
     "module": {
       "type": "object",
       "required": [
