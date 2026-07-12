@@ -156,3 +156,13 @@ applies the reference handlers, and runs the whole battery end-to-end. It is the
 `SKIP_EVAL_GATE=1` emergency escape). A fresh **docs-only LLM rebuild** of the
 slice under the isolation rules above is the periodic manual eval, recorded in
 `results.md`.
+
+## Migrator eval (capstone — un-skippable)
+
+`cargo test -p jerrycan --test migrate_supabase` (always on) and
+`JERRYCAN_TEST_PG_URL=… cargo test -p jerrycan --test migrate_e2e -- --ignored`
+(CI eval job + pre-publish) must both pass. The e2e migrates
+`conformance/fixtures/supabase-export`, generates, seeds, and requires
+`jerrycan check` green **plus** cross-tenant negative controls in REST,
+storage, and realtime (enforced by the generated isolation tests that
+`jerrycan check` runs). A red migrator eval blocks publish — no exceptions.
