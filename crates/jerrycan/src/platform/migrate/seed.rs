@@ -56,17 +56,23 @@ impl<R: Read> CsvReader<R> {
 
     fn read_record(&mut self) -> Option<Result<Vec<Option<String>>, String>> {
         let mut fields: Vec<Option<String>> = Vec::new();
-        let mut field = String::new();
+        // Fields accumulate as BYTES: the delimiters (`"`, `,`, newline) are
+        // ASCII and UTF-8 continuation bytes are ≥ 0x80, so byte-level framing
+        // is safe — pushing each byte `as char` was not (it mangled every
+        // non-ASCII character into Latin-1 mojibake). Conversion back to
+        // String happens once per field, failing loud on non-UTF-8 input.
+        let mut field: Vec<u8> = Vec::new();
         let mut in_quotes = false;
         let mut had_quote = false;
         let mut any = false;
 
-        let finish_field = |field: String, had_quote: bool| -> Option<String> {
-            if !had_quote && field == "\\N" {
-                None
-            } else {
-                Some(field)
+        let finish_field = |field: Vec<u8>, had_quote: bool| -> Result<Option<String>, String> {
+            if !had_quote && field == b"\\N" {
+                return Ok(None);
             }
+            String::from_utf8(field)
+                .map(Some)
+                .map_err(|_| "CSV field is not valid UTF-8".to_string())
         };
 
         loop {
@@ -76,41 +82,49 @@ impl<R: Read> CsvReader<R> {
                     if !any {
                         return None;
                     }
-                    fields.push(finish_field(field, had_quote));
+                    match finish_field(field, had_quote) {
+                        Ok(f) => fields.push(f),
+                        Err(e) => return Some(Err(e)),
+                    }
                     return Some(Ok(fields));
                 }
                 Some(Err(e)) => return Some(Err(e.to_string())),
                 Some(Ok(b)) => {
                     any = true;
-                    let c = b as char;
                     if in_quotes {
-                        if c == '"' {
+                        if b == b'"' {
                             // Doubled quote → literal; otherwise the field closes.
                             if matches!(self.bytes.peek(), Some(Ok(b'"'))) {
                                 self.bytes.next();
-                                field.push('"');
+                                field.push(b'"');
                             } else {
                                 in_quotes = false;
                             }
                         } else {
-                            field.push(c);
+                            field.push(b);
                         }
                     } else {
-                        match c {
-                            '"' => {
+                        match b {
+                            b'"' => {
                                 in_quotes = true;
                                 had_quote = true;
                             }
-                            ',' => {
-                                fields.push(finish_field(std::mem::take(&mut field), had_quote));
+                            b',' => {
+                                match finish_field(std::mem::take(&mut field), had_quote) {
+                                    Ok(f) => fields.push(f),
+                                    Err(e) => return Some(Err(e)),
+                                }
                                 had_quote = false;
                             }
-                            '\n' => {
-                                fields.push(finish_field(field, had_quote));
+                            b'\n' => {
+                                match finish_field(field, had_quote) {
+                                    Ok(f) => fields.push(f),
+                                    Err(e) => return Some(Err(e)),
+                                }
                                 return Some(Ok(fields));
                             }
-                            '\r' => {}
-                            _ => field.push(c),
+                            b'\r' => {}
+                            _ => field.push(b),
                         }
                     }
                 }
@@ -614,6 +628,27 @@ mod tests {
             "\\N is NULL"
         );
         assert_eq!(rows[1][2], Some("ok".into()));
+    }
+
+    #[test]
+    fn non_ascii_utf8_data_survives_byte_for_byte() {
+        // Lossless: names, notes and emoji in the export must round-trip.
+        // (The old char-per-byte reader turned "café" into "cafÃ©".)
+        let csv = "id,name\n1,café über 東京 🚀\n2,\"quoted, émoji 🧪\"\n";
+        let rows: Vec<Vec<Option<String>>> =
+            CsvReader::new(csv.as_bytes()).map(|r| r.unwrap()).collect();
+        assert_eq!(rows[0][1], Some("café über 東京 🚀".into()));
+        assert_eq!(rows[1][1], Some("quoted, émoji 🧪".into()));
+    }
+
+    #[test]
+    fn invalid_utf8_fails_loud_not_mangled() {
+        let bytes: &[u8] = b"id,name\n1,\xFF\xFE\n";
+        let rows: Vec<Result<Vec<Option<String>>, String>> = CsvReader::new(bytes).collect();
+        assert!(
+            rows.iter().any(|r| r.is_err()),
+            "invalid UTF-8 must surface an error"
+        );
     }
 
     #[test]
