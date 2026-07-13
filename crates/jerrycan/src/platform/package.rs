@@ -9,6 +9,53 @@ use std::path::Path;
 
 const PORT: u16 = 8000;
 
+/// The exact tail of a generated handler/job stub body — genroute and jobsgen both
+/// emit `Err(Error::internal("<name> not implemented — replace this stub"))`. Those
+/// two generators are the only writers of this phrase, so its presence in an
+/// agent-owned source file means that unit is still an unimplemented stub.
+const STUB_MARKER: &str = "not implemented — replace this stub";
+
+/// Every agent-owned source file under `crates/` that still carries the generated
+/// stub marker, relative to `root` (sorted). A stubbed handler serves JC0500, so
+/// shipping it is never safe.
+///
+/// This is a PACKAGE-ONLY gate. `jerrycan check` is deliberately green on a fresh
+/// scaffold — its lints stay clean (a hard conformance contract: "jerrycan lints
+/// must be clean on a fresh scaffold") and there are no tests yet, so the stub
+/// guard for `check` is the gen-tests acceptance suite (stubs fail it with JC0500).
+/// `package` is the ship step, so it must independently refuse an app whose
+/// handlers are unimplemented, even when the agent never ran gen-tests.
+fn unimplemented_stubs(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Build output is not agent-owned source; skip it.
+                if path.file_name().and_then(|n| n.to_str()) == Some("target") {
+                    continue;
+                }
+                walk(&path, root, out);
+            } else if path.extension().is_some_and(|x| x == "rs")
+                && std::fs::read_to_string(&path).is_ok_and(|c| c.contains(STUB_MARKER))
+            {
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root.join("crates"), root, &mut out);
+    out.sort();
+    out
+}
+
 /// Run the check gate, emit the requested artifacts (+ always an SBOM), and
 /// return (artifacts, sbom_path). Shared by the CLI `package` command and the
 /// MCP `jerrycan_package` tool so the two surfaces never drift.
@@ -20,6 +67,18 @@ pub fn run_package(
     systemd: bool,
     binary: bool,
 ) -> Result<(Vec<String>, String), String> {
+    // Gate 0 (package-only): never ship unimplemented handler stubs. Runs before
+    // the heavy check build so a stubbed app is refused immediately — matching the
+    // invariant that a fresh scaffold cannot be packaged (its handlers still 500).
+    let stubs = unimplemented_stubs(root);
+    if !stubs.is_empty() {
+        return Err(format!(
+            "check failed: {} handler(s) still return the generated \"not implemented\" stub ({}) — implement them before packaging",
+            stubs.len(),
+            stubs.join(", ")
+        ));
+    }
+
     // Gate: never package an app that doesn't pass check.
     let report = checkpipe::run_all(root, design, None).map_err(|e| e.to_string())?;
     if !report.ok {
@@ -279,4 +338,62 @@ fn target_installed(target: &str) -> bool {
                 .any(|t| t == target)
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::design::Design;
+
+    /// A fresh scaffold's handlers are stubs (`Err(Error::internal("… not
+    /// implemented — replace this stub"))`), so the package stub-gate must list
+    /// them; once a handler's body no longer carries the marker, the gate clears.
+    ///
+    /// WHY (Rule 9): this is the invariant `package_refuses_when_check_is_red`
+    /// encodes — jerrycan must never SHIP an app whose handlers still 500. `check`
+    /// is intentionally green on a fresh scaffold (lints stay clean by contract), so
+    /// the refusal has to live in `package`; a gate that couldn't tell an
+    /// implemented handler from a stub would let unimplemented code deploy.
+    #[test]
+    fn stub_gate_flags_scaffold_then_clears_when_implemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        let design: Design = serde_json::from_str(crate::platform::design::tests::MINIMAL).unwrap();
+        crate::platform::scaffold::scaffold(&app, &design).unwrap();
+
+        let stubs = unimplemented_stubs(&app);
+        assert!(
+            stubs.iter().any(|p| p.ends_with("handlers.rs")),
+            "a fresh scaffold's handlers are unimplemented stubs: {stubs:?}"
+        );
+
+        // Implement every stubbed unit (drop the marker): the gate must clear.
+        for rel in &stubs {
+            std::fs::write(app.join(rel), "// implemented — no stub marker\n").unwrap();
+        }
+        assert!(
+            unimplemented_stubs(&app).is_empty(),
+            "no stub markers remain once handlers are implemented"
+        );
+    }
+
+    /// `run_package` refuses (never emits artifacts) while any stub remains, and the
+    /// error names the failed `check` gate — the exact contract the MCP/CLI
+    /// `package` surfaces assert on.
+    #[test]
+    fn run_package_refuses_a_stub_scaffold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        let design: Design = serde_json::from_str(crate::platform::design::tests::MINIMAL).unwrap();
+        crate::platform::scaffold::scaffold(&app, &design).unwrap();
+
+        let err = run_package(&app, &design, false, true, false, false)
+            .expect_err("a stub scaffold must not package");
+        assert!(err.contains("check"), "error names the check gate: {err}");
+        // Refused before any artifact was written.
+        assert!(
+            !app.join("deploy/k8s.yaml").exists(),
+            "no artifacts on a refused package"
+        );
+    }
 }
