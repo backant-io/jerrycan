@@ -1,6 +1,6 @@
 ---
 name: jerrycan-backend
-description: Use when building, designing, or scaffolding a backend REST/CRUD API with the jerrycan framework. Guides the whole process step by step — eliciting exactly what the user intends, analyzing an existing frontend to derive the API contract, scoping against what jerrycan can build, authoring design.json, scaffolding, implementing handlers/jobs from the docs, and verifying — asking the user at every decision point so you never guess what to build next.
+description: Use when building, designing, or scaffolding a backend REST/CRUD API. Guides the whole process step by step — eliciting exactly what the user intends, analyzing an existing frontend to derive the API contract, scoping against what jerrycan can build, authoring design.json, scaffolding, implementing handlers/jobs from the docs, and verifying — asking the user at every decision point so you never guess what to build next.
 ---
 
 # Building a backend with jerrycan
