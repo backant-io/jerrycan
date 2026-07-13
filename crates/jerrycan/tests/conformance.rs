@@ -268,7 +268,10 @@ fn auth_observe_app_builds_checks_and_guards() {
         let auth = jerrycan::auth::Auth::with_secret("a-very-long-development-secret-string!!");
         let token = auth
             .sessions()
-            .encode(&serde_json::json!({ "id": 1, "role": "admin" }))
+            // SessionUser.id is a String (the stringified user pk), so the
+            // minted cookie must use a string id or the app's session decode
+            // rejects it as a 401.
+            .encode(&serde_json::json!({ "id": "1", "role": "admin" }))
             .unwrap();
         format!("Cookie: jerrycan_session={token}\r\n")
     };
