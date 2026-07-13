@@ -539,6 +539,36 @@ fn sql_repo(e: &Entity, design: &Design) -> String {
     let insert_sets = active_sets(e, true);
     let update_sets = active_sets(e, false);
     let scoped = scoped_methods(e, design);
+    // The insert differs by pk type. An auto-increment integer pk is assigned by
+    // the DB, so `ActiveModel::insert` returns the persisted row (with its id).
+    // A client-supplied text pk (string/uuid) is already known, and
+    // `ActiveModel::insert`'s post-insert refetch fails for a text pk on sqlite
+    // ("Failed to find inserted item" — it refetches by rowid, not the text id),
+    // so run the INSERT via `Entity::insert(..).exec(..)` and return the known id.
+    let insert_body = if key == "String" {
+        format!(
+            "    pub async fn insert(&self, item: {entity}) -> Result<{key}> {{\n\
+             \x20       let id = item.id.clone();\n\
+             \x20       {snake}::Entity::insert({snake}::ActiveModel {{\n\
+             {insert_sets}        }})\n\
+             \x20       .exec(self.db.conn())\n\
+             \x20       .await\n\
+             \x20       .map_err(db_error)?;\n\
+             \x20       Ok(id)\n\
+             \x20   }}"
+        )
+    } else {
+        format!(
+            "    pub async fn insert(&self, item: {entity}) -> Result<{key}> {{\n\
+             \x20       let row = {snake}::ActiveModel {{\n\
+             {insert_sets}        }}\n\
+             \x20       .insert(self.db.conn())\n\
+             \x20       .await\n\
+             \x20       .map_err(db_error)?;\n\
+             \x20       Ok(row.id)\n\
+             \x20   }}"
+        )
+    };
     format!(
         r#"pub struct {entity}Repo {{
     db: Db,
@@ -567,14 +597,7 @@ impl {entity}Repo {{
             .map_err(db_error)
     }}
 
-    pub async fn insert(&self, item: {entity}) -> Result<{key}> {{
-        let row = {snake}::ActiveModel {{
-{insert_sets}        }}
-        .insert(self.db.conn())
-        .await
-        .map_err(db_error)?;
-        Ok(row.id)
-    }}
+{insert_body}
 
     pub async fn remove(&self, id: {key}) -> Result<bool> {{
         let r = {snake}::Entity::delete_by_id(id)

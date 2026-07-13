@@ -490,21 +490,11 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
     let body = fixture_json(design, module, &entity.name);
     let create_path = format!("{base}/");
 
-    // user 1 (cookie 1) creates a row in tenant 1, then we read the id it echoes.
-    let mut t = String::new();
-    t.push_str(&format!(
-        "/// SECURITY: a tenant must not reach another tenant's {entity} rows. User 1\n/// creates a row in tenant 1; user 2 (tenant 2) must be denied read/list/delete.\n/// Passes only with the SCOPED repo accessors (get_for/all_for/remove_for).\n#[tokio::test]\nasync fn tenant_a_cannot_read_tenant_b_{plural}() {{\n    let t = app().await;\n",
-        entity = entity.name,
-    ));
-    t.push_str(&format!(
-        "    let created = t.post_json_with(\"{create_path}\", &serde_json::json!({body}), &[(\"cookie\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n    let id = &row[\"id\"];\n    let cookie2 = test_cookie_for(2);\n",
-        status = create.success.status,
-        entity = entity.name,
-    ));
-
     // A GET "/{id}" lets us assert the foreign row 404s for user 2 and survives
     // for user 1; a DELETE "/{id}" (role-gated → user 2's membership carries the
-    // role) must also 404 without destroying user 1's row.
+    // role) must also 404 without destroying user 1's row. Computed first so the
+    // id bindings below are only emitted when a probe consumes them (never an
+    // unused-variable warning under -D warnings).
     let get_one = module
         .endpoints
         .iter()
@@ -518,6 +508,30 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
         .iter()
         .find(|ep| ep.method == HttpMethod::GET && param_count(ep) == 0);
 
+    // user 1 (cookie 1) creates a row in tenant 1, then we read the id it echoes.
+    let mut t = String::new();
+    t.push_str(&format!(
+        "/// SECURITY: a tenant must not reach another tenant's {entity} rows. User 1\n/// creates a row in tenant 1; user 2 (tenant 2) must be denied read/list/delete.\n/// Passes only with the SCOPED repo accessors (get_for/all_for/remove_for).\n#[tokio::test]\nasync fn tenant_a_cannot_read_tenant_b_{plural}() {{\n    let t = app().await;\n",
+        entity = entity.name,
+    ));
+    t.push_str(&format!(
+        "    let created = t.post_json_with(\"{create_path}\", &serde_json::json!({body}), &[(\"cookie\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n    let cookie2 = test_cookie_for(2);\n",
+        status = create.success.status,
+        entity = entity.name,
+    ));
+    // The list negative-control compares the created id as a JSON Value.
+    if list.is_some() {
+        t.push_str("    let id_value = row[\"id\"].clone();\n");
+    }
+    // A by-id URL must carry the RAW id: a string PK's `Value::String` Display
+    // includes JSON quotes (`\"uuid\"`), so a `format!(\"…/{id}\")` would 404 every
+    // by-id request. Interpolate the unquoted string (a numeric PK is identical).
+    if get_one.is_some() || delete_one.is_some() {
+        t.push_str(
+            "    let id = row[\"id\"].as_str().map(str::to_string).unwrap_or_else(|| row[\"id\"].to_string());\n",
+        );
+    }
+
     if let Some(_get) = get_one {
         t.push_str(&format!(
             "    let foreign = t.get_with(&format!(\"{base}/{{id}}\"), &[(\"cookie\", &cookie2)]).await;\n    assert_eq!(foreign.status().as_u16(), 404, \"cross-tenant get must 404 (use get_for, not get); body: {{}}\", foreign.text());\n",
@@ -527,7 +541,7 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
         // Always cookied: even an unguarded list is safe to call with a cookie,
         // and a guarded one needs it. user 2 sees only tenant 2's (empty) rows.
         t.push_str(&format!(
-            "    let listed = t.get_with(\"{base}/\", &[(\"cookie\", &cookie2)]).await;\n    assert_eq!(listed.status().as_u16(), 200, \"user 2 lists their own {plural}; body: {{}}\", listed.text());\n    let rows: serde_json::Value = serde_json::from_str(&listed.text()).expect(\"list json\");\n    let absent = rows.as_array().map(|a| a.iter().all(|r| &r[\"id\"] != id)).unwrap_or(true);\n    assert!(absent, \"cross-tenant list must NOT contain tenant 1's row (use all_for); body: {{}}\", listed.text());\n",
+            "    let listed = t.get_with(\"{base}/\", &[(\"cookie\", &cookie2)]).await;\n    assert_eq!(listed.status().as_u16(), 200, \"user 2 lists their own {plural}; body: {{}}\", listed.text());\n    let rows: serde_json::Value = serde_json::from_str(&listed.text()).expect(\"list json\");\n    let absent = rows.as_array().map(|a| a.iter().all(|r| r[\"id\"] != id_value)).unwrap_or(true);\n    assert!(absent, \"cross-tenant list must NOT contain tenant 1's row (use all_for); body: {{}}\", listed.text());\n",
         ));
     }
     if let Some(_del) = delete_one {
