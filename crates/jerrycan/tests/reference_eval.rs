@@ -238,13 +238,14 @@ fn scaffold_and_apply_fixtures(app: &Path) {
             .unwrap_or_else(|e| panic!("copy fixture {fixture} → {dest}: {e}"));
     }
 
-    // Cargo feature patch: the `oauth` facade feature is now wired AUTOMATICALLY
-    // (the reference design declares the `oauth` dependency), so only `mock-idp` —
-    // the test-only IdP harness, never a production dependency — needs adding so
-    // the integrations module's hermetic mock transport compiles in this test.
+    // Cargo feature patch: `oauth` and `realtime` are wired AUTOMATICALLY (the
+    // reference design declares the `oauth` dependency and a `realtime` block), so
+    // only `mock-idp` — the test-only IdP harness, never a production dependency —
+    // needs adding so the integrations module's hermetic mock transport compiles
+    // in this test.
     let cargo = app.join("Cargo.toml");
-    let before = r#"features = ["db", "validate", "auth", "observe", "jobs", "oauth"]"#;
-    let after = r#"features = ["db", "validate", "auth", "observe", "jobs", "oauth", "mock-idp"]"#;
+    let before = r#"features = ["db", "validate", "auth", "observe", "jobs", "oauth", "realtime"]"#;
+    let after = r#"features = ["db", "validate", "auth", "observe", "jobs", "oauth", "realtime", "mock-idp"]"#;
     let txt = std::fs::read_to_string(&cargo).expect("read app Cargo.toml");
     assert!(
         txt.contains(before),
