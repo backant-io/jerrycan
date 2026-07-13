@@ -139,4 +139,29 @@ fn uuid_user_and_tenant_pk_generate_a_string_identity_end_to_end() {
         acceptance.contains("INSERT INTO \\\"workspace_members\\\" (user_id, workspace_id, role)"),
         "the isolation test seeds membership rows (login + tenancy work):\n{acceptance}"
     );
+    // REGRESSION (runtime): the isolation test interpolates the created id into
+    // by-id URLs. A uuid pk is echoed as a JSON string, and `Value::String`'s
+    // Display keeps the surrounding quotes — so a bare `format!("…/{}", &row["id"])`
+    // produces `/leads/"<uuid>"` and every by-id request 404s. The id must be the
+    // unquoted string.
+    assert!(
+        acceptance.contains("row[\"id\"].as_str().map(str::to_string)"),
+        "isolation test must interpolate the UNQUOTED uuid id into by-id URLs:\n{acceptance}"
+    );
+    assert!(
+        !acceptance.contains("let id = &row[\"id\"];"),
+        "the raw `&Value` id (with JSON quotes) must never reach a URL path:\n{acceptance}"
+    );
+
+    // REGRESSION (runtime): a uuid/text pk insert must run the INSERT via
+    // `Entity::insert(..).exec(..)` and return the KNOWN id. `ActiveModel::insert`
+    // refetches the row after inserting, and on sqlite that refetch keys on the
+    // integer rowid — for a text pk it finds nothing and fails at runtime with
+    // "Failed to find inserted item" (RecordNotFound). String-only tests missed
+    // this; every create on a migrated (uuid) entity 500s without the fix.
+    let leads_repo = std::fs::read_to_string(root.join("crates/routes/leads/src/repo.rs")).unwrap();
+    assert!(
+        leads_repo.contains("Entity::insert(") && leads_repo.contains("Ok(id)"),
+        "uuid-pk insert must exec + return the known id (not ActiveModel::insert's refetch):\n{leads_repo}"
+    );
 }
