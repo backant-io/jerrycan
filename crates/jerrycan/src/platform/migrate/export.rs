@@ -1,6 +1,6 @@
 //! The offline export-directory contract (spec §Input contract). Layout:
-//! schema.sql (required), data/<schema>.<table>.csv, storage/{buckets.json,objects/},
-//! functions/<name>/, cron.sql — every reader documents the command that produces it.
+//! `schema.sql` (required), `data/<schema>.<table>.csv`, `storage/{buckets.json,objects/}`,
+//! `functions/<name>/`, `cron.sql` — every reader documents the command that produces it.
 
 use std::path::{Path, PathBuf};
 
