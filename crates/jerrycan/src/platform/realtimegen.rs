@@ -41,7 +41,12 @@ fn find_entity<'a>(design: &'a Design, name: &str) -> Option<&'a Entity> {
 /// `snake_case(Entity)`, the pk is always `id`, and the tenant column is the
 /// tenancy fk when the entity `belongs_to` the tenancy entity, else None.
 fn changes_spec(design: &Design, entity: &str) -> (String, String, Option<String>) {
-    let table = Design::to_snake(entity);
+    // The change-capture table name MUST match the migration/schema table name
+    // (`schema.rs` / `genroute.rs` `table_name`): lowercased + pluralized —
+    // `Lead` → `leads`, `ApiKey` → `apikeys`. `to_snake` (`lead`/`api_key`) names
+    // a table that does not exist, so `CREATE PUBLICATION … FOR TABLE "lead"`
+    // (and the trigger path) fail at runtime against Postgres.
+    let table = format!("{}s", entity.to_lowercase());
     let pk = "id".to_string();
     let tenant_column = design.tenancy.as_ref().and_then(|t| {
         find_entity(design, entity)
@@ -289,7 +294,11 @@ mod tests {
         );
         // Lead belongs_to Workspace (the tenancy entity) ⇒ tenant filter on workspace_id.
         assert!(a.contains(r#"entity: "Lead".to_string()"#), "{a}");
-        assert!(a.contains(r#"table: "lead".to_string()"#), "{a}");
+        // The change-capture table is the MIGRATION table name — lowercased +
+        // pluralized (`Lead` → `leads`), NOT snake_case. `table: "lead"` names a
+        // non-existent relation and the replication/trigger DDL fails at runtime.
+        assert!(a.contains(r#"table: "leads".to_string()"#), "{a}");
+        assert!(!a.contains(r#"table: "lead".to_string()"#), "{a}");
         assert!(a.contains(r#"pk_column: "id".to_string()"#), "{a}");
         assert!(
             a.contains(r#"tenant_column: Some("workspace_id".to_string())"#),
