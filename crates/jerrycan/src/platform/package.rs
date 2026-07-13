@@ -5,9 +5,28 @@
 
 use super::design::Design;
 use super::{checkpipe, sbom};
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 const PORT: u16 = 8000;
+
+/// The static-musl target triple `jerrycan package --binary` prefers.
+const MUSL_TARGET: &str = "x86_64-unknown-linux-musl";
+
+/// Where cargo wrote the release `app` binary, honoring `CARGO_TARGET_DIR` the
+/// same way cargo does: an absolute value is used as-is; a relative value (and
+/// the `target` default) resolves against the app root that cargo ran in. A
+/// hardcoded `app_root/target/...` breaks in CI/monorepos that redirect the
+/// target dir — the copy then fails with "No such file or directory".
+fn built_binary_path(app_root: &Path, cargo_target_dir: Option<&OsStr>, musl: bool) -> PathBuf {
+    let base = app_root.join(cargo_target_dir.unwrap_or_else(|| OsStr::new("target")));
+    let sub = if musl {
+        format!("{MUSL_TARGET}/release/app")
+    } else {
+        "release/app".to_string()
+    };
+    base.join(sub)
+}
 
 /// The exact tail of a generated handler/job stub body — genroute and jobsgen both
 /// emit `Err(Error::internal("<name> not implemented — replace this stub"))`. Those
@@ -292,24 +311,23 @@ pub fn emit_text_artifacts(
 /// Build a release binary, preferring static musl; falls back to the host
 /// target with a note. Returns the relative artifact path.
 pub fn build_binary(app_root: &Path, design: &Design) -> Result<String, String> {
-    let musl = "x86_64-unknown-linux-musl";
     let musl_ok = std::process::Command::new("rustc")
         .args(["--print", "target-list"])
         .output()
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
-                .any(|t| t == musl)
+                .any(|t| t == MUSL_TARGET)
         })
         .unwrap_or(false)
-        && target_installed(musl);
-    let (target_args, built_path) = if musl_ok {
-        (vec!["--target", musl], format!("target/{musl}/release/app"))
+        && target_installed(MUSL_TARGET);
+    let target_args: Vec<&str> = if musl_ok {
+        vec!["--target", MUSL_TARGET]
     } else {
         eprintln!(
-            "jerrycan package: musl target unavailable — building a host-target binary (not fully static). Install with: rustup target add {musl}"
+            "jerrycan package: musl target unavailable — building a host-target binary (not fully static). Install with: rustup target add {MUSL_TARGET}"
         );
-        (vec![], "target/release/app".to_string())
+        vec![]
     };
     let mut args = vec!["build", "--release", "-p", "app"];
     args.extend(target_args);
@@ -321,10 +339,17 @@ pub fn build_binary(app_root: &Path, design: &Design) -> Result<String, String> 
     if !status.success() {
         return Err("release build failed".to_string());
     }
+    // Locate the binary where cargo actually wrote it (honoring CARGO_TARGET_DIR),
+    // not a hardcoded `app_root/target/...`.
+    let built_path = built_binary_path(
+        app_root,
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+        musl_ok,
+    );
     let deploy = app_root.join("deploy");
     std::fs::create_dir_all(&deploy).map_err(|e| e.to_string())?;
     let dest = deploy.join(&design.name);
-    std::fs::copy(app_root.join(&built_path), &dest).map_err(|e| format!("copy binary: {e}"))?;
+    std::fs::copy(&built_path, &dest).map_err(|e| format!("copy binary: {e}"))?;
     Ok(format!("deploy/{}", design.name))
 }
 
@@ -344,6 +369,42 @@ fn target_installed(target: &str) -> bool {
 mod tests {
     use super::*;
     use crate::platform::design::Design;
+
+    /// The binary-copy step must read the binary from where cargo wrote it,
+    /// honoring `CARGO_TARGET_DIR` like cargo does. Before this was fixed the
+    /// path was hardcoded to `app_root/target/release/app`, so `jerrycan package
+    /// --binary` under a redirected target dir (CI/monorepo, or a shared build
+    /// cache) failed with `copy binary: No such file or directory`.
+    #[test]
+    fn built_binary_path_honors_cargo_target_dir() {
+        let app = Path::new("/app");
+        // Default: app_root/target/release/app.
+        assert_eq!(
+            built_binary_path(app, None, false),
+            Path::new("/app/target/release/app")
+        );
+        // A relative CARGO_TARGET_DIR resolves against the app root cargo ran in.
+        assert_eq!(
+            built_binary_path(app, Some(OsStr::new("shared-target")), false),
+            Path::new("/app/shared-target/release/app")
+        );
+        // An absolute CARGO_TARGET_DIR is used as-is (not under app_root).
+        assert_eq!(
+            built_binary_path(app, Some(OsStr::new("/build/out")), false),
+            Path::new("/build/out/release/app")
+        );
+        // The musl target adds its triple subdir under whichever target dir.
+        assert_eq!(
+            built_binary_path(app, Some(OsStr::new("/build/out")), true),
+            Path::new("/build/out/x86_64-unknown-linux-musl/release/app")
+        );
+        // Regression guard: the default path must NOT be the bare hardcoded one
+        // when a target dir is redirected.
+        assert_ne!(
+            built_binary_path(app, Some(OsStr::new("/build/out")), false),
+            Path::new("/app/target/release/app")
+        );
+    }
 
     /// A fresh scaffold's handlers are stubs (`Err(Error::internal("… not
     /// implemented — replace this stub"))`), so the package stub-gate must list
