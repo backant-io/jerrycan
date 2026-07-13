@@ -76,7 +76,7 @@ pub(crate) async fn login(
         return Err(Error::unauthorized());
     }
     let cookie = auth.sessions().set_cookie(&shared::SessionUser {
-        id: user.id,
+        id: user.id.to_string(),
         role: user.role,
     })?;
     let mut res = "ok".into_response();

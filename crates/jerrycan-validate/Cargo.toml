@@ -12,7 +12,7 @@ keywords = ["validation", "openapi"]
 categories = ["web-programming"]
 
 [dependencies]
-jerrycan-core = { path = "../jerrycan-core", version = "0.2.0" }
+jerrycan-core = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 

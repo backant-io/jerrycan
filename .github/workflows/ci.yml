@@ -52,7 +52,10 @@ jobs:
           - 9000:9000
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain, components, and the musl target all come from
+      # rust-toolchain.toml (pinned to 1.97 == the declared MSRV). Keep this
+      # version in sync with that file when bumping stable.
+      - uses: dtolnay/rust-toolchain@1.97
         with:
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl
@@ -72,11 +75,13 @@ jobs:
       - name: Deny (licenses, bans, sources, yanked)
         run: cargo deny check
       - name: Semver checks (no unintended breaking API change vs the published baseline)
-        # Only the 7 crates already on crates.io have a 0.1.0 baseline to diff
-        # against; jerrycan-jobs/jerrycan-ratelimit are unpublished (no baseline)
-        # and are added here once they are reserved + published. For a 0.x crate
-        # cargo-semver-checks allows breaking changes on a minor bump (0.1 -> 0.2),
-        # so this passes today and tightens to patch-level once 0.2.0 is published.
+        # These 7 crates are on crates.io; their latest published baseline is
+        # 0.2.0. jerrycan-jobs/-ratelimit/-storage/-realtime are unpublished (no
+        # baseline) and join this list once reserved + published. For a 0.x crate
+        # cargo-semver-checks treats the middle number as the major, so a breaking
+        # change requires a 0.x-major bump (0.2 -> 0.3) — which the workspace now
+        # declares. This gate stays honest: the next breaking change must bump to
+        # 0.4.0, and it tightens to patch-level once the crates go 1.0.
         run: >-
           cargo semver-checks check-release
           -p jerrycan-core -p jerrycan-macros -p jerrycan-db -p jerrycan-auth
@@ -120,17 +125,11 @@ jobs:
       - name: Docs build (broken intra-doc links are errors)
         run: cargo doc --workspace --no-deps --all-features
 
-  msrv:
-    # Enforce the declared MSRV (rust-version = "1.88"): the whole workspace must
-    # compile (incl. test targets) on exactly 1.88, so a post-1.88 std/lang
-    # feature can't silently raise the real minimum below the declared one.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88
-      - uses: Swatinem/rust-cache@v2
-      - name: Check workspace on MSRV 1.88
-        run: cargo check --workspace --all-features --all-targets
+  # The declared MSRV (Cargo.toml `rust-version`) now equals the pinned stable in
+  # rust-toolchain.toml (1.97), so the `gate` job already builds and tests the
+  # whole workspace on the MSRV — a separate MSRV job would be redundant (and,
+  # because rust-toolchain.toml overrides any job-level toolchain, could not pin a
+  # lower version anyway). Reintroduce one only if MSRV is ever set below stable.
 
   fuzz-build:
     runs-on: ubuntu-latest
