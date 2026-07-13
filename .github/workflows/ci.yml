@@ -4,6 +4,11 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: every job here only checks out and builds/tests. None writes
+# to the repo, issues, or checks, so the whole workflow gets read-only scope.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTDOCFLAGS: -D warnings

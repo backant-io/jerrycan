@@ -4,6 +4,14 @@
 use jerrycan_core::http::HeaderMap;
 use jerrycan_core::{Error, Result};
 
+/// Inbound WebSocket size cap (256 KiB), mirroring jerrycan's REST body limit.
+/// tungstenite defaults to a 16 MiB frame / 64 MiB message ceiling, so an
+/// authenticated client on a single-tenant broadcast could force the server to
+/// buffer tens of MiB per frame — a memory-amplification DoS. Capping both the
+/// frame and the reassembled message makes an over-cap frame a hard protocol
+/// error (the read errors, the connection is dropped) instead.
+const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
+
 /// Validate the upgrade request headers and derive Sec-WebSocket-Accept.
 /// 400-class errors — the connection never upgrades on failure.
 pub(crate) fn handshake_accept(headers: &HeaderMap) -> Result<String> {
@@ -84,10 +92,13 @@ pub(crate) async fn ws_handler(start: WsStart) -> Result<jerrycan_core::Response
         match on_upgrade.await {
             Ok(upgraded) => {
                 let io = hyper_util::rt::TokioIo::new(upgraded);
+                let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                    .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
+                    .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
                 let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
                     io,
                     tokio_tungstenite::tungstenite::protocol::Role::Server,
-                    None,
+                    Some(config),
                 )
                 .await;
                 run_connection(ws, hub, principal).await;
