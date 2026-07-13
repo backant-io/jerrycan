@@ -1,0 +1,9 @@
+# Pins the toolchain for local dev and CI to the current stable (1.97).
+# jerrycan is pre-1.0 and scaffolds brand-new projects — there are no legacy
+# consumers pinned to older compilers — so dev, CI, and the declared MSRV
+# (Cargo.toml `rust-version`) all track the latest stable. Bump this in lockstep
+# with `rust-version` when a newer stable lands.
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl"]
