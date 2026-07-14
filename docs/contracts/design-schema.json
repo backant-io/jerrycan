@@ -115,8 +115,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["buckets"],
-      "description": "Contract v2: design-modeled object storage. Each bucket mounts guarded endpoints at /<name> (upload, list, download, delete, sign); object metadata lives in the storage_objects table; bytes live in the env-configured blob backend (JERRYCAN_STORAGE). Requires the db dependency and an active auth model.",
+      "description": "Contract v2: design-modeled object storage. Each bucket mounts guarded endpoints under {base_path}/<name> (upload, list, download, delete, sign); object metadata lives in the storage_objects table; bytes live in the env-configured blob backend (JERRYCAN_STORAGE). Requires the db dependency and an active auth model.",
       "properties": {
+        "base_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Mount prefix for every bucket: each serves under {base_path}/<name>. Defaults to /storage, keeping bucket routes clear of module mounts. Must be an absolute path (leading '/', no trailing slash or '//')."
+        },
         "buckets": {
           "type": "array",
           "minItems": 1,

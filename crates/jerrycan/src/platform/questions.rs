@@ -404,6 +404,24 @@ pub fn validate(d: &Design) -> Vec<Question> {
         }
         let module_mounts: std::collections::HashSet<String> =
             d.modules.iter().map(|m| m.effective_mount()).collect();
+        // A custom base_path is emitted verbatim into every bucket mount, so it
+        // must be a clean absolute path (leading `/`, no trailing/`//`), like a
+        // module mount.
+        if let Some(base) = &storage.base_path {
+            if !base.starts_with('/') {
+                qs.push(q(
+                    "/storage/base_path",
+                    format!("Storage base_path `{base}` must start with '/'."),
+                ));
+            }
+            if base.contains("//") || (base.len() > 1 && base.ends_with('/')) {
+                qs.push(q(
+                    "/storage/base_path",
+                    format!("Storage base_path `{base}` must not contain `//` or end with a trailing slash."),
+                ));
+            }
+        }
+        let base_path = storage.effective_base_path();
         let mut seen_buckets = std::collections::HashSet::new();
         for (i, b) in storage.buckets.iter().enumerate() {
             let bptr = format!("/storage/buckets/{i}");
@@ -429,10 +447,11 @@ pub fn validate(d: &Design) -> Vec<Question> {
                     ),
                 ));
             }
-            if module_mounts.contains(&format!("/{}", b.name)) {
+            let bucket_mount = format!("{base_path}/{}", b.name);
+            if module_mounts.contains(&bucket_mount) {
                 qs.push(q(
                     format!("{bptr}/name"),
-                    format!("Bucket `{}` mounts at /{} which collides with a module mount — rename the bucket or remount the module.", b.name, b.name),
+                    format!("Bucket `{}` mounts at {bucket_mount} which collides with a module mount — rename the bucket, change storage.base_path, or remount the module.", b.name),
                 ));
             }
             if let Some(ref owner) = b.owner
@@ -1024,14 +1043,37 @@ mod tests {
 
     #[test]
     fn bucket_mounts_must_not_collide_with_module_mounts() {
-        // WHY: buckets mount at /<name> beside the modules — a collision would
-        // shadow routes silently at serve time.
-        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
-        d.storage.as_mut().unwrap().buckets[0].name = "orgs".into();
+        // WHY: buckets mount at {base_path}/<name> beside the modules — a
+        // collision would shadow routes silently at serve time (issue #8). Under
+        // the default /storage prefix, a bucket named `avatars` no longer
+        // collides with a module at `/orgs`; the collision needs a module mounted
+        // at the bucket's actual path (`/storage/avatars`).
+        let base: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        assert!(
+            validate(&base).is_empty(),
+            "default /storage prefix keeps buckets clear of the /orgs module: {:?}",
+            validate(&base)
+        );
+        // A module remounted onto the bucket's storage path collides.
+        let mut d = base.clone();
+        d.modules[0].mount = Some("/storage/avatars".into());
         assert!(
             validate(&d)
                 .iter()
-                .any(|q| q.id == "/storage/buckets/0/name" && q.question.contains("mount"))
+                .any(|q| q.id == "/storage/buckets/0/name" && q.question.contains("collides")),
+            "a module at /storage/avatars collides with the avatars bucket: {:?}",
+            validate(&d)
+        );
+        // A custom base_path recomputes the collision against the new prefix.
+        let mut d2: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d2.storage.as_mut().unwrap().base_path = Some("/files".into());
+        d2.modules[0].mount = Some("/files/avatars".into());
+        assert!(
+            validate(&d2)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/name" && q.question.contains("collides")),
+            "collision follows the custom base_path: {:?}",
+            validate(&d2)
         );
     }
 

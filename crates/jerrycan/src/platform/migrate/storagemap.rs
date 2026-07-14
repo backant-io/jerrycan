@@ -177,6 +177,8 @@ impl StorageOutput {
             return None;
         }
         Some(StorageDesign {
+            // Default mount prefix (/storage) — no need to pin one for an import.
+            base_path: None,
             buckets: self.buckets.iter().map(BucketOut::to_design).collect(),
         })
     }

@@ -29,17 +29,22 @@ bytes live in a pluggable blob store.
 
 ## Generated endpoints (per bucket `<b>`)
 
+Buckets mount under `storage.base_path` (default `/storage`), so a bucket `<b>`
+serves at `/storage/<b>` — clear of your module mounts (a `media` bucket no
+longer shadows a `/media` module). Set `storage.base_path` (e.g. `/files`) to
+change the prefix; the paths below show the default.
+
 | Route | Behavior |
 |---|---|
-| `POST /<b>?key=<path>` | upload a raw body; `Content-Type` is the mime (415 `JC0415` outside `allowed_mime`; over `max_size` is 413 `JC0413`; duplicate key is 409) |
-| `GET /<b>` | list (owner/tenant scoped; open when public) |
-| `GET /<b>/{id}` | download — emits `ETag` (sha256) + `Cache-Control`, plus `X-Content-Type-Options: nosniff` and `Content-Disposition: attachment` (uploader-controlled bytes never render on the app's origin; `<img src=…>` embedding still works — subresource loads ignore the disposition); private buckets also accept `?exp=…&sig=…` |
-| `DELETE /<b>/{id}` | delete row + bytes (scoped; foreign object = 404) |
-| `POST /<b>/{id}/sign?ttl=300` | a time-limited signed URL |
+| `POST /storage/<b>?key=<path>` | upload a raw body; `Content-Type` is the mime (415 `JC0415` outside `allowed_mime`; over `max_size` is 413 `JC0413`; duplicate key is 409) |
+| `GET /storage/<b>` | list (owner/tenant scoped; open when public) |
+| `GET /storage/<b>/{id}` | download — emits `ETag` (sha256) + `Cache-Control`, plus `X-Content-Type-Options: nosniff` and `Content-Disposition: attachment` (uploader-controlled bytes never render on the app's origin; `<img src=…>` embedding still works — subresource loads ignore the disposition); private buckets also accept `?exp=…&sig=…` |
+| `DELETE /storage/<b>/{id}` | delete row + bytes (scoped; foreign object = 404) |
+| `POST /storage/<b>/{id}/sign?ttl=300` | a time-limited signed URL |
 
 ## Limitations (v1)
 
-- Upload is `POST /<b>?key=<path>` with a RAW request body only — there is no
+- Upload is `POST /storage/<b>?key=<path>` with a RAW request body only — there is no
   `multipart/form-data` parsing on bucket routes in v1. The request
   `Content-Type` header is the stored mime.
 - Uploads are buffered whole in memory before they reach the blob store,

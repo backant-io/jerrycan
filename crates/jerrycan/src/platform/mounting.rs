@@ -89,15 +89,18 @@ pub fn expected_main(design: &Design) -> String {
             crate_ident(&m.name)
         ));
     }
-    // Buckets mount at /<name> AFTER the module mounts, sorted by name (matches
-    // storagegen's sorted_buckets order). The block, not a dependency, is the
-    // gate; `storage` in `dependencies` stays a reserved (un-stubbed) name.
+    // Buckets mount under the storage base path (`/storage/<name>` by default),
+    // AFTER the module mounts, sorted by name (matches storagegen's sorted_buckets
+    // order). The prefix keeps buckets clear of module route mounts (a `media`
+    // bucket no longer shadows a `/media` module). The block, not a dependency, is
+    // the gate; `storage` in `dependencies` stays a reserved (un-stubbed) name.
     if let Some(ref storage) = design.storage {
+        let base = storage.effective_base_path();
         let mut buckets: Vec<_> = storage.buckets.iter().collect();
         buckets.sort_by(|a, b| a.name.cmp(&b.name));
         for b in buckets {
             mounts.push_str(&format!(
-                "        .mount(\"/{}\", storage::{}::module())\n",
+                "        .mount(\"{base}/{}\", storage::{}::module())\n",
                 b.name,
                 b.name.replace('-', "_")
             ));
@@ -526,15 +529,34 @@ mod tests {
         let module_mount = main
             .find(".mount(\"/orgs\", route_orgs::module())")
             .unwrap();
+        // Buckets mount under the default /storage prefix (issue #8), so they no
+        // longer collide with module mounts.
         let avatars = main
-            .find(".mount(\"/avatars\", storage::avatars::module())")
+            .find(".mount(\"/storage/avatars\", storage::avatars::module())")
             .unwrap();
         let invoices = main
-            .find(".mount(\"/invoices\", storage::invoices::module())")
+            .find(".mount(\"/storage/invoices\", storage::invoices::module())")
             .unwrap();
         assert!(
             module_mount < avatars && avatars < invoices,
             "bucket mounts sorted, after modules: {main}"
+        );
+    }
+
+    /// A custom `storage.base_path` overrides the default `/storage` prefix for
+    /// every bucket mount (issue #8).
+    #[test]
+    fn expected_main_honors_custom_storage_base_path() {
+        let mut d = storage_design();
+        d.storage.as_mut().unwrap().base_path = Some("/files".into());
+        let main = expected_main(&d);
+        assert!(
+            main.contains(".mount(\"/files/avatars\", storage::avatars::module())"),
+            "custom base_path prefixes bucket mounts: {main}"
+        );
+        assert!(
+            !main.contains("/storage/avatars"),
+            "the default prefix is replaced, not appended: {main}"
         );
     }
 

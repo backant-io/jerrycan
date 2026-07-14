@@ -191,7 +191,23 @@ pub struct JobDesign {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageDesign {
+    /// Mount prefix for every bucket: each serves under `{base_path}/{bucket}`
+    /// (default `/storage`, see `effective_base_path`), keeping bucket routes
+    /// clear of module mounts. A bucket named `media` no longer collides with a
+    /// module mounted at `/media`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
     pub buckets: Vec<BucketDesign>,
+}
+
+impl StorageDesign {
+    /// The normalized bucket mount prefix: the `base_path` override (validation
+    /// guarantees it starts with `/` and has no trailing slash) or `/storage`.
+    pub fn effective_base_path(&self) -> String {
+        self.base_path
+            .clone()
+            .unwrap_or_else(|| "/storage".to_string())
+    }
 }
 
 /// One bucket: mounts at `/<name>` with generated guarded endpoints.
@@ -773,6 +789,35 @@ pub(crate) mod tests {
         // v0/v1 designs stay valid and storage-free.
         let v0: Design = serde_json::from_str(MINIMAL).unwrap();
         assert!(v0.storage.is_none() && !v0.wants_storage());
+    }
+
+    #[test]
+    fn storage_base_path_defaults_to_storage_and_round_trips_an_override() {
+        // Buckets mount under the base path (default `/storage`), keeping them
+        // clear of module mounts (issue #8). Absent ⇒ `/storage`; an override is
+        // preserved across a round trip.
+        let d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        assert_eq!(
+            d.storage.as_ref().unwrap().effective_base_path(),
+            "/storage",
+            "absent base_path defaults to /storage"
+        );
+        // false-y default is skipped on serialize (no `base_path` key emitted).
+        let back = serde_json::to_value(d.storage.as_ref().unwrap()).unwrap();
+        assert!(
+            back.get("base_path").is_none(),
+            "absent base_path is not serialized: {back}"
+        );
+        // An override survives a round trip and drives effective_base_path.
+        let mut d2 = d;
+        d2.storage.as_mut().unwrap().base_path = Some("/files".into());
+        assert_eq!(d2.storage.as_ref().unwrap().effective_base_path(), "/files");
+        let s = serde_json::to_string(&d2).unwrap();
+        let re: Design = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            re.storage.as_ref().unwrap().base_path.as_deref(),
+            Some("/files")
+        );
     }
 
     #[test]
