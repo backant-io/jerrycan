@@ -234,9 +234,10 @@ agent-owned handlers are untouched — re-implement only new stubs).
 - **Cross-module `belongs_to` gets no scoped accessors.** A grandchild
   (`Application` → `Posting` → `Org`) isn't auto tenant-scoped; scope it by joining
   through the parent in your handler/repo.
-- **Table name = `lowercase(entity) + "s"`** (`Ticket` → `tickets`, `ApiKey` →
-  `apikeys`) — NOT snake_case, so it differs from the fk column (`api_key_id`).
-  You need the exact table name only for hand-written cross-module SQL.
+- **Table name = `snake_case(entity)` pluralized** (`Ticket` → `tickets`, `ApiKey`
+  → `api_keys`, `EnergySummary` → `energy_summaries`); override verbatim with
+  `"table": "…"`. It shares the fk column's snake stem (`ApiKey` table `api_keys`,
+  fk `api_key_id`). You need the exact table name only for hand-written cross-module SQL.
 - **`public` endpoints can't live in a module that owns a tenant-owned entity**
   (the generator binds the endpoint to that entity → guard bypass). Put webhooks /
   login / inbound-ingest routes in their OWN module (entity-less is fine).

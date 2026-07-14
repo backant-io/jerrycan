@@ -96,6 +96,11 @@ pub struct ModuleDesign {
 #[serde(deny_unknown_fields)]
 pub struct Entity {
     pub name: String,
+    /// Explicit SQL table name, used verbatim when present. Absent ⇒ the default
+    /// `snake_case(name)` pluralized (see `Design::table_name`). Lets a frozen
+    /// external schema keep its exact table name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub belongs_to: Vec<BelongsTo>,
     pub fields: Vec<Field>,
@@ -482,19 +487,67 @@ impl Design {
     /// (a fk may point at an entity in any module or subroute). Falls back to `i64`
     /// when the target is unknown (validation guarantees it exists in practice).
     pub fn target_key_rust_type(&self, target: &str) -> &'static str {
-        fn find<'a>(m: &'a ModuleDesign, target: &str) -> Option<&'a Entity> {
-            m.entities
-                .iter()
-                .find(|e| e.name == target)
-                .or_else(|| m.subroutes.iter().find_map(|s| find(s, target)))
-        }
-        self.modules
-            .iter()
-            .find_map(|m| find(m, target))
+        self.find_entity(target)
             .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
             .map(|f| f.field_type.rust_type())
             .unwrap_or("i64")
     }
+
+    /// Resolve an entity by name across the whole design tree (any module or
+    /// subroute). A belongs_to/tenancy target may live anywhere.
+    pub fn find_entity(&self, name: &str) -> Option<&Entity> {
+        fn find<'a>(m: &'a ModuleDesign, name: &str) -> Option<&'a Entity> {
+            m.entities
+                .iter()
+                .find(|e| e.name == name)
+                .or_else(|| m.subroutes.iter().find_map(|s| find(s, name)))
+        }
+        self.modules.iter().find_map(|m| find(m, name))
+    }
+
+    /// The SQL table name for an entity — the single source of truth every
+    /// generator shares (DDL, queries, schema.json, the realtime publication):
+    /// the entity's explicit `table` override when present, else
+    /// `snake_case(name)` with proper English pluralization
+    /// (`EnergySummary` → `energy_summaries`, `CaptureSession` → `capture_sessions`).
+    /// Resolves the override by NAME across the tree so a call site holding only
+    /// a fk/tenancy target name agrees with the one holding the `Entity`.
+    pub fn table_name(&self, entity: &str) -> String {
+        self.find_entity(entity)
+            .and_then(|e| e.table.clone())
+            .unwrap_or_else(|| Self::default_table_name(entity))
+    }
+
+    /// The DEFAULT table name for an entity name, ignoring any `table` override:
+    /// `snake_case(entity)` pluralized. The migration importer calls this to
+    /// decide whether a source table's name round-trips through the default or
+    /// needs an explicit `table` override to stay lossless.
+    pub fn default_table_name(entity: &str) -> String {
+        pluralize(&Self::to_snake(entity))
+    }
+}
+
+/// Deterministic English pluralization for a snake_case identifier (the default
+/// table-name rule): consonant + `y` → `ies` (`energy` → `energies`); ends in
+/// `s`/`x`/`z`/`ch`/`sh` → `es` (`box` → `boxes`, `dish` → `dishes`); vowel + `y`
+/// → `+s` (`day` → `days`); else `+s`. Not exhaustive English (no irregulars),
+/// but deterministic and correct for the multi-word entity names the old
+/// `lowercase + "s"` mangled (`energysummarys`).
+fn pluralize(word: &str) -> String {
+    if word.ends_with("ch")
+        || word.ends_with("sh")
+        || word.ends_with('s')
+        || word.ends_with('x')
+        || word.ends_with('z')
+    {
+        return format!("{word}es");
+    }
+    if let Some(stem) = word.strip_suffix('y')
+        && !stem.ends_with(['a', 'e', 'i', 'o', 'u'])
+    {
+        return format!("{stem}ies");
+    }
+    format!("{word}s")
 }
 
 /// Rust keywords (2018+): reserved words that need a raw identifier (`r#name`)
@@ -872,6 +925,47 @@ pub(crate) mod tests {
         // fk_column derives from the shared to_snake (DRY); both must agree.
         assert_eq!(Design::to_snake("ApiKey"), "api_key");
         assert_eq!(Design::to_snake("Lead"), "lead");
+    }
+
+    #[test]
+    fn table_name_snake_cases_and_pluralizes_by_default() {
+        // The default table name is snake_case(entity) + proper English
+        // pluralization — the old `lowercase + "s"` mangled multi-word names
+        // (`EnergySummary` → `energysummarys`). `table_name` falls back to the
+        // default for any name not carrying a `table` override, so a minimal
+        // design exercises pluralization directly.
+        let d: Design = serde_json::from_str(MINIMAL).unwrap();
+        assert_eq!(d.table_name("EnergySummary"), "energy_summaries");
+        assert_eq!(d.table_name("CaptureSession"), "capture_sessions");
+        assert_eq!(d.table_name("MediaItem"), "media_items");
+        assert_eq!(d.table_name("ApiKey"), "api_keys");
+        // Pluralization rules: consonant+y→ies, s/x/z/ch/sh→es, vowel+y→s, else +s.
+        assert_eq!(d.table_name("Todo"), "todos");
+        assert_eq!(d.table_name("Class"), "classes");
+        assert_eq!(d.table_name("Box"), "boxes");
+        assert_eq!(d.table_name("Dish"), "dishes");
+        assert_eq!(d.table_name("Batch"), "batches");
+        assert_eq!(d.table_name("Gateway"), "gateways", "vowel+y → +s");
+        assert_eq!(d.table_name("Company"), "companies", "consonant+y → ies");
+    }
+
+    #[test]
+    fn table_override_is_used_verbatim() {
+        // A frozen external schema can pin an exact table name via `table`; the
+        // override wins over the pluralized default, resolved by NAME across the
+        // tree so a fk/tenancy target agrees with the entity's own emission.
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "x", "contract_version": 1, "dependencies": ["db"],
+                "modules": [{ "name": "m",
+                    "entities": [{ "name": "EnergySummary", "table": "legacy_energy",
+                        "fields": [{ "name": "kwh", "type": "float" }] }],
+                    "endpoints": [{ "operation_id": "list_it", "method": "GET", "path": "/",
+                        "success": { "status": 200 } }] }] }"#,
+        )
+        .unwrap();
+        assert_eq!(d.table_name("EnergySummary"), "legacy_energy");
+        // An entity WITHOUT an override still gets the pluralized default.
+        assert_eq!(d.table_name("MediaItem"), "media_items");
     }
 
     #[test]

@@ -365,7 +365,7 @@ fn tenant_seed(design: &Design, module: &ModuleDesign) -> String {
     let Some(entity) = t.entities.iter().find(|e| e.name == tenancy.entity) else {
         return String::new();
     };
-    let table = format!("{}s", tenancy.entity.to_lowercase());
+    let table = design.table_name(&tenancy.entity);
     let members = format!("{}_members", Design::to_snake(&tenancy.entity));
     let fk = Design::fk_column(&tenancy.entity);
     let role = tenancy
@@ -438,7 +438,7 @@ fn seed_second_tenant_fn(design: &Design, module: &ModuleDesign) -> String {
     let Some(entity) = t.entities.iter().find(|e| e.name == tenancy.entity) else {
         return String::new();
     };
-    let table = format!("{}s", tenancy.entity.to_lowercase());
+    let table = design.table_name(&tenancy.entity);
     let members = format!("{}_members", Design::to_snake(&tenancy.entity));
     let fk = Design::fk_column(&tenancy.entity);
     let role = isolation_member_role(design, module);

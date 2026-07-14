@@ -335,7 +335,7 @@ pub fn acceptance_rs(design: &Design) -> String {
             .find(|e| e.name == tenancy.entity)
             .expect("validated: tenancy entity in its module");
         let t_snake = t.name.replace('-', "_");
-        let table = format!("{}s", tenancy.entity.to_lowercase());
+        let table = design.table_name(&tenancy.entity);
         let members = format!("{}_members", Design::to_snake(&tenancy.entity));
         let fk = Design::fk_column(&tenancy.entity);
         let role = tenancy

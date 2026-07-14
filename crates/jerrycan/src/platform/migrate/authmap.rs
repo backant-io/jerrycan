@@ -34,6 +34,8 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
     };
     let user = Entity {
         name: "User".into(),
+        // Default table name (`users`) is exactly the target — no override.
+        table: None,
         belongs_to: vec![],
         fields: vec![
             field("id", FieldType::Uuid, true, false),

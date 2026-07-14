@@ -284,7 +284,7 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design) -> Option<String> {
     );
     for e in &m.entities {
         let snake = Design::to_snake(&e.name);
-        let table = table_name(&e.name);
+        let table = design.table_name(&e.name);
         let key = key_rust_type(e);
         // The synthetic pk surfaces as a visible `id` field so POST bodies may
         // omit it (`#[serde(default)]`); a declared id has no default.
@@ -430,11 +430,6 @@ impl Default for {n}Repo {{
         ));
     }
     out
-}
-
-/// SQL table name for an entity: lowercased + pluralized (`Todo` → `todos`).
-fn table_name(entity: &str) -> String {
-    format!("{}s", entity.to_lowercase())
 }
 
 /// The Model field names in struct order — the order `model_rs_db` emits and
@@ -738,7 +733,7 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
     let local: std::collections::HashSet<&str> =
         m.entities.iter().map(|e| e.name.as_str()).collect();
     for e in &m.entities {
-        let tbl = table_name(&e.name);
+        let tbl = design.table_name(&e.name);
         let mut table = Table::create();
         table.table(Alias::new(tbl.clone()));
         // A declared `id` field IS the pk (typed as declared); only entities
@@ -764,7 +759,7 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
         // bare column + an index + a documenting comment (no FK constraint).
         for b in &e.belongs_to {
             let col = Design::fk_column(&b.entity);
-            let target_table = table_name(&b.entity);
+            let target_table = design.table_name(&b.entity);
             let mut fk_col = ColumnDef::new(Alias::new(col.clone()));
             match design.target_key_rust_type(&b.entity) {
                 "String" => ddl_typed(&mut fk_col, FieldType::String, backend_is_pg),
@@ -852,7 +847,7 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
     if let Some(tenancy) = &design.tenancy
         && m.entities.iter().any(|e| e.name == tenancy.entity)
     {
-        let tenant_table = table_name(&tenancy.entity);
+        let tenant_table = design.table_name(&tenancy.entity);
         let members = format!("{}_members", Design::to_snake(&tenancy.entity));
         let fk = Design::fk_column(&tenancy.entity);
         let mut table = Table::create();

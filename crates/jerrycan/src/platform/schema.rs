@@ -59,12 +59,6 @@ pub struct TableColumn {
     pub column: String,
 }
 
-/// SQL table name for an entity — mirrors genroute's `table_name`
-/// (lowercased + pluralized: `Lead` → `leads`, `ApiKey` → `apikeys`).
-fn table_name(entity: &str) -> String {
-    format!("{}s", entity.to_lowercase())
-}
-
 /// Walk a module + its subroutes, calling `f` for every (top_module, entity).
 /// Subroute entities attribute to the TOP-LEVEL module name because that crate
 /// holds the migration file on disk (`crates/routes/{top}/migrations/...`).
@@ -80,6 +74,8 @@ fn for_each_entity<'a>(m: &'a ModuleDesign, top: &'a str, f: &mut impl FnMut(&'a
 /// Index of every entity table → (owning top-level module, the Entity), plus the
 /// membership table → tenant module. Drives module attribution and type overlay.
 struct DesignIndex<'a> {
+    /// the design (source of truth for `table_name`, including `table` overrides)
+    design: &'a Design,
     /// table name → (module name, entity)
     entities: BTreeMap<String, (&'a str, &'a Entity)>,
     /// membership table name → tenant module name (if tenancy declared)
@@ -93,7 +89,7 @@ impl<'a> DesignIndex<'a> {
         let mut entities = BTreeMap::new();
         for m in &design.modules {
             for_each_entity(m, &m.name, &mut |top, e| {
-                entities.insert(table_name(&e.name), (top, e));
+                entities.insert(design.table_name(&e.name), (top, e));
             });
         }
         let mut membership = None;
@@ -111,6 +107,7 @@ impl<'a> DesignIndex<'a> {
             tenant_key_string = design.target_key_rust_type(&tenancy.entity) == "String";
         }
         Self {
+            design,
             entities,
             membership,
             tenant_key_string,
@@ -165,7 +162,7 @@ fn overlay_type(index: &DesignIndex, table: &str, column: &str) -> Option<String
 fn entity_owner_key_is_string(index: &DesignIndex, target: &str) -> bool {
     index
         .entities
-        .get(&table_name(target))
+        .get(&index.design.table_name(target))
         .and_then(|(_, e)| e.fields.iter().find(|f| f.name == "id"))
         .map(|f| f.field_type == FieldType::String)
         .unwrap_or(false)
@@ -348,7 +345,7 @@ async fn introspect_table(db: &Db, index: &DesignIndex<'_>, table: &str) -> Resu
             foreign_keys.push(ForeignKeyRef {
                 column: col,
                 references: TableColumn {
-                    table: table_name(&b.entity),
+                    table: index.design.table_name(&b.entity),
                     column: "id".to_string(),
                 },
                 on_delete: on_delete_token(b.on_delete),

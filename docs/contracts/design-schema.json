@@ -248,6 +248,11 @@
           "type": "string",
           "pattern": "^[A-Z][A-Za-z0-9]*$"
         },
+        "table": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "Explicit SQL table name, used verbatim. Absent -> the default snake_case(name) with proper English pluralization (EnergySummary -> energy_summaries). Set this to keep a frozen external schema's exact table name."
+        },
         "belongs_to": {
           "type": "array",
           "description": "Foreign-key relations to other entities. Each produces a NOT NULL fk column 'snake_case(entity) + \"_id\"' referencing the target's pk (nullable instead when on_delete is set_null). For a target in the SAME module the column carries a real DDL FOREIGN KEY with the given on_delete policy; for a cross-module target the column is emitted unenforced and indexed (no DDL constraint — the relation is reported in schema.json with \"enforced\": false, and referential integrity is enforced in handlers).",

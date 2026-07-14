@@ -101,11 +101,14 @@ complete. Fix every question before scaffolding.
     DB's.
 - `fields` (REQUIRED) — at least one (see Field).
 
-The SQL **table name** is `lowercase(entity) + "s"` — `Ticket` → `tickets`,
-`Workspace` → `workspaces`, `ApiKey` → `apikeys`. Note this is NOT snake_case, so
-a multi-word entity's table differs from its fk column: `ApiKey` → table
-`apikeys` but fk column `api_key_id`. You need the exact table name only for
-hand-written cross-module SQL (the generated repo handles intra-module access).
+The SQL **table name** defaults to `snake_case(entity)`, pluralized — `Ticket` →
+`tickets`, `Workspace` → `workspaces`, `ApiKey` → `api_keys`, `EnergySummary` →
+`energy_summaries`. Pluralization is the ordinary English rule (consonant + `y` →
+`ies`; ends in `s`/`x`/`z`/`ch`/`sh` → `es`; else `+s`). A multi-word entity's
+table therefore shares the snake_case stem of its fk column (`ApiKey` → table
+`api_keys`, fk column `api_key_id`). Set `"table": "…"` on an entity to override
+the name verbatim (a frozen external schema). You need the exact table name only
+for hand-written cross-module SQL (the generated repo handles intra-module access).
 
 ### The `id` field (primary key)
 Every entity has an `id` primary key. You usually do NOT declare it:

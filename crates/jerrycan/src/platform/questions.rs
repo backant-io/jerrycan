@@ -610,6 +610,16 @@ fn validate_module(
                 ),
             ));
         }
+        // An explicit `table` override is used VERBATIM in DDL/queries, so it must
+        // be a safe snake_case identifier — reject anything else up front.
+        if let Some(table) = &e.table
+            && !is_snake(table)
+        {
+            qs.push(q(
+                format!("{ptr}/entities/{i}/table"),
+                format!("Table override `{table}` must be snake_case (^[a-z][a-z0-9_]*$)."),
+            ));
+        }
         if e.fields.is_empty() {
             qs.push(q(
                 format!("{ptr}/entities/{i}/fields"),
