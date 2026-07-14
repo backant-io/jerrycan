@@ -5,6 +5,22 @@ One error type: `jerrycan::Error`. Every error has an HTTP status and a stable
 code (`JC####`) that links to documentation. Responses render as
 `{"code":"…","message":"…"}` — never stack traces, paths, or SQL.
 
+## App wire envelope (reshaping framework errors)
+Framework-emitted errors (the auth guard's 401, extractor 4xx, routing 404/405)
+never pass through a handler, so to give your API ONE wire envelope you register
+an app-level mapper in the AGENT-owned `crates/app/src/errors.rs` (created once,
+preserved across `jerrycan generate`; the tool-owned `main.rs` wires it). Edit
+`error_body` to return `Some(json)` for your envelope, or `None` to keep the
+default `{code, message[, details]}` body. It applies to EVERY error response —
+framework AND handler:
+```rust,ignore
+pub fn error_body(_status: jerrycan::http::StatusCode, code: &str, message: &str)
+    -> Option<jerrycan::serde_json::Value>
+{
+    Some(jerrycan::serde_json::json!({ "error": { "code": code, "message": message } }))
+}
+```
+
 ## Signature
 ```rust
 # use jerrycan::prelude::*;

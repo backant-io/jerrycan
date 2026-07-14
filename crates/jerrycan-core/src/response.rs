@@ -252,16 +252,34 @@ struct ErrorBody<'a> {
     details: Option<&'a serde_json::Value>,
 }
 
+/// The rendered error's parts, stashed as a response EXTENSION so an app-level
+/// error-body mapper (`App::map_error_body`) can reshape EVERY framework-emitted
+/// error (guard 401, extractor 4xx, …) at the dispatch exit — the point that
+/// has the app's config. Absent from non-error responses, so the mapper only
+/// ever sees errors.
+#[derive(Clone)]
+pub(crate) struct ErrorParts {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        json_body(
+        let mut r = json_body(
             self.status(),
             &ErrorBody {
                 code: self.code(),
                 message: self.message(),
                 details: self.details(),
             },
-        )
+        );
+        // Carry the parts so the app-level mapper can reshape this body later
+        // (the default flat body above stays when no mapper is registered).
+        r.extensions_mut().insert(ErrorParts {
+            code: self.code(),
+            message: self.message().to_string(),
+        });
+        r
     }
 }
 
