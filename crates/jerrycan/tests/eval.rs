@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -81,6 +83,7 @@ fn run_one(spec: &str) -> Result<(), String> {
     // check (full gate)
     let out = Command::new(jc())
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["--json", "check"])
         .output()
         .map_err(|e| e.to_string())?;
@@ -99,6 +102,7 @@ fn run_one(spec: &str) -> Result<(), String> {
     let addr = format!("127.0.0.1:{port}");
     let mut server = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .env("JERRYCAN_ADDR", &addr)
         .args(["run", "-p", "app"])
         .spawn()
@@ -115,6 +119,7 @@ fn run_one(spec: &str) -> Result<(), String> {
     let result = if up {
         let routes = Command::new(jc())
             .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
             .args(["--json", "list", "routes"])
             .output()
             .unwrap();

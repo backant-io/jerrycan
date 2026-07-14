@@ -12,6 +12,8 @@ use jerrycan::platform::design::Design;
 use jerrycan::platform::genroute::{GenMode, write_module};
 use std::fs;
 use std::path::Path;
+
+mod common;
 use std::process::Command;
 
 /// Mirror of design::tests::MINIMAL (that const is `#[cfg(test)]`-private to the
@@ -136,7 +138,7 @@ serde.workspace = true
         ])
         // Keep the generated workspace's target dir inside the tempdir so we don't
         // collide with / pollute the parent workspace's target.
-        .env("CARGO_TARGET_DIR", app.join("target"))
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .output()
         .expect("run cargo clippy");
 
@@ -238,7 +240,7 @@ fn generated_auth_module_crate_passes_strict_clippy() {
             "-D",
             "warnings",
         ])
-        .env("CARGO_TARGET_DIR", app.join("target"))
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .output()
         .expect("run cargo clippy");
 
@@ -351,7 +353,7 @@ fn generated_jobs_crate_passes_strict_clippy() {
             "-D",
             "warnings",
         ])
-        .env("CARGO_TARGET_DIR", app.join("target"))
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .output()
         .expect("run cargo clippy");
 
@@ -476,7 +478,7 @@ fn generated_storage_crate_passes_strict_clippy_and_its_acceptance_tests() {
             "-D",
             "warnings",
         ])
-        .env("CARGO_TARGET_DIR", app.join("target"))
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .output()
         .expect("run cargo clippy");
     if !output.status.success() {
@@ -493,7 +495,7 @@ fn generated_storage_crate_passes_strict_clippy_and_its_acceptance_tests() {
     let output = Command::new(env!("CARGO"))
         .current_dir(&app)
         .args(["test", "-p", "storage"])
-        .env("CARGO_TARGET_DIR", app.join("target"))
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .output()
         .expect("run cargo test");
     if !output.status.success() {
@@ -587,7 +589,7 @@ fn generated_uuid_tenant_storage_crate_passes_its_acceptance_tests() {
     let output = Command::new(env!("CARGO"))
         .current_dir(&app)
         .args(["test", "-p", "storage"])
-        .env("CARGO_TARGET_DIR", app.join("target"))
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .output()
         .expect("run cargo test");
     if !output.status.success() {
@@ -701,7 +703,7 @@ fn generated_realtime_crate_passes_strict_clippy() {
             "-D",
             "warnings",
         ])
-        .env("CARGO_TARGET_DIR", app.join("target"))
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .output()
         .expect("run cargo clippy");
     if !output.status.success() {
@@ -790,7 +792,7 @@ fn generated_cors_app_main_passes_strict_clippy() {
             "-D",
             "warnings",
         ])
-        .env("CARGO_TARGET_DIR", app.join("target"))
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .output()
         .expect("run cargo clippy");
     if !output.status.success() {
