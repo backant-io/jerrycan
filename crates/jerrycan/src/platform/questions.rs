@@ -100,6 +100,51 @@ pub fn validate(d: &Design) -> Vec<Question> {
         }
     }
 
+    // The `cors` block is emitted into `App::cors(CorsConfig::new(..))` (issue #21).
+    // Validate the origins at design time so a misconfig is a pointed question, not
+    // a runtime `App::build()` failure the deploy discovers on first boot.
+    if let Some(cors) = &d.cors {
+        if cors.origins.is_empty() {
+            qs.push(q(
+                "/cors/origins",
+                "CORS is declared with no origins — list the allowed origins (exact scheme://host[:port]) or `*` for any origin.",
+            ));
+        }
+        let is_wildcard = cors.origins.iter().any(|o| o == "*");
+        if is_wildcard && cors.origins.len() > 1 {
+            qs.push(q(
+                "/cors/origins",
+                "CORS origins mixes `*` with explicit origins — use either `*` (any origin) alone or an explicit allowlist.",
+            ));
+        }
+        // Fetch spec: a credentialed cross-origin request cannot use a wildcard
+        // origin. Core's `App::build` rejects the combination; catch it here so the
+        // generated app never fails to boot on it.
+        if is_wildcard && cors.allow_credentials {
+            qs.push(q(
+                "/cors/allow_credentials",
+                "CORS allow_credentials cannot be combined with `*` origins (the Fetch spec forbids it) — list explicit origins instead.",
+            ));
+        }
+        // Each explicit origin must be a bare origin (scheme://host[:port]) — no path
+        // or trailing slash — since it is matched byte-for-byte against the request's
+        // Origin header.
+        for (i, o) in cors.origins.iter().enumerate() {
+            if o == "*" {
+                continue;
+            }
+            let well_formed = (o.starts_with("http://") || o.starts_with("https://"))
+                && !o.ends_with('/')
+                && o.matches('/').count() == 2;
+            if !well_formed {
+                qs.push(q(
+                    format!("/cors/origins/{i}"),
+                    format!("CORS origin `{o}` is not a bare origin — use scheme://host[:port] with no path or trailing slash (e.g. https://app.example)."),
+                ));
+            }
+        }
+    }
+
     let declared_roles: Vec<&str> = d
         .auth
         .as_ref()
@@ -1101,6 +1146,74 @@ mod tests {
     #[test]
     fn complete_design_yields_no_questions() {
         assert!(validate(&design(MINIMAL)).is_empty());
+    }
+
+    /// Inject a `cors` block into MINIMAL (which is otherwise question-free).
+    fn with_cors(cors_json: &str) -> Design {
+        design(&MINIMAL.replace(
+            "\"contract_version\": 0,",
+            &format!("\"contract_version\": 0, \"cors\": {cors_json},"),
+        ))
+    }
+
+    /// A well-formed cors block yields NO questions — a valid cross-origin SPA
+    /// policy (issue #21) must validate clean.
+    #[test]
+    fn well_formed_cors_block_is_question_free() {
+        let d = with_cors(
+            r#"{ "origins": ["https://app.example", "http://localhost:3000"],
+                 "methods": ["GET", "POST"], "headers": ["content-type"],
+                 "allow_credentials": true }"#,
+        );
+        assert!(validate(&d).is_empty(), "{:?}", validate(&d));
+        // `*` alone (no credentials) is also valid.
+        let any = with_cors(r#"{ "origins": ["*"] }"#);
+        assert!(validate(&any).is_empty(), "{:?}", validate(&any));
+    }
+
+    /// The CORS footguns become pointed questions, not runtime boot failures:
+    /// empty origins, `*` mixed with an allowlist, `*` + credentials (Fetch-spec
+    /// forbidden — core's App::build rejects it), and a non-bare origin.
+    #[test]
+    fn cors_misconfig_yields_pointed_questions() {
+        // Empty origins.
+        let d = with_cors(r#"{ "origins": [] }"#);
+        assert!(
+            validate(&d).iter().any(|q| q.id == "/cors/origins"),
+            "empty origins must be a question: {:?}",
+            validate(&d)
+        );
+        // `*` mixed with an explicit origin.
+        let d = with_cors(r#"{ "origins": ["*", "https://app.example"] }"#);
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/cors/origins" && q.question.contains("mixes")),
+            "mixing `*` with explicit origins must be a question: {:?}",
+            validate(&d)
+        );
+        // `*` + credentials — the Fetch-spec violation core rejects at build time.
+        let d = with_cors(r#"{ "origins": ["*"], "allow_credentials": true }"#);
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/cors/allow_credentials"),
+            "`*` + credentials must be caught at design time: {:?}",
+            validate(&d)
+        );
+        // A non-bare origin (has a path / trailing slash / no scheme).
+        for bad in [
+            "https://app.example/",
+            "app.example",
+            "https://app.example/app",
+        ] {
+            let d = with_cors(&format!(r#"{{ "origins": ["{bad}"] }}"#));
+            assert!(
+                validate(&d).iter().any(|q| q.id == "/cors/origins/0"),
+                "malformed origin `{bad}` must be a question: {:?}",
+                validate(&d)
+            );
+        }
     }
 
     #[test]

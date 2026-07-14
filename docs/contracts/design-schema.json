@@ -29,6 +29,35 @@
       "type": "string",
       "description": "App-level mount prefix applied once to every module and bucket mount, e.g. '/v1' serves all routes under /v1. Health (/healthz) and metrics (/metrics) stay unprefixed. Empty, '/', or absent is a no-op. Must be an absolute path (leading '/', no trailing slash or '//')."
     },
+    "cors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origins"],
+      "description": "App-level CORS policy, installed via App::cors. Present => cross-origin requests from the listed origins are permitted (preflight OPTIONS answered before routing; actual responses decorated with the CORS headers); absent => same-origin only. The allowed origins are overridable at deploy time via the JERRYCAN_CORS_ORIGINS env var (comma-separated, '*' for any), falling back to this list — so a cross-origin SPA can be re-pointed without regenerating or hand-editing the tool-owned main.rs.",
+      "properties": {
+        "origins": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Allowed origins: exact scheme://host[:port] strings, or the single marker '*' for any origin (Access-Control-Allow-Origin: *). '*' cannot be combined with explicit origins or with allow_credentials."
+        },
+        "methods": {
+          "type": "array",
+          "items": { "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+          "description": "Methods advertised on preflight (Access-Control-Allow-Methods). Empty or absent => reflect the route's real methods."
+        },
+        "headers": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Request headers allowed on preflight (Access-Control-Allow-Headers), e.g. content-type, authorization. Empty or absent => reflect the request's Access-Control-Request-Headers."
+        },
+        "allow_credentials": {
+          "type": "boolean",
+          "default": false,
+          "description": "Emit Access-Control-Allow-Credentials: true (cookies / Authorization on cross-origin requests). The Fetch spec forbids combining this with '*' origins — validation rejects that pairing."
+        }
+      }
+    },
     "auth": {
       "type": "object",
       "additionalProperties": false,

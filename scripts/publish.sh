@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Publish jerrycan v0.2.0 to crates.io in dependency order.
+# Publish the jerrycan workspace to crates.io in dependency order (at whatever
+# version Cargo.toml currently carries).
 #
 # The crates form a DAG: jerrycan-core and jerrycan-macros have no internal
 # deps; jerrycan-db/auth/validate/observe depend on core; the `jerrycan` facade
@@ -36,7 +37,21 @@ else
   echo "!!! SKIP_EVAL_GATE=1 — skipping the eval gate (emergency republish only) !!!"
 fi
 
-CRATES=(jerrycan-core jerrycan-macros jerrycan-db jerrycan-auth jerrycan-validate jerrycan-observe jerrycan-ratelimit jerrycan-jobs jerrycan)
+# jerrycan-storage and jerrycan-realtime depend on core+db, so they publish
+# after those and before the facade. They were added in the 0.3.0 line and were
+# missing from this list, so the release pipeline never shipped them (issue #20).
+CRATES=(jerrycan-core jerrycan-macros jerrycan-db jerrycan-auth jerrycan-validate jerrycan-observe jerrycan-ratelimit jerrycan-jobs jerrycan-storage jerrycan-realtime jerrycan)
+
+# Publish-completeness guard (issue #20): every crate under crates/ MUST appear
+# in CRATES, or it silently never ships — exactly how storage/realtime were
+# missed. Fail loudly before any publish if a workspace crate is absent.
+for dir in crates/*/; do
+  name=$(sed -n 's/^name = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)
+  case " ${CRATES[*]} " in
+    *" $name "*) : ;;
+    *) echo "ERROR: workspace crate '$name' ($dir) is not in the publish list — add it in dependency order before the facade."; exit 1 ;;
+  esac
+done
 
 for c in "${CRATES[@]}"; do
   echo "=== publishing $c ==="
@@ -53,4 +68,4 @@ for c in "${CRATES[@]}"; do
   # Let the index update so the next crate resolves this one.
   echo "waiting 30s for crates.io index…"; sleep 30
 done
-echo "All crates published at 0.2.0."
+echo "All crates published."

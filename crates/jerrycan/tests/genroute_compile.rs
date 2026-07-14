@@ -713,6 +713,95 @@ fn generated_realtime_crate_passes_strict_clippy() {
     }
 }
 
+/// A memory-mode design carrying a `cors` block (issue #21): an explicit origin
+/// allowlist plus methods/headers/credentials. Memory mode keeps the build cheap
+/// (no db) while still emitting the full app/src/main.rs that carries the CORS
+/// wiring under test.
+const CORS_MINIMAL: &str = r#"{
+    "name": "cors-app",
+    "contract_version": 0,
+    "dependencies": [],
+    "cors": {
+        "origins": ["https://app.example", "https://admin.example"],
+        "methods": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+        "headers": ["content-type", "authorization"],
+        "allow_credentials": true
+    },
+    "modules": [{
+        "name": "things",
+        "endpoints": [
+            { "operation_id": "list_things", "method": "GET", "path": "/",
+              "success": { "status": 200 } }
+        ]
+    }]
+}"#;
+
+/// THE cors compile gate (issue #21): a `cors` block emits `.cors(CorsConfig::new(..))`
+/// plus a `JERRYCAN_CORS_ORIGINS` env-override preamble into the tool-owned
+/// app/src/main.rs. Nothing else in the suite compiles that main.rs under
+/// -D warnings, so this scaffolds a real app with a cors block and requires the
+/// `app` crate to pass strict clippy — empirically proving the emitted CORS wiring
+/// (and the env reader) actually compiles, not just that the string looks right.
+#[test]
+#[ignore = "scaffolds a cors app and invokes cargo on it; run with --include-ignored"]
+fn generated_cors_app_main_passes_strict_clippy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("cors-app");
+
+    let design: Design = serde_json::from_str(CORS_MINIMAL).expect("CORS_MINIMAL parses");
+    assert!(design.cors.is_some(), "design must declare a cors block");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, CORS_MINIMAL);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(status.success(), "jerrycan new must scaffold the cors app");
+
+    // Sanity: main.rs carries the emitted CORS layer + the env-override preamble.
+    let main = fs::read_to_string(app.join("crates/app/src/main.rs")).expect("read main.rs");
+    assert!(
+        main.contains(".cors(CorsConfig::new(cors_origins)")
+            && main.contains("std::env::var(\"JERRYCAN_CORS_ORIGINS\")"),
+        "main.rs must wire .cors(..) with the env override:\n{main}"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // The gate: strict clippy over the generated `app` crate compiles main.rs — the
+    // emitted `.cors(..)` layer and the JERRYCAN_CORS_ORIGINS reader must hold up
+    // under -D warnings (tool-owned code an agent never touches).
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "app",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", app.join("target"))
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "generated cors app failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");
