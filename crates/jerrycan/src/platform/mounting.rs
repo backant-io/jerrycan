@@ -66,11 +66,28 @@ fn extension_block(design: &Design) -> String {
     block
 }
 
+/// Join the app-level base prefix onto a mount path. `base` is `""` or `/v1`
+/// (no trailing slash); `mount` starts with `/`. A root module mount (`/`) under
+/// a base yields the base itself (`/v1`, never `/v1/`); an empty base is a no-op.
+fn join_mount(base: &str, mount: &str) -> String {
+    if base.is_empty() {
+        mount.to_string()
+    } else if mount == "/" {
+        base.to_string()
+    } else {
+        format!("{base}{mount}")
+    }
+}
+
 /// The complete, tool-owned app/src/main.rs for this design.
 pub fn expected_main(design: &Design) -> String {
     let mut modules: Vec<_> = design.modules.iter().collect();
     modules.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // App-level base prefix (issue #16): applied ONCE to every module and bucket
+    // mount here at assembly. Health/metrics come from the Observe extension, not
+    // these mounts, so they stay unprefixed.
+    let base = design.base_prefix();
     let mut mounts = String::new();
     for dep in design.dependencies.iter().filter(|d| {
         !matches!(
@@ -85,7 +102,7 @@ pub fn expected_main(design: &Design) -> String {
     for m in &modules {
         mounts.push_str(&format!(
             "        .mount(\"{}\", {}::module())\n",
-            m.effective_mount(),
+            join_mount(base, &m.effective_mount()),
             crate_ident(&m.name)
         ));
     }
@@ -95,13 +112,14 @@ pub fn expected_main(design: &Design) -> String {
     // bucket no longer shadows a `/media` module). The block, not a dependency, is
     // the gate; `storage` in `dependencies` stays a reserved (un-stubbed) name.
     if let Some(ref storage) = design.storage {
-        let base = storage.effective_base_path();
+        let storage_base = storage.effective_base_path();
         let mut buckets: Vec<_> = storage.buckets.iter().collect();
         buckets.sort_by(|a, b| a.name.cmp(&b.name));
         for b in buckets {
+            // Bucket mount = app base + storage base + bucket name.
+            let bucket_mount = join_mount(base, &format!("{storage_base}/{}", b.name));
             mounts.push_str(&format!(
-                "        .mount(\"{base}/{}\", storage::{}::module())\n",
-                b.name,
+                "        .mount(\"{bucket_mount}\", storage::{}::module())\n",
                 b.name.replace('-', "_")
             ));
         }
@@ -558,6 +576,65 @@ mod tests {
             !main.contains("/storage/avatars"),
             "the default prefix is replaced, not appended: {main}"
         );
+    }
+
+    /// A top-level base_path prefixes EVERY module and bucket mount once (issue
+    /// #16), while health (`/healthz`) and metrics (`/metrics`) — which come from
+    /// the Observe extension, not these mounts — stay unprefixed.
+    #[test]
+    fn app_base_path_prefixes_module_and_bucket_mounts_but_not_health_or_metrics() {
+        let mut d = storage_design();
+        d.base_path = Some("/v1".into());
+        let main = expected_main(&d);
+        assert!(
+            main.contains(".mount(\"/v1/orgs\", route_orgs::module())"),
+            "module mount is prefixed: {main}"
+        );
+        assert!(
+            main.contains(".mount(\"/v1/storage/avatars\", storage::avatars::module())"),
+            "bucket mount is prefixed (app base + storage base): {main}"
+        );
+        // Health/metrics are never mounted here, so the prefix can't reach them.
+        assert!(
+            !main.contains("/v1/healthz") && !main.contains("/v1/metrics"),
+            "health/metrics stay unprefixed: {main}"
+        );
+    }
+
+    /// A root-mounted module under a base_path yields the base itself, never a
+    /// dangling `/v1/`.
+    #[test]
+    fn app_base_path_joins_a_root_module_mount_without_a_trailing_slash() {
+        let mut d: Design = serde_json::from_str(
+            r#"{ "name": "root-api", "contract_version": 0, "dependencies": [],
+                "base_path": "/v1",
+                "modules": [{ "name": "api", "mount": "/",
+                    "endpoints": [{ "operation_id": "root", "method": "GET", "path": "/",
+                        "success": { "status": 200 } }] }] }"#,
+        )
+        .unwrap();
+        d.modules.sort_by(|a, b| a.name.cmp(&b.name));
+        let main = expected_main(&d);
+        assert!(
+            main.contains(".mount(\"/v1\", route_api::module())"),
+            "root module mounts at the base, no trailing slash: {main}"
+        );
+    }
+
+    /// Empty / `/` / absent base_path is a byte-for-byte no-op.
+    #[test]
+    fn empty_or_slash_base_path_is_a_no_op() {
+        let d = storage_design();
+        let baseline = expected_main(&d);
+        for bp in [None, Some(String::new()), Some("/".to_string())] {
+            let mut d2 = storage_design();
+            d2.base_path = bp.clone();
+            assert_eq!(
+                expected_main(&d2),
+                baseline,
+                "base_path {bp:?} must not change any mount"
+            );
+        }
     }
 
     /// No storage block → byte-for-byte no storage wiring.

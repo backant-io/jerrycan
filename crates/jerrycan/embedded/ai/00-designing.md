@@ -32,6 +32,10 @@ complete. Fix every question before scaffolding.
   is the legacy in-memory contract (a `json` field is rejected under db mode on
   v0). It does NOT have to be `1` — only `> 1` is rejected.
 - `description?` — free text.
+- `base_path?` — app-level mount prefix applied once to every module and bucket
+  mount, e.g. `"/v1"` serves all routes under `/v1`. Health (`/healthz`) and
+  metrics (`/metrics`) stay unprefixed. Empty/`/`/absent is a no-op; must be an
+  absolute path (leading `/`, no trailing slash).
 - `auth?` — `{ "model": "none" | "session" | "jwt", "roles": [string] }`. `model`
   is REQUIRED inside the block. A non-`none` model activates auth-mode generation
   (Session/Bearer guards, `require_role`) and implies the `auth` dependency.
@@ -127,7 +131,10 @@ Every entity has an `id` primary key. You usually do NOT declare it:
 ```json
 { "name": "status", "type": "string", "required": true, "unique": false, "index": false, "values": ["draft", "active"] }
 ```
-- `name` (REQUIRED) — snake_case, `^[a-z][a-z0-9_]*$`, and NOT a Rust keyword.
+- `name` (REQUIRED) — snake_case, `^[a-z][a-z0-9_]*$`. A Rust keyword (`type`,
+  `match`, `ref`, …) is allowed: codegen emits it as a raw identifier (`r#type`)
+  with a serde rename so the wire and column names stay unchanged. Only
+  `self`/`crate`/`super`, which no raw identifier can escape, are rejected.
 - `type` (REQUIRED) — one of seven: `string`, `integer`, `float`, `boolean`,
   `datetime`, `uuid`, `json`. Their Rust types:
 

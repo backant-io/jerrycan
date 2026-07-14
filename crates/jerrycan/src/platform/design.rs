@@ -10,6 +10,11 @@ pub struct Design {
     pub contract_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// App-level mount prefix applied ONCE to every module (and bucket) mount at
+    /// app assembly, e.g. `/v1` → all routes serve under `/v1`. Health (`/healthz`)
+    /// and metrics (`/metrics`) stay unprefixed. Empty/`/`/absent is a no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
     /// App-scoped dependency names the generator must provide on App.
@@ -339,6 +344,18 @@ impl ModuleDesign {
 }
 
 impl Design {
+    /// The normalized app-level mount prefix: the `base_path` override, or `""`
+    /// when absent / `/` / empty (a no-op). Prepended to every module and bucket
+    /// mount at app assembly; health/metrics are unaffected. Validation
+    /// guarantees a non-empty prefix starts with `/` and has no trailing slash,
+    /// so joining is a plain concatenation.
+    pub fn base_prefix(&self) -> &str {
+        match self.base_path.as_deref() {
+            None | Some("") | Some("/") => "",
+            Some(p) => p,
+        }
+    }
+
     /// Reserved dependency name `db` switches generation to SQL mode.
     pub fn wants_db(&self) -> bool {
         self.dependencies.iter().any(|d| d == "db")

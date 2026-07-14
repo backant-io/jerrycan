@@ -25,6 +25,10 @@
     "description": {
       "type": "string"
     },
+    "base_path": {
+      "type": "string",
+      "description": "App-level mount prefix applied once to every module and bucket mount, e.g. '/v1' serves all routes under /v1. Health (/healthz) and metrics (/metrics) stay unprefixed. Empty, '/', or absent is a no-op. Must be an absolute path (leading '/', no trailing slash or '//')."
+    },
     "auth": {
       "type": "object",
       "additionalProperties": false,

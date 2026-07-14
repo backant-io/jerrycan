@@ -78,6 +78,27 @@ pub fn validate(d: &Design) -> Vec<Question> {
             "No modules defined — what are the resource areas of this backend (each becomes a route crate)?",
         ));
     }
+    // A top-level base_path is emitted verbatim into every mount, so it must be a
+    // clean absolute path (like a module mount). Empty/`/` is a documented no-op.
+    if let Some(base) = &d.base_path
+        && !base.is_empty()
+        && base != "/"
+    {
+        if !base.starts_with('/') {
+            qs.push(q(
+                "/base_path",
+                format!("App base_path `{base}` must start with '/'."),
+            ));
+        }
+        if base.contains("//") || base.ends_with('/') {
+            qs.push(q(
+                "/base_path",
+                format!(
+                    "App base_path `{base}` must not contain `//` or end with a trailing slash."
+                ),
+            ));
+        }
+    }
 
     let declared_roles: Vec<&str> = d
         .auth
