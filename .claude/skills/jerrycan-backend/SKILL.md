@@ -115,7 +115,7 @@ OpenAPI · `jerrycan package` (binaries/containers/k8s/systemd).
 | Composite / nested / computed response shapes | `request_body`/`success` are entity-only | Hand-write a `Json<Value>` handler (declare `success.status` only) |
 | Custom middleware / interceptors | Fixed kit only (CORS, rate-limit, access-log) | Not extensible per-route in v2 |
 | Multi-step workflows / job chains / priorities | Jobs are single-shot | Out (the jobs contract is capped) |
-| WebAuthn / SAML / RS256 JWT | Out of scope | session/JWT(HS) + OAuth2-client + API keys only |
+| WebAuthn / SAML | Out of scope | session/JWT(HS) + OAuth2-client + API keys; native Apple/Google Sign-In via RS256 provider ID-token verify (`jerrycan-auth` `idtoken` feature) |
 | `std::process` / `std::fs` / raw sockets in handlers | Forbidden by the JL0007 lint | Go through a framework extension or an allow-hatch (rare) |
 
 **Checkpoint:** confirm the in-scope design and the agreed handling for any wall.
