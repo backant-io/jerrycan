@@ -44,6 +44,12 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 # provider, SCRAM). It owns the WAL socket / startup / auth / framing / standby
 # status; sqlx stays the sole data-layer client. Verified 0.3.2 on crates.io.
 pgwire-replication = { version = "0.3.2", default-features = false, features = ["tls-rustls", "scram"] }
+# Third-party ID-token (Sign in with Apple / Google) verification, behind
+# jerrycan-auth's `idtoken` feature only. RS256 + JWKS via `ring` (the crypto
+# backend already in the tree through hyper-rustls/rustls) — deliberately NOT the
+# pure-Rust `rsa` crate, so the RUSTSEC-2023-0071 Marvin advisory never enters the
+# compiled artifact. `use_pem` is enabled for the in-test token signer.
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 argon2 = "0.5"
 bcrypt = "0.17"
 chacha20poly1305 = "0.10"

@@ -32,6 +32,10 @@ complete. Fix every question before scaffolding.
   is the legacy in-memory contract (a `json` field is rejected under db mode on
   v0). It does NOT have to be `1` — only `> 1` is rejected.
 - `description?` — free text.
+- `base_path?` — app-level mount prefix applied once to every module and bucket
+  mount, e.g. `"/v1"` serves all routes under `/v1`. Health (`/healthz`) and
+  metrics (`/metrics`) stay unprefixed. Empty/`/`/absent is a no-op; must be an
+  absolute path (leading `/`, no trailing slash).
 - `auth?` — `{ "model": "none" | "session" | "jwt", "roles": [string] }`. `model`
   is REQUIRED inside the block. A non-`none` model activates auth-mode generation
   (Session/Bearer guards, `require_role`) and implies the `auth` dependency.
@@ -101,11 +105,14 @@ complete. Fix every question before scaffolding.
     DB's.
 - `fields` (REQUIRED) — at least one (see Field).
 
-The SQL **table name** is `lowercase(entity) + "s"` — `Ticket` → `tickets`,
-`Workspace` → `workspaces`, `ApiKey` → `apikeys`. Note this is NOT snake_case, so
-a multi-word entity's table differs from its fk column: `ApiKey` → table
-`apikeys` but fk column `api_key_id`. You need the exact table name only for
-hand-written cross-module SQL (the generated repo handles intra-module access).
+The SQL **table name** defaults to `snake_case(entity)`, pluralized — `Ticket` →
+`tickets`, `Workspace` → `workspaces`, `ApiKey` → `api_keys`, `EnergySummary` →
+`energy_summaries`. Pluralization is the ordinary English rule (consonant + `y` →
+`ies`; ends in `s`/`x`/`z`/`ch`/`sh` → `es`; else `+s`). A multi-word entity's
+table therefore shares the snake_case stem of its fk column (`ApiKey` → table
+`api_keys`, fk column `api_key_id`). Set `"table": "…"` on an entity to override
+the name verbatim (a frozen external schema). You need the exact table name only
+for hand-written cross-module SQL (the generated repo handles intra-module access).
 
 ### The `id` field (primary key)
 Every entity has an `id` primary key. You usually do NOT declare it:
@@ -124,7 +131,10 @@ Every entity has an `id` primary key. You usually do NOT declare it:
 ```json
 { "name": "status", "type": "string", "required": true, "unique": false, "index": false, "values": ["draft", "active"] }
 ```
-- `name` (REQUIRED) — snake_case, `^[a-z][a-z0-9_]*$`, and NOT a Rust keyword.
+- `name` (REQUIRED) — snake_case, `^[a-z][a-z0-9_]*$`. A Rust keyword (`type`,
+  `match`, `ref`, …) is allowed: codegen emits it as a raw identifier (`r#type`)
+  with a serde rename so the wire and column names stay unchanged. Only
+  `self`/`crate`/`super`, which no raw identifier can escape, are rejected.
 - `type` (REQUIRED) — one of seven: `string`, `integer`, `float`, `boolean`,
   `datetime`, `uuid`, `json`. Their Rust types:
 
@@ -183,6 +193,12 @@ Every entity has an `id` primary key. You usually do NOT declare it:
   tenant's rows. **Put public endpoints — webhooks, an inbound-ingest route, a
   login/register — in their OWN module** that has no tenant-owned entity
   (entity-less is fine).
+- `probe?` — `"auto"` (default) or `"skip"`. `skip` tells the generator NOT to
+  emit the happy-path 2xx probe for an endpoint whose success needs a credential
+  it can't synthesize (login, signed webhook, api-key route) — otherwise that
+  probe is un-greenable and `jerrycan check` can never reach `ok:true`. With
+  `skip` the generator emits an AGENT TODO; you write the credentialed success +
+  rejection tests yourself.
 - `request_body?` — `{ "entity": "<Name>" }` ONLY. The body is the named entity;
   the entity must be declared in THIS module. There is no narrower/custom input
   DTO in the design — for an endpoint that takes untrusted public input, defend

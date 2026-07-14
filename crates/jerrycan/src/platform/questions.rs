@@ -17,15 +17,6 @@ fn q(id: impl Into<String>, question: impl Into<String>) -> Question {
     }
 }
 
-/// Reserved words that cannot appear as field/entity identifiers: generated
-/// model.rs uses them verbatim as struct/field names and would not compile.
-const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
-    "where", "while",
-];
-
 fn is_kebab(s: &str) -> bool {
     !s.is_empty()
         && s.starts_with(|c: char| c.is_ascii_lowercase())
@@ -86,6 +77,27 @@ pub fn validate(d: &Design) -> Vec<Question> {
             "/modules",
             "No modules defined — what are the resource areas of this backend (each becomes a route crate)?",
         ));
+    }
+    // A top-level base_path is emitted verbatim into every mount, so it must be a
+    // clean absolute path (like a module mount). Empty/`/` is a documented no-op.
+    if let Some(base) = &d.base_path
+        && !base.is_empty()
+        && base != "/"
+    {
+        if !base.starts_with('/') {
+            qs.push(q(
+                "/base_path",
+                format!("App base_path `{base}` must start with '/'."),
+            ));
+        }
+        if base.contains("//") || base.ends_with('/') {
+            qs.push(q(
+                "/base_path",
+                format!(
+                    "App base_path `{base}` must not contain `//` or end with a trailing slash."
+                ),
+            ));
+        }
     }
 
     let declared_roles: Vec<&str> = d
@@ -413,6 +425,24 @@ pub fn validate(d: &Design) -> Vec<Question> {
         }
         let module_mounts: std::collections::HashSet<String> =
             d.modules.iter().map(|m| m.effective_mount()).collect();
+        // A custom base_path is emitted verbatim into every bucket mount, so it
+        // must be a clean absolute path (leading `/`, no trailing/`//`), like a
+        // module mount.
+        if let Some(base) = &storage.base_path {
+            if !base.starts_with('/') {
+                qs.push(q(
+                    "/storage/base_path",
+                    format!("Storage base_path `{base}` must start with '/'."),
+                ));
+            }
+            if base.contains("//") || (base.len() > 1 && base.ends_with('/')) {
+                qs.push(q(
+                    "/storage/base_path",
+                    format!("Storage base_path `{base}` must not contain `//` or end with a trailing slash."),
+                ));
+            }
+        }
+        let base_path = storage.effective_base_path();
         let mut seen_buckets = std::collections::HashSet::new();
         for (i, b) in storage.buckets.iter().enumerate() {
             let bptr = format!("/storage/buckets/{i}");
@@ -423,7 +453,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 ));
             }
             let ident = b.name.replace('-', "_");
-            if RUST_KEYWORDS.contains(&ident.as_str()) {
+            if is_rust_keyword(&ident) {
                 qs.push(q(
                     format!("{bptr}/name"),
                     format!("Bucket `{}` becomes the Rust module `{ident}`, which is a keyword — rename it.", b.name),
@@ -438,10 +468,11 @@ pub fn validate(d: &Design) -> Vec<Question> {
                     ),
                 ));
             }
-            if module_mounts.contains(&format!("/{}", b.name)) {
+            let bucket_mount = format!("{base_path}/{}", b.name);
+            if module_mounts.contains(&bucket_mount) {
                 qs.push(q(
                     format!("{bptr}/name"),
-                    format!("Bucket `{}` mounts at /{} which collides with a module mount — rename the bucket or remount the module.", b.name, b.name),
+                    format!("Bucket `{}` mounts at {bucket_mount} which collides with a module mount — rename the bucket, change storage.base_path, or remount the module.", b.name),
                 ));
             }
             if let Some(ref owner) = b.owner
@@ -610,13 +641,23 @@ fn validate_module(
                 format!("Entity `{}` must be PascalCase.", e.name),
             ));
         }
-        if RUST_KEYWORDS.contains(&e.name.as_str()) {
+        if is_rust_keyword(&e.name) {
             qs.push(q(
                 format!("{ptr}/entities/{i}/name"),
                 format!(
-                    "Entity `{}` is a Rust keyword — generated model code cannot use it; rename it (e.g. a domain-specific name).",
+                    "Entity `{}` is a Rust keyword — it becomes a module/type name that no raw identifier can escape; rename it (e.g. a domain-specific name).",
                     e.name
                 ),
+            ));
+        }
+        // An explicit `table` override is used VERBATIM in DDL/queries, so it must
+        // be a safe snake_case identifier — reject anything else up front.
+        if let Some(table) = &e.table
+            && !is_snake(table)
+        {
+            qs.push(q(
+                format!("{ptr}/entities/{i}/table"),
+                format!("Table override `{table}` must be snake_case (^[a-z][a-z0-9_]*$)."),
             ));
         }
         if e.fields.is_empty() {
@@ -635,11 +676,16 @@ fn validate_module(
                     format!("Field `{}` must be snake_case.", f.name),
                 ));
             }
-            if RUST_KEYWORDS.contains(&f.name.as_str()) {
+            // A keyword field name is fine: codegen emits it as a raw identifier
+            // (`type` → `r#type`) with a `#[serde(rename)]` so the wire name is
+            // unchanged — a frozen external contract keeps its `type`/`match`/
+            // `ref` field. Only `crate`/`self`/`super`, which no `r#` can escape,
+            // are still rejected.
+            if !can_be_rust_ident(&f.name) {
                 qs.push(q(
                     format!("{ptr}/entities/{i}/fields/{j}/name"),
                     format!(
-                        "Field `{name}` is a Rust keyword — generated model code cannot use it; rename (e.g. `{name}_field` or a domain-specific name).",
+                        "Field `{name}` is a Rust keyword that no raw identifier can escape — rename (e.g. `{name}_field` or a domain-specific name).",
                         name = f.name
                     ),
                 ));
@@ -1018,14 +1064,37 @@ mod tests {
 
     #[test]
     fn bucket_mounts_must_not_collide_with_module_mounts() {
-        // WHY: buckets mount at /<name> beside the modules — a collision would
-        // shadow routes silently at serve time.
-        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
-        d.storage.as_mut().unwrap().buckets[0].name = "orgs".into();
+        // WHY: buckets mount at {base_path}/<name> beside the modules — a
+        // collision would shadow routes silently at serve time (issue #8). Under
+        // the default /storage prefix, a bucket named `avatars` no longer
+        // collides with a module at `/orgs`; the collision needs a module mounted
+        // at the bucket's actual path (`/storage/avatars`).
+        let base: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        assert!(
+            validate(&base).is_empty(),
+            "default /storage prefix keeps buckets clear of the /orgs module: {:?}",
+            validate(&base)
+        );
+        // A module remounted onto the bucket's storage path collides.
+        let mut d = base.clone();
+        d.modules[0].mount = Some("/storage/avatars".into());
         assert!(
             validate(&d)
                 .iter()
-                .any(|q| q.id == "/storage/buckets/0/name" && q.question.contains("mount"))
+                .any(|q| q.id == "/storage/buckets/0/name" && q.question.contains("collides")),
+            "a module at /storage/avatars collides with the avatars bucket: {:?}",
+            validate(&d)
+        );
+        // A custom base_path recomputes the collision against the new prefix.
+        let mut d2: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d2.storage.as_mut().unwrap().base_path = Some("/files".into());
+        d2.modules[0].mount = Some("/files/avatars".into());
+        assert!(
+            validate(&d2)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/name" && q.question.contains("collides")),
+            "collision follows the custom base_path: {:?}",
+            validate(&d2)
         );
     }
 
@@ -1190,15 +1259,35 @@ mod tests {
     }
 
     #[test]
-    fn rust_keyword_field_names_are_rejected() {
-        // `type` is a Rust keyword — generated `pub type: ...` would not compile.
-        let d = design(&MINIMAL.replace("\"name\": \"title\"", "\"name\": \"type\""));
-        assert!(
-            validate(&d)
-                .iter()
-                .any(|q| q.question.contains("Rust keyword") && q.question.contains("`type`")),
-            "keyword field name must be flagged"
-        );
+    fn raw_escapable_keyword_field_names_are_accepted() {
+        // WHY: `type`/`match`/`ref` are common field names in frozen external
+        // wire contracts. Codegen raw-escapes them (`r#type`) with a serde
+        // rename, so forcing a rename would push a permanent wire↔storage
+        // mapping into every handler. Validation must NOT flag them.
+        for kw in ["type", "match", "ref"] {
+            let d = design(&MINIMAL.replace("\"name\": \"title\"", &format!("\"name\": \"{kw}\"")));
+            assert!(
+                !validate(&d)
+                    .iter()
+                    .any(|q| q.id.contains("/fields/") && q.question.contains("keyword")),
+                "keyword field `{kw}` is raw-escapable and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn unescapable_keyword_field_names_are_still_rejected() {
+        // `self`/`crate`/`super` are keywords no raw identifier can escape
+        // (`r#self` is invalid Rust), so a field named one still can't compile.
+        for kw in ["self", "crate", "super"] {
+            let d = design(&MINIMAL.replace("\"name\": \"title\"", &format!("\"name\": \"{kw}\"")));
+            assert!(
+                validate(&d)
+                    .iter()
+                    .any(|q| q.id.contains("/fields/") && q.question.contains("keyword")),
+                "unescapable keyword field `{kw}` must be flagged"
+            );
+        }
     }
 
     #[test]

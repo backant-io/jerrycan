@@ -222,18 +222,35 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
         out.push_str(&e.name);
         out.push_str(" {\n");
         for f in &e.fields {
+            out.push_str(&keyword_field_attrs(&f.name, "    ", false));
             if !f.required {
                 out.push_str("    #[serde(default)]\n");
             }
             out.push_str(&format!(
                 "    pub {}: {},\n",
-                f.name,
+                rust_ident(&f.name),
                 f.field_type.rust_type()
             ));
         }
         out.push_str("}\n\n");
     }
     Some(out)
+}
+
+/// serde `rename` (+ sea_orm `column_name` in db mode) attribute line(s) for a
+/// field whose name is a Rust keyword: its struct field is emitted as a raw
+/// identifier (`type` → `r#type`), so these keep the wire (JSON) name — and the
+/// SQL column name — as the original `type`. Empty for a non-keyword field, so
+/// output is byte-identical to before for every existing design.
+fn keyword_field_attrs(name: &str, indent: &str, db: bool) -> String {
+    if !is_rust_keyword(name) {
+        return String::new();
+    }
+    let mut s = format!("{indent}#[serde(rename = \"{name}\")]\n");
+    if db {
+        s.push_str(&format!("{indent}#[sea_orm(column_name = \"{name}\")]\n"));
+    }
+    s
 }
 
 /// PascalCase a snake_case column name for SeaORM's `Column` variants:
@@ -267,7 +284,7 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design) -> Option<String> {
     );
     for e in &m.entities {
         let snake = Design::to_snake(&e.name);
-        let table = table_name(&e.name);
+        let table = design.table_name(&e.name);
         let key = key_rust_type(e);
         // The synthetic pk surfaces as a visible `id` field so POST bodies may
         // omit it (`#[serde(default)]`); a declared id has no default.
@@ -296,11 +313,15 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design) -> Option<String> {
                 FieldType::Boolean => "bool",
                 _ => f.field_type.rust_type(),
             };
+            // A keyword field is a raw identifier (`type` → `r#type`); the serde
+            // rename + sea_orm column_name keep the wire and SQL names as `type`.
+            fields.push_str(&keyword_field_attrs(&f.name, "        ", true));
+            let ident = rust_ident(&f.name);
             if f.required {
-                fields.push_str(&format!("        pub {}: {base},\n", f.name));
+                fields.push_str(&format!("        pub {ident}: {base},\n"));
             } else {
                 fields.push_str("        #[serde(default)]\n");
-                fields.push_str(&format!("        pub {}: Option<{base}>,\n", f.name));
+                fields.push_str(&format!("        pub {ident}: Option<{base}>,\n"));
             }
         }
 
@@ -411,11 +432,6 @@ impl Default for {n}Repo {{
     out
 }
 
-/// SQL table name for an entity: lowercased + pluralized (`Todo` → `todos`).
-fn table_name(entity: &str) -> String {
-    format!("{}s", entity.to_lowercase())
-}
-
 /// The Model field names in struct order — the order `model_rs_db` emits and
 /// the order an ActiveModel literal must set them: pk `id`, then fk columns (in
 /// belongs_to order), then the declared non-id fields. Used to build the
@@ -449,7 +465,10 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
                 out.push_str(&format!("{indent}id: sea_orm::ActiveValue::NotSet,\n"));
             }
         } else {
-            out.push_str(&format!("{indent}{name}: Set(item.{name}),\n"));
+            // A keyword field is a raw identifier on both the ActiveModel field
+            // and the moved-in `item` value (`r#type: Set(item.r#type)`).
+            let ident = rust_ident(&name);
+            out.push_str(&format!("{indent}{ident}: Set(item.{ident}),\n"));
         }
     }
     out
@@ -714,7 +733,7 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
     let local: std::collections::HashSet<&str> =
         m.entities.iter().map(|e| e.name.as_str()).collect();
     for e in &m.entities {
-        let tbl = table_name(&e.name);
+        let tbl = design.table_name(&e.name);
         let mut table = Table::create();
         table.table(Alias::new(tbl.clone()));
         // A declared `id` field IS the pk (typed as declared); only entities
@@ -740,7 +759,7 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
         // bare column + an index + a documenting comment (no FK constraint).
         for b in &e.belongs_to {
             let col = Design::fk_column(&b.entity);
-            let target_table = table_name(&b.entity);
+            let target_table = design.table_name(&b.entity);
             let mut fk_col = ColumnDef::new(Alias::new(col.clone()));
             match design.target_key_rust_type(&b.entity) {
                 "String" => ddl_typed(&mut fk_col, FieldType::String, backend_is_pg),
@@ -828,7 +847,7 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
     if let Some(tenancy) = &design.tenancy
         && m.entities.iter().any(|e| e.name == tenancy.entity)
     {
-        let tenant_table = table_name(&tenancy.entity);
+        let tenant_table = design.table_name(&tenancy.entity);
         let members = format!("{}_members", Design::to_snake(&tenancy.entity));
         let fk = Design::fk_column(&tenancy.entity);
         let mut table = Table::create();
@@ -1523,6 +1542,58 @@ mod tests {
         );
     }
 
+    /// A field named after a Rust keyword (`type`) survives into generated code
+    /// as a RAW identifier (`r#type`) at every Rust position — the Model struct
+    /// field and the ActiveModel `field: Set(item.field)` binds — while the serde
+    /// rename + sea_orm column_name keep the wire (JSON) and SQL names as `type`.
+    /// WHY: frozen external wire contracts carry `type`/`match`/`ref` fields;
+    /// forcing a rename would push a permanent wire↔storage mapping into every
+    /// handler. (Issue #10.)
+    #[test]
+    fn keyword_field_names_become_raw_identifiers_with_preserved_wire_and_sql_names() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "webhooks", "contract_version": 1, "dependencies": ["db"],
+                "modules": [{ "name": "events",
+                    "entities": [{ "name": "Event", "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "type", "type": "string" } ] }],
+                    "endpoints": [{ "operation_id": "create_event", "method": "POST", "path": "/",
+                        "request_body": { "entity": "Event" },
+                        "success": { "status": 201, "entity": "Event" } }] }] }"#,
+        )
+        .unwrap();
+        // The design is accepted (validator no longer rejects the keyword field).
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "a `type` field must not raise a question: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let m = &d.modules[0];
+        // db-mode Model: raw ident + serde rename + sea_orm column_name.
+        let model = model_rs_db(m, &d).unwrap();
+        assert!(
+            model.contains("#[serde(rename = \"type\")]\n        #[sea_orm(column_name = \"type\")]\n        pub r#type: String,"),
+            "keyword field is a raw ident carrying rename + column_name: {model}"
+        );
+        // ActiveModel assignment uses the raw ident on both sides.
+        let e = &m.entities[0];
+        let sets = active_sets(e, true);
+        assert!(
+            sets.contains("r#type: Set(item.r#type),"),
+            "ActiveModel binds the raw ident: {sets}"
+        );
+        // memory-mode Model: raw ident + serde rename (no sea_orm attr).
+        let mem = model_rs(m).unwrap();
+        assert!(
+            mem.contains("#[serde(rename = \"type\")]\n    pub r#type: String,"),
+            "memory Model raw ident + rename: {mem}"
+        );
+        assert!(
+            !mem.contains("column_name"),
+            "no sea_orm attr in memory mode: {mem}"
+        );
+    }
+
     /// Intra-module belongs_to wires a Relation arm + Related impl (cross-module
     /// stays a bare fk for decoupling); a synthetic pk gets `#[serde(default)]`
     /// so POST bodies may omit `id`; SetNull makes the fk `Option<_>` + default.
@@ -1667,6 +1738,7 @@ mod tests {
             auth_required: false,
             required_roles: vec![],
             public: false,
+            probe: ProbePolicy::default(),
             request_body: None,
             success: Success {
                 status: 204,

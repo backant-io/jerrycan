@@ -50,6 +50,11 @@ enum Cmd {
     Check {
         #[arg(long)]
         module: Option<String>,
+        /// Run every test target (cargo --no-fail-fast) and report per-module
+        /// pass/fail counts, instead of stopping at the first failing target.
+        /// For TDD: see the whole red→green picture in one run.
+        #[arg(long, alias = "full-report")]
+        no_fail_fast: bool,
     },
     /// Run the app's (or one module's) test suite
     Test {
@@ -211,7 +216,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
             what: ListCmd::Routes,
         } => cmd_list_routes(cli.json),
         Cmd::Dev { addr } => cmd_dev(addr.as_deref()),
-        Cmd::Check { module } => cmd_check(module.as_deref(), cli.json),
+        Cmd::Check {
+            module,
+            no_fail_fast,
+        } => cmd_check(module.as_deref(), no_fail_fast, cli.json),
         Cmd::Test { module } => cmd_test(module.as_deref()),
         Cmd::GenTests { module } => cmd_gen_tests(&module, cli.json),
         Cmd::Docs {
@@ -888,7 +896,7 @@ fn cmd_list_routes(json_mode: bool) -> Result<(), Failure> {
     Ok(())
 }
 
-fn cmd_check(module: Option<&str>, json_mode: bool) -> Result<(), Failure> {
+fn cmd_check(module: Option<&str>, no_fail_fast: bool, json_mode: bool) -> Result<(), Failure> {
     let root = app_root()?;
     let design = load_design(&root.join("design.json"))?;
 
@@ -901,11 +909,19 @@ fn cmd_check(module: Option<&str>, json_mode: bool) -> Result<(), Failure> {
     }
 
     // Same shared core the MCP twin runs — drift between CLI and MCP is impossible.
-    let report = checkpipe::run_all(&root, &design, module).map_err(Failure::environment)?;
+    let report =
+        checkpipe::run_all(&root, &design, module, no_fail_fast).map_err(Failure::environment)?;
     if json_mode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("report serializes")
+        );
+    }
+    // --no-fail-fast: show the per-target red→green split for the human too.
+    for m in &report.test_modules {
+        eprintln!(
+            "tests[{}]: {} passed, {} failed",
+            m.module, m.passed, m.failed
         );
     }
     for d in &report.diagnostics {

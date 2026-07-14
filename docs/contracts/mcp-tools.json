@@ -104,6 +104,8 @@
         "type": "object",
         "properties": {
           "module": { "type": "string", "description": "Omit for the full workspace." },
+          "no_fail_fast": { "type": "boolean", "description": "Run every test target and return per-module pass/fail counts (test_modules) instead of stopping at the first failing target. For TDD red→green visibility." },
+          "full_report": { "type": "boolean", "description": "Alias for no_fail_fast." },
           "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
         },
         "additionalProperties": false
@@ -125,6 +127,19 @@
                 "doc_url": { "type": "string" }
               },
               "required": ["code", "message"]
+            }
+          },
+          "test_modules": {
+            "type": "array",
+            "description": "Present only under no_fail_fast: per-target (cargo package) pass/fail counts.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "module": { "type": "string" },
+                "passed": { "type": "integer" },
+                "failed": { "type": "integer" }
+              },
+              "required": ["module", "passed", "failed"]
             }
           },
           "next_step": { "type": "string" }

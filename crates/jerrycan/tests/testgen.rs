@@ -74,6 +74,47 @@ fn db_mode_preamble_migrates_an_in_memory_database() {
     assert!(generated.contains(".extend(db)"), "{generated}");
 }
 
+/// A module's TestApp migrates the FULL workspace schema (issue #14), not just
+/// its own tables — so a handler that legitimately writes ANOTHER module's table
+/// no longer 500s with "no such table" under the module TestApp. The `orders`
+/// TestApp must include BOTH its own migration (relative) AND the `products`
+/// module's migration (cross-crate `../../products/...`).
+#[test]
+fn module_testapp_migrates_the_full_workspace_schema() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "shop-api",
+        "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [
+            { "name": "products",
+              "entities": [{ "name": "Product", "fields": [
+                  { "name": "sku", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_products", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Product", "list": true } }] },
+            { "name": "orders",
+              "entities": [{ "name": "Order", "fields": [
+                  { "name": "total", "type": "integer" } ]}],
+              "endpoints": [{ "operation_id": "list_orders", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Order", "list": true } }] }
+        ]
+    }))
+    .unwrap();
+    let orders = design.modules.iter().find(|m| m.name == "orders").unwrap();
+    let generated = testgen::acceptance_rs(&design, orders);
+    // Its own tables (relative include).
+    assert!(
+        generated.contains("include_str!(\"../migrations/sqlite/0001_create_tables.sql\")"),
+        "orders TestApp migrates its own tables: {generated}"
+    );
+    // AND the products module's tables (cross-crate include) — the whole point:
+    // an orders handler may write the products table.
+    assert!(
+        generated
+            .contains("include_str!(\"../../products/migrations/sqlite/0001_create_tables.sql\")"),
+        "orders TestApp must also migrate the products module's tables: {generated}"
+    );
+}
+
 #[test]
 fn unsupported_error_cases_become_an_agent_todo_comment() {
     let mut design = golden(false);
@@ -397,6 +438,50 @@ fn credential_gated_endpoints_get_an_agent_todo_not_a_success_test() {
             "// AGENT TODO: stripe_webhook (POST /accounts/webhook) authenticates via a credential/signature"
         ),
         "webhook must get a credential AGENT TODO: {generated}"
+    );
+}
+
+/// An explicit `probe: "skip"` hint (issue #11) makes the generator drop the
+/// un-greenable 2xx probe even when the heuristic MISSES the endpoint — here a
+/// `public` webhook that declares NO 401/403 error, so `endpoint_is_credential_gated`
+/// wouldn't flag it. WHY (Rule 9): without the hint the generator would emit a
+/// `_returns_200` probe that a correct signature-checking handler MUST reject,
+/// so `jerrycan check` could never reach ok:true. With the hint it emits a TODO,
+/// and an ordinary (auto) endpoint in the same module still gets its success probe.
+#[test]
+fn probe_skip_hint_drops_the_ungreenable_success_probe() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "ingest-api",
+        "contract_version": 1,
+        "dependencies": [],
+        "modules": [{
+            "name": "ingest",
+            "endpoints": [
+                // A public webhook the heuristic misses (no declared 401/403, no
+                // "signature" in a `when`), marked probe: skip explicitly.
+                { "operation_id": "receive_hook", "method": "POST", "path": "/hook",
+                  "public": true, "probe": "skip",
+                  "success": { "status": 202 } },
+                // An ordinary endpoint (auto) still gets its happy-path probe.
+                { "operation_id": "health_ping", "method": "GET", "path": "/ping",
+                  "success": { "status": 200 } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        !generated.contains("async fn receive_hook_returns_"),
+        "probe: skip must drop the un-greenable success probe: {generated}"
+    );
+    assert!(
+        generated
+            .contains("// AGENT TODO: receive_hook (POST /ingest/hook) is marked `probe: skip`"),
+        "probe: skip must emit an explanatory TODO: {generated}"
+    );
+    assert!(
+        generated.contains("async fn health_ping_returns_200()"),
+        "an ordinary (auto) endpoint still gets its success probe: {generated}"
     );
 }
 

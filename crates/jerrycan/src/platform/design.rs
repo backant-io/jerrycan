@@ -10,6 +10,11 @@ pub struct Design {
     pub contract_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// App-level mount prefix applied ONCE to every module (and bucket) mount at
+    /// app assembly, e.g. `/v1` → all routes serve under `/v1`. Health (`/healthz`)
+    /// and metrics (`/metrics`) stay unprefixed. Empty/`/`/absent is a no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
     /// App-scoped dependency names the generator must provide on App.
@@ -96,6 +101,11 @@ pub struct ModuleDesign {
 #[serde(deny_unknown_fields)]
 pub struct Entity {
     pub name: String,
+    /// Explicit SQL table name, used verbatim when present. Absent ⇒ the default
+    /// `snake_case(name)` pluralized (see `Design::table_name`). Lets a frozen
+    /// external schema keep its exact table name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub belongs_to: Vec<BelongsTo>,
     pub fields: Vec<Field>,
@@ -186,7 +196,23 @@ pub struct JobDesign {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageDesign {
+    /// Mount prefix for every bucket: each serves under `{base_path}/{bucket}`
+    /// (default `/storage`, see `effective_base_path`), keeping bucket routes
+    /// clear of module mounts. A bucket named `media` no longer collides with a
+    /// module mounted at `/media`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
     pub buckets: Vec<BucketDesign>,
+}
+
+impl StorageDesign {
+    /// The normalized bucket mount prefix: the `base_path` override (validation
+    /// guarantees it starts with `/` and has no trailing slash) or `/storage`.
+    pub fn effective_base_path(&self) -> String {
+        self.base_path
+            .clone()
+            .unwrap_or_else(|| "/storage".to_string())
+    }
 }
 
 /// One bucket: mounts at `/<name>` with generated guarded endpoints.
@@ -236,9 +262,36 @@ pub struct Endpoint {
     pub public: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body: Option<RequestBody>,
+    /// How the generator probes this endpoint's success. Default `auto`. Set
+    /// `skip` for an endpoint whose success needs a credential/signature the
+    /// generator can't synthesize (login, signed webhook, api-key route): an
+    /// uncredentialed 2xx probe could never pass, so `jerrycan check` could never
+    /// reach `ok:true`. With `skip`, the generator emits a TODO for the author to
+    /// write the credentialed success + rejection tests instead.
+    #[serde(default, skip_serializing_if = "ProbePolicy::is_auto")]
+    pub probe: ProbePolicy,
     pub success: Success,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ErrorCase>,
+}
+
+/// Per-endpoint control over the generated happy-path success probe (issue #11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbePolicy {
+    /// Emit the happy-path 2xx probe (the default for every ordinary endpoint).
+    #[default]
+    Auto,
+    /// Do NOT emit the 2xx probe — the endpoint authenticates via a credential
+    /// the generator can't supply, so the author owns its success/rejection tests.
+    Skip,
+}
+
+impl ProbePolicy {
+    /// `true` for the default `auto` policy (so serialization can skip it).
+    pub fn is_auto(&self) -> bool {
+        matches!(self, ProbePolicy::Auto)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -318,6 +371,18 @@ impl ModuleDesign {
 }
 
 impl Design {
+    /// The normalized app-level mount prefix: the `base_path` override, or `""`
+    /// when absent / `/` / empty (a no-op). Prepended to every module and bucket
+    /// mount at app assembly; health/metrics are unaffected. Validation
+    /// guarantees a non-empty prefix starts with `/` and has no trailing slash,
+    /// so joining is a plain concatenation.
+    pub fn base_prefix(&self) -> &str {
+        match self.base_path.as_deref() {
+            None | Some("") | Some("/") => "",
+            Some(p) => p,
+        }
+    }
+
     /// Reserved dependency name `db` switches generation to SQL mode.
     pub fn wants_db(&self) -> bool {
         self.dependencies.iter().any(|d| d == "db")
@@ -482,18 +547,108 @@ impl Design {
     /// (a fk may point at an entity in any module or subroute). Falls back to `i64`
     /// when the target is unknown (validation guarantees it exists in practice).
     pub fn target_key_rust_type(&self, target: &str) -> &'static str {
-        fn find<'a>(m: &'a ModuleDesign, target: &str) -> Option<&'a Entity> {
-            m.entities
-                .iter()
-                .find(|e| e.name == target)
-                .or_else(|| m.subroutes.iter().find_map(|s| find(s, target)))
-        }
-        self.modules
-            .iter()
-            .find_map(|m| find(m, target))
+        self.find_entity(target)
             .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
             .map(|f| f.field_type.rust_type())
             .unwrap_or("i64")
+    }
+
+    /// Resolve an entity by name across the whole design tree (any module or
+    /// subroute). A belongs_to/tenancy target may live anywhere.
+    pub fn find_entity(&self, name: &str) -> Option<&Entity> {
+        fn find<'a>(m: &'a ModuleDesign, name: &str) -> Option<&'a Entity> {
+            m.entities
+                .iter()
+                .find(|e| e.name == name)
+                .or_else(|| m.subroutes.iter().find_map(|s| find(s, name)))
+        }
+        self.modules.iter().find_map(|m| find(m, name))
+    }
+
+    /// The SQL table name for an entity — the single source of truth every
+    /// generator shares (DDL, queries, schema.json, the realtime publication):
+    /// the entity's explicit `table` override when present, else
+    /// `snake_case(name)` with proper English pluralization
+    /// (`EnergySummary` → `energy_summaries`, `CaptureSession` → `capture_sessions`).
+    /// Resolves the override by NAME across the tree so a call site holding only
+    /// a fk/tenancy target name agrees with the one holding the `Entity`.
+    pub fn table_name(&self, entity: &str) -> String {
+        self.find_entity(entity)
+            .and_then(|e| e.table.clone())
+            .unwrap_or_else(|| Self::default_table_name(entity))
+    }
+
+    /// The DEFAULT table name for an entity name, ignoring any `table` override:
+    /// `snake_case(entity)` pluralized. The migration importer calls this to
+    /// decide whether a source table's name round-trips through the default or
+    /// needs an explicit `table` override to stay lossless.
+    pub fn default_table_name(entity: &str) -> String {
+        pluralize(&Self::to_snake(entity))
+    }
+}
+
+/// Deterministic English pluralization for a snake_case identifier (the default
+/// table-name rule): consonant + `y` → `ies` (`energy` → `energies`); ends in
+/// `s`/`x`/`z`/`ch`/`sh` → `es` (`box` → `boxes`, `dish` → `dishes`); vowel + `y`
+/// → `+s` (`day` → `days`); else `+s`. Not exhaustive English (no irregulars),
+/// but deterministic and correct for the multi-word entity names the old
+/// `lowercase + "s"` mangled (`energysummarys`).
+fn pluralize(word: &str) -> String {
+    if word.ends_with("ch")
+        || word.ends_with("sh")
+        || word.ends_with('s')
+        || word.ends_with('x')
+        || word.ends_with('z')
+    {
+        return format!("{word}es");
+    }
+    if let Some(stem) = word.strip_suffix('y')
+        && !stem.ends_with(['a', 'e', 'i', 'o', 'u'])
+    {
+        return format!("{stem}ies");
+    }
+    format!("{word}s")
+}
+
+/// Rust keywords (2018+): reserved words that need a raw identifier (`r#name`)
+/// to appear as a field/type name in generated code. Shared by the validator
+/// (`questions.rs`) and the code generators (`genroute.rs`) so the "is this a
+/// keyword?" decision has ONE source of truth.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+    "where", "while",
+];
+
+/// Keywords a raw identifier CANNOT escape — even `r#self` is invalid Rust — so
+/// a field/entity named one of these still can't become a Rust identifier and
+/// must be rejected by validation.
+const UNESCAPABLE_KEYWORDS: &[&str] = &["crate", "self", "Self", "super"];
+
+/// Whether `name` is a Rust keyword (would collide with generated struct/field
+/// idents unless raw-escaped).
+pub(crate) fn is_rust_keyword(name: &str) -> bool {
+    RUST_KEYWORDS.contains(&name)
+}
+
+/// Whether `name` can appear as a Rust identifier — directly, or raw-escaped
+/// (`r#name`). True for non-keywords and raw-escapable keywords (`type`, `match`,
+/// `ref`, …); false only for `crate`/`self`/`super`/`Self`, which no `r#` rescues.
+pub(crate) fn can_be_rust_ident(name: &str) -> bool {
+    !UNESCAPABLE_KEYWORDS.contains(&name)
+}
+
+/// A field/type name rendered as a Rust identifier: raw-escaped (`type` →
+/// `r#type`) when it is a keyword, unchanged otherwise. Every generated
+/// RUST-identifier position for a field name routes through this so a frozen
+/// wire contract can keep a `type`/`match`/`ref` field without a rename.
+/// Precondition: `can_be_rust_ident(name)` (validation guarantees it).
+pub(crate) fn rust_ident(name: &str) -> String {
+    if is_rust_keyword(name) {
+        format!("r#{name}")
+    } else {
+        name.to_string()
     }
 }
 
@@ -681,6 +836,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn storage_base_path_defaults_to_storage_and_round_trips_an_override() {
+        // Buckets mount under the base path (default `/storage`), keeping them
+        // clear of module mounts (issue #8). Absent ⇒ `/storage`; an override is
+        // preserved across a round trip.
+        let d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        assert_eq!(
+            d.storage.as_ref().unwrap().effective_base_path(),
+            "/storage",
+            "absent base_path defaults to /storage"
+        );
+        // false-y default is skipped on serialize (no `base_path` key emitted).
+        let back = serde_json::to_value(d.storage.as_ref().unwrap()).unwrap();
+        assert!(
+            back.get("base_path").is_none(),
+            "absent base_path is not serialized: {back}"
+        );
+        // An override survives a round trip and drives effective_base_path.
+        let mut d2 = d;
+        d2.storage.as_mut().unwrap().base_path = Some("/files".into());
+        assert_eq!(d2.storage.as_ref().unwrap().effective_base_path(), "/files");
+        let s = serde_json::to_string(&d2).unwrap();
+        let re: Design = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            re.storage.as_ref().unwrap().base_path.as_deref(),
+            Some("/files")
+        );
+    }
+
+    #[test]
     fn wants_storage_appends_the_storage_s3_facade_feature_last() {
         // Generated apps get storage-s3 (S3 compiled in) so JERRYCAN_STORAGE
         // can switch backends by env WITHOUT recompiling (zero-touch config).
@@ -833,6 +1017,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn table_name_snake_cases_and_pluralizes_by_default() {
+        // The default table name is snake_case(entity) + proper English
+        // pluralization — the old `lowercase + "s"` mangled multi-word names
+        // (`EnergySummary` → `energysummarys`). `table_name` falls back to the
+        // default for any name not carrying a `table` override, so a minimal
+        // design exercises pluralization directly.
+        let d: Design = serde_json::from_str(MINIMAL).unwrap();
+        assert_eq!(d.table_name("EnergySummary"), "energy_summaries");
+        assert_eq!(d.table_name("CaptureSession"), "capture_sessions");
+        assert_eq!(d.table_name("MediaItem"), "media_items");
+        assert_eq!(d.table_name("ApiKey"), "api_keys");
+        // Pluralization rules: consonant+y→ies, s/x/z/ch/sh→es, vowel+y→s, else +s.
+        assert_eq!(d.table_name("Todo"), "todos");
+        assert_eq!(d.table_name("Class"), "classes");
+        assert_eq!(d.table_name("Box"), "boxes");
+        assert_eq!(d.table_name("Dish"), "dishes");
+        assert_eq!(d.table_name("Batch"), "batches");
+        assert_eq!(d.table_name("Gateway"), "gateways", "vowel+y → +s");
+        assert_eq!(d.table_name("Company"), "companies", "consonant+y → ies");
+    }
+
+    #[test]
+    fn table_override_is_used_verbatim() {
+        // A frozen external schema can pin an exact table name via `table`; the
+        // override wins over the pluralized default, resolved by NAME across the
+        // tree so a fk/tenancy target agrees with the entity's own emission.
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "x", "contract_version": 1, "dependencies": ["db"],
+                "modules": [{ "name": "m",
+                    "entities": [{ "name": "EnergySummary", "table": "legacy_energy",
+                        "fields": [{ "name": "kwh", "type": "float" }] }],
+                    "endpoints": [{ "operation_id": "list_it", "method": "GET", "path": "/",
+                        "success": { "status": 200 } }] }] }"#,
+        )
+        .unwrap();
+        assert_eq!(d.table_name("EnergySummary"), "legacy_energy");
+        // An entity WITHOUT an override still gets the pluralized default.
+        assert_eq!(d.table_name("MediaItem"), "media_items");
+    }
+
+    #[test]
     fn target_key_rust_type_resolves_pk_across_the_tree() {
         let d: Design = serde_json::from_str(V1_FULL).unwrap();
         // Workspace declares an integer id → i64 key (the fk column type a
@@ -895,6 +1120,35 @@ pub(crate) mod tests {
         assert!(
             back.get("public").is_none(),
             "public: false must be skipped on serialize: {back}"
+        );
+    }
+
+    #[test]
+    fn probe_policy_defaults_to_auto_and_round_trips_skip() {
+        // Absent ⇒ auto (the ordinary happy-path probe); auto is skipped on
+        // serialize so ordinary endpoints emit no `probe` key. `skip` (issue #11)
+        // survives a round trip.
+        let plain: Endpoint = serde_json::from_str(
+            r#"{ "operation_id": "list", "method": "GET", "path": "/",
+                 "success": { "status": 200 } }"#,
+        )
+        .unwrap();
+        assert_eq!(plain.probe, ProbePolicy::Auto);
+        assert!(plain.probe.is_auto());
+        let back = serde_json::to_value(&plain).unwrap();
+        assert!(
+            back.get("probe").is_none(),
+            "auto is not serialized: {back}"
+        );
+        let skip: Endpoint = serde_json::from_str(
+            r#"{ "operation_id": "login", "method": "POST", "path": "/login",
+                 "public": true, "probe": "skip", "success": { "status": 200 } }"#,
+        )
+        .unwrap();
+        assert_eq!(skip.probe, ProbePolicy::Skip);
+        assert_eq!(
+            serde_json::to_value(&skip).unwrap()["probe"],
+            serde_json::json!("skip")
         );
     }
 

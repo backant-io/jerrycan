@@ -41,12 +41,12 @@ fn find_entity<'a>(design: &'a Design, name: &str) -> Option<&'a Entity> {
 /// `snake_case(Entity)`, the pk is always `id`, and the tenant column is the
 /// tenancy fk when the entity `belongs_to` the tenancy entity, else None.
 fn changes_spec(design: &Design, entity: &str) -> (String, String, Option<String>) {
-    // The change-capture table name MUST match the migration/schema table name
-    // (`schema.rs` / `genroute.rs` `table_name`): lowercased + pluralized —
-    // `Lead` → `leads`, `ApiKey` → `apikeys`. `to_snake` (`lead`/`api_key`) names
-    // a table that does not exist, so `CREATE PUBLICATION … FOR TABLE "lead"`
-    // (and the trigger path) fail at runtime against Postgres.
-    let table = format!("{}s", entity.to_lowercase());
+    // The change-capture table name MUST match the migration/schema table name,
+    // so it goes through the SAME `Design::table_name` (snake_case + proper
+    // pluralization, honoring any `table` override) — `Lead` → `leads`,
+    // `ApiKey` → `api_keys`. A mismatched name would make
+    // `CREATE PUBLICATION … FOR TABLE "…"` (and the trigger path) fail at runtime.
+    let table = design.table_name(entity);
     let pk = "id".to_string();
     let tenant_column = design.tenancy.as_ref().and_then(|t| {
         find_entity(design, entity)

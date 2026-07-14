@@ -495,6 +495,8 @@ fn emit_from_db(
         name,
         contract_version: 2,
         description: None,
+        // No app-level mount prefix for an import (routes serve at the root).
+        base_path: None,
         auth: Some(auth_out.auth.clone()),
         dependencies,
         tenancy,
