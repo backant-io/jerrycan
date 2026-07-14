@@ -46,7 +46,7 @@ pub struct Design {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CorsDesign {
-    /// Allowed origins: exact scheme+host[:port] strings, or the single marker
+    /// Allowed origins: exact `scheme+host[:port]` strings, or the single marker
     /// `"*"` for any origin (`CorsOrigins::any()` → `Access-Control-Allow-Origin: *`).
     /// Overridable at deploy time via `JERRYCAN_CORS_ORIGINS` (comma-separated).
     pub origins: Vec<String>,
