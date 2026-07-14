@@ -98,8 +98,9 @@ pub fn run_package(
         ));
     }
 
-    // Gate: never package an app that doesn't pass check.
-    let report = checkpipe::run_all(root, design, None).map_err(|e| e.to_string())?;
+    // Gate: never package an app that doesn't pass check. Packaging only needs
+    // the pass/fail verdict, so it keeps the fast fail-fast test stage.
+    let report = checkpipe::run_all(root, design, None, false).map_err(|e| e.to_string())?;
     if !report.ok {
         return Err(format!(
             "check failed ({} diagnostics) — fix before packaging",

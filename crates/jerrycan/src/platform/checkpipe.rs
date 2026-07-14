@@ -21,10 +21,25 @@ pub struct Diagnostic {
     pub doc_url: Option<String>,
 }
 
+/// Per-test-target (cargo package) pass/fail tally, emitted only for
+/// `--no-fail-fast` runs so a TDD consumer sees the whole red→green picture in
+/// one shot instead of hand-counting `cargo test --no-fail-fast`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleTestResult {
+    /// The cargo package the tests ran in (e.g. `route-todos`, `jobs`).
+    pub module: String,
+    pub passed: u64,
+    pub failed: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CheckReport {
     pub ok: bool,
     pub diagnostics: Vec<Diagnostic>,
+    /// Per-target pass/fail counts, present only under `--no-fail-fast`. Omitted
+    /// (not `[]`) in the default fail-fast run so the payload is byte-identical.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_modules: Vec<ModuleTestResult>,
     pub next_step: String,
 }
 
@@ -99,6 +114,44 @@ pub fn parse_test_output(stdout: &str) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// Sum every libtest `test result:` line in one package's output into
+/// (passed, failed). A package emits one such line per test binary (unit tests,
+/// each integration target, doctests), so summing gives the package total.
+pub fn parse_test_counts(stdout: &str) -> (u64, u64) {
+    let (mut passed, mut failed) = (0u64, 0u64);
+    for line in stdout.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("test result:") else {
+            continue;
+        };
+        // e.g. " FAILED. 4 passed; 1 failed; 0 ignored; …" — pull the integer
+        // that immediately precedes each `passed`/`failed` word.
+        let cleaned = rest.replace([';', '.', ','], " ");
+        let toks: Vec<&str> = cleaned.split_whitespace().collect();
+        for w in toks.windows(2) {
+            if let Ok(n) = w[0].parse::<u64>() {
+                match w[1] {
+                    "passed" => passed += n,
+                    "failed" => failed += n,
+                    _ => {}
+                }
+            }
+        }
+    }
+    (passed, failed)
+}
+
+/// The last ~400 chars of a captured stream, for surfacing a harness/compile
+/// failure tail without dumping the whole log.
+fn stream_tail(err: &str) -> String {
+    err.chars()
+        .rev()
+        .take(400)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+}
+
 fn cargo_in(root: &Path) -> Command {
     let mut c = Command::new("cargo");
     c.current_dir(root);
@@ -153,26 +206,123 @@ pub fn run_tests(root: &Path, module: Option<&str>) -> Result<Vec<Diagnostic>, S
     let mut ds = parse_test_output(&String::from_utf8_lossy(&out.stdout));
     if !out.status.success() && ds.is_empty() {
         // Compile error inside tests, or harness failure — surface stderr tail.
-        let err = String::from_utf8_lossy(&out.stderr);
         ds.push(Diagnostic {
             code: "TEST0002".into(),
             file: None,
             line: None,
             message: format!(
                 "test run failed: {}",
-                err.chars()
-                    .rev()
-                    .take(400)
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>()
+                stream_tail(&String::from_utf8_lossy(&out.stderr))
             ),
             suggestion: None,
             doc_url: None,
         });
     }
     Ok(ds)
+}
+
+/// The cargo packages whose test targets carry the acceptance suite: one
+/// `route-<module>` per top-level module (subroutes live in their parent's
+/// crate), plus `jobs` when the design declares background jobs. Module scope
+/// narrows to that single package (mirrors `package_args`).
+pub fn test_packages(
+    design: &crate::platform::design::Design,
+    module: Option<&str>,
+) -> Vec<String> {
+    match module {
+        Some(m) => vec![format!("route-{m}")],
+        None => {
+            let mut pkgs: Vec<String> = design
+                .modules
+                .iter()
+                .map(|m| format!("route-{}", m.name))
+                .collect();
+            if design.wants_jobs() {
+                pkgs.push("jobs".into());
+            }
+            pkgs
+        }
+    }
+}
+
+/// One package's captured `cargo test` result, threaded from the IO boundary
+/// into the pure aggregator so the fold can be unit-tested without cargo.
+pub struct PackageRun {
+    pub module: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+}
+
+/// Fold one package's `cargo test --no-fail-fast` result into (diagnostics,
+/// tally): EVERY failing test in this package becomes a diagnostic (not just the
+/// first), and the tally records the package's total pass/fail split.
+fn aggregate_package(run: &PackageRun) -> (Vec<Diagnostic>, ModuleTestResult) {
+    let mut diags = parse_test_output(&run.stdout);
+    let (passed, failed) = parse_test_counts(&run.stdout);
+    if !run.success && diags.is_empty() {
+        // Non-zero exit with no parsed failures = compile/harness problem.
+        diags.push(Diagnostic {
+            code: "TEST0002".into(),
+            file: None,
+            line: None,
+            message: format!(
+                "test run failed in {}: {}",
+                run.module,
+                stream_tail(&run.stderr)
+            ),
+            suggestion: None,
+            doc_url: None,
+        });
+    }
+    (
+        diags,
+        ModuleTestResult {
+            module: run.module.clone(),
+            passed,
+            failed,
+        },
+    )
+}
+
+/// Pure fold over every package's captured output: the full failure set across
+/// ALL packages (never truncated at the first failing one) plus one tally per
+/// package, preserving input order. This is the invariant `--no-fail-fast`
+/// exists to deliver, so it lives in a cargo-free function that a test can pin.
+pub fn aggregate_packages(runs: &[PackageRun]) -> (Vec<Diagnostic>, Vec<ModuleTestResult>) {
+    let mut all_diags = Vec::new();
+    let mut tallies = Vec::new();
+    for run in runs {
+        let (diags, tally) = aggregate_package(run);
+        all_diags.extend(diags);
+        tallies.push(tally);
+    }
+    (all_diags, tallies)
+}
+
+/// `--no-fail-fast`: run every package's test target to completion (cargo's own
+/// `--no-fail-fast` runs all targets WITHIN a package) and aggregate the results.
+/// Running per package is what makes the tally attributable — cargo's `Running`
+/// lines don't name the owning package, so a single `--workspace` run can't be
+/// split back apart.
+pub fn run_tests_full(
+    root: &Path,
+    packages: &[String],
+) -> Result<(Vec<Diagnostic>, Vec<ModuleTestResult>), String> {
+    let mut runs = Vec::with_capacity(packages.len());
+    for pkg in packages {
+        let out = cargo_in(root)
+            .args(["test", "-p", pkg, "--no-fail-fast"])
+            .output()
+            .map_err(|e| format!("cargo test not runnable: {e}"))?;
+        runs.push(PackageRun {
+            module: pkg.clone(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            success: out.status.success(),
+        });
+    }
+    Ok(aggregate_packages(&runs))
 }
 
 /// External tool steps. A missing tool is an ENVIRONMENT failure (exit 3), not a gate failure.
@@ -251,9 +401,17 @@ pub fn run_all(
     root: &Path,
     design: &crate::platform::design::Design,
     module: Option<&str>,
+    no_fail_fast: bool,
 ) -> Result<CheckReport, String> {
     let mut diagnostics = Vec::new();
     let mut failed_class: Option<&str> = None;
+    // `--no-fail-fast` runs every package's tests and records per-package tallies
+    // here (interior mutability so the boxed tests step can write them out while
+    // the generic loop keeps its `-> Vec<Diagnostic>` shape). Empty otherwise, so
+    // the default payload stays byte-identical.
+    let packages = test_packages(design, module);
+    let test_modules: std::cell::RefCell<Vec<ModuleTestResult>> =
+        std::cell::RefCell::new(Vec::new());
 
     #[allow(clippy::type_complexity)]
     let mut steps: Vec<(&str, Box<dyn FnOnce() -> Result<Vec<Diagnostic>, String>>)> = vec![
@@ -276,7 +434,18 @@ pub fn run_all(
             }),
         ));
     }
-    steps.push(("tests", Box::new(|| run_tests(root, module))));
+    steps.push((
+        "tests",
+        Box::new(|| {
+            if no_fail_fast {
+                let (ds, tallies) = run_tests_full(root, &packages)?;
+                *test_modules.borrow_mut() = tallies;
+                Ok(ds)
+            } else {
+                run_tests(root, module)
+            }
+        }),
+    ));
     steps.push((
         "jerrycan lints",
         Box::new(|| Ok(super::lints::run(root, design))),
@@ -303,6 +472,7 @@ pub fn run_all(
     Ok(CheckReport {
         ok,
         diagnostics,
+        test_modules: test_modules.into_inner(),
         next_step,
     })
 }
