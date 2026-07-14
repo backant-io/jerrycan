@@ -384,6 +384,11 @@
           "default": false,
           "description": "Genuinely public endpoints (credential-issuing login/register, public webhooks): exempt from the unguarded-mutation lint (JL0004) and generated 401 tests. Cannot combine with auth_required or required_roles, and rejected on endpoints whose entity is tenant-owned (a public route bypasses the Tenant guard)."
         },
+        "probe": {
+          "enum": ["auto", "skip"],
+          "default": "auto",
+          "description": "How the generator probes this endpoint's success. 'auto' (default) emits the happy-path 2xx probe. 'skip' emits an AGENT TODO instead — for an endpoint whose success needs a credential/signature the generator can't synthesize (login, signed webhook, api-key route), so an uncredentialed 2xx probe could never pass and `jerrycan check` could never reach ok:true. Write its credentialed success + rejection tests in your own test file."
+        },
         "request_body": {
           "type": "object",
           "additionalProperties": false,

@@ -262,9 +262,36 @@ pub struct Endpoint {
     pub public: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body: Option<RequestBody>,
+    /// How the generator probes this endpoint's success. Default `auto`. Set
+    /// `skip` for an endpoint whose success needs a credential/signature the
+    /// generator can't synthesize (login, signed webhook, api-key route): an
+    /// uncredentialed 2xx probe could never pass, so `jerrycan check` could never
+    /// reach `ok:true`. With `skip`, the generator emits a TODO for the author to
+    /// write the credentialed success + rejection tests instead.
+    #[serde(default, skip_serializing_if = "ProbePolicy::is_auto")]
+    pub probe: ProbePolicy,
     pub success: Success,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ErrorCase>,
+}
+
+/// Per-endpoint control over the generated happy-path success probe (issue #11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbePolicy {
+    /// Emit the happy-path 2xx probe (the default for every ordinary endpoint).
+    #[default]
+    Auto,
+    /// Do NOT emit the 2xx probe — the endpoint authenticates via a credential
+    /// the generator can't supply, so the author owns its success/rejection tests.
+    Skip,
+}
+
+impl ProbePolicy {
+    /// `true` for the default `auto` policy (so serialization can skip it).
+    pub fn is_auto(&self) -> bool {
+        matches!(self, ProbePolicy::Auto)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1093,6 +1120,35 @@ pub(crate) mod tests {
         assert!(
             back.get("public").is_none(),
             "public: false must be skipped on serialize: {back}"
+        );
+    }
+
+    #[test]
+    fn probe_policy_defaults_to_auto_and_round_trips_skip() {
+        // Absent ⇒ auto (the ordinary happy-path probe); auto is skipped on
+        // serialize so ordinary endpoints emit no `probe` key. `skip` (issue #11)
+        // survives a round trip.
+        let plain: Endpoint = serde_json::from_str(
+            r#"{ "operation_id": "list", "method": "GET", "path": "/",
+                 "success": { "status": 200 } }"#,
+        )
+        .unwrap();
+        assert_eq!(plain.probe, ProbePolicy::Auto);
+        assert!(plain.probe.is_auto());
+        let back = serde_json::to_value(&plain).unwrap();
+        assert!(
+            back.get("probe").is_none(),
+            "auto is not serialized: {back}"
+        );
+        let skip: Endpoint = serde_json::from_str(
+            r#"{ "operation_id": "login", "method": "POST", "path": "/login",
+                 "public": true, "probe": "skip", "success": { "status": 200 } }"#,
+        )
+        .unwrap();
+        assert_eq!(skip.probe, ProbePolicy::Skip);
+        assert_eq!(
+            serde_json::to_value(&skip).unwrap()["probe"],
+            serde_json::json!("skip")
         );
     }
 

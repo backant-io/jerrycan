@@ -4,7 +4,9 @@
 
 use super::pgmodel::PolicyCommand;
 use super::tenancy::TableAccess;
-use crate::platform::design::{Design, Endpoint, ErrorCase, HttpMethod, RequestBody, Success};
+use crate::platform::design::{
+    Design, Endpoint, ErrorCase, HttpMethod, ProbePolicy, RequestBody, Success,
+};
 
 fn plural_snake(entity: &str) -> String {
     let snake = Design::to_snake(entity);
@@ -74,6 +76,8 @@ pub fn endpoints_for(
             auth_required: guarded && !public,
             required_roles: if public { Vec::new() } else { roles_for(cmd) },
             public,
+            // Imported CRUD endpoints take the generator's happy-path probe.
+            probe: ProbePolicy::Auto,
             request_body: body.then(|| RequestBody {
                 entity: entity.into(),
             }),

@@ -185,13 +185,21 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         let guarded = auth && ep.is_guarded();
         // Endpoints whose success needs a credential/signature the generator can't
         // supply (login, signed webhook, api-key route): no un-greenable success
-        // probe — emit a TODO instead. These are never session-guarded (a guard
-        // would be threaded), so `guarded` is false and no 401 test is emitted.
-        let gated = endpoint_is_credential_gated(ep);
+        // probe — emit a TODO instead. Detected by heuristic OR declared
+        // explicitly with `probe: skip` (issue #11) so a design the heuristic
+        // misses can still reach `ok:true`. These are never session-guarded (a
+        // guard would be threaded), so `guarded` is false and no 401 test is emitted.
+        let probe_skip = ep.probe == ProbePolicy::Skip;
+        let gated = endpoint_is_credential_gated(ep) || probe_skip;
 
         if gated {
+            let reason = if probe_skip {
+                "is marked `probe: skip` — the generator can't synthesize a credential for its success"
+            } else {
+                "authenticates via a credential/signature the generator can't supply"
+            };
             out.todos.push(format!(
-                "// AGENT TODO: {fn_base} ({:?} {full_path}) authenticates via a credential/signature the generator can't supply — write its success test (with a valid credential) and its 401/403 rejection test in your own test file.",
+                "// AGENT TODO: {fn_base} ({:?} {full_path}) {reason} — write its success test (with a valid credential) and its 401/403 rejection test in your own test file.",
                 ep.method
             ));
         } else if param_count(ep) == 0 {

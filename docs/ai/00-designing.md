@@ -193,6 +193,12 @@ Every entity has an `id` primary key. You usually do NOT declare it:
   tenant's rows. **Put public endpoints — webhooks, an inbound-ingest route, a
   login/register — in their OWN module** that has no tenant-owned entity
   (entity-less is fine).
+- `probe?` — `"auto"` (default) or `"skip"`. `skip` tells the generator NOT to
+  emit the happy-path 2xx probe for an endpoint whose success needs a credential
+  it can't synthesize (login, signed webhook, api-key route) — otherwise that
+  probe is un-greenable and `jerrycan check` can never reach `ok:true`. With
+  `skip` the generator emits an AGENT TODO; you write the credentialed success +
+  rejection tests yourself.
 - `request_body?` — `{ "entity": "<Name>" }` ONLY. The body is the named entity;
   the entity must be declared in THIS module. There is no narrower/custom input
   DTO in the design — for an endpoint that takes untrusted public input, defend

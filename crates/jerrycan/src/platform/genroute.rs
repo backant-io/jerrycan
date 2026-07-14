@@ -1738,6 +1738,7 @@ mod tests {
             auth_required: false,
             required_roles: vec![],
             public: false,
+            probe: ProbePolicy::default(),
             request_body: None,
             success: Success {
                 status: 204,

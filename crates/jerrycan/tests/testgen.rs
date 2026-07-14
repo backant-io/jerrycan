@@ -400,6 +400,50 @@ fn credential_gated_endpoints_get_an_agent_todo_not_a_success_test() {
     );
 }
 
+/// An explicit `probe: "skip"` hint (issue #11) makes the generator drop the
+/// un-greenable 2xx probe even when the heuristic MISSES the endpoint — here a
+/// `public` webhook that declares NO 401/403 error, so `endpoint_is_credential_gated`
+/// wouldn't flag it. WHY (Rule 9): without the hint the generator would emit a
+/// `_returns_200` probe that a correct signature-checking handler MUST reject,
+/// so `jerrycan check` could never reach ok:true. With the hint it emits a TODO,
+/// and an ordinary (auto) endpoint in the same module still gets its success probe.
+#[test]
+fn probe_skip_hint_drops_the_ungreenable_success_probe() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "ingest-api",
+        "contract_version": 1,
+        "dependencies": [],
+        "modules": [{
+            "name": "ingest",
+            "endpoints": [
+                // A public webhook the heuristic misses (no declared 401/403, no
+                // "signature" in a `when`), marked probe: skip explicitly.
+                { "operation_id": "receive_hook", "method": "POST", "path": "/hook",
+                  "public": true, "probe": "skip",
+                  "success": { "status": 202 } },
+                // An ordinary endpoint (auto) still gets its happy-path probe.
+                { "operation_id": "health_ping", "method": "GET", "path": "/ping",
+                  "success": { "status": 200 } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        !generated.contains("async fn receive_hook_returns_"),
+        "probe: skip must drop the un-greenable success probe: {generated}"
+    );
+    assert!(
+        generated
+            .contains("// AGENT TODO: receive_hook (POST /ingest/hook) is marked `probe: skip`"),
+        "probe: skip must emit an explanatory TODO: {generated}"
+    );
+    assert!(
+        generated.contains("async fn health_ping_returns_200()"),
+        "an ordinary (auto) endpoint still gets its success probe: {generated}"
+    );
+}
+
 /// A db-mode module whose EVERY endpoint is a TODO (e.g. a billing module whose
 /// only route is a signature-gated webhook) emits ZERO `#[tokio::test]` functions.
 /// The generated file must then carry NO `app()` helper and NO `use` imports —
