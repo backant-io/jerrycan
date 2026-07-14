@@ -664,6 +664,21 @@ fn agent_builds_postgres_backed_api_test_first() {
 #[test]
 #[ignore = "heavy: package the golden app and prove binary/docker/k8s deploy paths"]
 fn golden_app_deploys_everywhere() {
+    // The heart of this test — a static `x86_64-unknown-linux-musl` binary built
+    // and served, plus a Linux container image — cannot be produced on a non-Linux
+    // host: there is no musl cross-linker, so the link fails (Apple's ld rejects
+    // the GNU `-Bstatic`/`--as-needed`/… flags). CI runs this on Linux; skip loudly
+    // elsewhere so `cargo test --include-ignored` stays green for macOS/other
+    // contributors. Package file-generation (Dockerfile/k8s/systemd/SBOM) is
+    // covered on every host by tests/package.rs.
+    if !cfg!(target_os = "linux") {
+        eprintln!(
+            "SKIP golden_app_deploys_everywhere: needs a Linux host for the musl \
+             binary + container legs (host is {}); CI covers it.",
+            std::env::consts::OS
+        );
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     // Reuse the memory-mode golden app (deploy paths are storage-agnostic).
     let app = scaffold_golden(tmp.path());
