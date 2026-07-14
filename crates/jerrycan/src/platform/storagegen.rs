@@ -20,6 +20,20 @@ fn bucket_ident(name: &str) -> String {
     name.replace('-', "_")
 }
 
+/// The full path prefix buckets mount UNDER: the app base_path (issue #16) +
+/// the storage base_path (issue #8), e.g. `/storage` or `/v1/storage`. This is
+/// exactly what `mounting.rs` prepends to each bucket mount, so the generated
+/// `Bucket.mount_prefix` (→ signed URLs) and the acceptance harness agree with
+/// the served routes.
+fn full_mount_prefix(design: &Design) -> String {
+    let storage_base = design
+        .storage
+        .as_ref()
+        .map(|s| s.effective_base_path())
+        .unwrap_or_else(|| "/storage".to_string());
+    format!("{}{storage_base}", design.base_prefix())
+}
+
 /// Buckets sorted by name — every emission site (lib.rs, mounts, tests)
 /// iterates in this order so output is byte-stable.
 fn sorted_buckets(design: &Design) -> Vec<&BucketDesign> {
@@ -141,6 +155,9 @@ pub fn lib_rs(design: &Design) -> String {
 /// and the five handlers (upload/list/download/remove/sign).
 pub(crate) fn bucket_rs(design: &Design, b: &BucketDesign) -> String {
     let name = &b.name;
+    // The full prefix this bucket mounts UNDER (app base + storage base), baked
+    // into the const so app-HMAC signed URLs resolve to the real download route.
+    let mount_prefix = full_mount_prefix(design);
     let public = matches!(b.visibility, Visibility::Public);
     let max_size = b
         .max_size
@@ -231,6 +248,7 @@ const BUCKET: Bucket = Bucket {{
     owner_prefix: {owner_prefix},
     max_size: {max_size},
     allowed_mime: &[{mime_list}],
+    mount_prefix: "{mount_prefix}",
 }};
 
 /// This bucket's routes. `body_limit` = the bucket's max_size, so an
@@ -314,13 +332,10 @@ fn concrete_mime(b: &BucketDesign) -> String {
 /// gen-tests does NOT count them toward expected_failing.
 pub fn acceptance_rs(design: &Design) -> String {
     let buckets = sorted_buckets(design);
-    // The mount prefix the generated app uses (default `/storage`): the harness
-    // mounts and requests buckets under it so it exercises the real path (#8).
-    let base = design
-        .storage
-        .as_ref()
-        .map(|s| s.effective_base_path())
-        .unwrap_or_else(|| "/storage".to_string());
+    // The full mount prefix the generated app uses (app base + storage base): the
+    // harness mounts and requests buckets under it so it exercises the real path
+    // AND the app-HMAC signed URLs (baked with the same prefix) resolve (#8, #16).
+    let base = full_mount_prefix(design);
     let needs_tenant = buckets.iter().any(|b| {
         matches!(
             bucket_scope(design, b),
