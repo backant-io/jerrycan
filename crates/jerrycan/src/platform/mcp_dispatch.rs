@@ -269,7 +269,10 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                 Ok(d) => d,
                 Err(e) => return err_payload(e),
             };
-            match checkpipe::run_all(&root, &design, args["module"].as_str()) {
+            // `full_report` is the MCP alias for the CLI's `--full-report` flag.
+            let no_fail_fast = args["no_fail_fast"].as_bool().unwrap_or(false)
+                || args["full_report"].as_bool().unwrap_or(false);
+            match checkpipe::run_all(&root, &design, args["module"].as_str(), no_fail_fast) {
                 Ok(report) => (
                     false,
                     serde_json::to_value(&report).expect("report serializes"),

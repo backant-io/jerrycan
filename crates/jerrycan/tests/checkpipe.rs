@@ -62,6 +62,7 @@ fn report_serializes_to_the_mcp_check_shape() {
             suggestion: None,
             doc_url: None,
         }],
+        test_modules: vec![],
         next_step: "fix the build diagnostics".into(),
     };
     let v = serde_json::to_value(&report).unwrap();
@@ -70,6 +71,100 @@ fn report_serializes_to_the_mcp_check_shape() {
     assert!(v["next_step"].is_string());
     // Optional fields are OMITTED when None (matches outputSchema: only code+message required).
     assert!(v["diagnostics"][0].get("suggestion").is_none());
+    // The default (fail-fast) payload never grows a `test_modules` key: an empty
+    // tally is skipped so the wire shape stays byte-identical to pre-flag runs.
+    assert!(
+        v.get("test_modules").is_none(),
+        "empty test_modules must be omitted, not serialized as []"
+    );
+}
+
+#[test]
+fn test_result_lines_sum_pass_fail_across_binaries() {
+    // A package with a unit-test bin and an integration bin emits two
+    // `test result:` lines; the tally is their sum, not just the first.
+    let out = "\
+running 2 tests
+test a ... ok
+test b ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+running 3 tests
+test c ... ok
+test d ... FAILED
+test e ... FAILED
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+";
+    assert_eq!(parse_test_counts(out), (3, 2));
+}
+
+#[test]
+fn no_fail_fast_reports_every_failing_target_not_just_the_first() {
+    // The whole point of --no-fail-fast: a TDD consumer with several red targets
+    // must see the FULL red→green picture in one run. Two packages both fail;
+    // the aggregation must carry BOTH tallies AND every failing test name — a
+    // fail-fast run would have stopped after `route-todos` and hidden the rest.
+    let todos = "\
+running 3 tests
+test todos::create ... FAILED
+test todos::list ... ok
+test todos::delete ... FAILED
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+";
+    let users = "\
+running 2 tests
+test users::login ... FAILED
+test users::logout ... ok
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+";
+    let runs = vec![
+        PackageRun {
+            module: "route-todos".into(),
+            stdout: todos.into(),
+            stderr: String::new(),
+            success: false,
+        },
+        PackageRun {
+            module: "route-users".into(),
+            stdout: users.into(),
+            stderr: String::new(),
+            success: false,
+        },
+    ];
+    let (diags, tallies) = aggregate_packages(&runs);
+
+    // Per-module counts for EVERY target, in order — not just the first failing one.
+    assert_eq!(tallies.len(), 2);
+    assert_eq!(tallies[0].module, "route-todos");
+    assert_eq!((tallies[0].passed, tallies[0].failed), (1, 2));
+    assert_eq!(tallies[1].module, "route-users");
+    assert_eq!((tallies[1].passed, tallies[1].failed), (1, 1));
+
+    // The full failure set spans both targets (2 + 1), so the consumer never has
+    // to re-run cargo to discover the second target's reds.
+    assert_eq!(diags.len(), 3, "all three failures surface: {diags:?}");
+    let msgs: String = diags.iter().map(|d| d.message.clone()).collect();
+    for failing in ["todos::create", "todos::delete", "users::login"] {
+        assert!(msgs.contains(failing), "missing {failing} in {msgs}");
+    }
+    assert!(diags.iter().all(|d| d.code == "TEST0001"));
+}
+
+#[test]
+fn harness_failure_surfaces_as_test0002_with_module_attribution() {
+    // A package that fails without any `... FAILED` line (link/harness error)
+    // must still be attributed to its module, not swallowed.
+    let runs = vec![PackageRun {
+        module: "route-todos".into(),
+        stdout: String::new(),
+        stderr: "error: linking with `cc` failed".into(),
+        success: false,
+    }];
+    let (diags, tallies) = aggregate_packages(&runs);
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0].code, "TEST0002");
+    assert!(diags[0].message.contains("route-todos"));
+    assert_eq!((tallies[0].passed, tallies[0].failed), (0, 0));
 }
 
 use jerrycan::platform::design::Design;
