@@ -116,6 +116,11 @@ db.conn()
   (the tool-owned `lib.rs` wires this; your handlers just declare `repo: Dep<NoteRepo>`).
 - `jerrycan db migrate --url postgres://…` applies module migrations from the CLI;
   generated apps also migrate automatically at startup.
+- Startup work (an idempotent dev seed, cache warm-up) goes in the AGENT-owned
+  `crates/app/src/boot.rs` — `on_boot(db: &Db)` runs after migrations and before
+  the app serves. It is created once and preserved across `jerrycan generate`
+  (the tool-owned `main.rs` calls it). Keep it idempotent: it runs on every boot.
+  (`jerrycan db seed` is separate — it applies a Supabase migration's streamed seed.)
 - Escape hatch for hand-written SQL — `db.sql()` translates `?`→`$n` for the
   connected backend, then `Statement::from_sql_and_values` binds the values:
   ```rust
