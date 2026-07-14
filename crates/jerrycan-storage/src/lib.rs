@@ -39,6 +39,11 @@ pub struct Bucket {
     pub max_size: usize,
     /// Content-type allowlist (`image/*` globs, exact types). Empty = allow all.
     pub allowed_mime: &'static [&'static str],
+    /// The path prefix this bucket is mounted UNDER, before `/<name>` (e.g.
+    /// `/storage`, or `/v1/storage` with an app base_path). App-HMAC signed URLs
+    /// are built as `{mount_prefix}/{name}/{id}?…` so they resolve to the bucket's
+    /// real download route. `""` = mounted at the root (`/<name>`).
+    pub mount_prefix: &'static str,
 }
 
 impl Bucket {
@@ -78,7 +83,7 @@ pub struct Scope {
 }
 
 /// A time-limited signed URL: native S3 presign when the backend supports it,
-/// else the app-HMAC path `/<bucket>/<id>?exp=…&sig=…`.
+/// else the app-HMAC path `{mount_prefix}/<bucket>/<id>?exp=…&sig=…`.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SignedUrl {
     pub url: String,
@@ -320,7 +325,13 @@ impl Storage {
         }
         let sig = sign::sign(self.sign_key()?, bucket.name, id, expires_at);
         Ok(SignedUrl {
-            url: format!("/{}/{}?exp={}&sig={}", bucket.name, id, expires_at, sig),
+            // The URL must route to THIS bucket's download endpoint, so include
+            // the mount prefix (`/storage`, `/v1/storage`, …) — otherwise the
+            // URL 404s wherever the bucket is mounted below the root.
+            url: format!(
+                "{}/{}/{}?exp={}&sig={}",
+                bucket.mount_prefix, bucket.name, id, expires_at, sig
+            ),
             expires_at,
         })
     }
@@ -441,6 +452,7 @@ mod tests {
         owner_prefix: false,
         max_size: 16,
         allowed_mime: &["image/*"],
+        mount_prefix: "",
     };
     const INVOICES: Bucket = Bucket {
         name: "invoices",
@@ -448,6 +460,7 @@ mod tests {
         owner_prefix: true,
         max_size: 1024,
         allowed_mime: &[],
+        mount_prefix: "",
     };
 
     fn owner(id: &str) -> Scope {
@@ -464,6 +477,7 @@ mod tests {
             owner_prefix: false,
             max_size: 1024,
             allowed_mime: allowed,
+            mount_prefix: "",
         }
     }
 
@@ -896,6 +910,46 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "JC0401"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_hmac_signed_url_carries_the_mount_prefix() {
+        // WHY: buckets mount under a prefix (/storage by default, issue #8), so
+        // the app-HMAC URL must include it or it 404s at the bucket's real
+        // download route. The signature itself is path-independent (bucket+id+exp).
+        const PREFIXED: Bucket = Bucket {
+            name: "invoices",
+            public: false,
+            owner_prefix: false,
+            max_size: 1024,
+            allowed_mime: &[],
+            mount_prefix: "/v1/storage",
+        };
+        let db = db().await;
+        let s = Storage::memory().with_sign_secret(SECRET);
+        let meta = s
+            .put_object(
+                &db,
+                &PREFIXED,
+                &owner("1"),
+                "inv.pdf",
+                "application/pdf",
+                Bytes::from_static(b"pdf"),
+            )
+            .await
+            .unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let signed = s
+            .sign_object(&db, &PREFIXED, &owner("1"), &meta.id, 300, now)
+            .await
+            .unwrap();
+        assert!(
+            signed
+                .url
+                .starts_with(&format!("/v1/storage/invoices/{}?", meta.id)),
+            "signed URL must carry the mount prefix: {}",
+            signed.url
         );
     }
 

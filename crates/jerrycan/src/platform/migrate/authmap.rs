@@ -3,8 +3,8 @@
 //! bcrypt dispatch). Passwords/keys are NEVER copied into config.
 
 use crate::platform::design::{
-    Auth, AuthModel, Endpoint, Entity, Field, FieldType, HttpMethod, ModuleDesign, RequestBody,
-    Success,
+    Auth, AuthModel, Endpoint, Entity, Field, FieldType, HttpMethod, ModuleDesign, ProbePolicy,
+    RequestBody, Success,
 };
 
 pub struct AuthOutput {
@@ -34,6 +34,8 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
     };
     let user = Entity {
         name: "User".into(),
+        // Default table name (`users`) is exactly the target — no override.
+        table: None,
         belongs_to: vec![],
         fields: vec![
             field("id", FieldType::Uuid, true, false),
@@ -54,6 +56,7 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
                 auth_required: false,
                 required_roles: vec![],
                 public: true,
+                probe: ProbePolicy::Auto,
                 request_body: Some(RequestBody {
                     entity: "User".into(),
                 }),
@@ -71,6 +74,10 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
                 auth_required: false,
                 required_roles: vec![],
                 public: true,
+                // Login verifies a credential the generator can't synthesize, so
+                // skip its un-greenable 2xx probe (issue #11) — keeps the migrated
+                // design able to reach `jerrycan check` ok:true.
+                probe: ProbePolicy::Skip,
                 request_body: Some(RequestBody {
                     entity: "User".into(),
                 }),

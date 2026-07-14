@@ -25,6 +25,10 @@
     "description": {
       "type": "string"
     },
+    "base_path": {
+      "type": "string",
+      "description": "App-level mount prefix applied once to every module and bucket mount, e.g. '/v1' serves all routes under /v1. Health (/healthz) and metrics (/metrics) stay unprefixed. Empty, '/', or absent is a no-op. Must be an absolute path (leading '/', no trailing slash or '//')."
+    },
     "auth": {
       "type": "object",
       "additionalProperties": false,
@@ -115,8 +119,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["buckets"],
-      "description": "Contract v2: design-modeled object storage. Each bucket mounts guarded endpoints at /<name> (upload, list, download, delete, sign); object metadata lives in the storage_objects table; bytes live in the env-configured blob backend (JERRYCAN_STORAGE). Requires the db dependency and an active auth model.",
+      "description": "Contract v2: design-modeled object storage. Each bucket mounts guarded endpoints under {base_path}/<name> (upload, list, download, delete, sign); object metadata lives in the storage_objects table; bytes live in the env-configured blob backend (JERRYCAN_STORAGE). Requires the db dependency and an active auth model.",
       "properties": {
+        "base_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Mount prefix for every bucket: each serves under {base_path}/<name>. Defaults to /storage, keeping bucket routes clear of module mounts. Must be an absolute path (leading '/', no trailing slash or '//')."
+        },
         "buckets": {
           "type": "array",
           "minItems": 1,
@@ -248,6 +257,11 @@
           "type": "string",
           "pattern": "^[A-Z][A-Za-z0-9]*$"
         },
+        "table": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "Explicit SQL table name, used verbatim. Absent -> the default snake_case(name) with proper English pluralization (EnergySummary -> energy_summaries). Set this to keep a frozen external schema's exact table name."
+        },
         "belongs_to": {
           "type": "array",
           "description": "Foreign-key relations to other entities. Each produces a NOT NULL fk column 'snake_case(entity) + \"_id\"' referencing the target's pk (nullable instead when on_delete is set_null). For a target in the SAME module the column carries a real DDL FOREIGN KEY with the given on_delete policy; for a cross-module target the column is emitted unenforced and indexed (no DDL constraint — the relation is reported in schema.json with \"enforced\": false, and referential integrity is enforced in handlers).",
@@ -369,6 +383,11 @@
           "type": "boolean",
           "default": false,
           "description": "Genuinely public endpoints (credential-issuing login/register, public webhooks): exempt from the unguarded-mutation lint (JL0004) and generated 401 tests. Cannot combine with auth_required or required_roles, and rejected on endpoints whose entity is tenant-owned (a public route bypasses the Tenant guard)."
+        },
+        "probe": {
+          "enum": ["auto", "skip"],
+          "default": "auto",
+          "description": "How the generator probes this endpoint's success. 'auto' (default) emits the happy-path 2xx probe. 'skip' emits an AGENT TODO instead — for an endpoint whose success needs a credential/signature the generator can't synthesize (login, signed webhook, api-key route), so an uncredentialed 2xx probe could never pass and `jerrycan check` could never reach ok:true. Write its credentialed success + rejection tests in your own test file."
         },
         "request_body": {
           "type": "object",

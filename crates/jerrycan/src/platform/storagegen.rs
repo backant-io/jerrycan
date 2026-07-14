@@ -20,6 +20,20 @@ fn bucket_ident(name: &str) -> String {
     name.replace('-', "_")
 }
 
+/// The full path prefix buckets mount UNDER: the app base_path (issue #16) +
+/// the storage base_path (issue #8), e.g. `/storage` or `/v1/storage`. This is
+/// exactly what `mounting.rs` prepends to each bucket mount, so the generated
+/// `Bucket.mount_prefix` (→ signed URLs) and the acceptance harness agree with
+/// the served routes.
+fn full_mount_prefix(design: &Design) -> String {
+    let storage_base = design
+        .storage
+        .as_ref()
+        .map(|s| s.effective_base_path())
+        .unwrap_or_else(|| "/storage".to_string());
+    format!("{}{storage_base}", design.base_prefix())
+}
+
 /// Buckets sorted by name — every emission site (lib.rs, mounts, tests)
 /// iterates in this order so output is byte-stable.
 fn sorted_buckets(design: &Design) -> Vec<&BucketDesign> {
@@ -141,6 +155,9 @@ pub fn lib_rs(design: &Design) -> String {
 /// and the five handlers (upload/list/download/remove/sign).
 pub(crate) fn bucket_rs(design: &Design, b: &BucketDesign) -> String {
     let name = &b.name;
+    // The full prefix this bucket mounts UNDER (app base + storage base), baked
+    // into the const so app-HMAC signed URLs resolve to the real download route.
+    let mount_prefix = full_mount_prefix(design);
     let public = matches!(b.visibility, Visibility::Public);
     let max_size = b
         .max_size
@@ -231,6 +248,7 @@ const BUCKET: Bucket = Bucket {{
     owner_prefix: {owner_prefix},
     max_size: {max_size},
     allowed_mime: &[{mime_list}],
+    mount_prefix: "{mount_prefix}",
 }};
 
 /// This bucket's routes. `body_limit` = the bucket's max_size, so an
@@ -314,6 +332,10 @@ fn concrete_mime(b: &BucketDesign) -> String {
 /// gen-tests does NOT count them toward expected_failing.
 pub fn acceptance_rs(design: &Design) -> String {
     let buckets = sorted_buckets(design);
+    // The full mount prefix the generated app uses (app base + storage base): the
+    // harness mounts and requests buckets under it so it exercises the real path
+    // AND the app-HMAC signed URLs (baked with the same prefix) resolve (#8, #16).
+    let base = full_mount_prefix(design);
     let needs_tenant = buckets.iter().any(|b| {
         matches!(
             bucket_scope(design, b),
@@ -335,7 +357,7 @@ pub fn acceptance_rs(design: &Design) -> String {
             .find(|e| e.name == tenancy.entity)
             .expect("validated: tenancy entity in its module");
         let t_snake = t.name.replace('-', "_");
-        let table = format!("{}s", tenancy.entity.to_lowercase());
+        let table = design.table_name(&tenancy.entity);
         let members = format!("{}_members", Design::to_snake(&tenancy.entity));
         let fk = Design::fk_column(&tenancy.entity);
         let role = tenancy
@@ -362,7 +384,7 @@ pub fn acceptance_rs(design: &Design) -> String {
         .iter()
         .map(|b| {
             format!(
-                "        .mount(\"/{}\", storage::{}::module())\n",
+                "        .mount(\"{base}/{}\", storage::{}::module())\n",
                 b.name,
                 bucket_ident(&b.name)
             )
@@ -371,7 +393,7 @@ pub fn acceptance_rs(design: &Design) -> String {
 
     let mut tests = String::new();
     for b in &buckets {
-        bucket_tests(design, b, &mut tests);
+        bucket_tests(design, b, &base, &mut tests);
     }
 
     format!(
@@ -406,8 +428,12 @@ pub fn acceptance_rs(design: &Design) -> String {
 
 /// The per-bucket test battery. Emission is conditional on the bucket's shape;
 /// every emitted body is complete (no agent TODOs — the surface is generated).
-fn bucket_tests(design: &Design, b: &BucketDesign, out: &mut String) {
+/// `base` is the storage mount prefix (e.g. `/storage`); every request path and
+/// the test-app mount go under `{base}/{bucket}` so the harness exercises the
+/// SAME mounted path the generated app serves (issue #8).
+fn bucket_tests(design: &Design, b: &BucketDesign, base: &str, out: &mut String) {
     let name = &b.name;
+    let mount = format!("{base}/{name}");
     let ident = bucket_ident(name);
     let public = matches!(b.visibility, Visibility::Public);
     let owned = bucket_scope(design, b) != BucketScope::Unowned;
@@ -420,39 +446,39 @@ fn bucket_tests(design: &Design, b: &BucketDesign, out: &mut String) {
 
     // 1. Round trip + ETag/Cache-Control (headers checked on every bucket).
     let download_1 = if public {
-        format!("t.get(&format!(\"/{name}/{{id}}\")).await")
+        format!("t.get(&format!(\"{mount}/{{id}}\")).await")
     } else {
         format!(
-            "t.get_with(&format!(\"/{name}/{{id}}\"), &[(\"cookie\", &test_cookie_for(1))]).await"
+            "t.get_with(&format!(\"{mount}/{{id}}\"), &[(\"cookie\", &test_cookie_for(1))]).await"
         )
     };
     out.push_str(&format!(
-        "#[tokio::test]\nasync fn {ident}_upload_then_download_round_trips() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"/{name}?key=probe.bin\", b\"{ident}-bytes\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(created.status().as_u16(), 201, \"upload; body: {{}}\", created.text());\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\").to_string();\n    let checksum = meta[\"checksum\"].as_str().expect(\"checksum\").to_string();\n    let res = {download_1};\n    assert_eq!(res.status().as_u16(), 200, \"download; body: {{}}\", res.text());\n    assert_eq!(res.bytes(), &b\"{ident}-bytes\"[..]);\n    let etag = res.headers().get(\"etag\").and_then(|v| v.to_str().ok()).expect(\"etag header\");\n    assert_eq!(etag, format!(\"\\\"{{checksum}}\\\"\"), \"ETag is the sha256 checksum\");\n    let cc = res.headers().get(\"cache-control\").and_then(|v| v.to_str().ok()).expect(\"cache-control header\");\n    assert_eq!(cc, \"{cache}\");\n}}\n\n"
+        "#[tokio::test]\nasync fn {ident}_upload_then_download_round_trips() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"{mount}?key=probe.bin\", b\"{ident}-bytes\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(created.status().as_u16(), 201, \"upload; body: {{}}\", created.text());\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\").to_string();\n    let checksum = meta[\"checksum\"].as_str().expect(\"checksum\").to_string();\n    let res = {download_1};\n    assert_eq!(res.status().as_u16(), 200, \"download; body: {{}}\", res.text());\n    assert_eq!(res.bytes(), &b\"{ident}-bytes\"[..]);\n    let etag = res.headers().get(\"etag\").and_then(|v| v.to_str().ok()).expect(\"etag header\");\n    assert_eq!(etag, format!(\"\\\"{{checksum}}\\\"\"), \"ETag is the sha256 checksum\");\n    let cc = res.headers().get(\"cache-control\").and_then(|v| v.to_str().ok()).expect(\"cache-control header\");\n    assert_eq!(cc, \"{cache}\");\n}}\n\n"
     ));
 
     // 2. Mutations are always guarded.
     out.push_str(&format!(
-        "#[tokio::test]\nasync fn {ident}_upload_without_auth_is_401() {{\n    let t = app().await;\n    let res = t.post_bytes_with(\"/{name}?key=noauth.bin\", b\"x\", &[(\"content-type\", \"{mime}\")]).await;\n    assert_eq!(res.status().as_u16(), 401, \"mutations are always guarded; body: {{}}\", res.text());\n}}\n\n"
+        "#[tokio::test]\nasync fn {ident}_upload_without_auth_is_401() {{\n    let t = app().await;\n    let res = t.post_bytes_with(\"{mount}?key=noauth.bin\", b\"x\", &[(\"content-type\", \"{mime}\")]).await;\n    assert_eq!(res.status().as_u16(), 401, \"mutations are always guarded; body: {{}}\", res.text());\n}}\n\n"
     ));
 
     // 3. Private reads are guarded.
     if !public {
         out.push_str(&format!(
-            "#[tokio::test]\nasync fn {ident}_download_without_auth_is_401() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"/{name}?key=guard.bin\", b\"x\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\");\n    let res = t.get(&format!(\"/{name}/{{id}}\")).await;\n    assert_eq!(res.status().as_u16(), 401, \"private read without a session; body: {{}}\", res.text());\n}}\n\n"
+            "#[tokio::test]\nasync fn {ident}_download_without_auth_is_401() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"{mount}?key=guard.bin\", b\"x\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\");\n    let res = t.get(&format!(\"{mount}/{{id}}\")).await;\n    assert_eq!(res.status().as_u16(), 401, \"private read without a session; body: {{}}\", res.text());\n}}\n\n"
         ));
     }
 
     // 4. allowed_mime → 415 JC0415.
     if !b.allowed_mime.is_empty() {
         out.push_str(&format!(
-            "#[tokio::test]\nasync fn {ident}_disallowed_mime_is_415() {{\n    let t = app().await;\n    let res = t.post_bytes_with(\"/{name}?key=bad-mime.bin\", b\"x\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"application/x-jerrycan-blocked\")]).await;\n    assert_eq!(res.status().as_u16(), 415, \"design: allowed_mime violation is 415 JC0415; body: {{}}\", res.text());\n    assert!(res.text().contains(\"JC0415\"), \"body: {{}}\", res.text());\n}}\n\n"
+            "#[tokio::test]\nasync fn {ident}_disallowed_mime_is_415() {{\n    let t = app().await;\n    let res = t.post_bytes_with(\"{mount}?key=bad-mime.bin\", b\"x\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"application/x-jerrycan-blocked\")]).await;\n    assert_eq!(res.status().as_u16(), 415, \"design: allowed_mime violation is 415 JC0415; body: {{}}\", res.text());\n    assert!(res.text().contains(\"JC0415\"), \"body: {{}}\", res.text());\n}}\n\n"
         ));
     }
 
     // 5. max_size → 413 (the route's body_limit fires at the transport).
     if let Some(max) = b.max_size.as_deref().and_then(Design::parse_size) {
         out.push_str(&format!(
-            "#[tokio::test]\nasync fn {ident}_oversize_upload_is_413() {{\n    let t = app().await;\n    let body = vec![0u8; {over}];\n    let res = t.post_bytes_with(\"/{name}?key=huge.bin\", &body, &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(res.status().as_u16(), 413, \"design: max_size violation is 413 JC0413; body: {{}}\", res.text());\n}}\n\n",
+            "#[tokio::test]\nasync fn {ident}_oversize_upload_is_413() {{\n    let t = app().await;\n    let body = vec![0u8; {over}];\n    let res = t.post_bytes_with(\"{mount}?key=huge.bin\", &body, &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(res.status().as_u16(), 413, \"design: max_size violation is 413 JC0413; body: {{}}\", res.text());\n}}\n\n",
             over = max + 1,
         ));
     }
@@ -465,20 +491,20 @@ fn bucket_tests(design: &Design, b: &BucketDesign, out: &mut String) {
             String::new() // public read is open by design — only writes are scoped.
         } else {
             format!(
-                "    let foreign = t.get_with(&format!(\"/{name}/{{id}}\"), &[(\"cookie\", &test_cookie_for(2))]).await;\n    assert_eq!(foreign.status().as_u16(), 404, \"cross-owner get must 404; body: {{}}\", foreign.text());\n    let listed = t.get_with(\"/{name}\", &[(\"cookie\", &test_cookie_for(2))]).await;\n    assert_eq!(listed.status().as_u16(), 200, \"user 2 lists their own objects; body: {{}}\", listed.text());\n    assert!(!listed.text().contains(&id), \"cross-owner list must not leak the foreign id; body: {{}}\", listed.text());\n"
+                "    let foreign = t.get_with(&format!(\"{mount}/{{id}}\"), &[(\"cookie\", &test_cookie_for(2))]).await;\n    assert_eq!(foreign.status().as_u16(), 404, \"cross-owner get must 404; body: {{}}\", foreign.text());\n    let listed = t.get_with(\"{mount}\", &[(\"cookie\", &test_cookie_for(2))]).await;\n    assert_eq!(listed.status().as_u16(), 200, \"user 2 lists their own objects; body: {{}}\", listed.text());\n    assert!(!listed.text().contains(&id), \"cross-owner list must not leak the foreign id; body: {{}}\", listed.text());\n"
             )
         };
         let survive_leg = if public {
             format!(
-                "    let survives = t.get(&format!(\"/{name}/{{id}}\")).await;\n    assert_eq!(survives.status().as_u16(), 200, \"the row must survive a cross-owner delete; body: {{}}\", survives.text());\n"
+                "    let survives = t.get(&format!(\"{mount}/{{id}}\")).await;\n    assert_eq!(survives.status().as_u16(), 200, \"the row must survive a cross-owner delete; body: {{}}\", survives.text());\n"
             )
         } else {
             format!(
-                "    let survives = t.get_with(&format!(\"/{name}/{{id}}\"), &[(\"cookie\", &test_cookie_for(1))]).await;\n    assert_eq!(survives.status().as_u16(), 200, \"the row must survive a cross-owner delete; body: {{}}\", survives.text());\n"
+                "    let survives = t.get_with(&format!(\"{mount}/{{id}}\"), &[(\"cookie\", &test_cookie_for(1))]).await;\n    assert_eq!(survives.status().as_u16(), 200, \"the row must survive a cross-owner delete; body: {{}}\", survives.text());\n"
             )
         };
         out.push_str(&format!(
-            "/// SECURITY: user/tenant 2 must not reach owner 1's `{name}` objects —\n/// this is the isolation contract; breaking any scope turns it red.\n#[tokio::test]\nasync fn {ident}_cross_owner_access_is_denied() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"/{name}?key=mine.bin\", b\"mine\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(created.status().as_u16(), 201, \"setup; body: {{}}\", created.text());\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\").to_string();\n{read_leg}    let del = t.delete_with(&format!(\"/{name}/{{id}}\"), &[(\"cookie\", &test_cookie_for(2))]).await;\n    assert_eq!(del.status().as_u16(), 404, \"cross-owner delete must 404; body: {{}}\", del.text());\n{survive_leg}}}\n\n"
+            "/// SECURITY: user/tenant 2 must not reach owner 1's `{name}` objects —\n/// this is the isolation contract; breaking any scope turns it red.\n#[tokio::test]\nasync fn {ident}_cross_owner_access_is_denied() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"{mount}?key=mine.bin\", b\"mine\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(created.status().as_u16(), 201, \"setup; body: {{}}\", created.text());\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\").to_string();\n{read_leg}    let del = t.delete_with(&format!(\"{mount}/{{id}}\"), &[(\"cookie\", &test_cookie_for(2))]).await;\n    assert_eq!(del.status().as_u16(), 404, \"cross-owner delete must 404; body: {{}}\", del.text());\n{survive_leg}}}\n\n"
         ));
     }
 
@@ -486,7 +512,7 @@ fn bucket_tests(design: &Design, b: &BucketDesign, out: &mut String) {
     // distinct prefixed objects; B never reaches A's.
     if b.owner_prefix {
         out.push_str(&format!(
-            "/// SECURITY: owner_prefix isolates keys per owner (Supabase\n/// folder-per-user parity): the same relative key lands under each owner's\n/// prefix and never collides or crosses.\n#[tokio::test]\nasync fn {ident}_owner_prefix_isolates_keys() {{\n    let t = app().await;\n    let a = t.post_bytes_with(\"/{name}?key=same.bin\", b\"a\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(a.status().as_u16(), 201, \"owner 1 upload; body: {{}}\", a.text());\n    let a_meta: serde_json::Value = serde_json::from_str(&a.text()).expect(\"meta json\");\n    assert_eq!(a_meta[\"key\"], serde_json::json!(\"1/same.bin\"), \"key is stored under owner 1's prefix\");\n    let b = t.post_bytes_with(\"/{name}?key=same.bin\", b\"b\", &[(\"cookie\", &test_cookie_for(2)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(b.status().as_u16(), 201, \"same relative key, different prefix — no collision; body: {{}}\", b.text());\n    let b_meta: serde_json::Value = serde_json::from_str(&b.text()).expect(\"meta json\");\n    assert_eq!(b_meta[\"key\"], serde_json::json!(\"2/same.bin\"));\n    let a_id = a_meta[\"id\"].as_str().expect(\"id\");\n    let cross = t.delete_with(&format!(\"/{name}/{{a_id}}\"), &[(\"cookie\", &test_cookie_for(2))]).await;\n    assert_eq!(cross.status().as_u16(), 404, \"cross-prefix delete must 404; body: {{}}\", cross.text());\n}}\n\n"
+            "/// SECURITY: owner_prefix isolates keys per owner (Supabase\n/// folder-per-user parity): the same relative key lands under each owner's\n/// prefix and never collides or crosses.\n#[tokio::test]\nasync fn {ident}_owner_prefix_isolates_keys() {{\n    let t = app().await;\n    let a = t.post_bytes_with(\"{mount}?key=same.bin\", b\"a\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(a.status().as_u16(), 201, \"owner 1 upload; body: {{}}\", a.text());\n    let a_meta: serde_json::Value = serde_json::from_str(&a.text()).expect(\"meta json\");\n    assert_eq!(a_meta[\"key\"], serde_json::json!(\"1/same.bin\"), \"key is stored under owner 1's prefix\");\n    let b = t.post_bytes_with(\"{mount}?key=same.bin\", b\"b\", &[(\"cookie\", &test_cookie_for(2)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(b.status().as_u16(), 201, \"same relative key, different prefix — no collision; body: {{}}\", b.text());\n    let b_meta: serde_json::Value = serde_json::from_str(&b.text()).expect(\"meta json\");\n    assert_eq!(b_meta[\"key\"], serde_json::json!(\"2/same.bin\"));\n    let a_id = a_meta[\"id\"].as_str().expect(\"id\");\n    let cross = t.delete_with(&format!(\"{mount}/{{a_id}}\"), &[(\"cookie\", &test_cookie_for(2))]).await;\n    assert_eq!(cross.status().as_u16(), 404, \"cross-prefix delete must 404; body: {{}}\", cross.text());\n}}\n\n"
         ));
     }
 
@@ -499,7 +525,7 @@ fn bucket_tests(design: &Design, b: &BucketDesign, out: &mut String) {
         )
     };
     out.push_str(&format!(
-        "#[tokio::test]\nasync fn {ident}_signed_url_grants_and_rejects() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"/{name}?key=to-sign.bin\", b\"signed\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(created.status().as_u16(), 201, \"setup; body: {{}}\", created.text());\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\");\n    let signed = t.post_json_with(&format!(\"/{name}/{{id}}/sign\"), &serde_json::json!({{}}), &[(\"cookie\", &test_cookie_for(1))]).await;\n    assert_eq!(signed.status().as_u16(), 200, \"sign; body: {{}}\", signed.text());\n    let url = serde_json::from_str::<serde_json::Value>(&signed.text()).expect(\"json\")[\"url\"].as_str().expect(\"url\").to_string();\n    let ok = t.get(&url).await;\n    assert_eq!(ok.status().as_u16(), 200, \"a signed URL needs no session; body: {{}}\", ok.text());\n    assert_eq!(ok.bytes(), &b\"signed\"[..]);\n{tamper_leg}}}\n\n"
+        "#[tokio::test]\nasync fn {ident}_signed_url_grants_and_rejects() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"{mount}?key=to-sign.bin\", b\"signed\", &[(\"cookie\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(created.status().as_u16(), 201, \"setup; body: {{}}\", created.text());\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\");\n    let signed = t.post_json_with(&format!(\"{mount}/{{id}}/sign\"), &serde_json::json!({{}}), &[(\"cookie\", &test_cookie_for(1))]).await;\n    assert_eq!(signed.status().as_u16(), 200, \"sign; body: {{}}\", signed.text());\n    let url = serde_json::from_str::<serde_json::Value>(&signed.text()).expect(\"json\")[\"url\"].as_str().expect(\"url\").to_string();\n    let ok = t.get(&url).await;\n    assert_eq!(ok.status().as_u16(), 200, \"a signed URL needs no session; body: {{}}\", ok.text());\n    assert_eq!(ok.bytes(), &b\"signed\"[..]);\n{tamper_leg}}}\n\n"
     ));
 }
 
@@ -695,13 +721,19 @@ mod tests {
             "{a}"
         );
         assert!(a.contains(".provide_dep(shared::tenant)"), "{a}");
+        // Buckets mount + are requested under the /storage prefix (issue #8), so
+        // the harness exercises the same path the generated app serves.
         assert!(
-            a.contains(".mount(\"/avatars\", storage::avatars::module())"),
+            a.contains(".mount(\"/storage/avatars\", storage::avatars::module())"),
             "{a}"
         );
         assert!(
-            a.contains(".mount(\"/invoices\", storage::invoices::module())"),
+            a.contains(".mount(\"/storage/invoices\", storage::invoices::module())"),
             "{a}"
+        );
+        assert!(
+            a.contains("t.post_bytes_with(\"/storage/avatars?key=probe.bin\""),
+            "requests go under the storage prefix: {a}"
         );
         // Tenant seeds: two tenants, two memberships (isolation acts as user 2).
         assert!(
@@ -743,6 +775,27 @@ mod tests {
         assert!(!a.contains("avatars_download_without_auth_is_401"), "{a}");
         // Private bucket: tampered signed URL is rejected.
         assert!(a.contains("invoices tampered signed URL"), "{a}");
+    }
+
+    /// A custom storage.base_path drives BOTH the acceptance mount and every
+    /// request path, so the harness keeps exercising the real mounted path (#8).
+    #[test]
+    fn acceptance_honors_custom_storage_base_path() {
+        let mut d = design();
+        d.storage.as_mut().unwrap().base_path = Some("/files".into());
+        let a = acceptance_rs(&d);
+        assert!(
+            a.contains(".mount(\"/files/avatars\", storage::avatars::module())"),
+            "mount uses the custom base_path: {a}"
+        );
+        assert!(
+            a.contains("t.post_bytes_with(\"/files/avatars?key=probe.bin\""),
+            "requests use the custom base_path: {a}"
+        );
+        assert!(
+            !a.contains("/storage/avatars"),
+            "the default prefix is fully replaced: {a}"
+        );
     }
 
     #[test]

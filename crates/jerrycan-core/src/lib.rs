@@ -38,6 +38,11 @@ pub use test_client::{TestApp, TestPart, TestResponse};
 /// Re-exported so apps and tests never add `http` to their own Cargo.toml.
 pub use http;
 
+/// Re-exported so agent-owned app code (e.g. the error-body mapper in
+/// `crates/app/src/errors.rs`) can build `serde_json::Value` bodies without
+/// adding a separate `serde_json` dependency to the app crate.
+pub use serde_json;
+
 /// Re-exported for webhook recipes that parse `application/x-www-form-urlencoded`
 /// bodies (e.g. Twilio's signed form params) without a separate dependency.
 pub use serde_urlencoded;

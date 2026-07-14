@@ -615,8 +615,9 @@ fn schema_answers_structural_questions(app: &Path) {
         "leads.status enum values"
     );
 
-    // Q: api_keys FK → workspaces (cascade), and prefix is unique.
-    let apikeys = table("apikeys");
+    // Q: api_keys FK → workspaces (cascade), and prefix is unique. `ApiKey`
+    // pluralizes to `api_keys` (snake_case + proper pluralization, issue #17).
+    let apikeys = table("api_keys");
     let ak_fk = apikeys
         .foreign_keys
         .iter()

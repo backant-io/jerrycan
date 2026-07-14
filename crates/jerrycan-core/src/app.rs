@@ -31,6 +31,16 @@ pub(crate) type BackgroundFactory = Box<
         + Send,
 >;
 
+/// An app-level error-body mapper (`App::map_error_body`). Given a
+/// framework-emitted error's status, stable code, and message, it returns
+/// `Some(body)` to reshape the JSON response into the app's own wire envelope,
+/// or `None` to keep jerrycan's default `{code, message[, details]}` body (so a
+/// mapper that only remaps some errors leaves the rest — and their `details` —
+/// untouched). Applied to EVERY error response (framework guards/extractors AND
+/// handler-returned `Error`) at the single dispatch exit.
+pub type ErrorBodyMapper =
+    dyn Fn(http::StatusCode, &str, &str) -> Option<serde_json::Value> + Send + Sync;
+
 /// The application builder. Generated `app/src/main.rs` is exactly this:
 /// provide app-level deps, mount modules, serve.
 pub struct App {
@@ -43,6 +53,9 @@ pub struct App {
     handler_timeout: std::time::Duration,
     body_read_timeout: std::time::Duration,
     write_stall_timeout: std::time::Duration,
+    /// App-level error-body mapper (spec §4.1 error envelope). None ⇒ the flat
+    /// `{code, message}` body. Shared into the `Arc`-cloned `BuiltApp`.
+    error_mapper: Option<Arc<ErrorBodyMapper>>,
     /// Serve-time-only background tasks (spec: `on_serve`). They are taken off
     /// the builder by the serve engine before `build()`; `into_test` drops them.
     background: Vec<(&'static str, BackgroundFactory)>,
@@ -66,6 +79,7 @@ impl Default for App {
             handler_timeout: std::time::Duration::from_secs(30),
             body_read_timeout: std::time::Duration::from_secs(30),
             write_stall_timeout: std::time::Duration::from_secs(30),
+            error_mapper: None,
             background: Vec::new(),
         }
     }
@@ -91,6 +105,20 @@ impl App {
     /// must be explicit — that is the contract.
     pub fn security_headers(mut self, on: bool) -> Self {
         self.security_headers = on;
+        self
+    }
+
+    /// Register an app-level error-body mapper so framework-emitted errors (the
+    /// auth guard's 401, extractor 4xx, …) render in the app's OWN wire envelope
+    /// instead of the flat `{code, message}` body — the only way to make those
+    /// framework errors conform. `f` receives each error's status, stable code,
+    /// and message; return `Some(json)` to reshape the body, or `None` to keep
+    /// the default (preserving `details`). Applies to every error response.
+    pub fn map_error_body<F>(mut self, f: F) -> Self
+    where
+        F: Fn(http::StatusCode, &str, &str) -> Option<serde_json::Value> + Send + Sync + 'static,
+    {
+        self.error_mapper = Some(Arc::new(f));
         self
     }
 
@@ -224,6 +252,7 @@ impl App {
             handler_timeout: self.handler_timeout,
             body_read_timeout: self.body_read_timeout,
             write_stall_timeout: self.write_stall_timeout,
+            error_mapper: self.error_mapper.clone(),
         })
     }
 
@@ -294,6 +323,9 @@ pub struct BuiltApp {
     pub(crate) handler_timeout: std::time::Duration,
     pub(crate) body_read_timeout: std::time::Duration,
     pub(crate) write_stall_timeout: std::time::Duration,
+    /// App-level error-body mapper, applied at the dispatch exit to every error
+    /// response so framework errors render in the app's wire envelope.
+    pub(crate) error_mapper: Option<Arc<ErrorBodyMapper>>,
 }
 
 // The trie holds type-erased handler fns and overrides are `dyn Any`, so the
@@ -355,6 +387,30 @@ impl BuiltApp {
         ))
     }
 
+    /// Reshape an error response's body through the app-level mapper — the seam
+    /// that lets an app render framework-emitted errors in its own wire envelope
+    /// (spec §4.1). A no-op unless a mapper is registered AND the response
+    /// carries [`ErrorParts`] (i.e. it IS an error — success responses are never
+    /// touched); a `None` from the mapper keeps the default body and its
+    /// `details`. Called at BOTH error exits (routing rejects + the handler
+    /// pipeline) so no framework error escapes it.
+    pub(crate) fn apply_error_mapper(&self, response: &mut Response) {
+        let Some(mapper) = &self.error_mapper else {
+            return;
+        };
+        let Some(parts) = response
+            .extensions()
+            .get::<crate::response::ErrorParts>()
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(body) = mapper(response.status(), parts.code, &parts.message) {
+            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            *response.body_mut() = crate::response::JcBody::full(bytes);
+        }
+    }
+
     /// Phase 1 of the two-phase read (spec §4.4): decide what to do with the
     /// request from its HEAD alone, before any body byte is read. A match
     /// yields the body limit to read up to; anything else yields a finished,
@@ -399,6 +455,9 @@ impl BuiltApp {
         }
         let reject = |response: Response| -> Policy {
             let mut response = response;
+            // Routing rejects (404/405/400) are framework-emitted errors too —
+            // reshape them through the app's envelope before decorating headers.
+            self.apply_error_mapper(&mut response);
             if self.security_headers {
                 apply_security_headers(&mut response);
             }
@@ -438,6 +497,9 @@ impl BuiltApp {
         // headers (the other half of preflight, handled in `route_policy`).
         let origin = parts.headers.get(http::header::ORIGIN).cloned();
         let mut response = self.dispatch_inner(parts, lane).await;
+        // Reshape any error body (guard 401, extractor 4xx, handler Error) into
+        // the app's wire envelope before headers/CORS decorate it.
+        self.apply_error_mapper(&mut response);
         if self.security_headers {
             apply_security_headers(&mut response);
         }
@@ -549,6 +611,76 @@ mod tests {
         assert_eq!(r.status(), http::StatusCode::METHOD_NOT_ALLOWED);
         let r = dispatch(&built, http::Method::GET, "/nope", "").await;
         assert_eq!(r.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    async fn body_string(r: Response) -> String {
+        use http_body_util::BodyExt;
+        let bytes = r.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A registered `map_error_body` reshapes FRAMEWORK-emitted error bodies (the
+    /// guard 401, a routing 404) into the app's own wire envelope — the whole
+    /// point of issue #13: those errors never pass through a handler, so an app
+    /// with a `{"error":{code,message}}` envelope could not otherwise make them
+    /// conform. Without a mapper the flat body is unchanged; a mapper returning
+    /// `None` keeps the default body (and its `details`).
+    #[tokio::test]
+    async fn registered_error_mapper_reshapes_framework_error_bodies() {
+        async fn guarded() -> crate::Result<&'static str> {
+            Err(Error::unauthorized()) // stands in for the auth guard's 401
+        }
+        let secure = || Module::new("secure").route("/", get(guarded));
+
+        let mapped = App::new()
+            .map_error_body(|_status, code, message| {
+                Some(serde_json::json!({ "error": { "code": code, "message": message } }))
+            })
+            .mount("/secure", secure())
+            .build()
+            .unwrap();
+        // The framework guard 401 renders in the app's envelope.
+        let r = dispatch(&mapped, http::Method::GET, "/secure/", "").await;
+        assert_eq!(r.status(), http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_string(r).await,
+            r#"{"error":{"code":"JC0401","message":"authentication required"}}"#
+        );
+        // A routing 404 (framework-emitted, never reaches a handler) too.
+        let r = dispatch(&mapped, http::Method::GET, "/nope", "").await;
+        let body = body_string(r).await;
+        assert!(
+            body.contains(r#""error""#) && body.contains("JC0404"),
+            "routing 404 must be reshaped: {body}"
+        );
+
+        // No mapper → the flat default body, unchanged.
+        let plain = App::new().mount("/secure", secure()).build().unwrap();
+        let r = dispatch(&plain, http::Method::GET, "/secure/", "").await;
+        assert_eq!(
+            body_string(r).await,
+            r#"{"code":"JC0401","message":"authentication required"}"#
+        );
+    }
+
+    /// A mapper that returns `None` for an error leaves the default body — and
+    /// its `details` — intact, so an app can remap only the errors it cares about.
+    #[tokio::test]
+    async fn error_mapper_returning_none_preserves_the_default_body_and_details() {
+        async fn detailed() -> crate::Result<&'static str> {
+            Err(Error::unprocessable("bad")
+                .with_details(serde_json::json!([{ "field": "x", "message": "required" }])))
+        }
+        let built = App::new()
+            .map_error_body(|_s, _c, _m| None)
+            .mount("/v", Module::new("v").route("/", get(detailed)))
+            .build()
+            .unwrap();
+        let body = body_string(dispatch(&built, http::Method::GET, "/v/", "").await).await;
+        assert!(
+            body.contains("JC0422") && body.contains("details") && body.contains("\"field\""),
+            "None must keep the default body with details: {body}"
+        );
     }
 
     #[test]

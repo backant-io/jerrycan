@@ -189,8 +189,14 @@ fn build_one(
         return None;
     }
 
+    // Preserve the source table name losslessly: pin `table` only when the
+    // default (snake_case + pluralization) would NOT reproduce it, so a clean
+    // name stays override-free while an irregular one round-trips exactly.
+    let table = (Design::default_table_name(&name) != table.name).then(|| table.name.clone());
+
     Some(Entity {
         name,
+        table,
         belongs_to,
         fields,
     })
@@ -291,5 +297,39 @@ create table public.order_items (
         assert_eq!(entity_name("statuses"), "Status");
         assert_eq!(entity_name("people"), "Person");
         assert_eq!(entity_name("workspace"), "Workspace");
+    }
+
+    #[test]
+    fn source_table_name_is_preserved_losslessly_only_when_the_default_would_drift() {
+        // WHY: the importer must reproduce the SOURCE DB's exact table names.
+        // A name the default table rule round-trips (workspaces → Workspace →
+        // workspaces) stays override-free; an irregular plural the default would
+        // NOT reproduce (people → Person → persons ≠ people) gets a pinned
+        // `table` override so the generated schema matches the source exactly.
+        let schema = r#"
+create table public.people (id uuid primary key, name text not null);
+create table public.workspaces (id uuid primary key, name text not null);
+"#;
+        let db = PgDatabase::fold(&parse::split_and_parse(schema));
+        let out = build_entities(&db);
+        let person = out
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "Person")
+            .unwrap();
+        assert_eq!(
+            person.1.table.as_deref(),
+            Some("people"),
+            "irregular plural must be pinned so the table stays `people`, not `persons`"
+        );
+        let ws = out
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "Workspace")
+            .unwrap();
+        assert!(
+            ws.1.table.is_none(),
+            "a name the default rule reproduces needs no override"
+        );
     }
 }

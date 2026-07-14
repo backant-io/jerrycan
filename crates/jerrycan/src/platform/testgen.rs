@@ -185,13 +185,21 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         let guarded = auth && ep.is_guarded();
         // Endpoints whose success needs a credential/signature the generator can't
         // supply (login, signed webhook, api-key route): no un-greenable success
-        // probe — emit a TODO instead. These are never session-guarded (a guard
-        // would be threaded), so `guarded` is false and no 401 test is emitted.
-        let gated = endpoint_is_credential_gated(ep);
+        // probe — emit a TODO instead. Detected by heuristic OR declared
+        // explicitly with `probe: skip` (issue #11) so a design the heuristic
+        // misses can still reach `ok:true`. These are never session-guarded (a
+        // guard would be threaded), so `guarded` is false and no 401 test is emitted.
+        let probe_skip = ep.probe == ProbePolicy::Skip;
+        let gated = endpoint_is_credential_gated(ep) || probe_skip;
 
         if gated {
+            let reason = if probe_skip {
+                "is marked `probe: skip` — the generator can't synthesize a credential for its success"
+            } else {
+                "authenticates via a credential/signature the generator can't supply"
+            };
             out.todos.push(format!(
-                "// AGENT TODO: {fn_base} ({:?} {full_path}) authenticates via a credential/signature the generator can't supply — write its success test (with a valid credential) and its 401/403 rejection test in your own test file.",
+                "// AGENT TODO: {fn_base} ({:?} {full_path}) {reason} — write its success test (with a valid credential) and its 401/403 rejection test in your own test file.",
                 ep.method
             ));
         } else if param_count(ep) == 0 {
@@ -333,18 +341,51 @@ fn module_needs_tenant(design: &Design, module: &ModuleDesign) -> bool {
 /// crate (cross-crate relative include) so the `{tenant}_members` table the
 /// `tenant` guard queries exists. Empty if the tenant module IS this module
 /// (its own migration is already included) or there is no tenancy.
-fn tenant_migration_item(design: &Design, module: &ModuleDesign) -> String {
-    let Some(t) = tenant_module(design) else {
-        return String::new();
-    };
-    if t.name == module.name || t.entities.is_empty() {
-        return String::new();
+/// Every module's create-tables migration for the FULL workspace schema, so a
+/// module's TestApp can touch ANY module's table (issue #14): a handler that
+/// legitimately writes another module's table no longer 500s with "no such
+/// table". The CURRENT module includes its own files by the relative
+/// `../migrations/...` path; every OTHER module by the cross-crate
+/// `../../{module}/migrations/...` path (the same shape the old tenant
+/// cross-include used). sqlite-memory schema is cheap, so migrating everything
+/// is the simplest correct default. Deterministic: document order, skipping
+/// entity-less modules (which have no migration file).
+fn collect_workspace_migration_items(design: &Design, current: &ModuleDesign, out: &mut String) {
+    for m in &design.modules {
+        let prefix = if m.name == current.name {
+            "..".to_string()
+        } else {
+            format!("../../{}", m.name)
+        };
+        let m_snake = m.name.replace('-', "_");
+        if !m.entities.is_empty() {
+            out.push_str(&format!(
+                "        jerrycan::db::Migration {{\n            name: \"{m_snake}_0001_create_tables\",\n            sqlite: include_str!(\"{prefix}/migrations/sqlite/0001_create_tables.sql\"),\n            postgres: include_str!(\"{prefix}/migrations/postgres/0001_create_tables.sql\"),\n        }},\n"
+            ));
+        }
+        collect_subroute_migration_items(m, &m_snake, &prefix, out);
     }
-    let t_snake = t.name.replace('-', "_");
-    format!(
-        "        jerrycan::db::Migration {{\n            name: \"{t_snake}_0001_create_tables\",\n            sqlite: include_str!(\"../../{t}/migrations/sqlite/0001_create_tables.sql\"),\n            postgres: include_str!(\"../../{t}/migrations/postgres/0001_create_tables.sql\"),\n        }},\n",
-        t = t.name,
-    )
+}
+
+/// Subroute create-tables migrations for one top-level module (recursive). A
+/// subroute's file lives in its TOP module's migrations dir as
+/// `0001_create_tables_{sub}.sql`; its name is namespaced by the top module so
+/// two modules' like-named subroutes never collide in the workspace list.
+fn collect_subroute_migration_items(
+    module: &ModuleDesign,
+    top_snake: &str,
+    prefix: &str,
+    out: &mut String,
+) {
+    for sub in &module.subroutes {
+        if !sub.entities.is_empty() {
+            let s = sub.name.replace('-', "_");
+            out.push_str(&format!(
+                "        jerrycan::db::Migration {{\n            name: \"{top_snake}_0001_create_tables_{s}\",\n            sqlite: include_str!(\"{prefix}/migrations/sqlite/0001_create_tables_{s}.sql\"),\n            postgres: include_str!(\"{prefix}/migrations/postgres/0001_create_tables_{s}.sql\"),\n        }},\n"
+            ));
+        }
+        collect_subroute_migration_items(sub, top_snake, prefix, out);
+    }
 }
 
 /// The seed statements that put the test user (id 1) into a tenant: insert one
@@ -365,7 +406,7 @@ fn tenant_seed(design: &Design, module: &ModuleDesign) -> String {
     let Some(entity) = t.entities.iter().find(|e| e.name == tenancy.entity) else {
         return String::new();
     };
-    let table = format!("{}s", tenancy.entity.to_lowercase());
+    let table = design.table_name(&tenancy.entity);
     let members = format!("{}_members", Design::to_snake(&tenancy.entity));
     let fk = Design::fk_column(&tenancy.entity);
     let role = tenancy
@@ -438,7 +479,7 @@ fn seed_second_tenant_fn(design: &Design, module: &ModuleDesign) -> String {
     let Some(entity) = t.entities.iter().find(|e| e.name == tenancy.entity) else {
         return String::new();
     };
-    let table = format!("{}s", tenancy.entity.to_lowercase());
+    let table = design.table_name(&tenancy.entity);
     let members = format!("{}_members", Design::to_snake(&tenancy.entity));
     let fk = Design::fk_column(&tenancy.entity);
     let role = isolation_member_role(design, module);
@@ -620,14 +661,15 @@ fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool) -> Strin
         String::new()
     };
     if design.wants_db() {
+        // Migrate the FULL workspace schema (issue #14), not just this module's
+        // tables: a handler may legitimately write another module's table, which
+        // would 500 with "no such table" under a module-only TestApp. This also
+        // subsumes the old tenant-module cross-include (the `{tenant}_members`
+        // table the Tenant guard queries is now always present). Tenancy still
+        // needs (b) a seeded membership row so the guard resolves a tenant (not
+        // 403) and (c) the `tenant` factory registered so `Dep<Tenant>` resolves.
         let mut migration_items = String::new();
-        collect_migration_items(module, &mut migration_items);
-        // Tenancy: the guarded handlers of a tenant-owned module take
-        // `Dep<Tenant>`. The test app must (a) migrate the tenant module's tables
-        // (the `{tenant}_members` table the guard queries), (b) seed a membership
-        // row so the guard resolves a tenant (not 403), and (c) register the
-        // `tenant` factory app-wide so `Dep<Tenant>` resolves at all.
-        migration_items.push_str(&tenant_migration_item(design, module));
+        collect_workspace_migration_items(design, module, &mut migration_items);
         let seed = tenant_seed(design, module);
         let tenant_dep = if module_needs_tenant(design, module) {
             ".provide_dep(shared::tenant)"
@@ -659,27 +701,6 @@ fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool) -> Strin
             "{auth_login}async fn app() -> TestApp {{\n    App::new(){auth_extend}.mount(\"{mount}\", module()).into_test()\n}}\n"
         )
     }
-}
-
-fn collect_migration_items(module: &ModuleDesign, out: &mut String) {
-    if !module.entities.is_empty() {
-        out.push_str(&format!(
-            "        jerrycan::db::Migration {{\n            name: \"{m}_0001_create_tables\",\n            sqlite: include_str!(\"../migrations/sqlite/0001_create_tables.sql\"),\n            postgres: include_str!(\"../migrations/postgres/0001_create_tables.sql\"),\n        }},\n",
-            m = module.name.replace('-', "_")
-        ));
-    }
-    fn subs(module: &ModuleDesign, out: &mut String) {
-        for sub in &module.subroutes {
-            if !sub.entities.is_empty() {
-                let s = sub.name.replace('-', "_");
-                out.push_str(&format!(
-                    "        jerrycan::db::Migration {{\n            name: \"{s}_0001_create_tables\",\n            sqlite: include_str!(\"../migrations/sqlite/0001_create_tables_{s}.sql\"),\n            postgres: include_str!(\"../migrations/postgres/0001_create_tables_{s}.sql\"),\n        }},\n"
-                ));
-            }
-            subs(sub, out);
-        }
-    }
-    subs(module, out);
 }
 
 /// The full tests/acceptance.rs for one top-level module.
