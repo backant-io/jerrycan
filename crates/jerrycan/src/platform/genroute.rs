@@ -222,18 +222,35 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
         out.push_str(&e.name);
         out.push_str(" {\n");
         for f in &e.fields {
+            out.push_str(&keyword_field_attrs(&f.name, "    ", false));
             if !f.required {
                 out.push_str("    #[serde(default)]\n");
             }
             out.push_str(&format!(
                 "    pub {}: {},\n",
-                f.name,
+                rust_ident(&f.name),
                 f.field_type.rust_type()
             ));
         }
         out.push_str("}\n\n");
     }
     Some(out)
+}
+
+/// serde `rename` (+ sea_orm `column_name` in db mode) attribute line(s) for a
+/// field whose name is a Rust keyword: its struct field is emitted as a raw
+/// identifier (`type` → `r#type`), so these keep the wire (JSON) name — and the
+/// SQL column name — as the original `type`. Empty for a non-keyword field, so
+/// output is byte-identical to before for every existing design.
+fn keyword_field_attrs(name: &str, indent: &str, db: bool) -> String {
+    if !is_rust_keyword(name) {
+        return String::new();
+    }
+    let mut s = format!("{indent}#[serde(rename = \"{name}\")]\n");
+    if db {
+        s.push_str(&format!("{indent}#[sea_orm(column_name = \"{name}\")]\n"));
+    }
+    s
 }
 
 /// PascalCase a snake_case column name for SeaORM's `Column` variants:
@@ -296,11 +313,15 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design) -> Option<String> {
                 FieldType::Boolean => "bool",
                 _ => f.field_type.rust_type(),
             };
+            // A keyword field is a raw identifier (`type` → `r#type`); the serde
+            // rename + sea_orm column_name keep the wire and SQL names as `type`.
+            fields.push_str(&keyword_field_attrs(&f.name, "        ", true));
+            let ident = rust_ident(&f.name);
             if f.required {
-                fields.push_str(&format!("        pub {}: {base},\n", f.name));
+                fields.push_str(&format!("        pub {ident}: {base},\n"));
             } else {
                 fields.push_str("        #[serde(default)]\n");
-                fields.push_str(&format!("        pub {}: Option<{base}>,\n", f.name));
+                fields.push_str(&format!("        pub {ident}: Option<{base}>,\n"));
             }
         }
 
@@ -449,7 +470,10 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
                 out.push_str(&format!("{indent}id: sea_orm::ActiveValue::NotSet,\n"));
             }
         } else {
-            out.push_str(&format!("{indent}{name}: Set(item.{name}),\n"));
+            // A keyword field is a raw identifier on both the ActiveModel field
+            // and the moved-in `item` value (`r#type: Set(item.r#type)`).
+            let ident = rust_ident(&name);
+            out.push_str(&format!("{indent}{ident}: Set(item.{ident}),\n"));
         }
     }
     out
@@ -1520,6 +1544,58 @@ mod tests {
         assert!(
             src.contains("impl ActiveModelBehavior for ActiveModel {}"),
             "{src}"
+        );
+    }
+
+    /// A field named after a Rust keyword (`type`) survives into generated code
+    /// as a RAW identifier (`r#type`) at every Rust position — the Model struct
+    /// field and the ActiveModel `field: Set(item.field)` binds — while the serde
+    /// rename + sea_orm column_name keep the wire (JSON) and SQL names as `type`.
+    /// WHY: frozen external wire contracts carry `type`/`match`/`ref` fields;
+    /// forcing a rename would push a permanent wire↔storage mapping into every
+    /// handler. (Issue #10.)
+    #[test]
+    fn keyword_field_names_become_raw_identifiers_with_preserved_wire_and_sql_names() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "webhooks", "contract_version": 1, "dependencies": ["db"],
+                "modules": [{ "name": "events",
+                    "entities": [{ "name": "Event", "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "type", "type": "string" } ] }],
+                    "endpoints": [{ "operation_id": "create_event", "method": "POST", "path": "/",
+                        "request_body": { "entity": "Event" },
+                        "success": { "status": 201, "entity": "Event" } }] }] }"#,
+        )
+        .unwrap();
+        // The design is accepted (validator no longer rejects the keyword field).
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "a `type` field must not raise a question: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let m = &d.modules[0];
+        // db-mode Model: raw ident + serde rename + sea_orm column_name.
+        let model = model_rs_db(m, &d).unwrap();
+        assert!(
+            model.contains("#[serde(rename = \"type\")]\n        #[sea_orm(column_name = \"type\")]\n        pub r#type: String,"),
+            "keyword field is a raw ident carrying rename + column_name: {model}"
+        );
+        // ActiveModel assignment uses the raw ident on both sides.
+        let e = &m.entities[0];
+        let sets = active_sets(e, true);
+        assert!(
+            sets.contains("r#type: Set(item.r#type),"),
+            "ActiveModel binds the raw ident: {sets}"
+        );
+        // memory-mode Model: raw ident + serde rename (no sea_orm attr).
+        let mem = model_rs(m).unwrap();
+        assert!(
+            mem.contains("#[serde(rename = \"type\")]\n    pub r#type: String,"),
+            "memory Model raw ident + rename: {mem}"
+        );
+        assert!(
+            !mem.contains("column_name"),
+            "no sea_orm attr in memory mode: {mem}"
         );
     }
 

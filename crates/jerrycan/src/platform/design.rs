@@ -497,6 +497,48 @@ impl Design {
     }
 }
 
+/// Rust keywords (2018+): reserved words that need a raw identifier (`r#name`)
+/// to appear as a field/type name in generated code. Shared by the validator
+/// (`questions.rs`) and the code generators (`genroute.rs`) so the "is this a
+/// keyword?" decision has ONE source of truth.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+    "where", "while",
+];
+
+/// Keywords a raw identifier CANNOT escape — even `r#self` is invalid Rust — so
+/// a field/entity named one of these still can't become a Rust identifier and
+/// must be rejected by validation.
+const UNESCAPABLE_KEYWORDS: &[&str] = &["crate", "self", "Self", "super"];
+
+/// Whether `name` is a Rust keyword (would collide with generated struct/field
+/// idents unless raw-escaped).
+pub(crate) fn is_rust_keyword(name: &str) -> bool {
+    RUST_KEYWORDS.contains(&name)
+}
+
+/// Whether `name` can appear as a Rust identifier — directly, or raw-escaped
+/// (`r#name`). True for non-keywords and raw-escapable keywords (`type`, `match`,
+/// `ref`, …); false only for `crate`/`self`/`super`/`Self`, which no `r#` rescues.
+pub(crate) fn can_be_rust_ident(name: &str) -> bool {
+    !UNESCAPABLE_KEYWORDS.contains(&name)
+}
+
+/// A field/type name rendered as a Rust identifier: raw-escaped (`type` →
+/// `r#type`) when it is a keyword, unchanged otherwise. Every generated
+/// RUST-identifier position for a field name routes through this so a frozen
+/// wire contract can keep a `type`/`match`/`ref` field without a rename.
+/// Precondition: `can_be_rust_ident(name)` (validation guarantees it).
+pub(crate) fn rust_ident(name: &str) -> String {
+    if is_rust_keyword(name) {
+        format!("r#{name}")
+    } else {
+        name.to_string()
+    }
+}
+
 /// Walk a module and its subroutes in document order, pairing each entity
 /// that belongs_to `tenant` with the owning module/subroute name.
 fn collect_tenant_owned<'a>(

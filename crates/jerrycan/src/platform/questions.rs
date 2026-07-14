@@ -17,15 +17,6 @@ fn q(id: impl Into<String>, question: impl Into<String>) -> Question {
     }
 }
 
-/// Reserved words that cannot appear as field/entity identifiers: generated
-/// model.rs uses them verbatim as struct/field names and would not compile.
-const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
-    "where", "while",
-];
-
 fn is_kebab(s: &str) -> bool {
     !s.is_empty()
         && s.starts_with(|c: char| c.is_ascii_lowercase())
@@ -423,7 +414,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 ));
             }
             let ident = b.name.replace('-', "_");
-            if RUST_KEYWORDS.contains(&ident.as_str()) {
+            if is_rust_keyword(&ident) {
                 qs.push(q(
                     format!("{bptr}/name"),
                     format!("Bucket `{}` becomes the Rust module `{ident}`, which is a keyword — rename it.", b.name),
@@ -610,11 +601,11 @@ fn validate_module(
                 format!("Entity `{}` must be PascalCase.", e.name),
             ));
         }
-        if RUST_KEYWORDS.contains(&e.name.as_str()) {
+        if is_rust_keyword(&e.name) {
             qs.push(q(
                 format!("{ptr}/entities/{i}/name"),
                 format!(
-                    "Entity `{}` is a Rust keyword — generated model code cannot use it; rename it (e.g. a domain-specific name).",
+                    "Entity `{}` is a Rust keyword — it becomes a module/type name that no raw identifier can escape; rename it (e.g. a domain-specific name).",
                     e.name
                 ),
             ));
@@ -635,11 +626,16 @@ fn validate_module(
                     format!("Field `{}` must be snake_case.", f.name),
                 ));
             }
-            if RUST_KEYWORDS.contains(&f.name.as_str()) {
+            // A keyword field name is fine: codegen emits it as a raw identifier
+            // (`type` → `r#type`) with a `#[serde(rename)]` so the wire name is
+            // unchanged — a frozen external contract keeps its `type`/`match`/
+            // `ref` field. Only `crate`/`self`/`super`, which no `r#` can escape,
+            // are still rejected.
+            if !can_be_rust_ident(&f.name) {
                 qs.push(q(
                     format!("{ptr}/entities/{i}/fields/{j}/name"),
                     format!(
-                        "Field `{name}` is a Rust keyword — generated model code cannot use it; rename (e.g. `{name}_field` or a domain-specific name).",
+                        "Field `{name}` is a Rust keyword that no raw identifier can escape — rename (e.g. `{name}_field` or a domain-specific name).",
                         name = f.name
                     ),
                 ));
@@ -1190,15 +1186,35 @@ mod tests {
     }
 
     #[test]
-    fn rust_keyword_field_names_are_rejected() {
-        // `type` is a Rust keyword — generated `pub type: ...` would not compile.
-        let d = design(&MINIMAL.replace("\"name\": \"title\"", "\"name\": \"type\""));
-        assert!(
-            validate(&d)
-                .iter()
-                .any(|q| q.question.contains("Rust keyword") && q.question.contains("`type`")),
-            "keyword field name must be flagged"
-        );
+    fn raw_escapable_keyword_field_names_are_accepted() {
+        // WHY: `type`/`match`/`ref` are common field names in frozen external
+        // wire contracts. Codegen raw-escapes them (`r#type`) with a serde
+        // rename, so forcing a rename would push a permanent wire↔storage
+        // mapping into every handler. Validation must NOT flag them.
+        for kw in ["type", "match", "ref"] {
+            let d = design(&MINIMAL.replace("\"name\": \"title\"", &format!("\"name\": \"{kw}\"")));
+            assert!(
+                !validate(&d)
+                    .iter()
+                    .any(|q| q.id.contains("/fields/") && q.question.contains("keyword")),
+                "keyword field `{kw}` is raw-escapable and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn unescapable_keyword_field_names_are_still_rejected() {
+        // `self`/`crate`/`super` are keywords no raw identifier can escape
+        // (`r#self` is invalid Rust), so a field named one still can't compile.
+        for kw in ["self", "crate", "super"] {
+            let d = design(&MINIMAL.replace("\"name\": \"title\"", &format!("\"name\": \"{kw}\"")));
+            assert!(
+                validate(&d)
+                    .iter()
+                    .any(|q| q.id.contains("/fields/") && q.question.contains("keyword")),
+                "unescapable keyword field `{kw}` must be flagged"
+            );
+        }
     }
 
     #[test]

@@ -17,6 +17,9 @@ use std::process::Command;
 /// Mirror of design::tests::MINIMAL (that const is `#[cfg(test)]`-private to the
 /// crate, so integration tests inline it). The todos module has an entity (Todo)
 /// → it emits model.rs + repo.rs, the exact dead-code-vs-stub shape under test.
+/// The Todo also carries a field named `type` — a Rust keyword — so this compile
+/// gate empirically proves issue #10: the emitted `r#type` raw identifier (Model
+/// field + ActiveModel binds) compiles under `-D warnings`.
 const MINIMAL: &str = r#"{
     "name": "demo-api",
     "contract_version": 0,
@@ -26,6 +29,7 @@ const MINIMAL: &str = r#"{
         "name": "todos",
         "entities": [{ "name": "Todo", "fields": [
             { "name": "title", "type": "string" },
+            { "name": "type", "type": "string", "required": false },
             { "name": "done", "type": "boolean", "required": false }
         ]}],
         "endpoints": [
