@@ -138,6 +138,51 @@ assert_eq!(t.get_from("/ping", ip).await.status().as_u16(), 204);
 # fn main() {}
 ```
 
+## CORS
+Cross-origin access is a policy on the `App`, not a middleware — preflight `OPTIONS`
+is answered *before* routing, and actual cross-origin responses (including 404/405)
+are decorated with the CORS headers. `App::cors(CorsConfig::new(origins))` installs
+it: `CorsOrigins::list([..])` is an exact allowlist, `CorsOrigins::any()` sends
+`Access-Control-Allow-Origin: *`. Chain `allow_methods([..])` / `allow_headers([..])`
+to pin the preflight response (omit them to reflect the request's method/headers),
+and `allow_credentials(true)` to allow cookies / `Authorization` — the Fetch spec
+forbids combining credentials with `any()`, so that pairing is a build error.
+
+```rust
+# use jerrycan::prelude::*;
+# fn main() {
+let _app = App::new()
+    .cors(
+        CorsConfig::new(CorsOrigins::list(["https://app.example"]))
+            .allow_methods([jerrycan::http::Method::GET, jerrycan::http::Method::POST])
+            .allow_headers(["content-type", "authorization"])
+            .allow_credentials(true),
+    )
+    .route("/", get(|| async { NoContent }));
+# }
+```
+
+In a generated app you declare CORS in `design.json` rather than hand-editing the
+tool-owned `crates/app/src/main.rs` (that edit trips the JL0003 tool-owned-file lint
+and is wiped by the next `jerrycan generate`):
+
+```json
+{
+  "cors": {
+    "origins": ["https://app.example", "https://admin.example"],
+    "methods": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    "headers": ["content-type", "authorization"],
+    "allow_credentials": true
+  }
+}
+```
+
+The generator emits `.cors(CorsConfig::new(..)..)` into app assembly. The allowed
+origins are overridable at deploy time via the `JERRYCAN_CORS_ORIGINS` env var
+(comma-separated; `*` for any) — falling back to the design's list — so the same
+binary serves staging and production SPAs without a rebuild. Use `"origins": ["*"]`
+for any origin (which cannot be combined with `allow_credentials`).
+
 ## Errors you'll hit
 - Borrow error inside `handle` after `next.run(ctx)` → you moved `ctx`; call
   `next.run(&mut *ctx)` (reborrow) as in the Signature example.

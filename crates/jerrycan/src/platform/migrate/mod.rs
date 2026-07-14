@@ -497,6 +497,9 @@ fn emit_from_db(
         description: None,
         // No app-level mount prefix for an import (routes serve at the root).
         base_path: None,
+        // No CORS policy inferred from an import; add a `cors` block post-migration
+        // if the migrated app serves a cross-origin SPA (issue #21).
+        cors: None,
         auth: Some(auth_out.auth.clone()),
         dependencies,
         tenancy,

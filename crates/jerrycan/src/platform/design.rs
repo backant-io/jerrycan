@@ -15,6 +15,13 @@ pub struct Design {
     /// and metrics (`/metrics`) stay unprefixed. Empty/`/`/absent is a no-op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_path: Option<String>,
+    /// App-level CORS policy (installed via `App::cors`). Present ⇒ the generated
+    /// main.rs wires a cross-origin policy for the listed origins; absent ⇒ no
+    /// CORS layer (same-origin only). The allowed origins are overridable at
+    /// deploy time via `JERRYCAN_CORS_ORIGINS` (comma-separated), so a cross-origin
+    /// SPA can be re-pointed without hand-editing the tool-owned main.rs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsDesign>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
     /// App-scoped dependency names the generator must provide on App.
@@ -29,6 +36,42 @@ pub struct Design {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realtime: Option<RealtimeDesign>,
     pub modules: Vec<ModuleDesign>,
+}
+
+/// The top-level `cors` block: a design-modeled CORS policy the generator installs
+/// via `App::cors(CorsConfig::new(..))`. Maps 1:1 onto jerrycan_core's
+/// `CorsConfig`/`CorsOrigins` — no options core can't honor. Serving a cross-origin
+/// SPA (console on one origin, API on another) is declarative here instead of a
+/// hand-edit of the tool-owned main.rs that the next `jerrycan generate` would wipe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorsDesign {
+    /// Allowed origins: exact scheme+host[:port] strings, or the single marker
+    /// `"*"` for any origin (`CorsOrigins::any()` → `Access-Control-Allow-Origin: *`).
+    /// Overridable at deploy time via `JERRYCAN_CORS_ORIGINS` (comma-separated).
+    pub origins: Vec<String>,
+    /// Methods allowed on preflight (`allow_methods`). Empty ⇒ core reflects the
+    /// route's real methods.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<HttpMethod>,
+    /// Request headers allowed on preflight (`allow_headers`). Empty ⇒ core reflects
+    /// the request's `Access-Control-Request-Headers`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<String>,
+    /// Emit `Access-Control-Allow-Credentials: true` (`allow_credentials`). The
+    /// Fetch spec forbids combining this with `"*"` origins (core's `App::build`
+    /// rejects it; validation catches it at design time).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_credentials: bool,
+}
+
+impl CorsDesign {
+    /// True when the origins are the single wildcard marker `"*"` (maps to
+    /// `CorsOrigins::any()`). Validation guarantees `"*"` is never mixed with
+    /// explicit origins, so any `"*"` present means "any origin".
+    pub fn is_any(&self) -> bool {
+        self.origins.iter().any(|o| o == "*")
+    }
 }
 
 /// The `realtime` block (contract v2): row-change subscriptions (scope-filtered
@@ -312,6 +355,19 @@ impl HttpMethod {
             HttpMethod::PUT => "put",
             HttpMethod::PATCH => "patch",
             HttpMethod::DELETE => "delete",
+        }
+    }
+
+    /// The `http::Method` associated-constant name (`GET`, `POST`, …) for emitting a
+    /// CORS `allow_methods([jerrycan::http::Method::GET, …])` list into generated
+    /// code (issue #21). The variant names already match the `http` constants.
+    pub fn as_http_const(self) -> &'static str {
+        match self {
+            HttpMethod::GET => "GET",
+            HttpMethod::POST => "POST",
+            HttpMethod::PUT => "PUT",
+            HttpMethod::PATCH => "PATCH",
+            HttpMethod::DELETE => "DELETE",
         }
     }
 }
@@ -812,6 +868,84 @@ pub(crate) mod tests {
         let s = include_str!("../../../../docs/contracts/design-schema.json");
         assert!(
             s.contains("\"realtime\"") && s.contains("\"broadcast\"") && s.contains("\"presence\"")
+        );
+    }
+
+    #[test]
+    fn cors_block_round_trips_and_maps_onto_core_config() {
+        // WHY: a cross-origin SPA (console on one origin, API on another) must be
+        // declarable in design.json — not hand-patched into the tool-owned main.rs.
+        // The block maps 1:1 onto CorsConfig/CorsOrigins (issue #21).
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "api", "contract_version": 0, "dependencies": [],
+                "cors": {
+                    "origins": ["https://app.example", "https://admin.example"],
+                    "methods": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                    "headers": ["content-type", "authorization"],
+                    "allow_credentials": true
+                },
+                "modules": [{ "name": "m", "endpoints": [
+                    { "operation_id": "list_m", "method": "GET", "path": "/",
+                      "success": { "status": 200 } }] }] }"#,
+        )
+        .unwrap();
+        let cors = d.cors.as_ref().expect("cors block parses");
+        assert_eq!(
+            cors.origins,
+            ["https://app.example", "https://admin.example"]
+        );
+        assert_eq!(
+            cors.methods,
+            [
+                HttpMethod::GET,
+                HttpMethod::POST,
+                HttpMethod::PUT,
+                HttpMethod::PATCH,
+                HttpMethod::DELETE
+            ]
+        );
+        assert_eq!(cors.headers, ["content-type", "authorization"]);
+        assert!(cors.allow_credentials);
+        assert!(!cors.is_any(), "an explicit allowlist is not `any`");
+        // Round trip preserves the block.
+        let back = serde_json::to_string(&d).unwrap();
+        let re: Design = serde_json::from_str(&back).unwrap();
+        assert_eq!(re.cors.as_ref().unwrap().origins, cors.origins);
+
+        // The `*` marker maps to CorsOrigins::any(); false-y defaults are skipped
+        // on serialize (no `methods`/`headers`/`allow_credentials` keys emitted).
+        let any: Design = serde_json::from_str(
+            r#"{ "name": "api", "contract_version": 0, "dependencies": [],
+                "cors": { "origins": ["*"] },
+                "modules": [{ "name": "m", "endpoints": [
+                    { "operation_id": "list_m", "method": "GET", "path": "/",
+                      "success": { "status": 200 } }] }] }"#,
+        )
+        .unwrap();
+        assert!(any.cors.as_ref().unwrap().is_any());
+        let val = serde_json::to_value(any.cors.as_ref().unwrap()).unwrap();
+        assert!(val.get("methods").is_none() && val.get("headers").is_none());
+        assert!(
+            val.get("allow_credentials").is_none(),
+            "false allow_credentials is not serialized: {val}"
+        );
+
+        // Absent block ⇒ no cors (v0/v1/v2 designs untouched, no facade feature).
+        let plain: Design = serde_json::from_str(MINIMAL).unwrap();
+        assert!(plain.cors.is_none());
+        assert!(
+            !plain.facade_features().iter().any(|f| f == &"cors"),
+            "cors is unconditional in core — it adds no facade feature"
+        );
+    }
+
+    #[test]
+    fn published_schema_accepts_the_cors_block() {
+        let s = include_str!("../../../../docs/contracts/design-schema.json");
+        assert!(
+            s.contains("\"cors\"")
+                && s.contains("\"origins\"")
+                && s.contains("\"allow_credentials\"")
         );
     }
 
