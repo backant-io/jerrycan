@@ -86,6 +86,7 @@ const REPORTS: Bucket = Bucket {
     owner_prefix: false,
     max_size: 1024 * 1024,
     allowed_mime: &["application/pdf"],
+    mount_prefix: "/storage",
 };
 
 async fn archive(storage: Dep<Storage>, db: Dep<jerrycan::db::Db>) -> Result<Json<String>> {
