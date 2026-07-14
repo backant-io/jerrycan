@@ -159,7 +159,9 @@ It's wired as an **un-skippable release gate** (CI + a fail-fast pre-publish blo
 
 **For:** CRUD-shaped, multi-tenant REST APIs. The backbone of most SaaS.
 
-**Not (yet):** realtime / WebSockets, GraphQL / gRPC, blob storage, edge / serverless. jerrycan runs as a normal long-lived service. We'd rather name the edges than oversell the middle.
+**Also shipping (contract v2):** design-modeled object storage (`storage.buckets`) and realtime (Postgres Changes + Broadcast + Presence).
+
+**Not (yet):** GraphQL / gRPC, edge / serverless. jerrycan runs as a normal long-lived service. We'd rather name the edges than oversell the middle.
 
 ## Built with
 
