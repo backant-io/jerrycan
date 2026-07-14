@@ -74,6 +74,47 @@ fn db_mode_preamble_migrates_an_in_memory_database() {
     assert!(generated.contains(".extend(db)"), "{generated}");
 }
 
+/// A module's TestApp migrates the FULL workspace schema (issue #14), not just
+/// its own tables — so a handler that legitimately writes ANOTHER module's table
+/// no longer 500s with "no such table" under the module TestApp. The `orders`
+/// TestApp must include BOTH its own migration (relative) AND the `products`
+/// module's migration (cross-crate `../../products/...`).
+#[test]
+fn module_testapp_migrates_the_full_workspace_schema() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "shop-api",
+        "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [
+            { "name": "products",
+              "entities": [{ "name": "Product", "fields": [
+                  { "name": "sku", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_products", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Product", "list": true } }] },
+            { "name": "orders",
+              "entities": [{ "name": "Order", "fields": [
+                  { "name": "total", "type": "integer" } ]}],
+              "endpoints": [{ "operation_id": "list_orders", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Order", "list": true } }] }
+        ]
+    }))
+    .unwrap();
+    let orders = design.modules.iter().find(|m| m.name == "orders").unwrap();
+    let generated = testgen::acceptance_rs(&design, orders);
+    // Its own tables (relative include).
+    assert!(
+        generated.contains("include_str!(\"../migrations/sqlite/0001_create_tables.sql\")"),
+        "orders TestApp migrates its own tables: {generated}"
+    );
+    // AND the products module's tables (cross-crate include) — the whole point:
+    // an orders handler may write the products table.
+    assert!(
+        generated
+            .contains("include_str!(\"../../products/migrations/sqlite/0001_create_tables.sql\")"),
+        "orders TestApp must also migrate the products module's tables: {generated}"
+    );
+}
+
 #[test]
 fn unsupported_error_cases_become_an_agent_todo_comment() {
     let mut design = golden(false);
