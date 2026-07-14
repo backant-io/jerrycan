@@ -9,6 +9,11 @@ use zeroize::Zeroizing;
 
 pub mod api_key;
 pub mod guard;
+// Third-party ID-token verifier (Sign in with Apple / Google Sign-In). Behind the
+// `idtoken` feature because it pulls jsonwebtoken + an outbound HTTPS client for
+// the JWKS fetch; the base crate gains nothing from these.
+#[cfg(feature = "idtoken")]
+pub mod idtoken;
 pub mod jwt;
 // The mock IdP is a test/eval-only harness that mints deterministic tokens. It
 // needs the oauth types, so it compiles for this crate's OWN tests when oauth is on
@@ -29,6 +34,8 @@ pub use api_key::{
     hash_key, mint, require_scope, verify,
 };
 pub use guard::{Bearer, Session, require_role};
+#[cfg(feature = "idtoken")]
+pub use idtoken::{HttpJwksSource, IdTokenClaims, Jwk, Jwks, JwksFuture, JwksSource, Verifier};
 #[cfg(any(all(test, feature = "oauth"), feature = "mock-idp"))]
 pub use mock_idp::MockIdp;
 #[cfg(feature = "oauth")]
