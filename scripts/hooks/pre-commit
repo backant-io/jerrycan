@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# jerrycan pre-commit: fast, hermetic checks only. The heavy suites run in CI —
+# this hook is a convenience, never the authority. Install once with
+# ./scripts/install-hooks.sh
+set -euo pipefail
+
+echo "pre-commit: cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "pre-commit: cargo clippy --workspace --all-features -- -D warnings"
+cargo clippy --workspace --all-features -- -D warnings
+
+echo "pre-commit: OK"

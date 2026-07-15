@@ -199,6 +199,7 @@ The v1 plan is in the [v1 design spec](docs/superpowers/specs/2026-06-09-jerryca
 <summary><b>Build · test · lint · bench · fuzz</b></summary>
 
 ```bash
+./scripts/install-hooks.sh              # one-time: fmt + clippy run on every commit
 cargo test --workspace --all-features   # CI runs this, every docs example is a doc-test
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
@@ -206,7 +207,7 @@ cargo bench                             # criterion benches (routing, extraction
 cargo +nightly fuzz run <target>        # fuzz targets live in fuzz/ (outside the workspace)
 ```
 
-The project is built docs-first and test-first: documentation examples are the executable specification.
+The project is built docs-first and test-first: documentation examples are the executable specification. Heavy end-to-end conformance (real builds, real Postgres/Redis/MinIO) runs off the per-PR path via the manual **Heavy suite** workflow (`.github/workflows/heavy.yml`).
 </details>
 
 ## Sponsors
