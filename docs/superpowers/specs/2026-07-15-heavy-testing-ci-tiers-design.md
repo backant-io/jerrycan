@@ -148,20 +148,36 @@ Scope is narrow: only `agent_builds_postgres_backed_api_test_first` uses the sha
 SQLite file** (`sqlite://<tmp>?mode=rwc`) and is left unchanged. In-memory
 conformance tests need nothing.
 
-For each Postgres-backed heavy test, isolate by **unique database**:
+For each Postgres-backed heavy test, reset the target database to a clean slate
+**before** migrating, by dropping and recreating the `public` schema:
 
-1. Parse the base `JERRYCAN_TEST_PG_URL`.
-2. Connect to it, `CREATE DATABASE jerrycan_test_<unique>` (unique suffix derived
-   from the test name / a counter — **not** `rand`/time, so it stays
-   reproducible).
-3. Rewrite the URL's database path to the fresh name; use that for
-   `db migrate --url` and the served app's `JERRYCAN_DATABASE_URL`.
-4. `DROP DATABASE` on completion (best-effort in a teardown guard).
+```
+psql "<JERRYCAN_TEST_PG_URL>" -v ON_ERROR_STOP=1 \
+  -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"
+```
 
-This keeps each DB-backed test starting from a clean, migrated schema regardless of
-what ran before it, so the suite is correct and repeatable as more Postgres-backed
-heavy tests are added. (Unique *database* over unique *schema* to avoid depending
-on `search_path`/`options` passthrough through the connection layer.)
+run via `std::process::Command` (matching the suite's existing shell-out style —
+no async runtime, no new dev-dependency; `psql` is provided by
+`postgresql-client`, installed in `heavy.yml`). The app then migrates into and
+serves against the same URL, unchanged.
+
+Rationale for reset-before over the originally-considered unique-database
+create/drop:
+
+- **No teardown race.** `DROP DATABASE` fails with *"database is being accessed by
+  other users"* if the served app's connection lingers — a new flake source, which
+  defeats the purpose. Resetting *before* the run means there is no teardown step
+  to race; a crashed test just gets reset by the next run.
+- **Sufficient under `--test-threads=1`.** Serialization already removes
+  concurrency, so isolation only needs a clean *starting* state, not concurrent
+  namespace separation.
+- **Simpler.** No maintenance-DB connection, no unique-name bookkeeping, no URL
+  rewrite. The generated todo app only creates tables in `public`, so recreating
+  `public` is a complete reset.
+
+The test panics with a clear message if `psql` is absent (it is gated on
+`JERRYCAN_TEST_PG_URL`, which only CI sets; anyone running a Postgres-backed test
+is expected to have the client).
 
 ## Rollout
 
@@ -191,5 +207,6 @@ is never a window where the heavy guarantee is unrun.
 - **Two workflows can drift** (toolchain, service versions). Mitigation: keep the
   toolchain pin (`rust-toolchain.toml`) and service-container blocks identical;
   note the coupling in both files.
-- **`CREATE/DROP DATABASE` needs privileges** on the CI Postgres. The service
-  container's `postgres` superuser has them; documented in the harness.
+- **The schema reset needs `psql`** on the runner and privileges to recreate
+  `public`. `heavy.yml` installs `postgresql-client`, and the service container's
+  `postgres` superuser owns the schema; documented in the harness.
