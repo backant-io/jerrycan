@@ -136,8 +136,9 @@ serde.workspace = true
             "-D",
             "warnings",
         ])
-        // Keep the generated workspace's target dir inside the tempdir so we don't
-        // collide with / pollute the parent workspace's target.
+        // Shared cargo target dir across scaffolded apps (see
+        // common::shared_app_target): deps compile once; the heavy suite is
+        // single-threaded so the shared output path is never contended.
         .env("CARGO_TARGET_DIR", common::shared_app_target())
         .output()
         .expect("run cargo clippy");
