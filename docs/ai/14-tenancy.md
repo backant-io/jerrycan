@@ -9,6 +9,23 @@ tests (tenant A must never read tenant B's rows). Tenancy requires auth (a
 session model supplies the caller identity) and db. It exists so an agent gets
 data isolation by construction, not by remembering to filter every query.
 
+## Per-user data without tenancy
+Tenancy is for **org/team** entities with memberships — a `Workspace`, `Org`, or
+`Team` that many users belong to and share rows within. It is the wrong tool for
+**per-user** data (a user's own notes, tasks, uploads), where each row belongs to
+exactly one identity.
+
+For per-user ownership, do NOT declare a `tenancy` block. Instead give the owned
+entity a `belongs_to` the identity entity your sessions resolve to (typically a
+`User`/`Account`) — deriving an indexed owner fk — and scope EVERY read and write
+by the session user's id in `repo.rs`/handlers, exactly as you would with a
+tenant id.
+
+The tenant entity must never BE the auth identity entity: a user cannot be their
+own tenant org. `tenancy.entity` names a separate org/team the identity holds a
+membership in. If the "tenant" and the logged-in user would be the same row, you
+want per-user scoping, not tenancy.
+
 ## Signature
 The design declares one tenant entity and the roles a membership can hold:
 ```json
