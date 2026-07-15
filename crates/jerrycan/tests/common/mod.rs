@@ -11,11 +11,12 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 /// share a huge, identical dependency tree (tokio/sqlx/sea-orm/hyper/
 /// libsqlite3-sys/…); building it into a throwaway `target/` per app compiled it
 /// from scratch N times and cost tens of GB. Pointing every app build at ONE dir
-/// compiles the deps ONCE and reuses them. Safe under `cargo test`'s parallelism:
-/// cargo locks the target dir so builds serialize, each spawned server holds its
-/// own binary inode and binds a distinct port, and the tiny per-app crates just
-/// rebuild. Lives under the repo's `target/` (cleaned by `cargo clean`) and is
-/// reused across runs. Override with `JERRYCAN_TEST_TARGET_DIR`.
+/// compiles the deps ONCE and reuses them. Every scaffolded app names its runnable
+/// crate `app`, so they all emit the SAME final binary path (`.../debug/app`); the
+/// heavy suite therefore runs single-threaded (`--test-threads=1`, set in
+/// `heavy.yml`) so only one app builds and serves at a time and that shared output
+/// path is never contended. Lives under the repo's `target/` (cleaned by `cargo
+/// clean`) and is reused across runs. Override with `JERRYCAN_TEST_TARGET_DIR`.
 pub fn shared_app_target() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("JERRYCAN_TEST_TARGET_DIR") {
         return std::path::PathBuf::from(p);

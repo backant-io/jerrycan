@@ -66,6 +66,33 @@ fn scaffold_golden_db(tmp: &Path) -> PathBuf {
     app
 }
 
+/// Reset the target Postgres to a clean slate before a DB-backed heavy test
+/// migrates into it. The heavy suite runs `--test-threads=1`, so there is never a
+/// concurrent user of this database; dropping and recreating `public` BEFORE the
+/// run (no teardown to race, unlike DROP DATABASE) fully isolates each
+/// Postgres-backed test from whatever ran before. Requires `psql` — `heavy.yml`
+/// installs `postgresql-client`.
+fn reset_pg_public_schema(pg_url: &str) {
+    let st = Command::new("psql")
+        .arg(pg_url)
+        .args(["-v", "ON_ERROR_STOP=1"])
+        .args([
+            "-c",
+            "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;",
+        ])
+        .status()
+        .unwrap_or_else(|e| {
+            panic!(
+                "psql is required to reset the Postgres schema for the DB-backed \
+                 heavy test (install postgresql-client): {e}"
+            )
+        });
+    assert!(
+        st.success(),
+        "failed to reset public schema on the test database"
+    );
+}
+
 #[test]
 #[ignore = "heavy: db-mode golden app must build and pass the full gate"]
 fn db_mode_scaffold_passes_jerrycan_check() {
@@ -591,6 +618,11 @@ fn agent_builds_postgres_backed_api_test_first() {
         )
         .unwrap();
     }
+
+    // Clean slate before migrating: isolate this test from any prior run's tables
+    // (see reset_pg_public_schema). Safe because the heavy suite runs
+    // single-threaded, so there is never a concurrent user of this database.
+    reset_pg_public_schema(&pg_url);
 
     // Apply migrations to the real Postgres, then serve against it and drive CRUD.
     let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
