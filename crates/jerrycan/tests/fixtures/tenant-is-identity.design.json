@@ -1,0 +1,38 @@
+{
+  "name": "tenant-is-identity",
+  "contract_version": 1,
+  "description": "Regression fixture (#27): tenancy.entity names the auth identity entity. Otherwise complete, so it exercises the design-conflict rule, not a completeness question.",
+  "auth": { "model": "jwt", "roles": ["user"] },
+  "dependencies": ["db", "auth", "validate"],
+  "tenancy": { "entity": "User", "member_roles": ["owner"] },
+  "modules": [
+    {
+      "name": "accounts",
+      "entities": [
+        { "name": "User", "fields": [
+          { "name": "email", "type": "string", "unique": true },
+          { "name": "password_hash", "type": "string" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "register", "method": "POST", "path": "/register", "public": true,
+          "request_body": { "entity": "User" }, "success": { "status": 201, "entity": "User" },
+          "errors": [{ "status": 409, "code": "JC0409", "when": "email already registered" }] }
+      ]
+    },
+    {
+      "name": "notes",
+      "entities": [
+        { "name": "Note",
+          "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+          "fields": [
+            { "name": "body", "type": "string" }
+          ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_notes", "method": "GET", "path": "/", "auth_required": true,
+          "success": { "status": 200, "entity": "Note", "list": true } }
+      ]
+    }
+  ]
+}

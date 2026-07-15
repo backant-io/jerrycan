@@ -42,6 +42,99 @@ fn missing_required_arg_is_usage_error_exit_2() {
 
 const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.json");
 
+/// #27 regression: a design whose `tenancy.entity` IS the auth identity entity.
+/// It validates clean (no completeness question) but can't scaffold — the
+/// generated membership table would declare `user_id` twice.
+const TENANT_IS_IDENTITY: &str = include_str!("fixtures/tenant-is-identity.design.json");
+
+/// #27 fail-loud: `tenancy.entity` naming the auth identity must be rejected
+/// BEFORE any file is written, with the JC0540 code and a message naming both
+/// fixes — not die mid-scaffold with a raw SQLite `duplicate column name`.
+#[test]
+fn new_rejects_tenant_as_auth_identity_before_scaffolding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design_path = tmp.path().join("design.json");
+    std::fs::write(&design_path, TENANT_IS_IDENTITY).unwrap();
+    let app_dir = tmp.path().join("app");
+
+    let out = jerrycan()
+        .args(["--json", "new"])
+        .arg(&app_dir)
+        .arg("--design")
+        .arg(&design_path)
+        .output()
+        .unwrap();
+
+    assert_ne!(out.status.code(), Some(0), "the conflict must fail the run");
+    // #28: a --json failure emits EXACTLY one JSON envelope on stdout.
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is exactly one JSON document");
+    assert_eq!(payload["ok"], serde_json::json!(false));
+    assert_eq!(payload["code"], "JC0540");
+    let err = payload["error"].as_str().expect("error is a string");
+    // The message names both fixes (per-user → belongs_to; orgs/teams → separate entity).
+    assert!(
+        err.contains("belongs_to") && err.contains("tenant entity"),
+        "error must name both fixes: {err}"
+    );
+    // No half-scaffolded tree: the app dir was never created.
+    assert!(
+        !app_dir.exists(),
+        "no files may be written when validation rejects the design"
+    );
+}
+
+/// #28: the machine envelope is universal — a failure with no JC code (a missing
+/// design file) still emits `{ok:false, code:null, error, hint}`, not empty stdout.
+#[test]
+fn json_failure_envelope_is_emitted_for_a_non_lint_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("does-not-exist.json");
+
+    let out = jerrycan()
+        .args(["--json", "new"])
+        .arg(tmp.path().join("app"))
+        .arg("--design")
+        .arg(&missing)
+        .output()
+        .unwrap();
+
+    assert_ne!(out.status.code(), Some(0), "a missing design must fail");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is exactly one JSON document");
+    assert_eq!(payload["ok"], serde_json::json!(false));
+    assert!(
+        payload["code"].is_null(),
+        "no JC code for a plain usage error"
+    );
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("does-not-exist"),
+        "error names the unreadable path: {}",
+        payload["error"]
+    );
+    assert!(payload.get("hint").is_some(), "hint key is always present");
+}
+
+/// #27: `jerrycan explain JC0540` returns the tenant-identity guidance.
+#[test]
+fn explain_jc0540_returns_the_tenant_identity_guidance() {
+    let out = jerrycan().args(["explain", "JC0540"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("JC0540"));
+    assert!(
+        text.contains("belongs_to") && text.contains("tenant entity"),
+        "explain names both fixes: {text}"
+    );
+}
+
 #[test]
 fn new_scaffolds_and_emits_json_output() {
     let tmp = tempfile::tempdir().unwrap();

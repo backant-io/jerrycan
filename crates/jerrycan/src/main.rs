@@ -192,10 +192,27 @@ fn main() {
         }
     };
 
+    // The --json flag is consumed inside run(cli); capture it for the sink so a
+    // failure can emit its machine envelope after run() returns.
+    let json_mode = cli.json;
     let result: Result<(), Failure> = run(cli);
     match result {
         Ok(()) => std::process::exit(EXIT_OK),
         Err(f) => {
+            // #28: EVERY --json failure carries exactly one JSON document on
+            // stdout. Commands that already emitted their own machine payload
+            // (questions list, check report) set json_emitted so we don't double.
+            if json_mode && !f.json_emitted {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false,
+                        "code": f.code,
+                        "error": f.message,
+                        "hint": f.hint,
+                    })
+                );
+            }
             eprintln!("error: {}", f.message);
             std::process::exit(f.exit);
         }
@@ -365,6 +382,15 @@ fn load_design(path: &Path) -> Result<Design, Failure> {
 
 /// Validate; on questions emit the jerrycan_design-shaped payload and exit 1.
 fn require_complete(design: &Design, json_mode: bool) -> Result<(), Failure> {
+    // #27: a fatal design-shape conflict (e.g. tenancy.entity is the auth
+    // identity) is rejected before any file is written, carrying its JC code so
+    // the --json sink emits `{ok:false, code, error, hint}`. Checked ahead of the
+    // completeness questions: it needs a redesign, not a field edit.
+    if let Some(conflict) = questions::design_conflict(design) {
+        return Err(Failure::gate(conflict.message)
+            .with_code(conflict.code)
+            .with_hint(conflict.hint));
+    }
     let qs = questions::validate(design);
     if qs.is_empty() {
         return Ok(());
@@ -381,7 +407,10 @@ fn require_complete(design: &Design, json_mode: bool) -> Result<(), Failure> {
     for q in &qs {
         human.push_str(&format!("  {} — {}\n", q.id, q.question));
     }
-    Err(Failure::gate(human))
+    // The questions JSON above is this failure's stdout document (in --json
+    // mode), so the sink must not add the generic envelope on top of it.
+    let f = Failure::gate(human);
+    Err(if json_mode { f.mark_json_emitted() } else { f })
 }
 
 fn cmd_new(target: &str, design_path: &str, json_mode: bool) -> Result<(), Failure> {
@@ -942,7 +971,10 @@ fn cmd_check(module: Option<&str>, no_fail_fast: bool, json_mode: bool) -> Resul
         eprintln!("check: all green");
         Ok(())
     } else {
-        Err(Failure::gate(report.next_step))
+        // In --json mode the report above is this failure's stdout document, so
+        // the sink must not add the generic envelope on top of it.
+        let f = Failure::gate(report.next_step);
+        Err(if json_mode { f.mark_json_emitted() } else { f })
     }
 }
 

@@ -31,31 +31,59 @@ pub const EXIT_GATE_FAILED: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_ENVIRONMENT: i32 = 3;
 
-/// A platform-level failure that knows its exit code and (in --json mode) its payload.
+/// A platform-level failure that knows its exit code and (in --json mode) its
+/// machine envelope. Every `--json` failure surfaces as one stdout document
+/// `{ok:false, code, error, hint}`; `code`/`hint` carry a diagnostic JC code and
+/// a recovery line when the failure has them (e.g. the tenancy/identity lint).
 #[derive(Debug)]
 pub struct Failure {
     pub exit: i32,
     pub message: String,
+    /// A stable diagnostic code (`jerrycan explain <code>`), when this failure
+    /// maps to one; `None` for plain usage/environment errors.
+    pub code: Option<&'static str>,
+    /// A short recovery hint, rendered as the envelope's `hint` field.
+    pub hint: Option<String>,
+    /// True when the failing command already wrote its own machine-readable JSON
+    /// to stdout (the questions list, the `jerrycan check` report). The `--json`
+    /// sink then skips the generic envelope so stdout stays exactly one document.
+    pub json_emitted: bool,
 }
 
 impl Failure {
     pub fn usage(msg: impl Into<String>) -> Self {
-        Self {
-            exit: EXIT_USAGE,
-            message: msg.into(),
-        }
+        Self::new(EXIT_USAGE, msg)
     }
     pub fn environment(msg: impl Into<String>) -> Self {
-        Self {
-            exit: EXIT_ENVIRONMENT,
-            message: msg.into(),
-        }
+        Self::new(EXIT_ENVIRONMENT, msg)
     }
     pub fn gate(msg: impl Into<String>) -> Self {
+        Self::new(EXIT_GATE_FAILED, msg)
+    }
+    fn new(exit: i32, msg: impl Into<String>) -> Self {
         Self {
-            exit: EXIT_GATE_FAILED,
+            exit,
             message: msg.into(),
+            code: None,
+            hint: None,
+            json_emitted: false,
         }
+    }
+    /// Attach a diagnostic code surfaced in the `--json` envelope's `code` field.
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+    /// Attach a recovery hint surfaced in the `--json` envelope's `hint` field.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+    /// Mark that the command already emitted its own stdout JSON, so the sink
+    /// must not add the generic envelope (avoids two documents on stdout).
+    pub fn mark_json_emitted(mut self) -> Self {
+        self.json_emitted = true;
+        self
     }
 }
 

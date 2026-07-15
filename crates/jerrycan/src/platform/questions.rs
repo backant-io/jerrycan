@@ -53,6 +53,50 @@ fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a
         .or_else(|| m.entities.first().map(|e| e.name.as_str()))
 }
 
+/// The fixed column the generated `{tenant}_members` table and the `Tenant`
+/// guard use for the authenticated principal: the membership DDL emits a
+/// `user_id` column (see `genroute` `write_module_migrations`) and the guard
+/// factory queries `WHERE user_id = ?` (see `scaffold::shared_tenancy_types`).
+/// It is a FIXED name, not a design-named identity entity, so the collision
+/// rule below compares the tenant's derived fk column against it rather than
+/// against a hardcoded `User` string.
+const AUTH_IDENTITY_FK_COLUMN: &str = "user_id";
+
+/// A fatal design-shape conflict caught before any scaffolding — distinct from
+/// the completeness questions `validate` returns (which a field edit can
+/// answer). This one needs a structural redesign, so it carries a stable JC
+/// code the CLI (`{ok:false, code, ...}`) and the MCP twin render.
+#[derive(Debug)]
+pub struct DesignConflict {
+    pub code: &'static str,
+    pub message: String,
+    pub hint: String,
+}
+
+/// Reject a design that cannot be generated regardless of completeness. One rule
+/// today (#27): `tenancy.entity` must not BE the auth identity entity. When it
+/// is, the tenant's derived fk column equals the membership table's fixed
+/// `user_id` column, so the auth_0001 migration declares `user_id` twice and
+/// dies with `duplicate column name: user_id` — mid-scaffold, on a half-written
+/// tree. Catch it up front instead. Shared by the CLI and MCP so they can't drift.
+pub fn design_conflict(d: &Design) -> Option<DesignConflict> {
+    if let Some(tenancy) = &d.tenancy
+        && Design::fk_column(&tenancy.entity) == AUTH_IDENTITY_FK_COLUMN
+    {
+        let entity = &tenancy.entity;
+        return Some(DesignConflict {
+            code: "JC0540",
+            message: format!(
+                "tenancy.entity `{entity}` is the auth identity entity — its derived foreign key column `{AUTH_IDENTITY_FK_COLUMN}` collides with the membership table's authenticated-user column, so scaffolding would die with `duplicate column name: {AUTH_IDENTITY_FK_COLUMN}`. A user cannot be their own tenant org. For per-user data, drop the `tenancy` block and give each owned entity a `belongs_to` `{entity}` plus tenant-scoped guard methods (all_for/get_for); for orgs/teams, point tenancy.entity at a separate tenant entity (e.g. Org or Workspace). See `jerrycan docs tenancy` / `jerrycan explain JC0540`."
+            ),
+            hint: format!(
+                "per-user data → `belongs_to` `{entity}` + scoped guard methods; orgs/teams → a separate tenant entity (Org/Workspace)"
+            ),
+        });
+    }
+    None
+}
+
 /// Validate a parsed design. Empty result == complete (status: "complete").
 pub fn validate(d: &Design) -> Vec<Question> {
     let mut qs = Vec::new();
@@ -1455,6 +1499,48 @@ mod tests {
         let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
         d.auth = None;
         assert!(validate(&d).iter().any(|q| q.id == "/tenancy"));
+    }
+
+    /// #27: a design whose `tenancy.entity` IS the auth identity entity is
+    /// otherwise complete (no completeness question), yet cannot scaffold — the
+    /// generated `{tenant}_members` table would derive the same fixed `user_id`
+    /// column twice. `design_conflict` rejects it up front with JC0540, so the
+    /// CLI fails loud before writing a byte instead of dying mid-migration with a
+    /// raw SQLite `duplicate column name: user_id`.
+    #[test]
+    fn tenancy_entity_as_auth_identity_is_a_design_conflict() {
+        let fixture = include_str!("../../tests/fixtures/tenant-is-identity.design.json");
+        let d: Design = serde_json::from_str(fixture).unwrap();
+        // Completeness is clean — the conflict is what the new rule catches.
+        assert!(
+            validate(&d).is_empty(),
+            "fixture must be otherwise complete: {:?}",
+            validate(&d)
+        );
+        let conflict = design_conflict(&d).expect("tenant==identity must be a conflict");
+        assert_eq!(conflict.code, "JC0540");
+        // Names both fixes: per-user → belongs_to; orgs/teams → a separate entity.
+        assert!(
+            conflict.message.contains("belongs_to") && conflict.message.contains("tenant entity"),
+            "{}",
+            conflict.message
+        );
+        assert!(!conflict.hint.is_empty());
+    }
+
+    /// The comparison is derived from the fixed membership `user_id` column, so a
+    /// tenancy over a SEPARATE tenant entity (the reference shape) is never
+    /// flagged — only the entity whose fk column collides with the identity is.
+    #[test]
+    fn separate_tenant_entity_is_not_a_conflict() {
+        let d: Design = serde_json::from_str(V1_FULL).unwrap();
+        assert!(
+            design_conflict(&d).is_none(),
+            "Workspace tenancy must not be flagged"
+        );
+        // No tenancy at all: nothing to conflict.
+        let plain: Design = serde_json::from_str(MINIMAL).unwrap();
+        assert!(design_conflict(&plain).is_none());
     }
 
     #[test]
