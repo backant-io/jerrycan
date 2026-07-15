@@ -437,7 +437,7 @@
             "status": {
               "type": "integer",
               "minimum": 200,
-              "maximum": 299
+              "maximum": 399
             },
             "entity": {
               "type": "string"

@@ -136,6 +136,26 @@ fn design_schema_is_module_grouped_and_recursive() {
     );
 }
 
+/// The published schema's success-status bound must admit the 3xx redirect
+/// statuses the docs promise (docs/ai/00-designing.md: "must be in 200-399";
+/// 17-response-types.md documents `Redirect`) — an external agent validating a
+/// draft against this contract must not be contradicted by the docs (issue #32).
+/// The runtime validator (questions.rs) already accepts 200..=399; this pins the
+/// contract to the same range so the two cannot drift apart.
+#[test]
+fn success_status_admits_3xx_redirects() {
+    let doc = load("design-schema.json");
+    let status = &doc["$defs"]["endpoint"]["properties"]["success"]["properties"]["status"];
+    assert_eq!(
+        status["minimum"], 200,
+        "success status floor is 200 (2xx/3xx success class)"
+    );
+    assert_eq!(
+        status["maximum"], 399,
+        "success status ceiling is 399: 3xx redirects are a valid success class (#32)"
+    );
+}
+
 /// A hand-authored design exercises the schema's own `required` lists so neither
 /// the instance nor the schema can drift without this test noticing.
 #[test]
