@@ -188,6 +188,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs errors",
     },
     CodeInfo {
+        code: "JC0540",
+        title: "tenant entity is the auth identity",
+        cause: "the design's tenancy.entity names the auth identity entity — its derived foreign key column is `user_id`, the same column the generated membership table already uses for the authenticated user, so a user cannot be their own tenant org and the auth_0001 migration would fail with `duplicate column name: user_id`",
+        fix: "for per-user data, drop the tenancy block and give each owned entity a belongs_to the identity plus tenant-scoped guard methods (all_for/get_for); for orgs/teams, point tenancy.entity at a SEPARATE tenant entity (e.g. Org or Workspace) that users hold a membership in",
+        doc: "jerrycan docs tenancy",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -242,6 +249,24 @@ mod tests {
         // allowlist cause, not just the Multipart boundary case.
         let info = lookup("JC0415").unwrap();
         assert!(info.cause.contains("allowed_mime"), "cause: {}", info.cause);
+    }
+
+    #[test]
+    fn jc0540_explains_the_tenant_identity_conflict() {
+        // WHY: JC0540 is the agent's stop after the CLI rejects a design whose
+        // tenancy.entity is the auth identity — the registry must state the cause
+        // ("a user cannot be their own tenant org") and BOTH fixes.
+        let info = lookup("JC0540").unwrap();
+        assert!(
+            info.cause.contains("auth identity") || info.cause.contains("own tenant"),
+            "cause: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("belongs_to") && info.fix.contains("tenant entity"),
+            "fix must name both remedies: {}",
+            info.fix
+        );
     }
 
     #[test]

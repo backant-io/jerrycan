@@ -114,6 +114,15 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                     json!({ "error": "design is incomplete", "questions": qs }),
                 );
             }
+            // #27: reject a fatal design-shape conflict before scaffolding, the
+            // same rule the CLI runs — the MCP twin must not die mid-scaffold on
+            // a half-written tree with a raw SQLite error.
+            if let Some(conflict) = questions::design_conflict(&design) {
+                return (
+                    true,
+                    json!({ "error": conflict.message, "code": conflict.code, "hint": conflict.hint }),
+                );
+            }
             match scaffold::scaffold(Path::new(directory), &design) {
                 Ok(mut created) => {
                     // db apps ship a derived schema.json contract.

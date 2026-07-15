@@ -22,9 +22,10 @@ by the session user's id in `repo.rs`/handlers, exactly as you would with a
 tenant id.
 
 The tenant entity must never BE the auth identity entity: a user cannot be their
-own tenant org. `tenancy.entity` names a separate org/team the identity holds a
-membership in. If the "tenant" and the logged-in user would be the same row, you
-want per-user scoping, not tenancy.
+own tenant org, and the validator rejects such a design before scaffolding with
+`JC0540` (`jerrycan explain JC0540`). `tenancy.entity` names a separate org/team
+the identity holds a membership in. If the "tenant" and the logged-in user would
+be the same row, you want per-user scoping, not tenancy.
 
 ## Signature
 The design declares one tenant entity and the roles a membership can hold:
