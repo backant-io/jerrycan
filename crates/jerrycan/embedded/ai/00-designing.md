@@ -27,10 +27,12 @@ complete. Fix every question before scaffolding.
 }
 ```
 - `name` (REQUIRED) — kebab-case, `^[a-z][a-z0-9-]*$`.
-- `contract_version` (REQUIRED) — an integer, `0` or `1`. Use `1`: v1 unlocks
-  `belongs_to` relations, enum `values`, and real `json` columns in db mode. `0`
-  is the legacy in-memory contract (a `json` field is rejected under db mode on
-  v0). It does NOT have to be `1` — only `> 1` is rejected.
+- `contract_version` (REQUIRED) — an integer, `0`, `1`, or `2`. Use `1` for
+  standard apps: v1 unlocks `belongs_to` relations, enum `values`, and real
+  `json` columns in db mode. `2` additionally unlocks storage buckets and
+  realtime channels (required when the design uses either). `0` is the legacy
+  in-memory contract (a `json` field is rejected under db mode on v0). Only
+  `> 2` is rejected.
 - `description?` — free text.
 - `base_path?` — app-level mount prefix applied once to every module and bucket
   mount, e.g. `"/v1"` serves all routes under `/v1`. Health (`/healthz`) and
@@ -228,9 +230,7 @@ Every entity has an `id` primary key. You usually do NOT declare it:
 > check` will not be fully green for it. That is normal and correct: **do NOT
 > weaken the handler to make the probe pass.** Leave the probe red, and cover the
 > real behavior (the 200 WITH a valid credential, and the 401/400 without) in
-> your own agent-owned test. (Same for the `404`-probe-as-`GET` on a POST-only
-> `/{id}` action, which the framework correctly answers `405`.) See
-> `jerrycan docs testing`.
+> your own agent-owned test. See `jerrycan docs testing`.
 
 ## Worked examples
 
@@ -585,8 +585,8 @@ IN-HANDLER over `RawBody` (see Auth):
 - **id/PK rules:** omit `id` (synthetic `i64` autoincrement) for most entities;
   declare `id` as `string`/`uuid` only for client-supplied keys; a declared `id`
   must be integer/string/uuid.
-- **`contract_version` is `0` or `1`.** Use `1` for relations, enums, and json
-  columns. v0 rejects `json` in db mode.
+- **`contract_version` is `0`, `1`, or `2`.** Use `1` for relations, enums, and
+  json columns; `2` for storage buckets or realtime. v0 rejects `json` in db mode.
 - **Jobs require `db`.** A `jobs` array with no `db` dependency is rejected.
 - **`public` is exclusive.** It cannot combine with `auth_required` /
   `required_roles`, and not on a tenant-owned entity.

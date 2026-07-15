@@ -23,10 +23,10 @@ docs --list`); read the relevant page before each step rather than guessing an A
 2. **`jerrycan check` and the validator are the truth.** Loop them; never claim
    green you haven't seen. Never weaken a generated check to pass it. **But a few
    generated tests are un-greenable BY CONSTRUCTION** (a happy-path probe that
-   posts no credential to a login/webhook/API-key endpoint; the `404`-probe sent
-   as `GET` to a POST-only route). For those, `check` will not be fully green and
-   that is correct — recognize them (see Phase 5), leave them, and move on; do
-   NOT thrash trying to green them or weaken the handler.
+   posts no credential to a login/webhook/API-key endpoint). For those, `check`
+   will not be fully green and that is correct — recognize them (see Phase 5),
+   leave them, and move on; do NOT thrash trying to green them or weaken the
+   handler.
 3. **Read the doc page before using a feature.** `jerrycan docs <page>` /
    `jerrycan explain <CODE>`. Start every project by reading `jerrycan docs designing`.
 4. **Flag scope walls EARLY** (Phase 2). If the user needs something jerrycan can't
@@ -69,6 +69,20 @@ Ask **one question at a time**, prefer multiple-choice. Cover, in roughly this o
 
 **Checkpoint:** write back a structured summary (resources + fields + relations +
 auth + tenancy + jobs + endpoints) and get explicit confirmation before designing.
+
+**Decide before you design** (these shape the whole design — settle them with the
+user now, don't discover them mid-scaffold):
+- **Auth model** — `session` or `none`? And exactly which endpoints are **public**
+  (login/register, webhooks, health) vs authenticated?
+- **Is there a real org/team tenant entity?** Only use `tenancy` when a distinct
+  org/workspace/team owns the data. If rows are just **per-user**, do NOT use
+  `tenancy` — the tenant entity must be a SEPARATE entity from the auth identity
+  (a user cannot be their own tenant). Instead give the row a `belongs_to` the
+  user identity and scope every query by the session user's id (see `jerrycan
+  docs tenancy`).
+- **Server-owned vs client-supplied fields** — which fields does the server set
+  (owner ids, timestamps, status) vs accept from the client? Server-owned fields
+  are forced in-handler, never trusted from the request body.
 
 ### Phase 1b — Frontend-first (only if a frontend exists)
 
@@ -157,10 +171,10 @@ cd <app-dir>
 for m in <each top-level module>; do jerrycan gen-tests --module "$m"; done
 ```
 
-This emits, per module: `model.rs`, `repo.rs` (TOOL-owned — regenerated, don't edit),
-`handlers.rs`/`deps.rs` (AGENT-owned — edit freely), migrations, and
-`tests/acceptance.rs` (TOOL-owned, currently failing — green is the goal). Run
-`jerrycan check` to see the red baseline.
+This emits, per module: `model.rs`, `repo.rs`, `handlers.rs`, and `deps.rs`
+(AGENT-owned — edit freely; `repo.rs` is where per-user query scoping lives),
+migrations, and `tests/acceptance.rs` (TOOL-owned, currently failing — green is
+the goal). Run `jerrycan check` to see the red baseline.
 
 ## Phase 5 — Implement (handlers + jobs), loop `jerrycan check` to green
 
