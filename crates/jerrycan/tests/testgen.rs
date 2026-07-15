@@ -688,3 +688,83 @@ fn two_tenant_seed_uses_distinct_values_for_a_unique_field() {
         "the two tenant org INSERTs must differ on the unique slug: {generated}"
     );
 }
+
+/// The server-owned-FK rule (issue #34): a GUARDED endpoint whose body entity
+/// `belongs_to` the auth identity entity (fk column `user_id`) gets probe
+/// bodies WITHOUT `user_id` — the handler injects the session user's id, so a
+/// clean client that omits it must reach the designed success (the agent-eval
+/// 422 scenario). Non-identity FKs stay in the body; an UNGUARDED endpoint on
+/// the same entity keeps `user_id` (no session to inject). WHY: the generated
+/// probes ARE the wire contract — if they still carried user_id, the contract
+/// would keep lying about a field the server overwrites anyway.
+#[test]
+fn guarded_identity_fk_is_omitted_from_probe_bodies() {
+    let s = r#"{
+        "name": "linkvault",
+        "contract_version": 1,
+        "auth": { "model": "session", "roles": ["admin"] },
+        "dependencies": ["db", "auth"],
+        "modules": [
+            { "name": "users",
+              "entities": [{ "name": "User", "fields": [
+                  { "name": "email", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "list_users", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "User", "list": true } }
+              ] },
+            { "name": "collections",
+              "entities": [
+                  { "name": "Collection",
+                    "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                    "fields": [{ "name": "title", "type": "string" }] },
+                  { "name": "Bookmark",
+                    "belongs_to": [
+                        { "entity": "User", "on_delete": "cascade" },
+                        { "entity": "Collection", "on_delete": "cascade" }
+                    ],
+                    "fields": [{ "name": "url", "type": "string" }] }
+              ],
+              "endpoints": [
+                  { "operation_id": "create_collection", "method": "POST", "path": "/",
+                    "auth_required": true,
+                    "request_body": { "entity": "Collection" },
+                    "success": { "status": 201, "entity": "Collection" } },
+                  { "operation_id": "create_bookmark", "method": "POST", "path": "/bookmarks",
+                    "auth_required": true,
+                    "request_body": { "entity": "Bookmark" },
+                    "success": { "status": 201, "entity": "Bookmark" } },
+                  { "operation_id": "import_collection", "method": "POST", "path": "/import",
+                    "request_body": { "entity": "Collection" },
+                    "success": { "status": 201, "entity": "Collection" } }
+              ] }
+        ]
+    }"#;
+    let design: Design = serde_json::from_str(s).unwrap();
+    let collections = design
+        .modules
+        .iter()
+        .find(|m| m.name == "collections")
+        .expect("collections module");
+    let generated = testgen::acceptance_rs(&design, collections);
+
+    // (a) guarded + identity FK: the create probe body omits user_id entirely.
+    assert!(
+        generated.contains(
+            "t.post_json_with(\"/collections/\", &serde_json::json!({\"title\": \"test-value\"})"
+        ),
+        "guarded create body must omit user_id: {generated}"
+    );
+    // (c) guarded + non-identity FK: collection_id stays required client input.
+    assert!(
+        generated.contains("serde_json::json!({\"collection_id\": 1, \"url\": \"test-value\"})"),
+        "non-identity fk stays in the body: {generated}"
+    );
+    // (b) unguarded + identity FK: user_id stays (no session to inject).
+    assert!(
+        generated.contains(
+            "t.post_json(\"/collections/import\", &serde_json::json!({\"user_id\": 1, \"title\": \"test-value\"}))"
+        ),
+        "unguarded body keeps user_id: {generated}"
+    );
+}

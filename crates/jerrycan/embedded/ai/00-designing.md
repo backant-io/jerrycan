@@ -206,6 +206,13 @@ Every entity has an `id` primary key. You usually do NOT declare it:
   DTO in the design — for an endpoint that takes untrusted public input, defend
   it IN-HANDLER (parse a hand-written input type, validate, then map to the
   entity).
+  - **Server-owned fk on guarded endpoints:** if the body entity `belongs_to`
+    the auth identity entity (derived fk column `user_id`) AND the endpoint is
+    guarded, the generated request body is a `{Entity}Request` DTO WITHOUT
+    `user_id` (the OpenAPI request schema omits it too) — the handler injects
+    the authenticated session user's id; clients never send it. Every other
+    `belongs_to` fk stays required client input, and an unguarded endpoint
+    keeps `user_id` (no session to inject).
 - `success` (REQUIRED) — `{ "status": <2xx-or-3xx>, "entity"?: "<Name>", "list"?: bool }`.
   - `status` must be in 200–399 (2xx OR 3xx — 3xx is valid for redirects like an
     OAuth connect).

@@ -89,6 +89,21 @@ fn endpoint_is_tenant_owned(m: &ModuleDesign, ep: &Endpoint, design: &Design) ->
         .is_some_and(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity))
 }
 
+/// The server-owned-FK rule (issue #34) at the Rust layer: a GUARDED endpoint
+/// whose body entity carries an identity FK takes `Json<{Entity}Request>` (the
+/// DTO without `user_id` — see `request_dto_rs`) instead of `Json<{Entity}>`;
+/// the handler injects the session user's id. db-gated on top of the design
+/// rule because only `model_rs_db` structs surface fk columns at all (the
+/// memory-mode entity has none, so its plain body already omits `user_id`).
+fn endpoint_takes_request_dto(
+    m: &ModuleDesign,
+    ep: &Endpoint,
+    mode: GenMode,
+    design: &Design,
+) -> bool {
+    mode.db && mode.auth && design.endpoint_omits_identity_fk(m, ep)
+}
+
 fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> String {
     let mut params = Vec::new();
     if let Some(e) = endpoint_repo_entity(m, ep) {
@@ -132,7 +147,13 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
         }
     }
     if let Some(ref rb) = ep.request_body {
-        params.push(format!("Json(_body): Json<{}>", rb.entity));
+        // Server-owned FK (issue #34): the guarded body drops `user_id`, so the
+        // param type is the `{Entity}Request` DTO, not the entity itself.
+        if endpoint_takes_request_dto(m, ep, mode, design) {
+            params.push(format!("Json(_body): Json<{}Request>", rb.entity));
+        } else {
+            params.push(format!("Json(_body): Json<{}>", rb.entity));
+        }
     }
     params.join(", ")
 }
@@ -200,14 +221,41 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
         } else {
             String::new()
         };
+        let server_owned = server_owned_fk_comment(m, ep, mode, design);
         out.push_str(&format!(
-            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}    Err(Error::internal(\"{op} not implemented — replace this stub\"))\n}}\n\n",
+            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{server_owned}    Err(Error::internal(\"{op} not implemented — replace this stub\"))\n}}\n\n",
             op = ep.operation_id,
             params = handler_params(m, ep, mode, design),
             ret = return_type(ep),
         ));
     }
     out
+}
+
+/// A leading comment for endpoints whose body DTO omits the identity FK (issue
+/// #34): tells the agent the SERVER injects the session user's id — the body
+/// (`{Entity}Request`) has no `user_id`, so the handler must set it when
+/// building the entity. Tenant-owned handlers take `Dep<Tenant>` (no session
+/// param in the stub), so their variant says to add a `CurrentUser` param.
+fn server_owned_fk_comment(
+    m: &ModuleDesign,
+    ep: &Endpoint,
+    mode: GenMode,
+    design: &Design,
+) -> String {
+    if !endpoint_takes_request_dto(m, ep, mode, design) {
+        return String::new();
+    }
+    let entity = &ep.request_body.as_ref().expect("dto implies body").entity;
+    if endpoint_is_tenant_owned(m, ep, design) {
+        format!(
+            "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Add a `user: CurrentUser` param and use `user.0.id` (the\n    // stringified user pk; parse it for an integer fk) when building the {entity}.\n"
+        )
+    } else {
+        format!(
+            "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Use `_user.0.id` (the stringified user pk; parse it for an\n    // integer fk) when building the {entity}.\n"
+        )
+    }
 }
 
 pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
@@ -273,7 +321,10 @@ fn col_pascal(snake: &str) -> String {
 /// aliases `use jerrycan::db::sea_orm;` (the derive macros emit bare `sea_orm::`
 /// paths; see docs/ai/08-database.md). `design` resolves fk target key types and
 /// whether a belongs_to target lives in the same module (intra-module relation).
-pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design) -> Option<String> {
+/// `auth` (the GenMode flag) gates the server-owned-FK request DTOs (issue #34):
+/// an identity-FK entity used as a GUARDED request body also gets a
+/// `{Entity}Request` struct without `user_id`.
+pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design, auth: bool) -> Option<String> {
     if m.entities.is_empty() {
         return None;
     }
@@ -372,8 +423,64 @@ pub use {snake}::Model as {entity};
 "#,
             entity = e.name,
         ));
+        // Server-owned FK (issue #34): an identity-FK entity that at least one
+        // GUARDED endpoint takes as its request body also gets the trimmed
+        // request DTO, emitted right after its entity block.
+        let needs_dto = auth
+            && m.endpoints.iter().any(|ep| {
+                design.endpoint_omits_identity_fk(m, ep)
+                    && ep
+                        .request_body
+                        .as_ref()
+                        .is_some_and(|rb| rb.entity == e.name)
+            });
+        if needs_dto {
+            out.push_str(&request_dto_rs(e, design));
+        }
     }
     Some(out)
+}
+
+/// The `{Entity}Request` DTO for a guarded identity-FK request body (issue
+/// #34): the entity's deserialization shape MINUS the `user_id` fk — the server
+/// injects the session user's id, so the wire contract must not demand it.
+/// Everything else mirrors the Model: the pk `id` (synthetic → `#[serde(default)]`),
+/// the non-identity fk columns (SetNull → `Option` + default), then the declared
+/// fields with the same optionality and keyword renames. Plain serde struct —
+/// only the Model touches SeaORM.
+fn request_dto_rs(e: &Entity, design: &Design) -> String {
+    let entity = &e.name;
+    let key = key_rust_type(e);
+    let id_default = if declared_id(e).is_some() {
+        ""
+    } else {
+        "    #[serde(default)]\n"
+    };
+    let mut fields = String::new();
+    for b in e.belongs_to.iter().filter(|b| !Design::is_identity_fk(b)) {
+        let col = Design::fk_column(&b.entity);
+        let ty = design.target_key_rust_type(&b.entity);
+        if b.on_delete == OnDelete::SetNull {
+            fields.push_str("    #[serde(default)]\n");
+            fields.push_str(&format!("    pub {col}: Option<{ty}>,\n"));
+        } else {
+            fields.push_str(&format!("    pub {col}: {ty},\n"));
+        }
+    }
+    for f in e.fields.iter().filter(|f| f.name != "id") {
+        let base = f.field_type.rust_type();
+        fields.push_str(&keyword_field_attrs(&f.name, "    ", false));
+        let ident = rust_ident(&f.name);
+        if f.required {
+            fields.push_str(&format!("    pub {ident}: {base},\n"));
+        } else {
+            fields.push_str("    #[serde(default)]\n");
+            fields.push_str(&format!("    pub {ident}: Option<{base}>,\n"));
+        }
+    }
+    format!(
+        "/// Request body for guarded `{entity}` endpoints — `user_id` is SERVER-OWNED:\n/// the handler injects the authenticated session user's id; clients never send it.\n#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\npub struct {entity}Request {{\n{id_default}    pub id: {key},\n{fields}}}\n\n"
+    )
 }
 
 fn memory_repo_rs(m: &ModuleDesign) -> String {
@@ -1133,7 +1240,7 @@ fn write_unit_files(
     write_agent_owned(&dir.join("deps.rs"), &deps_rs(m), created, root)?;
     // db mode emits SeaORM entities; memory mode keeps plain serde structs.
     let model = if mode.db {
-        model_rs_db(m, design)
+        model_rs_db(m, design, mode.auth)
     } else {
         model_rs(m)
     };
@@ -1335,7 +1442,7 @@ pub fn module_by_path_mut<'a>(design: &'a mut Design, path: &str) -> Option<&'a 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::platform::design::tests::MINIMAL;
 
@@ -1517,7 +1624,7 @@ mod tests {
     fn db_mode_models_are_sea_orm_entities() {
         let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
         let m = &d.modules[1];
-        let src = model_rs_db(m, &d).unwrap();
+        let src = model_rs_db(m, &d, false).unwrap();
         assert!(src.contains("pub mod lead {"), "{src}");
         // Cross-module belongs_to stays decoupled: fk field, NO relation arm.
         assert!(src.contains("pub enum Relation {}"), "{src}");
@@ -1570,7 +1677,7 @@ mod tests {
         );
         let m = &d.modules[0];
         // db-mode Model: raw ident + serde rename + sea_orm column_name.
-        let model = model_rs_db(m, &d).unwrap();
+        let model = model_rs_db(m, &d, false).unwrap();
         assert!(
             model.contains("#[serde(rename = \"type\")]\n        #[sea_orm(column_name = \"type\")]\n        pub r#type: String,"),
             "keyword field is a raw ident carrying rename + column_name: {model}"
@@ -1611,7 +1718,7 @@ mod tests {
         )
         .unwrap();
         d.modules[0].entities.push(member);
-        let src = model_rs_db(&d.modules[0], &d).unwrap();
+        let src = model_rs_db(&d.modules[0], &d, false).unwrap();
         // Synthetic pk → visible id field with serde(default) so POST may omit it.
         assert!(
             src.contains(
@@ -2006,5 +2113,157 @@ mod tests {
             h.contains("pub(crate) async fn list_comments() -> Result<Json<serde_json::Value>>"),
             "{h}"
         );
+    }
+
+    /// The server-owned-FK matrix design (issue #34): Collection belongs_to the
+    /// auth identity entity (User → fk column `user_id`); Bookmark belongs_to
+    /// BOTH User and Collection. `create_collection`/`create_bookmark` are
+    /// guarded; `import_collection` is the same entity UNGUARDED.
+    pub(crate) const SERVER_FK: &str = r#"{
+        "name": "linkvault",
+        "contract_version": 1,
+        "auth": { "model": "session", "roles": ["admin"] },
+        "dependencies": ["db", "auth"],
+        "modules": [
+            { "name": "users",
+              "entities": [{ "name": "User", "fields": [
+                  { "name": "email", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "list_users", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "User", "list": true } }
+              ] },
+            { "name": "collections",
+              "entities": [
+                  { "name": "Collection",
+                    "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                    "fields": [{ "name": "title", "type": "string" }] },
+                  { "name": "Bookmark",
+                    "belongs_to": [
+                        { "entity": "User", "on_delete": "cascade" },
+                        { "entity": "Collection", "on_delete": "cascade" }
+                    ],
+                    "fields": [{ "name": "url", "type": "string" }] }
+              ],
+              "endpoints": [
+                  { "operation_id": "create_collection", "method": "POST", "path": "/",
+                    "auth_required": true,
+                    "request_body": { "entity": "Collection" },
+                    "success": { "status": 201, "entity": "Collection" } },
+                  { "operation_id": "create_bookmark", "method": "POST", "path": "/bookmarks",
+                    "auth_required": true,
+                    "request_body": { "entity": "Bookmark" },
+                    "success": { "status": 201, "entity": "Bookmark" } },
+                  { "operation_id": "import_collection", "method": "POST", "path": "/import",
+                    "request_body": { "entity": "Collection" },
+                    "success": { "status": 201, "entity": "Collection" } }
+              ] }
+        ]
+    }"#;
+
+    /// Issue #34: a guarded endpoint whose body entity has an identity FK gets a
+    /// `{Entity}Request` DTO WITHOUT `user_id` (the server injects the session
+    /// user's id); non-identity FKs stay required; the Model keeps `user_id`
+    /// (responses + DB still carry it); unguarded endpoints keep the plain entity.
+    #[test]
+    fn guarded_identity_fk_gets_a_request_dto_without_user_id() {
+        let d: Design = serde_json::from_str(SERVER_FK).unwrap();
+        let m = &d.modules[1]; // collections
+        let model = model_rs_db(m, &d, true).unwrap();
+
+        // (a) guarded + identity FK → DTO exists and omits user_id.
+        let dto = model
+            .split("pub struct CollectionRequest {")
+            .nth(1)
+            .expect("CollectionRequest emitted")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(!dto.contains("user_id"), "DTO must omit user_id: {dto}");
+        assert!(dto.contains("pub title: String,"), "{dto}");
+        // (c) non-identity FK stays required client input in the DTO.
+        let bdto = model
+            .split("pub struct BookmarkRequest {")
+            .nth(1)
+            .expect("BookmarkRequest emitted")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(bdto.contains("pub collection_id: i64,"), "{bdto}");
+        assert!(!bdto.contains("user_id"), "{bdto}");
+        // The Model itself keeps the fk column — the server writes it.
+        assert!(model.contains("pub user_id: i64,"), "{model}");
+
+        // Handler params: guarded → DTO; unguarded → plain entity.
+        let h = handlers_rs(
+            m,
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        );
+        assert!(
+            h.contains(
+                "pub(crate) async fn create_collection(_repo: Dep<CollectionRepo>, _user: CurrentUser, Json(_body): Json<CollectionRequest>)"
+            ),
+            "{h}"
+        );
+        assert!(h.contains("Json(_body): Json<BookmarkRequest>"), "{h}");
+        // (b) unguarded endpoint keeps the full entity (no session to inject).
+        assert!(
+            h.contains(
+                "pub(crate) async fn import_collection(_repo: Dep<CollectionRepo>, Json(_body): Json<Collection>)"
+            ),
+            "{h}"
+        );
+        // The stub tells the agent the server owns the fk.
+        let create_stub = h
+            .split("async fn create_collection")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            create_stub.contains("server-owned") && create_stub.contains("_user.0.id"),
+            "stub must say the session injects user_id: {create_stub}"
+        );
+        let import_stub = h
+            .split("async fn import_collection")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            !import_stub.contains("server-owned"),
+            "unguarded stub carries no injection note: {import_stub}"
+        );
+    }
+
+    /// The DTO is auth-mode-gated: generating the same design with auth off
+    /// (genroute_compile's harness does this) must emit NO Request structs, and
+    /// memory mode keeps the plain entity body (its struct has no fk fields).
+    #[test]
+    fn request_dto_is_absent_without_auth_or_db() {
+        let d: Design = serde_json::from_str(SERVER_FK).unwrap();
+        let m = &d.modules[1];
+        let model = model_rs_db(m, &d, false).unwrap();
+        assert!(!model.contains("CollectionRequest"), "{model}");
+        assert!(!model.contains("BookmarkRequest"), "{model}");
+        let h = handlers_rs(
+            m,
+            GenMode {
+                db: false,
+                auth: true,
+            },
+            &d,
+        );
+        assert!(
+            h.contains("Json(_body): Json<Collection>"),
+            "memory mode keeps the entity body: {h}"
+        );
+        assert!(!h.contains("CollectionRequest"), "{h}");
     }
 }
