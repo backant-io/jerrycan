@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+Fail-loud CLI hardening from the multi-model agent eval (issues #27–#35):
+`--json` failures now emit a machine envelope (`{ok:false, code, error, hint}`),
+and the tenancy=identity design trap is rejected at validation time (JC0540).
+Carrying the envelope on `Failure` broke 0.3.0's struct-literal contract, hence
+the 0.x-major bump; `Failure` is `#[non_exhaustive]` from here on so future
+fields stay non-breaking.
+
 ## 0.2.0 — unreleased
 
 The v2 data foundation: a single contract bump that lands relations, constraints,

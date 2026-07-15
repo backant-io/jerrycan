@@ -40,12 +40,14 @@ jobs:
         run: cargo deny check
       - name: Semver checks (no unintended breaking API change vs the published baseline)
         # These 7 crates are on crates.io; their latest published baseline is
-        # 0.2.0. jerrycan-jobs/-ratelimit/-storage/-realtime are unpublished (no
+        # 0.3.0. jerrycan-jobs/-ratelimit/-storage/-realtime are unpublished (no
         # baseline) and join this list once reserved + published. For a 0.x crate
         # cargo-semver-checks treats the middle number as the major, so a breaking
-        # change requires a 0.x-major bump (0.2 -> 0.3) — which the workspace now
-        # declares. This gate stays honest: the next breaking change must bump to
-        # 0.4.0, and it tightens to patch-level once the crates go 1.0.
+        # change requires a 0.x-major bump — the workspace declares 0.4.0 (the
+        # Failure envelope fields broke 0.3.0's literal contract; Failure is now
+        # non_exhaustive so field additions stop being breaking). This gate stays
+        # honest: the next breaking change must bump to 0.5.0, and it tightens to
+        # patch-level once the crates go 1.0.
         run: >-
           cargo semver-checks check-release
           -p jerrycan-core -p jerrycan-macros -p jerrycan-db -p jerrycan-auth
