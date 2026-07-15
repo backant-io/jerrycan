@@ -35,7 +35,13 @@ pub const EXIT_ENVIRONMENT: i32 = 3;
 /// machine envelope. Every `--json` failure surfaces as one stdout document
 /// `{ok:false, code, error, hint}`; `code`/`hint` carry a diagnostic JC code and
 /// a recovery line when the failure has them (e.g. the tenancy/identity lint).
+// `non_exhaustive` (since 0.4.0): adding envelope fields to a struct-literal-
+// constructible pub struct was a breaking change against published 0.3.0 (the
+// gate caught it). Construction goes through the `usage`/`environment`/`gate`
+// constructors + `with_*` builders; downstream literals are intentionally
+// impossible so future fields stay semver-minor.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Failure {
     pub exit: i32,
     pub message: String,
