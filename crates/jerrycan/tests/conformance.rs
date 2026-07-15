@@ -66,6 +66,33 @@ fn scaffold_golden_db(tmp: &Path) -> PathBuf {
     app
 }
 
+/// Reset the target Postgres to a clean slate before a DB-backed heavy test
+/// migrates into it. The heavy suite runs `--test-threads=1`, so there is never a
+/// concurrent user of this database; dropping and recreating `public` BEFORE the
+/// run (no teardown to race, unlike DROP DATABASE) fully isolates each
+/// Postgres-backed test from whatever ran before. Requires `psql` — `heavy.yml`
+/// installs `postgresql-client`.
+fn reset_pg_public_schema(pg_url: &str) {
+    let st = Command::new("psql")
+        .arg(pg_url)
+        .args(["-v", "ON_ERROR_STOP=1"])
+        .args([
+            "-c",
+            "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;",
+        ])
+        .status()
+        .unwrap_or_else(|e| {
+            panic!(
+                "psql is required to reset the Postgres schema for the DB-backed \
+                 heavy test (install postgresql-client): {e}"
+            )
+        });
+    assert!(
+        st.success(),
+        "failed to reset public schema on the test database"
+    );
+}
+
 #[test]
 #[ignore = "heavy: db-mode golden app must build and pass the full gate"]
 fn db_mode_scaffold_passes_jerrycan_check() {
@@ -73,6 +100,7 @@ fn db_mode_scaffold_passes_jerrycan_check() {
     let app = scaffold_golden_db(tmp.path());
     let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["--json", "check"])
         .output()
         .unwrap();
@@ -92,6 +120,7 @@ fn scaffolded_app_builds_with_zero_warnings() {
     let app = scaffold_golden(tmp.path());
     let out = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .env("RUSTFLAGS", "-D warnings")
         .args(["build", "--workspace"])
         .output()
@@ -110,6 +139,7 @@ fn fresh_scaffold_passes_jerrycan_check() {
     let app = scaffold_golden(tmp.path());
     let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["--json", "check"])
         .output()
         .unwrap();
@@ -206,6 +236,7 @@ fn auth_observe_app_builds_checks_and_guards() {
     // Full gate green (JL0004 must be satisfied — guarded mutations).
     let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["--json", "check"])
         .output()
         .unwrap();
@@ -224,6 +255,7 @@ fn auth_observe_app_builds_checks_and_guards() {
     let addr = format!("127.0.0.1:{port}");
     let mut server = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .env("JERRYCAN_ADDR", &addr)
         .env("JERRYCAN_SECRET", "a-very-long-development-secret-string!!")
         .args(["run", "-p", "app"])
@@ -306,8 +338,14 @@ fn agent_generates_working_crud_service_via_mcp_only() {
         "jerrycan = {{ path = \"{}\", default-features = false }}",
         repo_root().join("crates/jerrycan").display()
     );
-    let mut c =
-        common::McpClient::start_in_with_env(tmp.path(), &[("JERRYCAN_FRAMEWORK_DEP", &dep)]);
+    let shared_target = common::shared_app_target();
+    let mut c = common::McpClient::start_in_with_env(
+        tmp.path(),
+        &[
+            ("JERRYCAN_FRAMEWORK_DEP", &dep),
+            ("CARGO_TARGET_DIR", shared_target.to_str().unwrap()),
+        ],
+    );
 
     // 1. design: draft in, validated design.json out.
     let draft: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
@@ -364,6 +402,7 @@ fn agent_generates_working_crud_service_via_mcp_only() {
     let addr = format!("127.0.0.1:{port}");
     let mut server = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .env("JERRYCAN_ADDR", &addr)
         .args(["run", "-p", "app"])
         .spawn()
@@ -430,6 +469,7 @@ fn tdd_loop_goes_red_then_green_on_sqlite() {
     for module in ["todos", "users"] {
         let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
             .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
             .args(["--json", "gen-tests", "--module", module])
             .output()
             .unwrap();
@@ -448,6 +488,7 @@ fn tdd_loop_goes_red_then_green_on_sqlite() {
     // only the todos binary's `test result: FAILED.` line would be emitted).
     let out = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["test", "--workspace", "--no-fail-fast"])
         .output()
         .unwrap();
@@ -511,6 +552,7 @@ fn tdd_loop_goes_red_then_green_on_sqlite() {
     // 4. GREEN: the same acceptance tests pass.
     let st = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["test", "--workspace"])
         .status()
         .unwrap();
@@ -522,6 +564,7 @@ fn tdd_loop_goes_red_then_green_on_sqlite() {
     // 5. And the full gate holds.
     let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["--json", "check"])
         .output()
         .unwrap();
@@ -549,6 +592,7 @@ fn agent_builds_postgres_backed_api_test_first() {
     for module in ["todos", "users"] {
         let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
             .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
             .args(["gen-tests", "--module", module])
             .status()
             .unwrap();
@@ -575,9 +619,15 @@ fn agent_builds_postgres_backed_api_test_first() {
         .unwrap();
     }
 
+    // Clean slate before migrating: isolate this test from any prior run's tables
+    // (see reset_pg_public_schema). Safe because the heavy suite runs
+    // single-threaded, so there is never a concurrent user of this database.
+    reset_pg_public_schema(&pg_url);
+
     // Apply migrations to the real Postgres, then serve against it and drive CRUD.
     let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["db", "migrate", "--url", &pg_url])
         .status()
         .unwrap();
@@ -590,6 +640,7 @@ fn agent_builds_postgres_backed_api_test_first() {
     let addr = format!("127.0.0.1:{port}");
     let mut server = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .env("JERRYCAN_ADDR", &addr)
         .env("JERRYCAN_DATABASE_URL", &pg_url)
         .args(["run", "-p", "app"])
@@ -633,6 +684,7 @@ fn agent_builds_postgres_backed_api_test_first() {
     // Test-first, all green, against Postgres:
     let st = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .env("JERRYCAN_DATABASE_URL", &pg_url)
         .args(["test", "--workspace"])
         .status()
@@ -700,6 +752,7 @@ fn golden_app_deploys_everywhere() {
     // ONE command emits every artifact (after a green check gate).
     let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args([
             "--json",
             "package",
@@ -786,6 +839,7 @@ fn golden_app_deploys_everywhere() {
         let tag = "jerrycan-conformance:test";
         let build = Command::new("docker")
             .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
             .args(["build", "-f", "Dockerfile.thin", "-t", tag, "."])
             .status()
             .unwrap();
@@ -831,6 +885,7 @@ fn golden_app_deploys_everywhere() {
     if kubectl_present() && cluster_reachable() {
         let out = Command::new("kubectl")
             .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
             .args(["apply", "--dry-run=client", "-f", "deploy/k8s.yaml"])
             .output()
             .unwrap();
@@ -916,6 +971,7 @@ fn reference_slice_scaffold_passes_check() {
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
             .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
             .args(["--json", "gen-tests", "--module", module])
             .output()
             .unwrap();
@@ -938,6 +994,7 @@ fn reference_slice_scaffold_passes_check() {
     let t0 = std::time::Instant::now();
     let build = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["build", "--workspace"])
         .output()
         .unwrap();
@@ -955,6 +1012,7 @@ fn reference_slice_scaffold_passes_check() {
     let t1 = std::time::Instant::now();
     let leads_build = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["test", "-p", "route-leads", "--no-run"])
         .output()
         .unwrap();
@@ -970,6 +1028,7 @@ fn reference_slice_scaffold_passes_check() {
     // test binaries (it otherwise halts at the first failing crate).
     let out = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["test", "--workspace", "--no-fail-fast"])
         .output()
         .unwrap();

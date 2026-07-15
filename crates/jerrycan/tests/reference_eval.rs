@@ -34,6 +34,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+mod common;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -74,6 +76,7 @@ fn reference_slice_live_battery() {
     // ---- 2. `jerrycan --json check` → ok:true (the full gate) ---------------
     let check = Command::new(jc())
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .env("JERRYCAN_FRAMEWORK_DEP", framework_dep())
         .args(["--json", "check"])
         .output()
@@ -94,6 +97,7 @@ fn reference_slice_live_battery() {
     let t_cold = Instant::now();
     let suite = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .args(["test", "--workspace", "--no-fail-fast"])
         .output()
         .expect("run generated acceptance suite");
@@ -134,6 +138,7 @@ fn reference_slice_live_battery() {
     let db_url = format!("sqlite://{}?mode=rwc", db_file.display());
     let mut server = Command::new("cargo")
         .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
         .env("JERRYCAN_ADDR", &addr)
         .env("JERRYCAN_SECRET", SECRET)
         .env("JERRYCAN_DATABASE_URL", &db_url)

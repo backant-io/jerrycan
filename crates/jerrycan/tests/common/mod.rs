@@ -6,6 +6,28 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+/// One shared cargo target dir for every scaffolded conformance/eval app, set as
+/// `CARGO_TARGET_DIR` on each app build/check/package/run. The generated apps
+/// share a huge, identical dependency tree (tokio/sqlx/sea-orm/hyper/
+/// libsqlite3-sys/…); building it into a throwaway `target/` per app compiled it
+/// from scratch N times and cost tens of GB. Pointing every app build at ONE dir
+/// compiles the deps ONCE and reuses them. Every scaffolded app names its runnable
+/// crate `app`, so they all emit the SAME final binary path (`.../debug/app`); the
+/// heavy suite therefore runs single-threaded (`--test-threads=1`, set in
+/// `heavy.yml`) so only one app builds and serves at a time and that shared output
+/// path is never contended. Lives under the repo's `target/` (cleaned by `cargo
+/// clean`) and is reused across runs. Override with `JERRYCAN_TEST_TARGET_DIR`.
+pub fn shared_app_target() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("JERRYCAN_TEST_TARGET_DIR") {
+        return std::path::PathBuf::from(p);
+    }
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root")
+        .join("target/conformance-apps")
+}
+
 pub struct McpClient {
     pub child: Child,
     pub stdin: ChildStdin,

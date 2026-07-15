@@ -12,44 +12,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTDOCFLAGS: -D warnings
-  JERRYCAN_TEST_PG_URL: postgres://postgres:jerrycan@localhost:5432/jerrycan_test
 
 jobs:
   gate:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_PASSWORD: jerrycan
-          POSTGRES_DB: jerrycan_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      # Service containers cannot pass container args, and minio/minio's
-      # entrypoint requires `server /data` — edge-cicd is MinIO's CI image
-      # whose default command starts the server. Readiness is checked by the
-      # explicit wait in the storage-s3 step (the image bundles no health tool).
-      minio:
-        image: minio/minio:edge-cicd
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        ports:
-          - 9000:9000
     steps:
       - uses: actions/checkout@v4
       # Toolchain, components, and the musl target all come from
@@ -59,8 +25,6 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl
-      - name: Install musl + container tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
       - name: Install verification tools
         uses: taiki-e/install-action@v2
@@ -92,36 +56,6 @@ jobs:
         run: cargo build --workspace --benches --all-features
       - name: Build facade with no default features (generated-app config)
         run: cargo build -p jerrycan --no-default-features
-      - name: "Conformance (heavy: generated apps must build, check, serve, and pass the scripted eval)"
-        run: |
-          cargo test -p jerrycan --all-features --test conformance -- --include-ignored
-          cargo test -p jerrycan --test genroute_compile -- --include-ignored
-          cargo test -p jerrycan --test eval -- --include-ignored
-          cargo test -p jerrycan --all-features --test reference_eval -- --include-ignored
-      - name: "Durable-store behavioral tests (ignored: real Postgres + Redis)"
-        # The durable JobStore/RateLimitStore impls and the concurrent-migrator
-        # guarantee are #[ignore]d (they need a live server). With the postgres +
-        # redis services up, run them for real so a regression in the Redis Lua,
-        # the Postgres SKIP-LOCKED leasing, the advisory-lock cron leader, or the
-        # migrate advisory lock is caught by CI — not just by compilation.
-        run: |
-          cargo test -p jerrycan-db --lib tests::concurrent_migrators_do_not_race -- --ignored
-          cargo test -p jerrycan-jobs --test postgres_store -- --ignored
-          cargo test -p jerrycan-jobs --features jobs-redis --test redis_store -- --ignored
-          cargo test -p jerrycan-ratelimit --features rate-limit-redis --test redis_store -- --ignored
-      - name: "Storage S3 behavioral tests (real MinIO: single-shot, multipart, presign)"
-        # s3_minio.rs is env-gated (it silently no-ops without JERRYCAN_TEST_S3),
-        # so the env MUST be set here or the suite never runs anywhere. The
-        # loopback http endpoint is the one plaintext exception the S3 store
-        # allows. Credentials are read by S3Store::from_url via the standard
-        # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY vars.
-        env:
-          JERRYCAN_TEST_S3: s3://jerrycan-test?region=us-east-1&endpoint=http://127.0.0.1:9000
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-        run: |
-          timeout 60 bash -c 'until curl -sf http://127.0.0.1:9000/minio/health/live; do sleep 1; done'
-          cargo test -p jerrycan-storage --features storage-s3 --test s3_minio
       - name: Docs build (broken intra-doc links are errors)
         run: cargo doc --workspace --no-deps --all-features
 
