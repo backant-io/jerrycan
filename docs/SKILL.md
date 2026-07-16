@@ -184,7 +184,8 @@ the goal). Run `jerrycan check` to see the red baseline.
 ## Phase 5 — Implement (handlers + jobs), loop `jerrycan check` to green
 
 For each module, read the relevant doc page, then implement every handler stub:
-- Data access: `jerrycan docs database` (+ `tenancy` for scoped `*_for` accessors).
+- Data access: `jerrycan docs database` (+ `tenancy` for scoped `*_for` accessors;
+  another module's table → declare a narrow second entity, same page).
 - Auth/guards: `jerrycan docs auth`, `jerrycan docs auth-advanced` (OAuth, API keys,
   token-at-rest).
 - Request data: `jerrycan docs extractors` (`Path`/`Query`/`Json`/`Headers`/

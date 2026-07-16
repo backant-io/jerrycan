@@ -159,6 +159,80 @@ code must keep. The `belongs_to` derivation rules behind this live in
 `jerrycan docs modules` (Relations); tenant-scoped relations in
 `jerrycan docs tenancy`.
 
+## Cross-module data access
+A route crate exports only `module()` (the JL0001 lint enforces it), so you
+CANNOT import a sibling module's `model`/`repo`. There are two supported
+channels — pick by *what* you need to share:
+
+- **A shared TYPE** (a DTO/enum both modules serialize) → put it in the app's
+  `shared` crate (`crates/shared/src/lib.rs`). Every route crate already depends
+  on `shared`; keep it deliberately tiny (a lint guards its growth).
+- **Another module's TABLE** (an admin sweep, a cross-module read) → declare a
+  **narrow second SeaORM entity** on that table in YOUR module's agent-owned
+  `model.rs`. A SeaORM entity is just a typed description of a table, and the
+  running app has every module's tables migrated — so a second entity pointing at
+  the same `table_name` resolves at runtime and queries through `db.conn()` like
+  any of your own. Declare only the columns you actually touch.
+
+```rust
+# use jerrycan::prelude::*;
+# use jerrycan::db::sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+# use jerrycan::db::{db_error, Db};
+// A NARROW second entity for another module's `subscribers` table, declared in
+// YOUR module's agent-owned `model.rs` — only the columns the sweep touches.
+mod subscriber {
+    use jerrycan::db::sea_orm;
+    use jerrycan::db::sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "subscribers")]   // must match the OWNING module's migration
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i32,
+        pub status: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+// An admin sweep — flip every `pending` subscriber to `expired`. A cross-module
+// write with no access to the subscribers crate, only to its table.
+async fn expire_pending(db: Dep<Db>) -> Result<Json<u64>> {
+    let stale = subscriber::Entity::find()
+        .filter(subscriber::Column::Status.eq("pending"))
+        .all(db.conn())
+        .await
+        .map_err(db_error)?;
+    let mut expired = 0u64;
+    for row in stale {
+        // Update by pk: build the ActiveModel with `id` Set, change `status`.
+        let m = subscriber::ActiveModel {
+            id: Set(row.id),
+            status: Set("expired".to_string()),
+        };
+        m.update(db.conn()).await.map_err(db_error)?;
+        expired += 1;
+    }
+    Ok(Json(expired))
+}
+# fn main() { let _ = expire_pending; }
+```
+
+Do NOT instead hand-edit the owning module's `lib.rs` to re-export its entity, or
+add any `pub` item beyond `module()` to a route crate's `lib.rs` — JL0001 flags
+it, and the next `jerrycan generate` clobbers the edit (`lib.rs` is tool-owned).
+`model.rs` is agent-owned; the second entity belongs there.
+
+**The tradeoff — you now keep two entity definitions of one table in sync.** The
+OWNING module's migration is the single source of truth for that table's schema;
+your second entity is a hand-maintained view of it. If the owner adds or renames
+a column your entity reads, nothing checks the two still agree — YOU update your
+copy. Keeping the second entity narrow (only the columns the sweep needs) shrinks
+that surface.
+
 ## Errors you'll hit
 - A unique-key violation surfaces as `409 JC0409` (a re-POSTed id is the
   client's fault); every other database failure is `500 JC0510`. Neither leaks
