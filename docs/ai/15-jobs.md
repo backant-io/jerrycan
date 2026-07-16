@@ -155,11 +155,18 @@ assert!(send_email(t.task_context()).await.is_ok());
 - **First run**: a freshly-deployed cron job (no recorded last-fired) fires the
   most-recent tick immediately on deploy. Seed a baseline if you don't want a
   fire on first boot.
-- **Leader**: only ONE instance fires each tick. On Postgres this is a
-  `pg_advisory_xact_lock` leader — the lock, the enqueue, and the last-fired
-  advance all happen in one transaction, so two nodes can't double-fire.
-  Single-process / in-memory deploys are the trivial leader (one process). Cron
-  leadership is **Postgres-only** (the in-memory leader is single-process).
+- **Leader**: only ONE instance fires each tick, and cron fires on every
+  backend — it is never silently dropped.
+  - **SQLite (the dev default)**: a single-file DB is a single node, so cron
+    fires **in-process** through the in-memory single-process leader — a declared
+    cron job fires in dev with no extra setup. Its per-`(job, fire)` idempotency
+    key means even a duplicate tick enqueues the job at most once.
+  - **Postgres (multi-node)**: a `pg_advisory_xact_lock` leader — the lock, the
+    enqueue, and the last-fired advance all happen in one transaction, so across
+    many nodes exactly one fires each tick and two nodes can't double-fire.
+
+  Multi-node leader **election** is Postgres-only; SQLite and Redis deploys use
+  the single-process leader (the trivial one-node leader).
 
 ## Redis store (multi-node)
 `Jobs::redis(RedisStore::connect(url).await?)` (the `jobs-redis` feature) is a

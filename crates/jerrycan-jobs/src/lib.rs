@@ -23,7 +23,7 @@ pub use worker::{JobConfig, JobFn, Worker};
 
 use cron::CronSchedule as Schedule;
 use jerrycan_core::{App, Extension};
-use jerrycan_db::Db;
+use jerrycan_db::{Backend, Db};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -35,8 +35,10 @@ use std::time::SystemTime;
 /// enqueue), spawns `concurrency` per-queue worker `on_serve` loops, and — if
 /// any cron jobs are registered — a single cron-poller `on_serve` loop. The
 /// store defaults to the in-memory reference; swap in Postgres/Redis via
-/// [`Jobs::store`]. The cron poller is an in-memory single-process leader here;
-/// the Postgres advisory-lock leader lands in a later task.
+/// [`Jobs::store`]. The cron poller is the Postgres advisory-lock leader on a
+/// Postgres backend and the in-memory single-process leader on every other
+/// backend (sqlite — the dev default — and Redis); [`cron_poll_once`](Jobs::cron_poll_once)
+/// is the routing.
 #[derive(Clone)]
 pub struct Jobs {
     store: Arc<dyn JobStore>,
@@ -74,19 +76,32 @@ impl Jobs {
     /// The store is shared as both the `JobStore` (workers + enqueue) and — when
     /// the `Db` is Postgres-backed — the cron leader, so the cron poller uses the
     /// `pg_advisory_xact_lock` leader instead of the in-memory single-process one.
+    /// On a non-Postgres backend (sqlite — the dev default) the store still speaks
+    /// the durable SQL, but cron is served by the in-memory single-process leader:
+    /// a declared cron job fires in dev, it is not silently dropped.
     ///
     /// Call [`PostgresStore::migrate`] (or apply [`JOBS_MIGRATIONS`]) once before
     /// serving so the `jerrycan_jobs*` tables exist.
     pub fn postgres(db: Db) -> Self {
         let pg = PostgresStore::new(db);
+        // The advisory-lock cron leader is Postgres-only (it needs
+        // `pg_advisory_xact_lock`). On a non-Postgres backend — sqlite, the dev
+        // default — a single-file DB is a single node, so there is no leader to
+        // elect: the in-memory single-process poller (`cron_tick_once`) fires
+        // cron against the durable store, its per-`(job, fire)` idempotency key
+        // collapsing any duplicate tick. Gating `pg_leader` on the backend is
+        // what makes the serve loop pick that leader; leaving it `Some` on sqlite
+        // would route cron to `PostgresStore::cron_tick`, which short-circuits to
+        // `Ok(0)` — a declared cron job would then SILENTLY never fire (#49).
+        let pg_leader = (pg.db().backend() == Backend::Postgres).then(|| pg.clone());
         Self {
-            store: Arc::new(pg.clone()),
+            store: Arc::new(pg),
             config: JobConfig::default(),
             dispatch: Arc::new(HashMap::new()),
             queues: Vec::new(),
             crons: Vec::new(),
             cron_state: Arc::new(Mutex::new(HashMap::new())),
-            pg_leader: Some(pg),
+            pg_leader,
         }
     }
 
@@ -219,6 +234,23 @@ impl Jobs {
         }
         enqueued
     }
+
+    /// One cron poll, routed to the active leader — exactly what the `jobs-cron`
+    /// `on_serve` loop runs each interval, lifted to a single testable method so
+    /// the routing itself can be pinned. A Postgres-backed engine uses the
+    /// advisory-lock leader ([`PostgresStore::cron_tick`], multi-node safe);
+    /// every other backend — sqlite (the dev default) or Redis — uses the
+    /// in-memory single-process leader ([`cron_tick_once`](Jobs::cron_tick_once))
+    /// against the durable store, whose per-`(job, fire)` idempotency key
+    /// collapses any duplicate tick. Returns the number of jobs enqueued this
+    /// tick. Only the Postgres leader is fallible; the in-memory leader is
+    /// infallible, hence the `Ok`-wrapped count.
+    pub async fn cron_poll_once(&self, now: SystemTime) -> jerrycan_core::Result<usize> {
+        match &self.pg_leader {
+            Some(pg) => pg.cron_tick(&self.crons, now).await,
+            None => Ok(self.cron_tick_once(now).await),
+        }
+    }
 }
 
 /// The per-`(job, fire)` cron idempotency key. The store no-ops a second
@@ -329,22 +361,16 @@ impl Extension for Jobs {
                         match tokio::time::timeout(interval, shutdown.changed()).await {
                             Ok(_) => break, // shutdown fired
                             Err(_) => {
-                                // Log a cron tick failure (e.g. a DB outage in the
-                                // advisory-lock leader) for operator visibility, but
+                                // One cron poll, routed to the active leader
+                                // (Postgres advisory-lock, or the in-memory
+                                // single-process leader on sqlite/Redis). Log a
+                                // tick failure (e.g. a DB outage in the
+                                // advisory-lock leader) for operator visibility but
                                 // keep polling — a transient blip must not kill the
-                                // cron loop. The in-memory leader is infallible
-                                // (returns a plain count), so only the Postgres
-                                // leader can surface an error here.
-                                if let Some(pg) = &jobs.pg_leader {
-                                    // Advisory-lock leader: the lock + enqueue +
-                                    // last_fired all live in one transaction.
-                                    if let Err(e) = pg.cron_tick(&jobs.crons, clock.now()).await {
-                                        eprintln!("jerrycan-jobs: cron tick failed: {e}");
-                                    }
-                                } else {
-                                    // The mutex is never held across this await:
-                                    // cron_tick_once locks → drops → enqueues → re-locks.
-                                    jobs.cron_tick_once(clock.now()).await;
+                                // cron loop. Only the Postgres leader is fallible;
+                                // the in-memory leader returns Ok.
+                                if let Err(e) = jobs.cron_poll_once(clock.now()).await {
+                                    eprintln!("jerrycan-jobs: cron tick failed: {e}");
                                 }
                             }
                         }

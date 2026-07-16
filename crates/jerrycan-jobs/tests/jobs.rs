@@ -4,8 +4,9 @@
 //! real `cron_tick_once` path.
 
 use jerrycan_core::prelude::*;
+use jerrycan_db::Db;
 use jerrycan_jobs::worker::{JobConfig, JobFn, Worker};
-use jerrycan_jobs::{InMemoryStore, JobStore, Jobs, NewJob};
+use jerrycan_jobs::{InMemoryStore, JOBS_MIGRATIONS, JobStore, Jobs, NewJob, PostgresStore};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -266,6 +267,52 @@ async fn cron_enqueues_once_per_due_tick_via_the_real_leader_path() {
     // At 02:00 the next tick is due and enqueues again.
     let t3 = SystemTime::UNIX_EPOCH + Duration::from_secs(2 * 3600);
     assert_eq!(jobs.cron_tick_once(t3).await, 1, "the 02:00 tick is due");
+}
+
+#[tokio::test]
+async fn cron_fires_on_sqlite_via_the_in_memory_leader() {
+    // #49 regression: `Jobs::postgres` over sqlite — the dev DEFAULT backend —
+    // must FIRE a due cron tick. Because the advisory-lock leader is
+    // Postgres-only, sqlite cron is served by the in-memory single-process
+    // leader routed through `cron_poll_once` (exactly what the on_serve loop
+    // runs). Before the fix, `Jobs::postgres` set a pg leader unconditionally,
+    // so on sqlite `cron_poll_once` routed to `PostgresStore::cron_tick`, which
+    // short-circuits to Ok(0): a declared cron job compiled, passed `check`, and
+    // SILENTLY never fired.
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    db.migrate(JOBS_MIGRATIONS).await.unwrap();
+
+    // No `.store(..)` (that would clear the pg leader and hide the routing under
+    // test): `Jobs::postgres` keeps its own durable PostgresStore over this Db.
+    let jobs = Jobs::postgres(db.clone()).cron("hourly", "0 * * * *", "default");
+
+    // 01:01:30 — the 01:00 tick is the most-recent due tick and has not fired.
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600 + 90);
+    assert_eq!(
+        jobs.cron_poll_once(now).await.unwrap(),
+        1,
+        "a due cron tick fires on sqlite (not the dead pg-leader Ok(0))"
+    );
+
+    // It landed in the DURABLE store and is leasable by a worker. The sqlite pool
+    // is size 1, so this `db.clone()`-backed store shares the one in-memory
+    // database the engine enqueued into.
+    let store = PostgresStore::new(db);
+    let leased = store
+        .lease("default", now, Duration::from_secs(30), 10)
+        .await
+        .unwrap();
+    assert_eq!(leased.len(), 1, "the fired cron job is durably enqueued");
+    assert_eq!(leased[0].name, "hourly", "the enqueued job is the cron job");
+
+    // A second poll in the same hour does NOT re-fire: last_fired advanced to
+    // 01:00, so nothing new is due until 02:00 (no double-fire).
+    let later = SystemTime::UNIX_EPOCH + Duration::from_secs(3600 + 120);
+    assert_eq!(
+        jobs.cron_poll_once(later).await.unwrap(),
+        0,
+        "the single-process leader does not double-fire within a tick window"
+    );
 }
 
 #[tokio::test]

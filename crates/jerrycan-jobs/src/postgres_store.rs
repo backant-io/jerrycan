@@ -919,13 +919,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cron_tick_is_a_noop_on_non_postgres() {
-        // The advisory-lock leader is Postgres-only; on sqlite it must not run (no
-        // pg_advisory_xact_lock) and simply returns 0.
+    async fn advisory_lock_cron_tick_is_postgres_only_not_a_silent_cron_path() {
+        // The advisory-lock leader needs `pg_advisory_xact_lock`, so this METHOD
+        // is Postgres-only and returns 0 on sqlite. This is NOT silent cron death
+        // (#49): `Jobs::postgres` gates its `pg_leader` on the backend, so a
+        // sqlite engine never routes cron through here — the in-memory
+        // single-process leader (`Jobs::cron_tick_once`, via `cron_poll_once`)
+        // fires it against the durable store instead. See the behavioral proof
+        // `cron_fires_on_sqlite_via_the_in_memory_leader` in tests/jobs.rs.
         let s = store().await;
         let sched = CronSchedule::parse("0 * * * *").unwrap();
         let crons = vec![("hourly".to_string(), sched, "default".to_string())];
         let n = s.cron_tick(&crons, t0()).await.unwrap();
-        assert_eq!(n, 0, "cron_tick is a no-op on non-Postgres backends");
+        assert_eq!(
+            n, 0,
+            "the advisory-lock leader is a no-op on non-Postgres; sqlite cron is \
+             served by the in-memory leader, not this method"
+        );
     }
 }
