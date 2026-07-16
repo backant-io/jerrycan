@@ -274,6 +274,7 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
             if !f.required {
                 out.push_str("    #[serde(default)]\n");
             }
+            out.push_str(&enum_validate_attr(e, f, "    ", ""));
             out.push_str(&format!(
                 "    pub {}: {},\n",
                 rust_ident(&f.name),
@@ -282,6 +283,7 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
         }
         out.push_str("}\n\n");
     }
+    out.push_str(&enum_deserialize_fns(&m.entities));
     Some(out)
 }
 
@@ -299,6 +301,62 @@ fn keyword_field_attrs(name: &str, indent: &str, db: bool) -> String {
         s.push_str(&format!("{indent}#[sea_orm(column_name = \"{name}\")]\n"));
     }
     s
+}
+
+/// The `#[serde(deserialize_with = ...)]` line wiring an enum `values` field to
+/// its generated allow-list validator (issue #47), or empty for a non-enum field
+/// so every design WITHOUT `values` stays byte-identical. `path_prefix` is
+/// `"super::"` for the db-mode SeaORM Model (nested in `pub mod {snake}`, so the
+/// root-level validator is reached via `super::`) and `""` for the root-level
+/// memory struct and the `{Entity}Request` DTO.
+fn enum_validate_attr(entity: &Entity, f: &Field, indent: &str, path_prefix: &str) -> String {
+    if f.values.is_none() {
+        return String::new();
+    }
+    format!(
+        "{indent}#[serde(deserialize_with = \"{path_prefix}de_{snake}_{field}\")]\n",
+        snake = Design::to_snake(&entity.name),
+        field = f.name,
+    )
+}
+
+/// The root-level `de_{entity}_{field}` validators for every enum `values` field
+/// across a module's entities (issue #47). Each rejects an out-of-range value with
+/// a serde error, which the `Json` extractor surfaces as `422 JC0422` — so invalid
+/// enum input is refused at the request boundary, on EVERY write path (create AND
+/// update), BEFORE the database (whose CHECK stays as defense-in-depth). Empty when
+/// no entity declares `values`. serde paths are fully qualified so the module's
+/// `use` list is untouched (the db root imports nothing; the memory root imports
+/// only serde's derives).
+fn enum_deserialize_fns(entities: &[Entity]) -> String {
+    let mut out = String::new();
+    for e in entities {
+        let snake = Design::to_snake(&e.name);
+        for f in &e.fields {
+            let Some(values) = &f.values else {
+                continue;
+            };
+            let allowed = values
+                .iter()
+                .map(|v| format!("\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let msg = format!("{} must be one of: {}", f.name, values.join(", "));
+            let name = format!("de_{snake}_{}", f.name);
+            if f.required {
+                out.push_str(&format!(
+                    "// Enum validator (issue #47): out-of-range `{field}` → serde error → 422.\nfn {name}<'de, D>(de: D) -> std::result::Result<String, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <String as serde::Deserialize>::deserialize(de)?;\n    const ALLOWED: &[&str] = &[{allowed}];\n    if !ALLOWED.contains(&value.as_str()) {{\n        return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n    }}\n    Ok(value)\n}}\n\n",
+                    field = f.name,
+                ));
+            } else {
+                out.push_str(&format!(
+                    "// Enum validator (issue #47): checks `{field}` when present (optional).\nfn {name}<'de, D>(de: D) -> std::result::Result<Option<String>, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <Option<String> as serde::Deserialize>::deserialize(de)?;\n    if let Some(ref inner) = value {{\n        const ALLOWED: &[&str] = &[{allowed}];\n        if !ALLOWED.contains(&inner.as_str()) {{\n            return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n        }}\n    }}\n    Ok(value)\n}}\n\n",
+                    field = f.name,
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// PascalCase a snake_case column name for SeaORM's `Column` variants:
@@ -369,9 +427,11 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design, auth: bool) -> Opti
             fields.push_str(&keyword_field_attrs(&f.name, "        ", true));
             let ident = rust_ident(&f.name);
             if f.required {
+                fields.push_str(&enum_validate_attr(e, f, "        ", "super::"));
                 fields.push_str(&format!("        pub {ident}: {base},\n"));
             } else {
                 fields.push_str("        #[serde(default)]\n");
+                fields.push_str(&enum_validate_attr(e, f, "        ", "super::"));
                 fields.push_str(&format!("        pub {ident}: Option<{base}>,\n"));
             }
         }
@@ -438,6 +498,7 @@ pub use {snake}::Model as {entity};
             out.push_str(&request_dto_rs(e, design));
         }
     }
+    out.push_str(&enum_deserialize_fns(&m.entities));
     Some(out)
 }
 
@@ -472,9 +533,11 @@ fn request_dto_rs(e: &Entity, design: &Design) -> String {
         fields.push_str(&keyword_field_attrs(&f.name, "    ", false));
         let ident = rust_ident(&f.name);
         if f.required {
+            fields.push_str(&enum_validate_attr(e, f, "    ", ""));
             fields.push_str(&format!("    pub {ident}: {base},\n"));
         } else {
             fields.push_str("    #[serde(default)]\n");
+            fields.push_str(&enum_validate_attr(e, f, "    ", ""));
             fields.push_str(&format!("    pub {ident}: Option<{base}>,\n"));
         }
     }
@@ -2265,5 +2328,111 @@ pub(crate) mod tests {
             "memory mode keeps the entity body: {h}"
         );
         assert!(!h.contains("CollectionRequest"), "{h}");
+    }
+
+    /// A guarded identity-FK design whose body carries an enum `values` field —
+    /// exercises the Model + `{Entity}Request` DTO validator wiring (issue #47).
+    const ENUM_DTO: &str = r#"{
+        "name": "tasks-app", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["admin"] },
+        "dependencies": ["db", "auth"],
+        "modules": [
+            { "name": "users",
+              "entities": [{ "name": "User", "fields": [{ "name": "email", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_users", "method": "GET", "path": "/",
+                  "auth_required": true,
+                  "success": { "status": 200, "entity": "User", "list": true } }] },
+            { "name": "tasks",
+              "entities": [{ "name": "Task",
+                  "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                  "fields": [
+                      { "name": "title", "type": "string" },
+                      { "name": "status", "type": "string", "values": ["todo", "doing", "done"] },
+                      { "name": "priority", "type": "string", "required": false, "values": ["low", "high"] }
+                  ]}],
+              "endpoints": [{ "operation_id": "create_task", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "Task" },
+                  "success": { "status": 201, "entity": "Task" } }] }
+        ]
+    }"#;
+
+    /// Issue #47: an enum `values` field must reject out-of-range input at the
+    /// request boundary (422), not die in the DB CHECK (500). The generator wires
+    /// each enum field to a generated allow-list `deserialize_with` validator, so
+    /// `Json<T>` extraction 422s an out-of-range value BEFORE the handler/DB — in
+    /// memory mode (the plain serde struct).
+    #[test]
+    fn enum_field_validates_at_deserialize_memory() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let src = model_rs(&d.modules[0]).unwrap(); // workspaces: Workspace.plan enum
+        assert!(
+            src.contains("#[serde(deserialize_with = \"de_workspace_plan\")]"),
+            "enum field wired to its validator: {src}"
+        );
+        assert!(
+            src.contains("fn de_workspace_plan"),
+            "validator fn emitted: {src}"
+        );
+        assert!(
+            src.contains("&[\"trial\", \"pro\"]"),
+            "allow-list derived from `values`: {src}"
+        );
+        assert!(
+            src.contains("custom("),
+            "out-of-range → serde custom error (surfaces as 422): {src}"
+        );
+    }
+
+    /// Same, in db mode: the SeaORM Model is nested in `pub mod {snake}`, so it
+    /// references the root-level validator via `super::`.
+    #[test]
+    fn enum_field_validates_at_deserialize_db() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let src = model_rs_db(&d.modules[0], &d, false).unwrap();
+        assert!(
+            src.contains("#[serde(deserialize_with = \"super::de_workspace_plan\")]"),
+            "db Model wires the validator via super::: {src}"
+        );
+        assert!(src.contains("fn de_workspace_plan"), "{src}");
+        assert!(src.contains("&[\"trial\", \"pro\"]"), "{src}");
+    }
+
+    /// No-drift: an entity with NO enum field emits ZERO validation — output is
+    /// byte-identical to before the fix.
+    #[test]
+    fn enum_free_entity_emits_no_validator() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let leads = model_rs_db(&d.modules[1], &d, false).unwrap(); // Lead: no enum
+        assert!(
+            !leads.contains("deserialize_with"),
+            "enum-free entity keeps byte-identical output: {leads}"
+        );
+        assert!(!leads.contains("fn de_"), "no validator fns: {leads}");
+    }
+
+    /// The `{Entity}Request` DTO (issue #34) must validate its enum fields too —
+    /// both required (`status`) and optional (`priority`). The Model references the
+    /// validator via `super::`; the root-level DTO references it directly.
+    #[test]
+    fn dto_and_model_enum_fields_both_validate() {
+        let d: Design = serde_json::from_str(ENUM_DTO).unwrap();
+        let src = model_rs_db(&d.modules[1], &d, true).unwrap(); // tasks
+        assert!(
+            src.contains("#[serde(deserialize_with = \"super::de_task_status\")]"),
+            "Model wires validator via super::: {src}"
+        );
+        assert!(
+            src.contains("#[serde(deserialize_with = \"de_task_status\")]"),
+            "DTO wires the same validator at root: {src}"
+        );
+        assert!(
+            src.contains("fn de_task_priority"),
+            "optional enum validated too: {src}"
+        );
+        assert!(
+            src.contains("Result<Option<String>, D::Error>"),
+            "optional validator returns Option<String>: {src}"
+        );
     }
 }

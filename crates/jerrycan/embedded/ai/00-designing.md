@@ -157,7 +157,10 @@ Every entity has an `id` primary key. You usually do NOT declare it:
 - `index?` — defaults to `false`. Adds a non-unique index.
 - `values?` — the ENUM mechanism. ONLY valid on a `string` field, and must be
   non-empty. A `string` field + `values` becomes a TEXT column with a CHECK
-  constraint plus `Valid<T>` validation. There is NO separate `enum` field type —
+  constraint AND generated request validation: the model rejects an out-of-range
+  value at deserialization, so invalid enum input is answered `422 JC0422` before
+  it reaches the database — on every write path (create AND update), and the same
+  422 in memory mode (which has no DB). There is NO separate `enum` field type —
   enums are always `string` + `values`.
 
 ## Endpoint
@@ -572,7 +575,8 @@ IN-HANDLER over `RawBody` (see Auth):
 
 ## Gotchas (these cost real time)
 - **Enums are `string` + `values`, not a type.** There is no `enum` field type.
-  `{ "type": "string", "values": ["a", "b"] }` → TEXT + CHECK + `Valid<T>`.
+  `{ "type": "string", "values": ["a", "b"] }` → TEXT + CHECK + a generated request
+  validator (an out-of-range value 422s at deserialization, before the DB).
   `values` on a non-string field is rejected; an empty `values` is rejected.
 - **`datetime`/`uuid` are `String` at the Rust layer.** There is no native time
   type and no built-in `now() → rfc3339`. Handle time in-handler (format/parse a
