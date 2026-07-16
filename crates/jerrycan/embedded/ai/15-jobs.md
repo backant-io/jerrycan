@@ -146,6 +146,11 @@ assert!(send_email(t.task_context()).await.is_ok());
 - **Idempotency keys**: a second `enqueue` with a key already seen is a no-op
   reporting the existing id (`EnqueueOutcome::Duplicate`) — use it to make an
   at-most-one-enqueue contract from a handler that may retry.
+- **Touching another module's table** (an admin sweep — expire stale rows of a
+  sibling module — is the classic case): the task reaches the shared `Db` via
+  `ctx.resolve::<jerrycan::db::Db>()`, but a route crate can't import a sibling's
+  entity. Declare a narrow second SeaORM entity on that table in your own module
+  and query it directly — see Cross-module data access in `jerrycan docs database`.
 
 ## Cron semantics
 - **Skip-missed**: after downtime, a cron job fires the **most recent** missed

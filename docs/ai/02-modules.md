@@ -106,7 +106,9 @@ Derivation rules:
 
 ## Anti-patterns
 - Don't reach into another module's internals — route crates expose `module()`
-  and nothing else; shared types live in the app's `shared` crate.
+  and nothing else; shared types live in the app's `shared` crate, and to read
+  another module's *table* you declare a narrow second entity in your own module
+  (`jerrycan docs database`, Cross-module data access).
 - Don't use module middleware for cross-cutting concerns that belong app-level
   (logging, request IDs); module middleware is for subtree policy (auth zones,
   rate limits).

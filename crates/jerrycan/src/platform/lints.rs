@@ -215,7 +215,7 @@ fn lint_public_surface(root: &Path, m: &ModuleDesign, out: &mut Vec<Diagnostic>)
                 m.name,
                 t.trim_end()
             ),
-            "make it pub(crate), move shared types to the shared crate, or expose via module()",
+            "make it pub(crate), move shared types to the shared crate, or expose via module(); to reach another module's TABLE, declare a narrow second entity in your own module (jerrycan docs database)",
             "jerrycan docs modules#anti-patterns",
         ));
     }
