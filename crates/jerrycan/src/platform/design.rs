@@ -469,6 +469,26 @@ impl Design {
             || self.dependencies.iter().any(|d| d == "auth")
     }
 
+    /// The active auth model, defaulting to `None` when no `auth` block is set.
+    /// A guard/codegen decision (cookie vs Bearer) keys on this.
+    pub fn auth_model(&self) -> AuthModel {
+        self.auth
+            .as_ref()
+            .map(|a| a.model)
+            .unwrap_or(AuthModel::None)
+    }
+
+    /// The HTTP header the GENERATED acceptance tests thread the test credential
+    /// through: `authorization` (a `Bearer <jwt>` token) under the `jwt` model,
+    /// else `cookie` (a `jerrycan_session=…` cookie). Session/none output stays
+    /// byte-identical (issue #29 — jwt REST routes get real Bearer guards).
+    pub(crate) fn test_auth_header(&self) -> &'static str {
+        match self.auth_model() {
+            AuthModel::Jwt => "authorization",
+            _ => "cookie",
+        }
+    }
+
     /// Reserved dependency name `observe` wires logging + the metrics/health
     /// extension. Pure extension wiring — no per-route codegen.
     pub fn wants_observe(&self) -> bool {

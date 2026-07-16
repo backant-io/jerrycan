@@ -29,8 +29,28 @@ fn success_schema(s: &Success) -> Option<Value> {
     })
 }
 
+/// The OpenAPI security scheme NAME advertised for a design's auth model
+/// (issue #29): `bearerAuth` under `jwt`, `cookieAuth` under `session`, and none
+/// under `none` (so a no-auth design's document is byte-identical to before).
+fn security_scheme_name(design: &Design) -> Option<&'static str> {
+    match design.auth_model() {
+        AuthModel::Jwt => Some("bearerAuth"),
+        AuthModel::Session => Some("cookieAuth"),
+        AuthModel::None => None,
+    }
+}
+
 fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
     let mut op = json!({ "operationId": ep.operation_id, "responses": {} });
+
+    // A guarded op requires the design's credential (issue #29): stamp `security`
+    // referencing the model's scheme so a generated client sends it. Public /
+    // signature-authenticated ops (and any op in a `none` design) carry none.
+    if ep.is_guarded()
+        && let Some(scheme) = security_scheme_name(design)
+    {
+        op["security"] = json!([{ scheme: [] }]);
+    }
 
     let params: Vec<Value> = {
         // every {x} in route order, integer in v0 (the generator emits i64)
@@ -164,6 +184,17 @@ pub fn document(design: &Design) -> Value {
         walk_paths(design, m, "", &mut paths);
         walk_schemas(design, m, &mut schemas);
     }
+    let mut components = json!({ "schemas": schemas });
+    // securitySchemes only when the design has a real guard credential (issue #29);
+    // omitted entirely for `none` so that document stays byte-identical to before.
+    if let Some(name) = security_scheme_name(design) {
+        let scheme = match design.auth_model() {
+            AuthModel::Jwt => json!({ "type": "http", "scheme": "bearer", "bearerFormat": "JWT" }),
+            // The generated `Session` guard reads the `jerrycan_session` cookie.
+            _ => json!({ "type": "apiKey", "in": "cookie", "name": "jerrycan_session" }),
+        };
+        components["securitySchemes"] = json!({ name: scheme });
+    }
     json!({
         "openapi": "3.1.0",
         "info": {
@@ -172,7 +203,7 @@ pub fn document(design: &Design) -> Value {
             "description": design.description.clone().unwrap_or_default(),
         },
         "paths": paths,
-        "components": { "schemas": schemas },
+        "components": components,
     })
 }
 
@@ -188,9 +219,81 @@ mod tests {
     use super::*;
 
     const GOLDEN: &str = include_str!("../../../../conformance/designs/todo-api.design.json");
+    const REFERENCE_SLICE: &str =
+        include_str!("../../../../conformance/designs/reference-slice.design.json");
 
     fn doc() -> Value {
         document(&serde_json::from_str::<Design>(GOLDEN).unwrap())
+    }
+
+    /// A `jwt` design advertises `bearerAuth` (http/bearer/JWT) and stamps
+    /// `security` on every guarded operation, so a client generated from the
+    /// contract sends `Authorization: Bearer <jwt>` — the credential the
+    /// generated Bearer guard actually verifies (issue #29). Unguarded (public)
+    /// ops carry no security.
+    #[test]
+    fn jwt_design_advertises_bearer_security_on_guarded_ops() {
+        let d = document(&serde_json::from_str::<Design>(REFERENCE_SLICE).unwrap());
+        let scheme = &d["components"]["securitySchemes"]["bearerAuth"];
+        assert_eq!(scheme["type"], "http");
+        assert_eq!(scheme["scheme"], "bearer");
+        assert_eq!(scheme["bearerFormat"], "JWT");
+        assert!(
+            d["components"]["securitySchemes"]["cookieAuth"].is_null(),
+            "jwt advertises bearer, never cookie: {}",
+            d["components"]["securitySchemes"]
+        );
+        // create_lead is auth_required → per-op bearer security.
+        assert_eq!(
+            d["paths"]["/leads/"]["post"]["security"],
+            json!([{ "bearerAuth": [] }])
+        );
+        // register is public → no security stanza.
+        assert!(
+            d["paths"]["/users/register"]["post"]
+                .get("security")
+                .is_none(),
+            "public op carries no security: {}",
+            d["paths"]["/users/register"]["post"]
+        );
+    }
+
+    /// A `session` design advertises `cookieAuth` (apiKey in the
+    /// `jerrycan_session` cookie) and stamps `security` on guarded ops.
+    #[test]
+    fn session_design_advertises_cookie_security_on_guarded_ops() {
+        let d = document(
+            &serde_json::from_str::<Design>(crate::platform::genroute::tests::SERVER_FK).unwrap(),
+        );
+        let scheme = &d["components"]["securitySchemes"]["cookieAuth"];
+        assert_eq!(scheme["type"], "apiKey");
+        assert_eq!(scheme["in"], "cookie");
+        assert_eq!(scheme["name"], "jerrycan_session");
+        assert!(
+            d["components"]["securitySchemes"]["bearerAuth"].is_null(),
+            "session advertises cookie, never bearer"
+        );
+        // list_users is auth_required → per-op cookie security.
+        assert_eq!(
+            d["paths"]["/users/"]["get"]["security"],
+            json!([{ "cookieAuth": [] }])
+        );
+    }
+
+    /// A `none`-model design emits NO security schemes and NO per-op security —
+    /// its OpenAPI stays byte-identical to before this feature (issue #29).
+    #[test]
+    fn no_auth_design_emits_no_security() {
+        let d = doc();
+        assert!(
+            d["components"].get("securitySchemes").is_none(),
+            "none model adds no securitySchemes: {}",
+            d["components"]
+        );
+        assert!(
+            d["paths"]["/todos/"]["post"].get("security").is_none(),
+            "none model adds no per-op security"
+        );
     }
 
     #[test]

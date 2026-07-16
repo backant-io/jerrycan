@@ -254,6 +254,98 @@ fn generated_auth_module_crate_passes_strict_clippy() {
     }
 }
 
+/// A minimal JWT design with realtime (issue #29): a guarded route + a `changes`
+/// channel. The `jwt` model flips the shared alias to `Bearer<SessionUser>` AND
+/// the realtime `?token=` fallback to `jerrycan::auth::Bearer(claims)` — the two
+/// MUST move in lockstep or the realtime `match` arms disagree on the guard type
+/// and the realtime crate won't compile. This is the compile gate for that
+/// coupling (the unit tests pin the emitted strings; this proves they build).
+const JWT_REALTIME: &str = r#"{
+    "name": "jwt-rt",
+    "contract_version": 2,
+    "auth": { "model": "jwt", "roles": ["admin"] },
+    "dependencies": ["db", "auth", "realtime"],
+    "modules": [{
+        "name": "notes",
+        "entities": [{ "name": "Note", "fields": [
+            { "name": "text", "type": "string", "required": true }
+        ]}],
+        "endpoints": [
+            { "operation_id": "list_notes", "method": "GET", "path": "/",
+              "auth_required": true,
+              "success": { "status": 200, "entity": "Note", "list": true } }
+        ]
+    }],
+    "realtime": { "changes": ["Note"], "broadcast": [], "presence": [] }
+}"#;
+
+#[test]
+#[ignore = "invokes cargo on a scaffolded jwt+realtime app; run with --include-ignored"]
+fn generated_jwt_realtime_app_passes_strict_clippy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("jwt-rt-app");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, JWT_REALTIME);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(
+        status.success(),
+        "jerrycan new must scaffold the jwt+realtime app"
+    );
+
+    // The jwt model flips the shared guard alias to Bearer...
+    let shared = fs::read_to_string(app.join("crates/shared/src/lib.rs")).expect("read shared");
+    assert!(
+        shared.contains("pub type CurrentUser = jerrycan::auth::Bearer<SessionUser>;"),
+        "jwt design must alias CurrentUser to Bearer:\n{shared}"
+    );
+    // ...and the realtime `?token=` fallback wraps claims in Bearer to match it.
+    let rt = fs::read_to_string(app.join("crates/realtime/src/lib.rs")).expect("read realtime");
+    assert!(
+        rt.contains("jerrycan::auth::Bearer(claims)")
+            && !rt.contains("jerrycan::auth::Session(claims)"),
+        "realtime jwt fallback must wrap claims in Bearer (lockstep with the alias):\n{rt}"
+    );
+
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // Both the guarded route crate and the realtime crate must build — the realtime
+    // crate is where the guard-type coupling would surface as a compile error.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "route-notes",
+            "-p",
+            "realtime",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo clippy");
+
+    if !output.status.success() {
+        panic!(
+            "scaffolded jwt+realtime app failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 /// A minimal JOBS-mode design: db + two jobs — one CRON (`expire_trials`, with a
 /// schedule + a named queue) and one QUEUE-only (`send_email`, no schedule → a
 /// `{Name}Payload` struct + the 2-arg stub). This exercises BOTH generated task

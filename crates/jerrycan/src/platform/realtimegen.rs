@@ -84,7 +84,7 @@ pub fn resolver_rs(design: &Design) -> String {
              \x20                   let auth = ctx.resolve::<jerrycan::auth::Auth>().await?;\n\
              \x20                   let claims = jerrycan::auth::jwt::decode::<shared::SessionUser>(&token, auth.jwt_key())\n\
              \x20                       .map_err(|_| jerrycan::Error::unauthorized())?;\n\
-             \x20                   jerrycan::auth::Session(claims)\n\
+             \x20                   jerrycan::auth::Bearer(claims)\n\
              \x20               }\n\
              \x20           };\n"
         }
@@ -327,12 +327,17 @@ mod tests {
         );
         assert!(a.contains("jerrycan::auth::jwt::decode"), "{a}");
         // The emitted wiring must use the REAL API (proven by the realtime
-        // compile-smoke, pinned cheaply here): CurrentUser is Session<SessionUser>,
-        // so the JWT fallback wraps claims in `Session(..)`; the user id is the
-        // `user.0.id` String field; and Tenant.role is a FIELD, not a method.
+        // compile-smoke, pinned cheaply here): under the jwt model CurrentUser is
+        // Bearer<SessionUser> (issue #29), so the JWT `?token=` fallback wraps
+        // claims in `Bearer(..)` — matching the alias so the `match` type-checks;
+        // the user id is the `user.0.id` String field; Tenant.role is a FIELD.
         assert!(
-            a.contains("jerrycan::auth::Session(claims)"),
-            "JWT fallback wraps claims in Session (CurrentUser = Session<SessionUser>): {a}"
+            a.contains("jerrycan::auth::Bearer(claims)"),
+            "JWT fallback wraps claims in Bearer (CurrentUser = Bearer<SessionUser>): {a}"
+        );
+        assert!(
+            !a.contains("jerrycan::auth::Session(claims)"),
+            "jwt model must NOT wrap in Session — the alias is Bearer: {a}"
         );
         assert!(
             a.contains("user_id: user.0.id.clone()"),

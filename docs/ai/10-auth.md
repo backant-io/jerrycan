@@ -47,6 +47,53 @@ assert_eq!(t.get_with("/me", &[("cookie", &cookie_pair)]).await.json::<i64>(), 4
 # }); }
 ```
 
+## The generated guard follows `auth.model`
+The design's `auth.model` decides which guard your scaffolded handlers extract —
+the generated `shared::CurrentUser` alias, which every guarded REST route uses:
+
+| `auth.model` | generated `CurrentUser` | credential the guard checks | rejects with |
+|---|---|---|---|
+| `"session"` | `Session<SessionUser>` | the `jerrycan_session` cookie (AEAD-encrypted) | `401` if absent/invalid |
+| `"jwt"` | `Bearer<SessionUser>` | the `Authorization: Bearer <jwt>` header (HS256) | `401` if absent/invalid |
+
+`SessionUser` is identical for both models (`{ id: String, role: String }` — `id`
+is the STRINGIFIED user pk, so an integer or a uuid Supabase id round-trips). A
+`jwt` design gets REAL bearer-token guards; a Supabase-migrated app (whose auth
+is always JWT) is served correctly. Pick the model up front — REST routes,
+realtime, and the OpenAPI `securityScheme` all follow it.
+
+Under `"jwt"`, the agent writes the login that mints the token (there is no
+cookie to set). Mint over the same `SessionUser` shape with `Auth::jwt_key()`,
+and ALWAYS include an `exp` claim (unix seconds) — `decode` enforces it when
+present, and `Bearer<SessionUser>` ignores the extra field on the way back in:
+```rust
+# use jerrycan::prelude::*;
+# use jerrycan::auth::{Auth, Bearer};
+# use serde::{Deserialize, Serialize};
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+// The generated shared::SessionUser; a jwt design guards on Bearer<SessionUser>.
+#[derive(Serialize, Deserialize, Clone)]
+struct SessionUser { id: String, role: String }
+async fn me(Bearer(u): Bearer<SessionUser>) -> Json<String> { Json(u.id) }
+
+// The agent-written login mints the bearer token (add `exp` to the payload).
+#[derive(Serialize)]
+struct Claims { id: String, role: String, exp: u64 }
+let auth = Auth::with_secret("a-very-long-development-secret-string!!");
+let token = jerrycan::auth::jwt::encode(
+    &Claims { id: 42.to_string(), role: "user".into(), exp: 9_999_999_999 },
+    auth.jwt_key(),
+).unwrap();
+
+let t = App::new().extend(auth).route("/me", get(me)).into_test();
+assert_eq!(t.get("/me").await.status(), jerrycan::http::StatusCode::UNAUTHORIZED);
+assert_eq!(
+    t.get_with("/me", &[("authorization", &format!("Bearer {token}"))]).await.json::<String>(),
+    "42",
+);
+# }); }
+```
+
 ## Variations
 - Passwords: `jerrycan::auth::hash_password(pw)` → `Result<String>` (a PHC
   string for storage); `verify_password(pw, &stored)` → `Result<bool>`

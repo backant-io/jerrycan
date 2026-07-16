@@ -1,6 +1,6 @@
 //! `jerrycan new`: design → complete crate-per-module workspace on disk.
 
-use super::design::Design;
+use super::design::{AuthModel, Design};
 use super::genroute;
 use super::mounting;
 use super::templates::*;
@@ -9,9 +9,23 @@ use std::path::Path;
 
 /// The session-user type + guard alias appended to the shared crate's lib.rs in
 /// auth mode. `CurrentUser` is what handler stubs extract, so every module's
-/// guard agrees on one app-wide session payload.
-fn shared_auth_types() -> &'static str {
-    "\n/// The session payload (app-wide). Generated because the design declares auth.\n/// `id` is the stringified user pk (mirrors storage's TEXT `owner_id`), so both\n/// integer and uuid/string user identities — e.g. a migrated Supabase\n/// `auth.users` uuid — round-trip through the session, JWT, and tenant guard.\n#[derive(serde::Serialize, serde::Deserialize, Clone)]\npub struct SessionUser {\n    pub id: String,\n    pub role: String,\n}\n\n/// The guard extractor handlers use: a decrypted session.\npub type CurrentUser = jerrycan::auth::Session<SessionUser>;\n"
+/// guard agrees on one app-wide session payload. The guard TYPE follows the
+/// declared auth model (issue #29): `Session<SessionUser>` (cookie) under the
+/// `session` model, `Bearer<SessionUser>` (`Authorization: Bearer <jwt>`) under
+/// the `jwt` model — a jwt design gets REAL Bearer-token guards, not cookies.
+fn shared_auth_types(design: &Design) -> String {
+    // The `SessionUser` payload is identical for both models — its `id` is the
+    // stringified user pk (mirrors storage's TEXT `owner_id`), so integer and
+    // uuid/string identities round-trip through the session, JWT, and tenant
+    // guard alike. Only the guard alias line differs by model, so the session /
+    // none path stays byte-identical to before.
+    let struct_block = "\n/// The session payload (app-wide). Generated because the design declares auth.\n/// `id` is the stringified user pk (mirrors storage's TEXT `owner_id`), so both\n/// integer and uuid/string user identities — e.g. a migrated Supabase\n/// `auth.users` uuid — round-trip through the session, JWT, and tenant guard.\n#[derive(serde::Serialize, serde::Deserialize, Clone)]\npub struct SessionUser {\n    pub id: String,\n    pub role: String,\n}\n\n";
+    let alias = if design.auth_model() == AuthModel::Jwt {
+        "/// The guard extractor handlers use: a verified `Authorization: Bearer` JWT.\npub type CurrentUser = jerrycan::auth::Bearer<SessionUser>;\n"
+    } else {
+        "/// The guard extractor handlers use: a decrypted session.\npub type CurrentUser = jerrycan::auth::Session<SessionUser>;\n"
+    };
+    format!("{struct_block}{alias}")
 }
 
 /// The membership-checked `Tenant` guard appended to shared/src/lib.rs when the
@@ -164,7 +178,7 @@ pub fn scaffold(target: &Path, design: &Design) -> Result<Vec<String>, String> {
         // (validation guarantees an active auth model alongside tenancy). The
         // shared crate inherits the workspace `jerrycan` features (incl. `db`)
         // via `jerrycan.workspace = true`, so `jerrycan::db::Db` resolves here.
-        let mut lib = format!("{SHARED_LIB}{}", shared_auth_types());
+        let mut lib = format!("{SHARED_LIB}{}", shared_auth_types(design));
         if design.tenancy.is_some() {
             lib.push_str(&shared_tenancy_types(design));
         }

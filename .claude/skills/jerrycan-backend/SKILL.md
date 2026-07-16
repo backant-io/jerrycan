@@ -72,7 +72,11 @@ auth + tenancy + jobs + endpoints) and get explicit confirmation before designin
 
 **Decide before you design** (these shape the whole design — settle them with the
 user now, don't discover them mid-scaffold):
-- **Auth model** — `session` or `none`? And exactly which endpoints are **public**
+- **Auth model** — `session`, `jwt`, or `none`? `session` gates REST routes with
+  the encrypted `jerrycan_session` cookie; `jwt` gates them with an
+  `Authorization: Bearer <jwt>` token (the model a Supabase migration always
+  uses). Pick it up front — REST guards, realtime, and the OpenAPI security
+  scheme all follow it. And exactly which endpoints are **public**
   (login/register, webhooks, health) vs authenticated?
 - **Is there a real org/team tenant entity?** Only use `tenancy` when a distinct
   org/workspace/team owns the data. If rows are just **per-user**, do NOT use
