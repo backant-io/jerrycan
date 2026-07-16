@@ -141,7 +141,8 @@ OpenAPI · `jerrycan package` (binaries/containers/k8s/systemd).
 ## Phase 3 — Author the design.json (iteratively, with the user)
 
 Build the design **incrementally**, validating as you go. Reference `jerrycan docs
-designing` for every construct. Work in this order, confirming each:
+designing` for every construct, and `jerrycan docs designing-examples` for
+copy-ready starting points. Work in this order, confirming each:
 
 1. **Skeleton**: `name`, `contract_version: 1`, `dependencies` (pick from `db`,
    `auth`, `validate`, `observe`, `oauth` — `db` switches on SQL mode; `oauth`

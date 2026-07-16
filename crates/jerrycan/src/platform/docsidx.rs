@@ -9,6 +9,10 @@ pub const PAGES: &[(&str, &str)] = &[
         "designing",
         include_str!("../../embedded/ai/00-designing.md"),
     ),
+    (
+        "designing-examples",
+        include_str!("../../embedded/ai/20-designing-examples.md"),
+    ),
     ("app", include_str!("../../embedded/ai/01-app.md")),
     ("modules", include_str!("../../embedded/ai/02-modules.md")),
     (
