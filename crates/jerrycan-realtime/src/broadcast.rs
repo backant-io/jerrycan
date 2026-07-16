@@ -61,7 +61,7 @@ impl crate::Hub {
                 StatusCode::FORBIDDEN,
                 "JC0403",
                 format!(
-                    "broadcast topic `{topic}` is tenant-scoped; a server-side publish is un-partitioned and would reach every tenant — declare the topic scope `none` or `auth` to publish it from a handler"
+                    "broadcast topic `{topic}` is tenant-scoped; a server-side publish is un-partitioned and would leak across tenants, so it is refused. Tenant-partitioned server publish is not supported yet (tracked upstream) — do NOT downgrade the topic's scope to work around this: `none`/`auth` topics are visible to every tenant"
                 ),
             ));
         }
