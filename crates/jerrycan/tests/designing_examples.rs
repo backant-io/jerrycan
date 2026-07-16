@@ -1,9 +1,9 @@
-//! Proves every JSON example design in the `00-designing.md` reference page is
-//! real: the page's job is to let an agent author a valid design from the docs
-//! alone, so a shipped example that doesn't validate (or scaffold) would teach
+//! Proves every JSON example design in the `20-designing-examples.md` appendix
+//! page is real: the page's job is to let an agent author a valid design from the
+//! docs alone, so a shipped example that doesn't validate (or scaffold) would teach
 //! the wrong schema. JSON code fences are NOT doctested, so this test parses the
 //! fences straight out of the embedded page bytes (the same bytes served by
-//! `jerrycan docs designing`) and runs each through the real validator and
+//! `jerrycan docs designing-examples`) and runs each through the real validator and
 //! scaffolder — the page can never drift from a working design.
 
 use jerrycan::platform::design::Design;
@@ -38,7 +38,8 @@ fn json_fences(md: &str) -> Vec<String> {
 /// designs is asserted so a dropped example can't pass silently.
 #[test]
 fn every_worked_example_validates_and_scaffolds() {
-    let page = docsidx::get("designing", None).expect("designing page is registered");
+    let page =
+        docsidx::get("designing-examples", None).expect("designing-examples page is registered");
     let fences = json_fences(&page);
     assert!(!fences.is_empty(), "page has json fences");
 
