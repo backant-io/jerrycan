@@ -208,11 +208,18 @@ POST-only `/{id}` actions.) **Do NOT weaken the handler to make these pass.** Le
 the probe, and prove the REAL behavior (success WITH a valid credential, and the
 4xx without) in an **agent-owned test file** you write. Get every test you CAN
 green green, then tell the user exactly which generated probes are un-satisfiable
-and why. (One further known generator rough edge: a `unique` non-PK field on the
-tenant entity collides in the two-tenant isolation seed — make it a plain `index`
-instead. Enum `values` fields now get a generated "out-of-range → 422" reject test
-that passes on stubs — the request validator refuses the bad value before the
-handler; keep it.)
+and why. A **hand-written format/`Valid` constraint the generator can't see** is
+the same case: the probe fills a `string` field with `"test-value"`, but if the
+handler requires that field to be an **email, URL, or other format** (the design
+contract has no field-format declaration, so this lives in a hand-written `Valid`
+impl), a CORRECT handler rejects the fixture and the 2xx probe is un-greenable —
+mark that endpoint **`probe: "skip"`** and write its success test with a real
+value yourself. (Declared `uuid`/`datetime` fields already get format-valid
+fixtures; only constraints invisible to the design need `skip`.) (One further
+known generator rough edge: a `unique` non-PK field on the tenant entity collides
+in the two-tenant isolation seed — make it a plain `index` instead. Enum `values`
+fields now get a generated "out-of-range → 422" reject test that passes on stubs —
+the request validator refuses the bad value before the handler; keep it.)
 
 ## Phase 6 — Verify
 
