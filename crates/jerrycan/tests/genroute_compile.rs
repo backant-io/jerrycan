@@ -273,11 +273,110 @@ const JWT_REALTIME: &str = r#"{
         "endpoints": [
             { "operation_id": "list_notes", "method": "GET", "path": "/",
               "auth_required": true,
-              "success": { "status": 200, "entity": "Note", "list": true } }
+              "success": { "status": 200, "entity": "Note", "list": true } },
+            { "operation_id": "create_note", "method": "POST", "path": "/",
+              "auth_required": true,
+              "request_body": { "entity": "Note" },
+              "success": { "status": 201, "entity": "Note" } }
         ]
     }],
-    "realtime": { "changes": ["Note"], "broadcast": [], "presence": [] }
+    "realtime": { "changes": ["Note"], "broadcast": [{ "name": "note_created", "scope": "auth" }], "presence": [] }
 }"#;
+
+/// The same realtime-publish design under the SESSION auth model — the server
+/// publish API (issue #50) must compile under both auth models (the P5 realtime
+/// coupling). Session flips the shared alias to `Session<SessionUser>` and the
+/// resolver to plain `CurrentUser::from_request` (no `?token=`), but the write
+/// handler's `Dep<RealtimeHandle>` publish path is identical.
+const SESSION_REALTIME: &str = r#"{
+    "name": "sess-rt",
+    "contract_version": 2,
+    "auth": { "model": "session", "roles": ["admin"] },
+    "dependencies": ["db", "auth", "realtime"],
+    "modules": [{
+        "name": "notes",
+        "entities": [{ "name": "Note", "fields": [
+            { "name": "text", "type": "string", "required": true }
+        ]}],
+        "endpoints": [
+            { "operation_id": "list_notes", "method": "GET", "path": "/",
+              "auth_required": true,
+              "success": { "status": 200, "entity": "Note", "list": true } },
+            { "operation_id": "create_note", "method": "POST", "path": "/",
+              "auth_required": true,
+              "request_body": { "entity": "Note" },
+              "success": { "status": 201, "entity": "Note" } }
+        ]
+    }],
+    "realtime": { "changes": ["Note"], "broadcast": [{ "name": "note_created", "scope": "auth" }], "presence": [] }
+}"#;
+
+/// Given a scaffolded realtime-publish app (module `notes`, an `auth`-scoped
+/// broadcast topic `note_created`, a write endpoint `create_note`), assert the
+/// generator wired the `Dep<RealtimeHandle>` param + the publish stub comment
+/// (issue #50), IMPLEMENT the advertised one-liner (the agent's edit), and
+/// require the route + realtime crates to pass strict clippy — so the server
+/// publish call is compiled against the live facade, not just asserted as a
+/// string. Shared by the jwt and session gates.
+fn implement_publish_and_clippy(app: &std::path::Path) {
+    let handlers_path = app.join("crates/routes/notes/src/handlers.rs");
+    let handlers = fs::read_to_string(&handlers_path).expect("read notes handlers");
+    assert!(
+        handlers.contains("_rt: Dep<jerrycan::realtime::RealtimeHandle>"),
+        "the write handler must take the RealtimeHandle dep:\n{handlers}"
+    );
+    assert!(
+        handlers.contains("_rt.publish(\"note_created\", serde_json::json!("),
+        "the stub comment must show the publish one-liner on the declared topic:\n{handlers}"
+    );
+    // The read handler must NOT gain the dep (canonical pattern is write→push).
+    let before_create = handlers
+        .split("pub(crate) async fn create_note")
+        .next()
+        .expect("list_notes precedes create_note");
+    assert!(
+        !before_create.contains("_rt"),
+        "read handlers must not gain the realtime dep:\n{before_create}"
+    );
+    // Implement the one-liner the comment advertises: the publish call must
+    // type-check against the real facade (the return keeps the stub's Err).
+    let implemented = handlers.replace(
+        "    Err(Error::internal(\"create_note not implemented — replace this stub\"))",
+        "    _rt.publish(\"note_created\", serde_json::json!({ \"type\": \"created\" })).await?;\n    Err(Error::internal(\"realtime publish wired\"))",
+    );
+    assert_ne!(
+        implemented, handlers,
+        "the create_note stub must be replaced with a real publish call"
+    );
+    write(&handlers_path, &implemented);
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    let output = Command::new(env!("CARGO"))
+        .current_dir(app)
+        .args([
+            "clippy",
+            "-p",
+            "route-notes",
+            "-p",
+            "realtime",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "realtime-publish app failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
 
 #[test]
 #[ignore = "invokes cargo on a scaffolded jwt+realtime app; run with --include-ignored"]
@@ -316,34 +415,48 @@ fn generated_jwt_realtime_app_passes_strict_clippy() {
         "realtime jwt fallback must wrap claims in Bearer (lockstep with the alias):\n{rt}"
     );
 
-    write(&app.join("rust-toolchain.toml"), "");
-
     // Both the guarded route crate and the realtime crate must build — the realtime
-    // crate is where the guard-type coupling would surface as a compile error.
-    let output = Command::new(env!("CARGO"))
-        .current_dir(&app)
-        .args([
-            "clippy",
-            "-p",
-            "route-notes",
-            "-p",
-            "realtime",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .env("CARGO_TARGET_DIR", common::shared_app_target())
-        .output()
-        .expect("run cargo clippy");
+    // crate is where the guard-type coupling would surface as a compile error — AND
+    // the write handler's server-side publish one-liner (issue #50) must compile.
+    implement_publish_and_clippy(&app);
+}
 
-    if !output.status.success() {
-        panic!(
-            "scaffolded jwt+realtime app failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
+/// The server publish API (issue #50) must also compile under the SESSION auth
+/// model (the P5 realtime coupling: jwt AND session move in lockstep). Scaffolds
+/// a session+realtime app, implements the emitted publish one-liner, and gates
+/// on strict clippy over the route + realtime crates.
+#[test]
+#[ignore = "invokes cargo on a scaffolded session+realtime app; run with --include-ignored"]
+fn generated_session_realtime_app_handler_publishes_broadcast() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("sess-rt-app");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, SESSION_REALTIME);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(
+        status.success(),
+        "jerrycan new must scaffold the session+realtime app"
+    );
+
+    // Session model: the realtime resolver reads the session cookie via
+    // CurrentUser (no `?token=` fallback, no Bearer wrapping).
+    let rt = fs::read_to_string(app.join("crates/realtime/src/lib.rs")).expect("read realtime");
+    assert!(
+        rt.contains("shared::CurrentUser") && !rt.contains("jerrycan::auth::Bearer(claims)"),
+        "session realtime resolver uses CurrentUser, not a Bearer/token fallback:\n{rt}"
+    );
+
+    implement_publish_and_clippy(&app);
 }
 
 /// A minimal JOBS-mode design: db + two jobs — one CRON (`expire_trials`, with a

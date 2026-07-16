@@ -522,6 +522,22 @@ impl Design {
         })
     }
 
+    /// The first broadcast topic a SERVER handler may publish to via
+    /// `RealtimeHandle::publish` (issue #50): scope `none` or `auth`, i.e.
+    /// un-partitioned. A `tenant`-scoped topic is excluded — a server publish has
+    /// no connection principal to derive a tenant partition from, so the runtime
+    /// `publish` rejects it. `None` when the design declares no such topic, which
+    /// is what keeps realtime-free AND tenant-only-broadcast designs' generated
+    /// handlers byte-identical (no dep, no stub comment).
+    pub fn server_publishable_broadcast(&self) -> Option<&str> {
+        self.realtime
+            .as_ref()?
+            .broadcast
+            .iter()
+            .find(|t| matches!(t.scope, RealtimeScope::None | RealtimeScope::Auth))
+            .map(|t| t.name.as_str())
+    }
+
     /// "5MB" → bytes. Uppercase B/KB/MB/GB suffixes (binary multiples); a bare
     /// number is bytes. None = unparseable (a validation question).
     pub fn parse_size(s: &str) -> Option<u64> {
