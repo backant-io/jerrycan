@@ -426,6 +426,15 @@ impl ModuleDesign {
     }
 }
 
+/// The fixed column the generated `{tenant}_members` table and the `Tenant`
+/// guard use for the authenticated principal: the membership DDL emits a
+/// `user_id` column (see `genroute` `write_module_migrations`) and the guard
+/// factory queries `WHERE user_id = ?` (see `scaffold::shared_tenancy_types`).
+/// It is a FIXED name, not a design-named identity entity, so identity checks
+/// (JC0540's tenancy collision, the server-owned-FK rule) compare a derived fk
+/// column against it rather than against a hardcoded `User` string.
+pub(crate) const AUTH_IDENTITY_FK_COLUMN: &str = "user_id";
+
 impl Design {
     /// The normalized app-level mount prefix: the `base_path` override, or `""`
     /// when absent / `/` / empty (a no-op). Prepended to every module and bucket
@@ -581,6 +590,39 @@ impl Design {
     /// The fk column a belongs_to derives: snake_case(target) + "_id".
     pub fn fk_column(target: &str) -> String {
         format!("{}_id", Self::to_snake(target))
+    }
+
+    /// True when this belongs_to targets the AUTH IDENTITY entity: its derived
+    /// fk column is the fixed `user_id` linkage the membership table and the
+    /// session guard key on (see `AUTH_IDENTITY_FK_COLUMN`). Identity is a
+    /// COLUMN-name fact, not an entity-name one — the same resolution JC0540
+    /// uses.
+    pub(crate) fn is_identity_fk(b: &BelongsTo) -> bool {
+        Self::fk_column(&b.entity) == AUTH_IDENTITY_FK_COLUMN
+    }
+
+    /// True when the entity carries an identity FK (a belongs_to aimed at the
+    /// auth identity entity). Such an entity's GUARDED request bodies omit
+    /// `user_id` — the server injects the session user's id (issue #34).
+    pub(crate) fn has_identity_fk(e: &Entity) -> bool {
+        e.belongs_to.iter().any(Self::is_identity_fk)
+    }
+
+    /// The server-owned-FK rule (issue #34), design-level: a GUARDED endpoint
+    /// whose request-body entity carries an identity FK omits that FK from the
+    /// wire contract — the generated probe bodies and the OpenAPI request
+    /// schema drop `user_id`, and the handler injects the authenticated session
+    /// user's id. Unguarded endpoints keep the field (no session to inject);
+    /// every other belongs_to FK stays required client input.
+    pub(crate) fn endpoint_omits_identity_fk(&self, m: &ModuleDesign, ep: &Endpoint) -> bool {
+        self.wants_auth()
+            && ep.is_guarded()
+            && ep.request_body.as_ref().is_some_and(|rb| {
+                m.entities
+                    .iter()
+                    .find(|e| e.name == rb.entity)
+                    .is_some_and(Self::has_identity_fk)
+            })
     }
 
     /// snake_case a validated PascalCase entity name. Entity names are validated

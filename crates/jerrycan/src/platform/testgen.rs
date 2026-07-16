@@ -37,20 +37,29 @@ fn fk_fixture_value(design: &Design, target: &str) -> &'static str {
     }
 }
 
-fn fixture_json(design: &Design, m: &ModuleDesign, entity: &str) -> String {
+/// `omit_identity_fk` is the server-owned-FK rule (issue #34): true for a
+/// GUARDED endpoint's body in an auth design — its `user_id` fk is dropped
+/// because the handler injects the session user's id, and the probe must prove
+/// a clean client that OMITS it reaches the designed success (not a 422).
+fn fixture_json(design: &Design, m: &ModuleDesign, entity: &str, omit_identity_fk: bool) -> String {
     let Some(e) = m.entities.iter().find(|e| e.name == entity) else {
         return "{}".to_string();
     };
     // belongs_to fk columns first: a tenant-owned entity's body must carry the
     // fk (NOT NULL) so the handler's Json<Entity> deserializes (else 422 before
     // the stub), valued at the seeded tenant so a scoped query can resolve it.
-    let fks = e.belongs_to.iter().map(|b| {
-        format!(
-            "\"{}\": {}",
-            Design::fk_column(&b.entity),
-            fk_fixture_value(design, &b.entity)
-        )
-    });
+    // The identity fk (`user_id`) is dropped on guarded bodies (issue #34).
+    let fks = e
+        .belongs_to
+        .iter()
+        .filter(|b| !(omit_identity_fk && Design::is_identity_fk(b)))
+        .map(|b| {
+            format!(
+                "\"{}\": {}",
+                Design::fk_column(&b.entity),
+                fk_fixture_value(design, &b.entity)
+            )
+        });
     let cols = e
         .fields
         .iter()
@@ -104,7 +113,17 @@ fn request_expr(
     let body = || {
         ep.request_body
             .as_ref()
-            .map(|rb| fixture_json(design, unit, &rb.entity))
+            // The omission keys on the ENDPOINT being guarded (the design-level
+            // rule), not on whether THIS request threads a cookie — a guarded
+            // endpoint's 401 probe still sends the guarded body shape.
+            .map(|rb| {
+                fixture_json(
+                    design,
+                    unit,
+                    &rb.entity,
+                    design.endpoint_omits_identity_fk(unit, ep),
+                )
+            })
             .unwrap_or_else(|| "{}".to_string())
     };
     if guarded_and_auth {
@@ -167,6 +186,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             design,
             unit,
             &ep.request_body.as_ref().expect("creator has body").entity,
+            design.endpoint_omits_identity_fk(unit, ep),
         );
         // In auth mode a guarded creator needs the cookie to seed successfully.
         if auth && ep.is_guarded() {
@@ -528,7 +548,12 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
     let base = module.effective_mount();
     let base = base.trim_end_matches('/');
     let plural = module.name.replace('-', "_");
-    let body = fixture_json(design, module, &entity.name);
+    let body = fixture_json(
+        design,
+        module,
+        &entity.name,
+        design.endpoint_omits_identity_fk(module, create),
+    );
     let create_path = format!("{base}/");
 
     // A GET "/{id}" lets us assert the foreign row 404s for user 2 and survives

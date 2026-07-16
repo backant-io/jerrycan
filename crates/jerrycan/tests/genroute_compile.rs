@@ -805,6 +805,192 @@ fn generated_cors_app_main_passes_strict_clippy() {
     }
 }
 
+/// The agent-eval LinkVault shape (issue #34): `Collection` belongs_to the auth
+/// identity entity (`User`, cross-module), every collections endpoint guarded.
+/// Before the server-owned-FK rule, the generated `Json<Collection>` body made
+/// `user_id` REQUIRED on the wire — a clean client omitting it got a 422 before
+/// the handler could inject the session user's id.
+const LINKVAULT: &str = r#"{
+    "name": "linkvault",
+    "contract_version": 1,
+    "auth": { "model": "session", "roles": ["admin"] },
+    "dependencies": ["db", "auth"],
+    "modules": [
+        { "name": "users",
+          "entities": [{ "name": "User", "fields": [
+              { "name": "email", "type": "string" } ]}],
+          "endpoints": [
+              { "operation_id": "list_users", "method": "GET", "path": "/",
+                "auth_required": true,
+                "success": { "status": 200, "entity": "User", "list": true } }
+          ] },
+        { "name": "collections",
+          "entities": [{ "name": "Collection",
+              "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+              "fields": [{ "name": "title", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "create_collection", "method": "POST", "path": "/",
+                "auth_required": true,
+                "request_body": { "entity": "Collection" },
+                "success": { "status": 201, "entity": "Collection" } },
+              { "operation_id": "list_collections", "method": "GET", "path": "/",
+                "auth_required": true,
+                "success": { "status": 200, "entity": "Collection", "list": true } }
+          ] }
+    ]
+}"#;
+
+/// The agent's side of the e2e: a real `create_collection` that INJECTS the
+/// session user's id (the body has no `user_id`) plus a plain list handler.
+/// This is exactly what the generated stub comment tells the agent to write.
+const LINKVAULT_HANDLERS: &str = r#"//! E2E fixture: implemented handlers for the collections module.
+use super::model::*;
+use super::repo::*;
+use jerrycan::prelude::*;
+use shared::CurrentUser;
+
+pub(crate) async fn create_collection(
+    repo: Dep<CollectionRepo>,
+    user: CurrentUser,
+    Json(body): Json<CollectionRequest>,
+) -> Result<Created<Collection>> {
+    // server-owned fk: the session, not the client, decides user_id.
+    let user_id: i64 = user
+        .0
+        .id
+        .parse()
+        .map_err(|_| Error::internal("session id is not an integer"))?;
+    let id = repo
+        .insert(Collection { id: body.id, user_id, title: body.title })
+        .await?;
+    let row = repo.get(id).await?.ok_or_else(Error::not_found)?;
+    Ok(Created(row))
+}
+
+pub(crate) async fn list_collections(
+    repo: Dep<CollectionRepo>,
+    _user: CurrentUser,
+) -> Result<Json<Vec<Collection>>> {
+    Ok(Json(repo.all().await?))
+}
+"#;
+
+/// THE issue #34 e2e gate: scaffold the LinkVault shape, implement the handlers
+/// the way the stub comment instructs, and require (1) the whole scaffolded
+/// workspace to pass strict clippy — the DTO emission and the untouched users
+/// stubs compile under `-D warnings` — and (2) the GENERATED acceptance battery
+/// for the collections module to PASS. Its create probe posts a body WITHOUT
+/// `user_id`; green means the eval's 422 scenario is fixed end to end (contract,
+/// probe, and wire behavior agree: the server injects the session user's id).
+#[test]
+#[ignore = "scaffolds an app and invokes cargo on it; run with --include-ignored"]
+fn guarded_identity_fk_scaffold_accepts_bodies_without_user_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("linkvault");
+
+    let design: Design = serde_json::from_str(LINKVAULT).expect("LINKVAULT parses");
+    assert!(design.wants_auth() && design.wants_db(), "auth + db mode");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, LINKVAULT);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(status.success(), "jerrycan new must scaffold linkvault");
+
+    // Generate the acceptance battery for the module under test (gen-tests is
+    // a separate step from `new`, mirroring the real agent workflow).
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .args(["gen-tests", "--module", "collections"])
+        .output()
+        .expect("run jerrycan gen-tests");
+    assert!(
+        out.status.success(),
+        "gen-tests failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The emitted artifacts carry the server-owned-FK shape end to end.
+    let read =
+        |rel: &str| fs::read_to_string(app.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    let model = read("crates/routes/collections/src/model.rs");
+    assert!(
+        model.contains("pub struct CollectionRequest"),
+        "request DTO emitted:\n{model}"
+    );
+    let handlers = read("crates/routes/collections/src/handlers.rs");
+    assert!(
+        handlers.contains("Json(_body): Json<CollectionRequest>")
+            && handlers.contains("server-owned fk"),
+        "stub takes the DTO and says the server injects user_id:\n{handlers}"
+    );
+    let acceptance = read("crates/routes/collections/tests/acceptance.rs");
+    // The JSON key form (`"user_id"`) must be absent from every probe body;
+    // the bare identifier still appears in the `test_cookie_for(user_id: i64)`
+    // preamble helper, which is fine.
+    assert!(
+        acceptance.contains("serde_json::json!({\"title\": \"test-value\"})")
+            && !acceptance.contains("\"user_id\""),
+        "generated probe bodies must omit user_id:\n{acceptance}"
+    );
+
+    // Implement the handlers the way the stub comment instructs.
+    write(
+        &app.join("crates/routes/collections/src/handlers.rs"),
+        LINKVAULT_HANDLERS,
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // Gate 1: the scaffolded WORKSPACE (DTO, implemented handlers, untouched
+    // users stubs, generated tests) compiles under strict clippy.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "linkvault workspace failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    // Gate 2: the generated acceptance battery passes — the create probe posts
+    // WITHOUT user_id and must reach 201 (the eval's 422 scenario, now green).
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args(["test", "-p", "route-collections"])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo test");
+    if !output.status.success() {
+        panic!(
+            "linkvault generated acceptance tests failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");

@@ -53,14 +53,9 @@ fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a
         .or_else(|| m.entities.first().map(|e| e.name.as_str()))
 }
 
-/// The fixed column the generated `{tenant}_members` table and the `Tenant`
-/// guard use for the authenticated principal: the membership DDL emits a
-/// `user_id` column (see `genroute` `write_module_migrations`) and the guard
-/// factory queries `WHERE user_id = ?` (see `scaffold::shared_tenancy_types`).
-/// It is a FIXED name, not a design-named identity entity, so the collision
-/// rule below compares the tenant's derived fk column against it rather than
-/// against a hardcoded `User` string.
-const AUTH_IDENTITY_FK_COLUMN: &str = "user_id";
+// The fixed `user_id` identity linkage (AUTH_IDENTITY_FK_COLUMN) lives in
+// `design.rs` — shared with the server-owned-FK emission rule (issue #34).
+// It reaches this module through the `use super::design::*` glob above.
 
 /// A fatal design-shape conflict caught before any scaffolding — distinct from
 /// the completeness questions `validate` returns (which a field edit can
