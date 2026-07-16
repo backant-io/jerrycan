@@ -45,6 +45,17 @@ fn fk_fixture_value(design: &Design, target: &str) -> &'static str {
     }
 }
 
+/// The server-owned-FK omission (issue #34), db-gated (issue #43) so all three
+/// surfaces agree: genroute only emits the `{Entity}Request` DTO in db mode (a
+/// memory-mode struct carries no fk columns), so a memory-mode probe must NOT drop
+/// `user_id` either — otherwise the probe body and the OpenAPI request schema would
+/// diverge from the entity genroute actually deserializes. The fk it carries in
+/// memory mode is serde-ignored (the struct has no such field), matching pre-#34
+/// behavior; the omission is a db-mode contract only.
+fn omits_identity_fk(design: &Design, unit: &ModuleDesign, ep: &Endpoint) -> bool {
+    design.wants_db() && design.endpoint_omits_identity_fk(unit, ep)
+}
+
 /// `omit_identity_fk` is the server-owned-FK rule (issue #34): true for a
 /// GUARDED endpoint's body in an auth design — its `user_id` fk is dropped
 /// because the handler injects the session user's id, and the probe must prove
@@ -165,7 +176,7 @@ fn seed_line(
             .as_ref()
             .expect("creator has body")
             .entity,
-        design.endpoint_omits_identity_fk(unit, creator),
+        omits_identity_fk(design, unit, creator),
         None,
     );
     if auth && creator.is_guarded() {
@@ -333,7 +344,7 @@ fn request_expr(
                     design,
                     unit,
                     &rb.entity,
-                    design.endpoint_omits_identity_fk(unit, ep),
+                    omits_identity_fk(design, unit, ep),
                     bad_enum,
                 )
             })
@@ -574,6 +585,11 @@ const TEST_SECRET: &str = "a-very-long-development-secret-string!!";
 /// `Auth::jwt_key()`, matching the generated `Bearer<SessionUser>` guard. The
 /// helpers keep the `test_cookie` names in both models so the isolation seed and
 /// probes stay untouched and the session/none output stays byte-identical.
+///
+/// No-`exp` (issue #45): the jwt token is minted deliberately WITHOUT an `exp`
+/// claim. These are test-only, in-process credentials and must NOT be
+/// time-dependent — a "helpfully" added `exp` would make the isolation tests expire
+/// and flake. Keep it exp-free.
 fn auth_preamble_login(design: &Design) -> String {
     let mint = if design.auth_model() == AuthModel::Jwt {
         "let token = jerrycan::auth::jwt::encode(&shared::SessionUser { id: user_id.to_string(), role: \"admin\".into() }, auth.jwt_key()).expect(\"encode\");\n    format!(\"Bearer {token}\")"
@@ -806,7 +822,7 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
         design,
         module,
         &entity.name,
-        design.endpoint_omits_identity_fk(module, create),
+        omits_identity_fk(design, module, create),
         None,
     );
     let create_path = format!("{base}/");

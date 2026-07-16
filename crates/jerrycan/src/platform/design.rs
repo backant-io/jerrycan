@@ -749,6 +749,28 @@ impl Design {
             || self.endpoint_omits_path_fk(m, ep)
     }
 
+    /// True when entity `entity` produces a generated `{entity}Request` DTO — it is
+    /// the request body of some endpoint that omits a server-owned field, in db mode
+    /// (the DTO is a db-mode construct; issue #43 gates it there). The JC0541 lint
+    /// (issue #44) uses this to detect a REAL collision with an entity literally
+    /// named `{entity}Request`: only a base entity that actually mints the DTO
+    /// clashes, so a plain `*Request` name that shadows nothing is left alone.
+    pub(crate) fn entity_generates_request_dto(&self, entity: &str) -> bool {
+        if !self.wants_db() {
+            return false;
+        }
+        let auth = self.wants_auth();
+        fn walk(design: &Design, m: &ModuleDesign, entity: &str, auth: bool) -> bool {
+            m.endpoints.iter().any(|ep| {
+                ep.request_body
+                    .as_ref()
+                    .is_some_and(|rb| rb.entity == entity)
+                    && design.endpoint_uses_request_dto(m, ep, auth)
+            }) || m.subroutes.iter().any(|s| walk(design, s, entity, auth))
+        }
+        self.modules.iter().any(|m| walk(self, m, entity, auth))
+    }
+
     /// snake_case a validated PascalCase entity name. Entity names are validated
     /// `^[A-Z][A-Za-z0-9]*$`, so each uppercase letter (past the first char)
     /// starts a new word: "ApiKey" -> "api_key".

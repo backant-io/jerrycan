@@ -52,6 +52,9 @@ fn return_type(ep: &Endpoint) -> String {
     let entity = ep.success.entity.as_deref();
     match (ep.success.status, entity, ep.success.list) {
         (204, _, _) => "Result<NoContent>".to_string(),
+        // A 3xx-success endpoint (issue #46) redirects — it returns a `Redirect`,
+        // never a JSON body. `success_body` emits a matching `Ok(Redirect::…)` stub.
+        (s, _, _) if (300..400).contains(&s) => "Result<Redirect>".to_string(),
         (201, Some(e), _) => format!("Result<Created<{e}>>"),
         (201, None, _) => "Result<Created<serde_json::Value>>".to_string(),
         (_, Some(e), true) => format!("Result<Json<Vec<{e}>>>"),
@@ -199,6 +202,34 @@ fn guard_comment(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
     }
 }
 
+/// The stub body a generated handler returns until the agent implements it.
+/// Every non-redirect handler returns a 500 (`Err(Error::internal(...))`) so the
+/// acceptance suite is RED until real logic lands. A 3xx-success endpoint (issue
+/// #46) instead gets a COMPILING `Redirect`-shaped stub whose status already
+/// matches the contract — the agent only needs to point it at the real target, not
+/// hand-switch the whole return type from `Json`. The `"/"` placeholder is flagged
+/// with a TODO; the constructor is chosen so the declared 3xx status is emitted
+/// verbatim (302→`to`, 303→`see_other`, 307→`temporary`, 308→`permanent`; any other
+/// 3xx falls back to `see_other`, which the agent adjusts alongside the target).
+fn success_body(ep: &Endpoint) -> String {
+    let status = ep.success.status;
+    if (300..400).contains(&status) {
+        let ctor = match status {
+            302 => "to",
+            307 => "temporary",
+            308 => "permanent",
+            _ => "see_other",
+        };
+        return format!(
+            "    // TODO (issue #46): redirect to the real target — replace \"/\" with the\n    // destination this {status} endpoint should send clients to.\n    Ok(Redirect::{ctor}(\"/\"))"
+        );
+    }
+    format!(
+        "    Err(Error::internal(\"{op} not implemented — replace this stub\"))",
+        op = ep.operation_id
+    )
+}
+
 pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     let mut uses = String::from("use jerrycan::prelude::*;\n");
     let mentions_entities = m
@@ -244,10 +275,11 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
         let server_owned = server_owned_fk_comment(m, ep, mode, design);
         let realtime = realtime_publish_comment(ep, design);
         out.push_str(&format!(
-            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{server_owned}{realtime}    Err(Error::internal(\"{op} not implemented — replace this stub\"))\n}}\n\n",
+            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{server_owned}{realtime}{body}\n}}\n\n",
             op = ep.operation_id,
             params = handler_params(m, ep, mode, design),
             ret = return_type(ep),
+            body = success_body(ep),
         ));
     }
     out
@@ -272,17 +304,28 @@ fn server_owned_fk_comment(
         return String::new();
     };
     let mut out = String::new();
-    // Identity fk (#34): guarded + auth → the server injects the session user's id.
+    // Identity fk (#34): guarded + auth → the wire body omits `user_id`. The rule is
+    // method-agnostic, but the STUB GUIDANCE is not (issue #42): a CREATE (POST)
+    // injects the session user's id; an UPDATE (PUT/PATCH) must PRESERVE the existing
+    // row's owner — reassigning it to the caller would let an admin editing another
+    // user's row silently take ownership. So split the note by method.
     if mode.auth && design.endpoint_omits_identity_fk(m, ep) {
-        if endpoint_is_tenant_owned(m, ep, design) {
-            out.push_str(&format!(
+        let is_create = matches!(ep.method, HttpMethod::POST);
+        let tenant_owned = endpoint_is_tenant_owned(m, ep, design);
+        out.push_str(&match (is_create, tenant_owned) {
+            (true, true) => format!(
                 "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Add a `user: CurrentUser` param and use `user.0.id` (the\n    // stringified user pk; parse it for an integer fk) when building the {entity}.\n"
-            ));
-        } else {
-            out.push_str(&format!(
+            ),
+            (true, false) => format!(
                 "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Use `_user.0.id` (the stringified user pk; parse it for an\n    // integer fk) when building the {entity}.\n"
-            ));
-        }
+            ),
+            (false, true) => format!(
+                "    // server-owned fk: `{entity}Request` has NO `user_id` — on UPDATE, PRESERVE the\n    // existing row's owner. Do NOT reassign `user_id`; scope the update through the\n    // membership (`_tenant`) so a non-owner can't take the row.\n"
+            ),
+            (false, false) => format!(
+                "    // server-owned fk: `{entity}Request` has NO `user_id` — on UPDATE, PRESERVE the\n    // existing row's owner. Do NOT reassign `user_id` to `_user.0.id`; scope the\n    // UPDATE to the owner (e.g. WHERE user_id = _user.0.id) so a non-owner can't take it.\n"
+            ),
+        });
     }
     // Path-redundant parent fk (#53b): comes from the endpoint's own path param
     // (`_{col}`), so the handler injects it instead of reading it from the body.
@@ -2016,6 +2059,62 @@ pub(crate) mod tests {
         assert!(h.contains("not implemented — replace this stub"));
     }
 
+    /// Issue #46: a 3xx-success endpoint gets a COMPILING `Redirect`-shaped stub —
+    /// `Result<Redirect>` with `Ok(Redirect::<ctor>("/"))` whose status already
+    /// matches the contract — plus a TODO naming the real target. WHY (Rule 9):
+    /// before this, a 3xx endpoint emitted `Result<Json<serde_json::Value>>` and the
+    /// agent had to hand-switch the whole return type to go green (the P3 papercut).
+    /// The constructor tracks the declared status so the acceptance probe (which
+    /// asserts the raw status — TestClient does not follow redirects) passes on the
+    /// stub. A non-redirect endpoint keeps the 500 stub.
+    #[test]
+    fn redirect_endpoints_get_a_compiling_redirect_stub() {
+        const SHORTENER: &str = r#"{
+            "name": "shortener", "contract_version": 0, "dependencies": [],
+            "modules": [{ "name": "links",
+                "endpoints": [
+                    { "operation_id": "follow_link", "method": "GET", "path": "/{code}",
+                      "success": { "status": 303 } },
+                    { "operation_id": "moved_link", "method": "GET", "path": "/old/{code}",
+                      "success": { "status": 308 } } ] }]
+        }"#;
+        let d: Design = serde_json::from_str(SHORTENER).unwrap();
+        let h = handlers_rs(&d.modules[0], GenMode::default(), &d);
+        // 303 → see_other, and the return type is Redirect, not Json.
+        assert!(
+            h.contains(
+                "pub(crate) async fn follow_link(Path(_code): Path<i64>) -> Result<Redirect>"
+            ),
+            "3xx handler returns Redirect: {h}"
+        );
+        assert!(
+            h.contains("Ok(Redirect::see_other(\"/\"))"),
+            "303 stub uses see_other and compiles: {h}"
+        );
+        // 308 → permanent (constructor tracks the declared status).
+        assert!(
+            h.contains("Ok(Redirect::permanent(\"/\"))"),
+            "308 stub uses permanent: {h}"
+        );
+        // The TODO tells the agent to point it at the real destination.
+        assert!(
+            h.contains("TODO (issue #46): redirect to the real target"),
+            "redirect stub carries a target TODO: {h}"
+        );
+        // A redirect stub must NOT be the 500 Err stub.
+        let follow_stub = h
+            .split("async fn follow_link")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            !follow_stub.contains("not implemented — replace this stub"),
+            "redirect stub is not the 500 stub: {follow_stub}"
+        );
+    }
+
     /// A design body with realtime + a server-publishable broadcast topic
     /// (`scope: auth`) and both a read and a write endpoint. Used to pin the
     /// realtime publish wiring (issue #50) and its gating.
@@ -2418,6 +2517,10 @@ pub(crate) mod tests {
                     "auth_required": true,
                     "request_body": { "entity": "Collection" },
                     "success": { "status": 201, "entity": "Collection" } },
+                  { "operation_id": "update_collection", "method": "PUT", "path": "/{id}",
+                    "auth_required": true,
+                    "request_body": { "entity": "Collection" },
+                    "success": { "status": 200, "entity": "Collection" } },
                   { "operation_id": "create_bookmark", "method": "POST", "path": "/bookmarks",
                     "auth_required": true,
                     "request_body": { "entity": "Bookmark" },
@@ -2507,6 +2610,63 @@ pub(crate) mod tests {
         assert!(
             !import_stub.contains("server-owned"),
             "unguarded stub carries no injection note: {import_stub}"
+        );
+    }
+
+    /// Issue #42: the identity-FK omission is method-agnostic, but the stub GUIDANCE
+    /// is not. A guarded UPDATE (PUT/PATCH) on an identity-FK entity also drops
+    /// `user_id`, but the handler must NOT re-inject `_user.0.id` — that would let an
+    /// admin editing another user's row reassign ownership to themselves. The update
+    /// stub says PRESERVE the existing owner; the create stub still says inject. WHY
+    /// (Rule 9): "updates can't move ownership" is the security-relevant semantics —
+    /// a comment that told the agent to set `user_id` on update would encode a
+    /// row-theft footgun.
+    #[test]
+    fn update_on_identity_fk_preserves_owner_not_reassigns() {
+        let d: Design = serde_json::from_str(SERVER_FK).unwrap();
+        let m = &d.modules[1]; // collections
+        let h = handlers_rs(
+            m,
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        );
+        // The update also takes the DTO (user_id off the wire) — method-agnostic rule.
+        assert!(
+            h.contains(
+                "pub(crate) async fn update_collection(_repo: Dep<CollectionRepo>, _user: CurrentUser, Path(_id): Path<i64>, Json(_body): Json<CollectionRequest>)"
+            ),
+            "{h}"
+        );
+        let update_stub = h
+            .split("async fn update_collection")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        // The update stub tells the agent to PRESERVE the owner, not reassign it.
+        assert!(
+            update_stub.contains("PRESERVE the")
+                && update_stub.contains("Do NOT reassign")
+                && !update_stub.contains("injects the\n    // session user's id. Use `_user.0.id`"),
+            "update stub must preserve ownership, not inject the session user: {update_stub}"
+        );
+        // The create stub on the SAME entity still says inject (create-oriented).
+        let create_stub = h
+            .split("async fn create_collection")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            create_stub.contains("the server injects the")
+                && create_stub.contains("Use `_user.0.id`")
+                && !create_stub.contains("PRESERVE"),
+            "create stub still injects the session user's id: {create_stub}"
         );
     }
 
