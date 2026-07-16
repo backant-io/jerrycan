@@ -37,6 +37,50 @@ fn is_pascal(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// A validation message when a field's server-owned `default` (issue #53a) is
+/// invalid, or `None` when the default is absent or valid. Three ways to be
+/// wrong: (1) declared without a `db` dependency — the default is applied via the
+/// db-mode request DTO, so it is silently inert in memory mode; (2) the value
+/// does not type-check against the field's `type`; (3) the value is outside the
+/// field's enum `values`. The default is written into a NOT-NULL column verbatim,
+/// so a mistyped or out-of-enum literal is a design-time error, not a run-time
+/// surprise. A `json` field accepts any JSON value.
+fn default_type_error(f: &Field, wants_db: bool) -> Option<String> {
+    let value = f.default.as_ref()?;
+    if !wants_db {
+        return Some(format!(
+            "Field `{}` declares a `default` but the design has no `db` dependency — server-owned defaults are applied through the db-mode request DTO (add `db` to `dependencies`, or drop the default).",
+            f.name
+        ));
+    }
+    // Enum membership: a default on a string field with `values` must be listed.
+    if let Some(values) = &f.values {
+        return match value.as_str() {
+            Some(s) if values.contains(&s.to_string()) => None,
+            _ => Some(format!(
+                "Field `{}` default {value} is not one of its enum values [{}] — the default must be a declared value.",
+                f.name,
+                values.join(", ")
+            )),
+        };
+    }
+    let ok = match f.field_type {
+        FieldType::String | FieldType::Datetime | FieldType::Uuid => value.is_string(),
+        FieldType::Integer => value.is_i64() || value.is_u64(),
+        FieldType::Float => value.is_number(),
+        FieldType::Boolean => value.is_boolean(),
+        FieldType::Json => true,
+    };
+    if ok {
+        None
+    } else {
+        Some(format!(
+            "Field `{}` default {value} does not match its type `{:?}` — the server writes it verbatim, so it must be a valid {:?} literal.",
+            f.name, f.field_type, f.field_type
+        ))
+    }
+}
+
 /// The entity an endpoint's repo operates on (mirrors genroute's resolution):
 /// the request_body entity, else the success entity, else the module's first
 /// entity. `None` when the module declares no entities. Kept in lockstep with
@@ -304,6 +348,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
         m: &ModuleDesign,
         ptr: &str,
         entity_names: &std::collections::HashSet<&str>,
+        wants_db: bool,
         qs: &mut Vec<Question>,
     ) {
         for (i, e) in m.entities.iter().enumerate() {
@@ -338,14 +383,34 @@ pub fn validate(d: &Design) -> Vec<Question> {
                         ));
                     }
                 }
+                // A server-owned `default` (issue #53a) must type-check against the
+                // field type (and enum membership) — the server writes it verbatim
+                // into a NOT-NULL column, so a mistyped literal would fail at run
+                // time, not design time.
+                if let Some(msg) = default_type_error(f, wants_db) {
+                    qs.push(q(format!("{ptr}/entities/{i}/fields/{j}/default"), msg));
+                }
             }
         }
         for (i, sub) in m.subroutes.iter().enumerate() {
-            check_relations_and_enums(sub, &format!("{ptr}/subroutes/{i}"), entity_names, qs);
+            check_relations_and_enums(
+                sub,
+                &format!("{ptr}/subroutes/{i}"),
+                entity_names,
+                wants_db,
+                qs,
+            );
         }
     }
+    let wants_db = d.wants_db();
     for (i, m) in d.modules.iter().enumerate() {
-        check_relations_and_enums(m, &format!("/modules/{i}"), &entity_names, &mut qs);
+        check_relations_and_enums(
+            m,
+            &format!("/modules/{i}"),
+            &entity_names,
+            wants_db,
+            &mut qs,
+        );
     }
 
     // Tenancy: the named entity must resolve, and the Tenant guard needs an
@@ -1602,6 +1667,72 @@ mod tests {
     }
 
     #[test]
+    fn field_default_must_type_check_against_field_type_and_enum() {
+        // Issue #53a: a server-owned `default` is written verbatim into a NOT-NULL
+        // column, so a mistyped or out-of-enum literal is a design-time error, not
+        // a run-time surprise. Valid defaults raise no question.
+        let base = |field: &str| {
+            design(&format!(
+                r#"{{ "name": "news", "contract_version": 0, "dependencies": ["db"],
+                    "modules": [{{ "name": "subs",
+                        "entities": [{{ "name": "Subscriber", "fields": [{field}] }}],
+                        "endpoints": [{{ "operation_id": "create_subscriber", "method": "POST", "path": "/",
+                            "request_body": {{ "entity": "Subscriber" }},
+                            "success": {{ "status": 201, "entity": "Subscriber" }} }}] }}] }}"#
+            ))
+        };
+        // A boolean default `false` and an enum default `"active"` are valid.
+        let ok = base(
+            r#"{ "name": "confirmed", "type": "boolean", "default": false },
+               { "name": "status", "type": "string", "values": ["active", "expired"], "default": "active" }"#,
+        );
+        assert!(
+            !validate(&ok).iter().any(|q| q.id.ends_with("/default")),
+            "valid defaults raise no question: {:?}",
+            validate(&ok)
+        );
+        // A string literal on a boolean field is rejected.
+        let bad_type = base(r#"{ "name": "confirmed", "type": "boolean", "default": "false" }"#);
+        assert!(
+            validate(&bad_type)
+                .iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/default"),
+            "mistyped default must be a question: {:?}",
+            validate(&bad_type)
+        );
+        // A default outside the enum `values` is rejected.
+        let bad_enum = base(
+            r#"{ "name": "status", "type": "string", "values": ["active", "expired"], "default": "draft" }"#,
+        );
+        assert!(
+            validate(&bad_enum)
+                .iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/default"),
+            "out-of-enum default must be a question: {:?}",
+            validate(&bad_enum)
+        );
+        // A default without a `db` dependency is inert (no request DTO) → rejected.
+        let no_db: Design = serde_json::from_str(
+            r#"{ "name": "news", "contract_version": 0, "dependencies": [],
+                "modules": [{ "name": "subs",
+                    "entities": [{ "name": "Subscriber", "fields": [
+                        { "name": "email", "type": "string" },
+                        { "name": "confirmed", "type": "boolean", "default": false } ] }],
+                    "endpoints": [{ "operation_id": "list_subs", "method": "GET", "path": "/",
+                        "success": { "status": 200 } }] }] }"#,
+        )
+        .unwrap();
+        assert!(
+            validate(&no_db)
+                .iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/1/default"
+                    && q.question.contains("no `db` dependency")),
+            "a default without db must be a question: {:?}",
+            validate(&no_db)
+        );
+    }
+
+    #[test]
     fn explicit_fk_named_field_conflicts_with_belongs_to() {
         let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
         d.modules[1].entities[0].fields.push(Field {
@@ -1611,6 +1742,7 @@ mod tests {
             unique: false,
             index: false,
             values: None,
+            default: None,
         });
         assert!(
             validate(&d)

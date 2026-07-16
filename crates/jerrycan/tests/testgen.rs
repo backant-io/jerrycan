@@ -1077,3 +1077,88 @@ fn format_typed_fields_use_valid_fixtures_not_placeholders() {
         "uuid v4 variant nibble"
     );
 }
+
+/// Issue #53a (defaulted fields): the happy-path probe body OMITS every field
+/// with a server-owned `default`, so `POST /subscribers/ {"email": ...}` proves a
+/// minimal client body reaches 201 (the server applies confirmed=false /
+/// status="active"). A defaulted ENUM field gets no reject probe — it is not on
+/// the wire, so a bad value would be ignored, not 422'd.
+#[test]
+fn defaulted_fields_are_omitted_from_the_probe_body() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "news",
+        "contract_version": 0,
+        "dependencies": ["db"],
+        "modules": [{ "name": "subscribers",
+            "entities": [{ "name": "Subscriber", "fields": [
+                { "name": "email", "type": "string" },
+                { "name": "confirmed", "type": "boolean", "default": false },
+                { "name": "status", "type": "string", "values": ["active", "expired"], "default": "active" } ] }],
+            "endpoints": [{ "operation_id": "create_subscriber", "method": "POST", "path": "/",
+                "request_body": { "entity": "Subscriber" },
+                "success": { "status": 201, "entity": "Subscriber" } }] }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        generated.contains("async fn create_subscriber_returns_201"),
+        "{generated}"
+    );
+    // The probe body carries email but NOT the defaulted fields.
+    assert!(generated.contains("\"email\""), "{generated}");
+    assert!(
+        !generated.contains("\"confirmed\"") && !generated.contains("\"status\""),
+        "defaulted fields must not appear in any probe body: {generated}"
+    );
+    // A defaulted enum field is off the wire — no reject probe.
+    assert!(
+        !generated.contains("rejects_out_of_range_status"),
+        "a defaulted enum field gets no boundary-reject probe: {generated}"
+    );
+}
+
+/// Issue #53b (nested parent fk): a checkin created under `POST /{habit_id}/checkins`
+/// seeds a parent Habit, addresses `/habits/1/checkins`, and OMITS `habit_id` from
+/// the body — the handler injects it from the path, so the row attaches to the
+/// path's habit.
+#[test]
+fn nested_parent_fk_is_omitted_from_the_probe_body_and_taken_from_the_path() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "habits",
+        "contract_version": 0,
+        "dependencies": ["db"],
+        "modules": [{ "name": "habits",
+            "entities": [
+                { "name": "Habit", "fields": [{ "name": "name", "type": "string" }] },
+                { "name": "Checkin", "belongs_to": [{ "entity": "Habit" }],
+                  "fields": [{ "name": "note", "type": "string" }] } ],
+            "endpoints": [
+                { "operation_id": "create_habit", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Habit" },
+                  "success": { "status": 201, "entity": "Habit" } },
+                { "operation_id": "create_checkin", "method": "POST", "path": "/{habit_id}/checkins",
+                  "request_body": { "entity": "Checkin" },
+                  "success": { "status": 201, "entity": "Checkin" } }] }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        generated.contains("async fn create_checkin_returns_201"),
+        "{generated}"
+    );
+    // Seeds a Habit, then posts the checkin under the seeded habit's id.
+    assert!(
+        generated.contains("post_json(\"/habits/\""),
+        "seed habit: {generated}"
+    );
+    assert!(
+        generated.contains("post_json(\"/habits/1/checkins\""),
+        "checkin addressed under the path's habit: {generated}"
+    );
+    // The checkin body carries `note` but NOT the path-redundant `habit_id`.
+    assert!(generated.contains("\"note\""), "{generated}");
+    assert!(
+        !generated.contains("\"habit_id\""),
+        "path-redundant fk must not appear in the body: {generated}"
+    );
+}
