@@ -70,6 +70,28 @@ Every frame is one JSON object tagged by `op`. Channels are namespaced strings: 
 
 Errors never drop the connection — they come back as `{"op":"error","code":"JC0403",...}` with the offending `channel`/`ref`.
 
+## Publishing from a REST handler
+
+The common pattern is server-driven: a REST handler creates a row and wants every subscriber to see it immediately. Resolve `RealtimeHandle` as a dependency and call `publish(topic, payload)` — no WebSocket client, no round-trip.
+
+```rust
+use jerrycan::prelude::*;
+use jerrycan::realtime::RealtimeHandle;
+
+// The generator adds `_rt: Dep<RealtimeHandle>` to write handlers (and a stub
+// comment with this one-liner) whenever the design declares a broadcast topic
+// with scope `none` or `auth`.
+async fn create_note(rt: Dep<RealtimeHandle>) -> Result<NoContent> {
+    // ... the handler just wrote a Note ...
+    rt.publish("events", serde_json::json!({ "type": "created", "id": 7 }))
+        .await?;
+    Ok(NoContent)
+}
+# let _ = create_note;
+```
+
+`publish` enforces the same gate as the client `publish` op: `topic` must name a **declared** broadcast topic, so an unknown name or a `changes`/`presence` channel returns a clear `Err` (**JC0404**), never a silent drop. A server publish carries no connection identity, so it is un-partitioned and reaches **every** subscriber of the topic — which means publishing to a `tenant`-scoped topic is a **JC0403** `Err` (delivering to all tenants would break the isolation the scope promises). Declare the topic scope `none` or `auth` to publish it from a handler. (Per-tenant server publishing lands with dynamic topics — tracked in the realtime roadmap.)
+
 ## Delivery is scope-filtered (you only receive what you could GET)
 
 Every event passes the same tenant/owner check your REST endpoints use, **before** it leaves the server. If a row moves from tenant A to tenant B, the old tenant receives a `delete`-shaped event and the new tenant an `update` — nobody else sees anything. This is the security pillar; the generated acceptance tests include a cross-tenant negative control that fails if a change ever leaks.

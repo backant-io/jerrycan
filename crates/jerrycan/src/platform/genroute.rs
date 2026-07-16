@@ -104,6 +104,16 @@ fn endpoint_takes_request_dto(
     mode.db && mode.auth && design.endpoint_omits_identity_fk(m, ep)
 }
 
+/// True when this endpoint gets the server-side realtime publish wiring (issue
+/// #50): a MUTATING endpoint (POST/PUT/PATCH/DELETE — the "created a row, now
+/// push it" shape) in a design that declares a server-publishable broadcast
+/// topic (scope `none`/`auth`). GET endpoints and designs with no such topic
+/// (realtime-free, or only tenant-scoped broadcasts) emit nothing, keeping their
+/// handlers byte-identical.
+fn endpoint_emits_realtime_publish(ep: &Endpoint, design: &Design) -> bool {
+    !matches!(ep.method, HttpMethod::GET) && design.server_publishable_broadcast().is_some()
+}
+
 fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> String {
     let mut params = Vec::new();
     if let Some(e) = endpoint_repo_entity(m, ep) {
@@ -120,6 +130,13 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
         } else {
             params.push("_user: CurrentUser".to_string());
         }
+    }
+    // Server-side realtime publish (issue #50): a mutating handler in a
+    // server-publishable-broadcast design resolves the RealtimeHandle so it can
+    // push the write to subscribers (fully-qualified path — no `use` line to
+    // keep byte-identical output for designs the rule doesn't touch).
+    if endpoint_emits_realtime_publish(ep, design) {
+        params.push("_rt: Dep<jerrycan::realtime::RealtimeHandle>".to_string());
     }
     let params_in_path = path_params(ep);
     // A param named `id` keys the endpoint's entity, so it takes that entity's
@@ -222,8 +239,9 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
             String::new()
         };
         let server_owned = server_owned_fk_comment(m, ep, mode, design);
+        let realtime = realtime_publish_comment(ep, design);
         out.push_str(&format!(
-            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{server_owned}    Err(Error::internal(\"{op} not implemented — replace this stub\"))\n}}\n\n",
+            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{server_owned}{realtime}    Err(Error::internal(\"{op} not implemented — replace this stub\"))\n}}\n\n",
             op = ep.operation_id,
             params = handler_params(m, ep, mode, design),
             ret = return_type(ep),
@@ -256,6 +274,23 @@ fn server_owned_fk_comment(
             "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Use `_user.0.id` (the stringified user pk; parse it for an\n    // integer fk) when building the {entity}.\n"
         )
     }
+}
+
+/// The stub comment for server-side realtime publish (issue #50): shows the
+/// one-liner that pushes this write to every subscriber of a declared broadcast
+/// topic, using the `_rt: Dep<RealtimeHandle>` param `handler_params` added.
+/// Empty unless `endpoint_emits_realtime_publish`, so untouched designs stay
+/// byte-identical.
+fn realtime_publish_comment(ep: &Endpoint, design: &Design) -> String {
+    if !endpoint_emits_realtime_publish(ep, design) {
+        return String::new();
+    }
+    let topic = design
+        .server_publishable_broadcast()
+        .expect("gated by endpoint_emits_realtime_publish");
+    format!(
+        "    // realtime (issue #50): after the write succeeds, push it to every\n    // subscriber of a broadcast topic —\n    //   _rt.publish(\"{topic}\", serde_json::json!({{ /* event payload */ }})).await?;\n"
+    )
 }
 
 pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
@@ -1896,6 +1931,91 @@ pub(crate) mod tests {
             "{h}"
         );
         assert!(h.contains("not implemented — replace this stub"));
+    }
+
+    /// A design body with realtime + a server-publishable broadcast topic
+    /// (`scope: auth`) and both a read and a write endpoint. Used to pin the
+    /// realtime publish wiring (issue #50) and its gating.
+    const RT_BROADCAST: &str = r#"{
+        "name": "rt-pub", "contract_version": 2,
+        "auth": { "model": "jwt", "roles": ["admin"] },
+        "dependencies": ["db", "auth", "realtime"],
+        "modules": [{
+            "name": "notes",
+            "entities": [{ "name": "Note", "fields": [
+                { "name": "text", "type": "string", "required": true } ]}],
+            "endpoints": [
+                { "operation_id": "list_notes", "method": "GET", "path": "/",
+                  "auth_required": true,
+                  "success": { "status": 200, "entity": "Note", "list": true } },
+                { "operation_id": "create_note", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "Note" },
+                  "success": { "status": 201, "entity": "Note" } }
+            ]
+        }],
+        "realtime": { "changes": [], "broadcast": [{ "name": "events", "scope": "auth" }], "presence": [] }
+    }"#;
+
+    /// A mutating handler in a design that declares a server-publishable broadcast
+    /// topic gets a `Dep<RealtimeHandle>` param plus a stub comment showing the
+    /// one-liner (issue #50). A READ endpoint gets neither — the canonical pattern
+    /// is "a write created a row, now push it".
+    #[test]
+    fn write_handler_gets_realtime_publish_dep_and_comment() {
+        let d: Design = serde_json::from_str(RT_BROADCAST).unwrap();
+        let m = &d.modules[0];
+        let h = handlers_rs(
+            m,
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        );
+        // The POST handler carries the resolvable dep and the copy-pasteable call.
+        assert!(
+            h.contains("_rt: Dep<jerrycan::realtime::RealtimeHandle>"),
+            "write handler must take the RealtimeHandle dep:\n{h}"
+        );
+        assert!(
+            h.contains(r#"_rt.publish("events", serde_json::json!("#),
+            "stub comment must show the publish one-liner on the declared topic:\n{h}"
+        );
+        // The GET handler is untouched — no dep, no comment.
+        let list = h
+            .split("pub(crate) async fn create_note")
+            .next()
+            .expect("list_notes precedes create_note");
+        assert!(
+            !list.contains("_rt"),
+            "read handlers must not gain the realtime dep:\n{list}"
+        );
+    }
+
+    /// No-drift guard: a design whose ONLY broadcast topic is tenant-scoped is NOT
+    /// server-publishable (a global server publish can't pick a tenant), so its
+    /// handlers stay byte-identical — no dep, no comment. This is what keeps the
+    /// reference-slice conformance design (its only topic is `deal_room`/tenant)
+    /// unchanged.
+    #[test]
+    fn tenant_only_broadcast_emits_no_realtime_publish_wiring() {
+        let mut d: Design = serde_json::from_str(RT_BROADCAST).unwrap();
+        d.realtime.as_mut().unwrap().broadcast[0].scope =
+            crate::platform::design::RealtimeScope::Tenant;
+        let m = &d.modules[0];
+        let h = handlers_rs(
+            m,
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        );
+        assert!(
+            !h.contains("_rt"),
+            "tenant-only broadcast designs get no server-publish wiring:\n{h}"
+        );
     }
 
     #[test]
