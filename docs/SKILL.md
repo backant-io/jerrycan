@@ -208,10 +208,11 @@ POST-only `/{id}` actions.) **Do NOT weaken the handler to make these pass.** Le
 the probe, and prove the REAL behavior (success WITH a valid credential, and the
 4xx without) in an **agent-owned test file** you write. Get every test you CAN
 green green, then tell the user exactly which generated probes are un-satisfiable
-and why. (Two further known generator rough edges: a `unique` non-PK field on the
+and why. (One further known generator rough edge: a `unique` non-PK field on the
 tenant entity collides in the two-tenant isolation seed — make it a plain `index`
-instead; and a single-value enum makes its "wrong value → 4xx" branch
-unreachable.)
+instead. Enum `values` fields now get a generated "out-of-range → 422" reject test
+that passes on stubs — the request validator refuses the bad value before the
+handler; keep it.)
 
 ## Phase 6 — Verify
 
@@ -240,8 +241,10 @@ agent-owned handlers are untouched — re-implement only new stubs).
 ## Gotchas (these cost real time if you don't know them)
 
 - **Enums are `string` + `values: [...]`** — there is no `enum` field type. It
-  becomes a TEXT column with a `CHECK` constraint and a `Valid<T>`; the Rust field
-  is `String`. **Server-assign** privileged enum/role fields on create (e.g.
+  becomes a TEXT column with a `CHECK` constraint AND a generated request validator
+  (an out-of-range value 422s at deserialization, before the DB — on create AND
+  update, and the same 422 in memory mode); the Rust field is `String`.
+  **Server-assign** privileged enum/role fields on create (e.g.
   registration sets `role = "user"`, never trusts the client) — generated success
   probes post the first declared value, but untrusted input must be defended.
 - **`datetime`/`uuid` are `String`** at the Rust layer (no native time/uuid type,

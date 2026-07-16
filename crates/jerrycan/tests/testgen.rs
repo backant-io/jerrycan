@@ -786,3 +786,74 @@ fn guarded_identity_fk_is_omitted_from_probe_bodies() {
         "unguarded body keeps user_id: {generated}"
     );
 }
+
+/// Issue #47: an endpoint whose request body carries an enum `values` field gets a
+/// generated acceptance test proving an OUT-OF-RANGE value is rejected with 422 at
+/// the request boundary (before the DB), on BOTH the create (POST /) and update
+/// (PUT /{id}) paths. WHY (Rule 9): the docs promise enum inputs are validated;
+/// this pins that an out-of-range value 422s (JC0422), never dies as a 500 DB CHECK.
+#[test]
+fn enum_request_body_gets_out_of_range_reject_test() {
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
+    let design: Design = serde_json::from_str(s).unwrap();
+    let leads = design
+        .modules
+        .iter()
+        .find(|m| m.name == "leads")
+        .expect("leads module");
+    let generated = testgen::acceptance_rs(&design, leads);
+    // create path (POST /) and update path (PUT /{id}) both reject out-of-range.
+    assert!(
+        generated.contains("async fn create_lead_rejects_out_of_range_status"),
+        "create reject test: {generated}"
+    );
+    assert!(
+        generated.contains("async fn update_lead_rejects_out_of_range_status"),
+        "update reject test: {generated}"
+    );
+    // the reject body carries an out-of-range sentinel and asserts 422.
+    assert!(
+        generated.contains("\"status\": \"__invalid_enum_value__\""),
+        "reject body uses an out-of-range sentinel: {generated}"
+    );
+    assert!(
+        generated.contains("as_u16(), 422"),
+        "reject test asserts 422: {generated}"
+    );
+    // guarded endpoints thread the credential so the guard doesn't 401 first.
+    assert!(
+        generated.contains("_rejects_out_of_range_status() {\n    let t = app().await;\n    let res = t.post_json_with"),
+        "guarded create reject threads the cookie: {generated}"
+    );
+}
+
+/// The enum reject tests PASS on stubs (extraction 422s before the handler runs),
+/// so gen-tests must NOT count them toward `expected_failing` — mirrors the storage
+/// acceptance-test convention. Otherwise the RED-on-stubs invariant (`failed ==
+/// expected_failing`) would over-count.
+#[test]
+fn enum_reject_tests_are_excluded_from_expected_failing() {
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
+    let design: Design = serde_json::from_str(s).unwrap();
+    let leads = design
+        .modules
+        .iter()
+        .find(|m| m.name == "leads")
+        .expect("leads module");
+    let generated = testgen::acceptance_rs(&design, leads);
+    let total = testgen::test_count(&generated);
+    let rejects = generated.matches("_rejects_out_of_range_").count();
+    assert!(
+        rejects >= 2,
+        "at least create + update reject tests: {rejects}"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_rel, expected_failing) =
+        testgen::write_acceptance(tmp.path(), &design, "leads").expect("write acceptance");
+    assert_eq!(
+        expected_failing,
+        total - rejects,
+        "expected_failing must exclude exactly the reject tests (total {total}, rejects {rejects})"
+    );
+}

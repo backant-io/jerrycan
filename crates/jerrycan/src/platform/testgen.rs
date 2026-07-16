@@ -41,7 +41,13 @@ fn fk_fixture_value(design: &Design, target: &str) -> &'static str {
 /// GUARDED endpoint's body in an auth design — its `user_id` fk is dropped
 /// because the handler injects the session user's id, and the probe must prove
 /// a clean client that OMITS it reaches the designed success (not a 422).
-fn fixture_json(design: &Design, m: &ModuleDesign, entity: &str, omit_identity_fk: bool) -> String {
+fn fixture_json(
+    design: &Design,
+    m: &ModuleDesign,
+    entity: &str,
+    omit_identity_fk: bool,
+    bad_enum: Option<&str>,
+) -> String {
     let Some(e) = m.entities.iter().find(|e| e.name == entity) else {
         return "{}".to_string();
     };
@@ -60,10 +66,17 @@ fn fixture_json(design: &Design, m: &ModuleDesign, entity: &str, omit_identity_f
                 fk_fixture_value(design, &b.entity)
             )
         });
-    let cols = e
-        .fields
-        .iter()
-        .map(|f| format!("\"{}\": {}", f.name, fixture_value(f)));
+    let cols = e.fields.iter().map(|f| {
+        // The reject probe (issue #47) corrupts ONE enum field to an out-of-range
+        // sentinel; every other field keeps its valid fixture value so the ONLY
+        // reason for a 422 is that enum.
+        let value = if bad_enum == Some(f.name.as_str()) {
+            format!("\"{ENUM_REJECT_SENTINEL}\"")
+        } else {
+            fixture_value(f)
+        };
+        format!("\"{}\": {}", f.name, value)
+    });
     let fields = fks.chain(cols).collect::<Vec<_>>().join(", ");
     format!("{{{fields}}}")
 }
@@ -96,9 +109,28 @@ struct TestOut {
     code: String,
     todos: Vec<String>,
     count: usize,
+    /// Issue #47: enum "reject" tests PASS on stubs (an out-of-range value 422s at
+    /// deserialization, before the handler runs), so they are subtracted from
+    /// `expected_failing` — they are not part of the RED-on-stubs baseline.
+    reject: usize,
     /// Auth mode: success tests on guarded endpoints carry a session cookie and
     /// every guarded endpoint also gets a no-cookie 401 test.
     auth: bool,
+}
+
+/// A value guaranteed to be OUT-OF-RANGE for any declared enum `values` set — the
+/// reject probe sends it in an enum field to prove the request boundary answers
+/// 422 (JC0422) before the DB (issue #47).
+const ENUM_REJECT_SENTINEL: &str = "__invalid_enum_value__";
+
+/// The first enum (`values`) field of an endpoint's request-body entity, if any —
+/// the field the reject probe corrupts to an out-of-range value.
+fn first_enum_field<'a>(unit: &'a ModuleDesign, entity: &str) -> Option<&'a str> {
+    unit.entities
+        .iter()
+        .find(|e| e.name == entity)
+        .and_then(|e| e.fields.iter().find(|f| f.values.is_some()))
+        .map(|f| f.name.as_str())
 }
 
 /// A request expression `t.<verb>(...)`. In auth mode a guarded endpoint threads
@@ -109,6 +141,7 @@ fn request_expr(
     ep: &Endpoint,
     path: &str,
     guarded_and_auth: bool,
+    bad_enum: Option<&str>,
 ) -> String {
     let body = || {
         ep.request_body
@@ -122,6 +155,7 @@ fn request_expr(
                     unit,
                     &rb.entity,
                     design.endpoint_omits_identity_fk(unit, ep),
+                    bad_enum,
                 )
             })
             .unwrap_or_else(|| "{}".to_string())
@@ -190,6 +224,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             unit,
             &ep.request_body.as_ref().expect("creator has body").entity,
             design.endpoint_omits_identity_fk(unit, ep),
+            None,
         );
         // In auth mode a guarded creator needs the credential to seed successfully
         // (cookie under session, Bearer under jwt — issue #29).
@@ -228,7 +263,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 ep.method
             ));
         } else if param_count(ep) == 0 {
-            let request = request_expr(design, unit, ep, &full_path, guarded);
+            let request = request_expr(design, unit, ep, &full_path, guarded, None);
             // A creator that echoes its entity must echo the id it was given —
             // catches inserts that return a backend default (0) instead.
             let id_echo = (ep.method == HttpMethod::POST)
@@ -249,9 +284,17 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             if guarded {
                 push_401_test(design, out, unit, ep, &full_path, false);
             }
+            // Issue #47: an enum request body gets an out-of-range reject probe.
+            if let Some(field) = ep
+                .request_body
+                .as_ref()
+                .and_then(|rb| first_enum_field(unit, &rb.entity))
+            {
+                push_enum_reject_test(design, out, unit, ep, &full_path, guarded, field);
+            }
         } else if param_count(ep) == 1 && seed.is_some() {
             let seeded_path = full_path.replacen(&regex_free_param(&ep.path), &seed_id, 1);
-            let request = request_expr(design, unit, ep, &seeded_path, guarded);
+            let request = request_expr(design, unit, ep, &seeded_path, guarded, None);
             out.code.push_str(&format!(
                 "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n}}\n\n",
                 seed = seed.as_deref().unwrap_or("")
@@ -259,6 +302,14 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             out.count += 1;
             if guarded {
                 push_401_test(design, out, unit, ep, &seeded_path, seed.is_some());
+            }
+            // Issue #47: update path (PUT/PATCH /{id}) rejects out-of-range too.
+            if let Some(field) = ep
+                .request_body
+                .as_ref()
+                .and_then(|rb| first_enum_field(unit, &rb.entity))
+            {
+                push_enum_reject_test(design, out, unit, ep, &seeded_path, guarded, field);
             }
         } else if param_count(ep) >= 1 {
             out.todos.push(format!(
@@ -275,7 +326,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 // POST-only `/{id}` action would hit 405, not the 404 we assert.
                 // Guarded endpoints run the auth guard before not-found logic, so
                 // `request_expr` threads the cookie when guarded.
-                let request = request_expr(design, unit, ep, &missing_path, guarded);
+                let request = request_expr(design, unit, ep, &missing_path, guarded, None);
                 out.code.push_str(&format!(
                     "#[tokio::test]\nasync fn {fn_base}_missing_id_is_404() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 404, \"design: {fn_base} lists 404 ({when}); body: {{}}\", res.text());\n}}\n\n",
                     when = ec.when
@@ -307,11 +358,36 @@ fn push_401_test(
     _seeded: bool,
 ) {
     let fn_base = &ep.operation_id;
-    let request = request_expr(design, unit, ep, path, false); // no cookie
+    let request = request_expr(design, unit, ep, path, false, None); // no cookie
     out.code.push_str(&format!(
         "#[tokio::test]\nasync fn {fn_base}_without_auth_is_401() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 401, \"design: {fn_base} is guarded — no cookie must 401; body: {{}}\", res.text());\n}}\n\n"
     ));
     out.count += 1;
+}
+
+/// An enum "reject" probe (issue #47): sends the endpoint's fixture body with ONE
+/// enum field corrupted to an out-of-range value, and asserts the request boundary
+/// answers 422 (JC0422) — the generated `deserialize_with` validator refuses it at
+/// deserialization, before the handler and the DB. It PASSES on stubs (the 422
+/// precedes the stub), so it is NOT part of the RED-on-stubs baseline: `out.reject`
+/// tracks it so gen-tests can exclude it from `expected_failing`. Guarded endpoints
+/// thread the credential (via `request_expr`) so the guard doesn't 401 first.
+fn push_enum_reject_test(
+    design: &Design,
+    out: &mut TestOut,
+    unit: &ModuleDesign,
+    ep: &Endpoint,
+    path: &str,
+    guarded: bool,
+    field: &str,
+) {
+    let fn_base = &ep.operation_id;
+    let request = request_expr(design, unit, ep, path, guarded, Some(field));
+    out.code.push_str(&format!(
+        "#[tokio::test]\nasync fn {fn_base}_rejects_out_of_range_{field}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 422, \"design: out-of-range `{field}` enum must 422 at the request boundary, not 500 at the DB CHECK; body: {{}}\", res.text());\n}}\n\n"
+    ));
+    out.count += 1;
+    out.reject += 1;
 }
 
 /// "{id}" as it appears inside the full path (the literal brace token).
@@ -570,6 +646,7 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
         module,
         &entity.name,
         design.endpoint_omits_identity_fk(module, create),
+        None,
     );
     let create_path = format!("{base}/");
 
@@ -750,10 +827,18 @@ fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool) -> Strin
 
 /// The full tests/acceptance.rs for one top-level module.
 pub fn acceptance_rs(design: &Design, module: &ModuleDesign) -> String {
+    render_acceptance(design, module).0
+}
+
+/// Renders the acceptance file AND the count of enum "reject" tests (issue #47)
+/// that PASS on stubs — `write_acceptance` subtracts these from `expected_failing`
+/// so the RED-on-stubs baseline stays exact.
+fn render_acceptance(design: &Design, module: &ModuleDesign) -> (String, usize) {
     let mut out = TestOut {
         code: String::new(),
         todos: Vec::new(),
         count: 0,
+        reject: 0,
         auth: design.wants_auth(),
     };
     unit_tests(design, module, &module.effective_mount(), &mut out);
@@ -775,17 +860,18 @@ pub fn acceptance_rs(design: &Design, module: &ModuleDesign) -> String {
     // trip the generated workspace's `-D warnings`. Emit only the banner + the
     // TODOs in that case — there is nothing for the imports/app() to support.
     if !out.code.contains("#[tokio::test]") {
-        return format!("{banner}{todos}");
+        return (format!("{banner}{todos}"), out.reject);
     }
     // Only emit the cookie helpers if the rendered tests reference them (a module
     // with no guarded endpoint and no isolation test uses neither).
     let uses_cookies = out.code.contains("test_cookie");
-    format!(
+    let content = format!(
         "{banner}use jerrycan::prelude::*;\nuse {ident}::module;\n\n{preamble}\n{code}{todos}",
         ident = super::genroute::crate_ident(&module.name),
         preamble = preamble(design, module, uses_cookies),
         code = out.code,
-    )
+    );
+    (content, out.reject)
 }
 
 /// Write tests/acceptance.rs for a TOP-LEVEL module. Returns (rel_path, expected_failing).
@@ -799,12 +885,14 @@ pub fn write_acceptance(
             "module `{module_name}` not found in design.json (top-level modules only)"
         ));
     };
-    let content = acceptance_rs(design, module);
+    let (content, reject) = render_acceptance(design, module);
     let rel = format!("crates/routes/{module_name}/tests/acceptance.rs");
     let path = root.join(&rel);
     std::fs::create_dir_all(path.parent().expect("parent")).map_err(|e| e.to_string())?;
     std::fs::write(&path, &content).map_err(|e| e.to_string())?;
-    Ok((rel, test_count(&content)))
+    // Enum reject tests (issue #47) pass on stubs, so they are NOT part of the
+    // RED-on-stubs baseline: exclude them from `expected_failing`.
+    Ok((rel, test_count(&content) - reject))
 }
 
 /// How many #[tokio::test] functions a generated file contains.
