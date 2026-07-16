@@ -456,6 +456,145 @@ fn agent_generates_working_crud_service_via_mcp_only() {
     let _ = server.wait();
 }
 
+/// The J3 face-off failure (issue #51): ONE module with a root entity (Project at
+/// `/`) AND a second entity (Task) that has its own creator (`POST /tasks`) and
+/// its own `/{id}` routes. The generated `update_task`/`delete_task` probes must
+/// seed a TASK (via `POST /tasks`) — not reuse the module-root Project creator —
+/// so they are GREEN on a CORRECT handler. Before the fix they seeded a Project
+/// and hit `/tasks/1`, a guaranteed 404 on correct code.
+const J3_TWO_ENTITY: &str = r#"{
+  "name": "j3",
+  "contract_version": 1,
+  "auth": { "model": "none" },
+  "dependencies": ["db"],
+  "modules": [{
+    "name": "projects",
+    "entities": [
+      { "name": "Task", "fields": [{ "name": "title", "type": "string" }] },
+      { "name": "Project", "fields": [{ "name": "name", "type": "string" }] }
+    ],
+    "endpoints": [
+      { "operation_id": "list_projects", "method": "GET", "path": "/", "success": { "status": 200, "entity": "Project", "list": true } },
+      { "operation_id": "create_project", "method": "POST", "path": "/", "request_body": { "entity": "Project" }, "success": { "status": 201, "entity": "Project" } },
+      { "operation_id": "list_tasks", "method": "GET", "path": "/tasks", "success": { "status": 200, "entity": "Task", "list": true } },
+      { "operation_id": "create_task", "method": "POST", "path": "/tasks", "request_body": { "entity": "Task" }, "success": { "status": 201, "entity": "Task" } },
+      { "operation_id": "update_task", "method": "PUT", "path": "/tasks/{id}", "request_body": { "entity": "Task" }, "success": { "status": 200, "entity": "Task" }, "errors": [{ "status": 404, "when": "unknown id" }] },
+      { "operation_id": "delete_task", "method": "DELETE", "path": "/tasks/{id}", "success": { "status": 204 }, "errors": [{ "status": 404, "when": "unknown id" }] }
+    ]
+  }]
+}"#;
+
+/// The correct `projects` handlers: `update_task`/`delete_task` operate on the
+/// TASK repo. They only pass if the generated probe seeded a real Task row.
+const J3_HANDLERS: &str = r#"//! Correct J3 handlers.
+use jerrycan::prelude::*;
+use super::model::*;
+use super::repo::*;
+
+pub(crate) async fn list_projects(repo: Dep<ProjectRepo>) -> Result<Json<Vec<Project>>> {
+    Ok(Json(repo.all().await?))
+}
+pub(crate) async fn create_project(repo: Dep<ProjectRepo>, Json(body): Json<Project>) -> Result<Created<Project>> {
+    repo.insert(body.clone()).await?;
+    Ok(Created(body))
+}
+pub(crate) async fn list_tasks(repo: Dep<TaskRepo>) -> Result<Json<Vec<Task>>> {
+    Ok(Json(repo.all().await?))
+}
+pub(crate) async fn create_task(repo: Dep<TaskRepo>, Json(body): Json<Task>) -> Result<Created<Task>> {
+    repo.insert(body.clone()).await?;
+    Ok(Created(body))
+}
+pub(crate) async fn update_task(repo: Dep<TaskRepo>, Path(id): Path<i64>, Json(body): Json<Task>) -> Result<Json<Task>> {
+    if repo.update(id, body.clone()).await? { Ok(Json(body)) } else { Err(Error::not_found()) }
+}
+pub(crate) async fn delete_task(repo: Dep<TaskRepo>, Path(id): Path<i64>) -> Result<NoContent> {
+    if repo.remove(id).await? { Ok(NoContent) } else { Err(Error::not_found()) }
+}
+"#;
+
+/// Issue #51 end-to-end: a two-entity module's `/{id}` probes seed the RIGHT
+/// entity and go GREEN on a correct scaffold. Scaffold → gen-tests (RED on stubs)
+/// → implement the correct handlers → the SAME probes pass. Mirrors
+/// `tdd_loop_goes_red_then_green_on_sqlite` for the J3 shape.
+#[test]
+#[ignore = "heavy: scaffold + gen-tests + red run + implement + green run (J3 seeding)"]
+fn second_entity_id_probes_go_green_on_a_correct_scaffold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, J3_TWO_ENTITY).unwrap();
+    let app = tmp.path().join("j3");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .args(["new"])
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "J3 must scaffold");
+
+    // gen-tests: the two /{id} probes seed a Task via its OWN creator.
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "gen-tests", "--module", "projects"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let acceptance = app.join("crates/routes/projects/tests/acceptance.rs");
+    let generated = std::fs::read_to_string(&acceptance).unwrap();
+    // The Task probes seed the /tasks collection, not the root Project creator.
+    for probe in ["update_task_returns_200", "delete_task_returns_204"] {
+        let body = &generated[generated.find(probe).expect(probe)..];
+        assert!(
+            body[..body.find("assert_eq!").unwrap()].contains("post_json(\"/projects/tasks\""),
+            "{probe} must seed a Task via POST /projects/tasks:\n{generated}"
+        );
+    }
+
+    // RED: stubs (500) fail the suite.
+    let red = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace", "--no-fail-fast"])
+        .output()
+        .unwrap();
+    assert!(!red.status.success(), "stub handlers must fail the suite");
+
+    // Implement the correct handlers.
+    let dest = app.join("crates/routes/projects/src/handlers.rs");
+    std::fs::write(&dest, J3_HANDLERS).unwrap();
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(&dest)
+        .unwrap()
+        .set_modified(future)
+        .unwrap();
+
+    // GREEN: the same probes pass — proving the update/delete probes addressed a
+    // seeded Task row, not a phantom id.
+    let green = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace"])
+        .status()
+        .unwrap();
+    assert!(
+        green.success(),
+        "the second-entity /{{id}} probes must go green on a correct handler"
+    );
+}
+
 /// The Phase 2 TDD loop: gen-tests makes the design executable and FAILING,
 /// the agent implements, the same tests go green, the gate stays green.
 #[test]

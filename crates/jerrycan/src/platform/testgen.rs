@@ -20,7 +20,15 @@ fn fixture_value(f: &Field) -> String {
         FieldType::Float => "1.0",
         FieldType::Boolean => "false",
         FieldType::Datetime => "\"2026-01-01T00:00:00Z\"",
-        FieldType::Uuid => "\"00000000-0000-0000-0000-000000000000\"",
+        // A FIXED valid v4 (issue #48a): the design's declared format types must
+        // yield format-VALID fixtures so the endpoint's own happy-path probe is
+        // greenable against a handler that validates the format. The nil uuid
+        // (`0000…`) is a valid string but NOT a valid v4 — a v4 validator would
+        // reject it, making the 2xx probe un-greenable. datetime above is already
+        // valid RFC3339. (email/url are NOT design-contract format types — they
+        // ride on `string` via a hand-written `Valid` impl the generator can't
+        // see; that case is `probe:"skip"`, see docs/ai/00-designing.md.)
+        FieldType::Uuid => "\"f47ac10b-58cc-4372-a567-0e02b2c3d479\"",
         FieldType::Json => "{}",
     }
     .to_string()
@@ -81,15 +89,173 @@ fn fixture_json(
     format!("{{{fields}}}")
 }
 
-/// The module's root creator (POST with body at "/"), used to seed id 1.
-fn creator(m: &ModuleDesign) -> Option<&Endpoint> {
+/// The POST creator (with a body) mounted at a bare collection `path` — the route
+/// that seeds a row addressable under `path/{id}`. `creator_at(m, "/")` is the
+/// module-root creator; `creator_at(m, "/tasks")` seeds the second entity (#51).
+fn creator_at<'a>(m: &'a ModuleDesign, path: &str) -> Option<&'a Endpoint> {
     m.endpoints
         .iter()
-        .find(|ep| ep.method == HttpMethod::POST && ep.path == "/" && ep.request_body.is_some())
+        .find(|ep| ep.method == HttpMethod::POST && ep.path == path && ep.request_body.is_some())
+}
+
+/// The POST creator (with a body) whose request body is `entity`, at a bare
+/// collection path — used to seed a belongs_to PARENT before its dependent (#51).
+fn creator_for_entity<'a>(m: &'a ModuleDesign, entity: &str) -> Option<&'a Endpoint> {
+    m.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::POST
+            && param_count(ep) == 0
+            && ep
+                .request_body
+                .as_ref()
+                .is_some_and(|rb| rb.entity == entity)
+    })
 }
 
 fn param_count(ep: &Endpoint) -> usize {
     ep.path.matches('{').count()
+}
+
+/// The collection path a `/{id}` endpoint acts under: its path with the trailing
+/// `/{param}` segment removed (`/tasks/{id}` → `/tasks`, `/{id}` → `/`). The POST
+/// creator at THIS path seeds the row the probe addresses (#51).
+fn collection_path(ep: &Endpoint) -> String {
+    let p = &ep.path;
+    let brace = p.rfind('{').expect("parameterized path");
+    let cut = p[..brace].rfind('/').unwrap_or(0);
+    if cut == 0 {
+        "/".to_string()
+    } else {
+        p[..cut].to_string()
+    }
+}
+
+/// The fully-qualified collection URL a creator posts to. For the root collection
+/// (`"/"`) this is byte-identical to the pre-#51 module-root seed (`{base}/`), so
+/// a one-entity module's output is unchanged (conformance no-drift).
+fn collection_url(base: &str, coll: &str) -> String {
+    if coll == "/" {
+        format!("{base}/")
+    } else {
+        format!("{}{}", base.trim_end_matches('/'), coll)
+    }
+}
+
+/// One creator POST that seeds a row, threading the credential in auth mode for a
+/// guarded creator. Byte-identical to the pre-#51 module-root seed line for the
+/// root-collection case.
+fn seed_line(
+    design: &Design,
+    unit: &ModuleDesign,
+    url: &str,
+    creator: &Endpoint,
+    auth: bool,
+    comment: &str,
+) -> String {
+    let body = fixture_json(
+        design,
+        unit,
+        &creator
+            .request_body
+            .as_ref()
+            .expect("creator has body")
+            .entity,
+        design.endpoint_omits_identity_fk(unit, creator),
+        None,
+    );
+    if auth && creator.is_guarded() {
+        let hk = design.test_auth_header();
+        format!(
+            "    t.post_json_with(\"{url}\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie())]).await; {comment}\n"
+        )
+    } else {
+        format!("    t.post_json(\"{url}\", &serde_json::json!({body})).await; {comment}\n")
+    }
+}
+
+/// Seed statements + the id literal for a `/{id}` probe (#51): create the entity
+/// THIS endpoint operates on — via the POST creator at the endpoint's collection
+/// path — preceded by each belongs_to PARENT (via its own creator) so an enforced
+/// intra-module FK resolves. Returns None when the target entity has no creator
+/// route (the caller emits an AGENT TODO rather than a guaranteed-red probe).
+/// The identity fk (handler-injected) and the tenancy entity (seeded by
+/// `tenant_seed`) are never re-created here. Byte-identical to the pre-#51 single
+/// module-root seed for a one-entity module (collection `"/"`, no such parents).
+fn seed_for_id_probe(
+    design: &Design,
+    unit: &ModuleDesign,
+    base: &str,
+    ep: &Endpoint,
+    auth: bool,
+) -> Option<(String, String)> {
+    let coll = collection_path(ep);
+    let creator = creator_at(unit, &coll)?;
+    let entity_name = &creator
+        .request_body
+        .as_ref()
+        .expect("creator has body")
+        .entity;
+    let entity = unit.entities.iter().find(|e| &e.name == entity_name)?;
+
+    let mut seed = String::new();
+    let mut seen = vec![entity.name.clone()];
+    seed_parents(design, unit, base, entity, auth, &mut seed, &mut seen);
+    seed.push_str(&seed_line(
+        design,
+        unit,
+        &collection_url(base, &coll),
+        creator,
+        auth,
+        "// seed id 1",
+    ));
+
+    let seed_id = entity
+        .fields
+        .iter()
+        .find(|f| f.name == "id")
+        .map(|f| fixture_value(f).trim_matches('"').to_string())
+        .unwrap_or_else(|| "1".to_string());
+    Some((seed, seed_id))
+}
+
+/// Append seed lines for `entity`'s belongs_to PARENTS (grandparents first), so a
+/// dependent row's fk points at a real parent row. Skips the identity fk (the
+/// handler injects it), the tenancy entity (already seeded), a parent with no
+/// creator in this module (a cross-module target is an UNENFORCED relation — the
+/// fk fixture's `1` needs no row), and already-seeded entities (cycle guard).
+fn seed_parents(
+    design: &Design,
+    unit: &ModuleDesign,
+    base: &str,
+    entity: &Entity,
+    auth: bool,
+    seed: &mut String,
+    seen: &mut Vec<String>,
+) {
+    let tenancy = design.tenancy.as_ref().map(|t| t.entity.as_str());
+    for b in &entity.belongs_to {
+        if Design::is_identity_fk(b)
+            || Some(b.entity.as_str()) == tenancy
+            || seen.contains(&b.entity)
+        {
+            continue;
+        }
+        let (Some(parent_creator), Some(parent)) = (
+            creator_for_entity(unit, &b.entity),
+            unit.entities.iter().find(|e| e.name == b.entity),
+        ) else {
+            continue;
+        };
+        seen.push(b.entity.clone());
+        seed_parents(design, unit, base, parent, auth, seed, seen);
+        seed.push_str(&seed_line(
+            design,
+            unit,
+            &collection_url(base, &parent_creator.path),
+            parent_creator,
+            auth,
+            &format!("// seed parent {} id 1", parent.name),
+        ));
+    }
 }
 
 /// True when this endpoint's SUCCESS requires a credential/signature the generator
@@ -209,34 +375,6 @@ fn request_expr(
 
 fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOut) {
     let auth = out.auth;
-    // The path-param value a seeded row answers to: the fixture id for entities
-    // that declare one (text pks seed their fixture string), "1" otherwise
-    // (matching the synthetic/integer pk the creator's fixture inserts).
-    let seed_id = creator(unit)
-        .and_then(|ep| ep.request_body.as_ref())
-        .and_then(|rb| unit.entities.iter().find(|e| e.name == rb.entity))
-        .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
-        .map(|f| fixture_value(f).trim_matches('"').to_string())
-        .unwrap_or_else(|| "1".to_string());
-    let seed = creator(unit).map(|ep| {
-        let body = fixture_json(
-            design,
-            unit,
-            &ep.request_body.as_ref().expect("creator has body").entity,
-            design.endpoint_omits_identity_fk(unit, ep),
-            None,
-        );
-        // In auth mode a guarded creator needs the credential to seed successfully
-        // (cookie under session, Bearer under jwt — issue #29).
-        if auth && ep.is_guarded() {
-            let hk = design.test_auth_header();
-            format!(
-                "    t.post_json_with(\"{base}/\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie())]).await; // seed id 1\n"
-            )
-        } else {
-            format!("    t.post_json(\"{base}/\", &serde_json::json!({body})).await; // seed id 1\n")
-        }
-    });
 
     for ep in &unit.endpoints {
         let full_path = format!("{}{}", base.trim_end_matches('/'), ep.path);
@@ -292,24 +430,34 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             {
                 push_enum_reject_test(design, out, unit, ep, &full_path, guarded, field);
             }
-        } else if param_count(ep) == 1 && seed.is_some() {
-            let seeded_path = full_path.replacen(&regex_free_param(&ep.path), &seed_id, 1);
-            let request = request_expr(design, unit, ep, &seeded_path, guarded, None);
-            out.code.push_str(&format!(
-                "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n}}\n\n",
-                seed = seed.as_deref().unwrap_or("")
-            ));
-            out.count += 1;
-            if guarded {
-                push_401_test(design, out, unit, ep, &seeded_path, seed.is_some());
-            }
-            // Issue #47: update path (PUT/PATCH /{id}) rejects out-of-range too.
-            if let Some(field) = ep
-                .request_body
-                .as_ref()
-                .and_then(|rb| first_enum_field(unit, &rb.entity))
-            {
-                push_enum_reject_test(design, out, unit, ep, &seeded_path, guarded, field);
+        } else if param_count(ep) == 1 {
+            // Issue #51: seed the row THIS `/{id}` endpoint addresses via ITS OWN
+            // entity's creator (`POST /tasks` for `/tasks/{id}`), walking belongs_to
+            // parents first — not the module-root creator, which would seed the
+            // wrong entity and make the probe 404 on a CORRECT handler.
+            if let Some((seed, seed_id)) = seed_for_id_probe(design, unit, base, ep, auth) {
+                let seeded_path = full_path.replacen(&regex_free_param(&ep.path), &seed_id, 1);
+                let request = request_expr(design, unit, ep, &seeded_path, guarded, None);
+                out.code.push_str(&format!(
+                    "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n}}\n\n"
+                ));
+                out.count += 1;
+                if guarded {
+                    push_401_test(design, out, unit, ep, &seeded_path, true);
+                }
+                // Issue #47: update path (PUT/PATCH /{id}) rejects out-of-range too.
+                if let Some(field) = ep
+                    .request_body
+                    .as_ref()
+                    .and_then(|rb| first_enum_field(unit, &rb.entity))
+                {
+                    push_enum_reject_test(design, out, unit, ep, &seeded_path, guarded, field);
+                }
+            } else {
+                out.todos.push(format!(
+                    "// AGENT TODO: {fn_base} ({:?} {full_path}) has no creator route to seed its {{id}} — encode its success case in your own test file.",
+                    ep.method
+                ));
             }
         } else if param_count(ep) >= 1 {
             out.todos.push(format!(

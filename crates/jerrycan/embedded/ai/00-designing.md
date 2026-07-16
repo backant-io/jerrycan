@@ -241,6 +241,16 @@ Every entity has an `id` primary key. You usually do NOT declare it:
 > weaken the handler to make the probe pass.** Leave the probe red, and cover the
 > real behavior (the 200 WITH a valid credential, and the 401/400 without) in
 > your own agent-owned test. See `jerrycan docs testing`.
+>
+> **A hand-written format/`Valid` constraint the generator can't see is the same
+> case.** The probe fills each field with a generic fixture — a `string` gets
+> `"test-value"`; declared `uuid`/`datetime` get format-valid fixtures and enum
+> `values` get a declared value. But the design contract has **no field-format
+> declaration** (no email/url/pattern), so a `string` the handler additionally
+> requires to be an **email, URL, or other format** — enforced by a hand-written
+> `Valid` impl the design can't express — is rejected by a CORRECT handler, and
+> that endpoint's 2xx probe is un-greenable too. Mark such an endpoint
+> **`probe: "skip"`** and write its success test with a real value yourself.
 
 ## Worked examples
 

@@ -857,3 +857,223 @@ fn enum_reject_tests_are_excluded_from_expected_failing() {
         "expected_failing must exclude exactly the reject tests (total {total}, rejects {rejects})"
     );
 }
+
+/// Slice one generated `#[tokio::test]` function body out of the acceptance file
+/// (from its `async fn NAME(` to the next test), so a seeding assertion can be
+/// scoped to the probe under test rather than the whole file.
+fn test_body<'a>(generated: &'a str, fn_name: &str) -> &'a str {
+    let start = generated
+        .find(&format!("async fn {fn_name}("))
+        .unwrap_or_else(|| panic!("no `async fn {fn_name}` in:\n{generated}"));
+    let rest = &generated[start..];
+    match rest[1..].find("#[tokio::test]") {
+        Some(i) => &rest[..=i],
+        None => rest,
+    }
+}
+
+/// The design behind the J3 face-off failure (issue #51): ONE module holding a
+/// root entity (Project at `/`) AND a second entity (Task) with its OWN creator
+/// (`POST /tasks`) and its own `/{id}` routes. `contract_version` 1, db mode, no
+/// auth — the minimal reproduction.
+fn j3_two_entity_module() -> Design {
+    serde_json::from_value(serde_json::json!({
+        "name": "j3-api",
+        "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "projects",
+            "entities": [
+                { "name": "Task", "fields": [{ "name": "title", "type": "string" }] },
+                { "name": "Project", "fields": [{ "name": "name", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "list_projects", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Project", "list": true } },
+                { "operation_id": "create_project", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Project" },
+                  "success": { "status": 201, "entity": "Project" } },
+                { "operation_id": "list_tasks", "method": "GET", "path": "/tasks",
+                  "success": { "status": 200, "entity": "Task", "list": true } },
+                { "operation_id": "create_task", "method": "POST", "path": "/tasks",
+                  "request_body": { "entity": "Task" },
+                  "success": { "status": 201, "entity": "Task" } },
+                { "operation_id": "update_task", "method": "PUT", "path": "/tasks/{id}",
+                  "request_body": { "entity": "Task" },
+                  "success": { "status": 200, "entity": "Task" },
+                  "errors": [{ "status": 404, "when": "unknown id" }] },
+                { "operation_id": "delete_task", "method": "DELETE", "path": "/tasks/{id}",
+                  "success": { "status": 204 },
+                  "errors": [{ "status": 404, "when": "unknown id" }] }
+            ]
+        }]
+    }))
+    .unwrap()
+}
+
+/// Issue #51: a `/{id}` probe for a NON-root entity must seed a row of THAT
+/// entity via its own creator (`POST /tasks`), not reuse the module-root creator
+/// (`POST /`, which makes a Project). Before the fix, `update_task`/`delete_task`
+/// seeded a Project and then hit `/tasks/1` — 404 on a CORRECT handler.
+#[test]
+fn second_entity_id_probe_seeds_via_its_own_creator() {
+    let design = j3_two_entity_module();
+    let module = &design.modules[0];
+    let generated = testgen::acceptance_rs(&design, module);
+
+    for probe in ["update_task_returns_200", "delete_task_returns_204"] {
+        let body = test_body(&generated, probe);
+        assert!(
+            body.contains("post_json(\"/projects/tasks\""),
+            "{probe} must seed a Task via its own creator POST /projects/tasks:\n{body}"
+        );
+        // The probe addresses the seeded Task id, under the /tasks collection.
+        assert!(
+            body.contains("/projects/tasks/1"),
+            "{probe} must address the seeded Task:\n{body}"
+        );
+        // ...and it must NOT reuse the root Project creator for an independent
+        // entity (that seed row is the wrong table entirely).
+        assert!(
+            !body.contains("post_json(\"/projects/\""),
+            "{probe} must not seed a Project for a Task probe:\n{body}"
+        );
+    }
+}
+
+/// Issue #51: when the target entity `belongs_to` another entity that has its own
+/// creator in the module, the probe seeds the PARENT first (so the enforced
+/// intra-module FK resolves), THEN the entity.
+#[test]
+fn id_probe_seeds_belongs_to_parents_before_the_entity() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "j3-fk-api",
+        "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "projects",
+            "entities": [
+                { "name": "Task",
+                  "belongs_to": [{ "entity": "Project" }],
+                  "fields": [{ "name": "title", "type": "string" }] },
+                { "name": "Project", "fields": [{ "name": "name", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_project", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Project" },
+                  "success": { "status": 201, "entity": "Project" } },
+                { "operation_id": "create_task", "method": "POST", "path": "/tasks",
+                  "request_body": { "entity": "Task" },
+                  "success": { "status": 201, "entity": "Task" } },
+                { "operation_id": "update_task", "method": "PUT", "path": "/tasks/{id}",
+                  "request_body": { "entity": "Task" },
+                  "success": { "status": 200, "entity": "Task" } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let module = &design.modules[0];
+    let generated = testgen::acceptance_rs(&design, module);
+    let body = test_body(&generated, "update_task_returns_200");
+    let parent = body
+        .find("post_json(\"/projects/\"")
+        .expect("parent Project must be seeded (POST /projects/)");
+    let child = body
+        .find("post_json(\"/projects/tasks\"")
+        .expect("Task must be seeded (POST /projects/tasks)");
+    assert!(
+        parent < child,
+        "the parent Project must be seeded before the Task:\n{body}"
+    );
+    assert!(
+        body.contains("\"project_id\": 1"),
+        "the Task fixture must carry the fk pointing at the seeded parent:\n{body}"
+    );
+}
+
+/// Issue #51: a `/{id}` endpoint whose entity has NO creator route can't be
+/// seeded — degrade to an AGENT TODO instead of emitting a guaranteed-red probe.
+#[test]
+fn id_probe_without_a_creator_becomes_agent_todo() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "j3-nocreate-api",
+        "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "projects",
+            "entities": [
+                { "name": "Project", "fields": [{ "name": "name", "type": "string" }] },
+                { "name": "Task", "fields": [{ "name": "title", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_project", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Project" },
+                  "success": { "status": 201, "entity": "Project" } },
+                { "operation_id": "update_task", "method": "PUT", "path": "/tasks/{id}",
+                  "request_body": { "entity": "Task" },
+                  "success": { "status": 200, "entity": "Task" } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let module = &design.modules[0];
+    let generated = testgen::acceptance_rs(&design, module);
+    assert!(
+        !generated.contains("async fn update_task_returns_200"),
+        "no un-greenable success probe when the entity can't be seeded:\n{generated}"
+    );
+    assert!(
+        generated.contains("// AGENT TODO: update_task")
+            && generated.contains("no creator route to seed"),
+        "must emit an AGENT TODO naming the missing creator:\n{generated}"
+    );
+}
+
+/// Issue #48a: a design-declared format type must yield a FORMAT-VALID fixture, so
+/// the endpoint's own happy-path probe is greenable against a handler that
+/// validates it. `uuid` used the NIL uuid (a valid string but NOT a valid v4 — a
+/// v4 validator rejects it); `datetime` was already valid RFC3339.
+#[test]
+fn format_typed_fields_use_valid_fixtures_not_placeholders() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "fmt-api",
+        "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "events",
+            "entities": [{ "name": "Event", "fields": [
+                { "name": "ref_id", "type": "uuid" },
+                { "name": "at", "type": "datetime" }
+            ]}],
+            "endpoints": [{ "operation_id": "create_event", "method": "POST", "path": "/",
+                "request_body": { "entity": "Event" },
+                "success": { "status": 201, "entity": "Event" } }]
+        }]
+    }))
+    .unwrap();
+    let module = &design.modules[0];
+    let generated = testgen::acceptance_rs(&design, module);
+
+    const V4: &str = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+    assert!(
+        generated.contains(V4),
+        "uuid fixture must be a valid v4:\n{generated}"
+    );
+    assert!(
+        !generated.contains("00000000-0000-0000-0000-000000000000"),
+        "the nil uuid is not a valid v4 — un-greenable against a v4 validator:\n{generated}"
+    );
+    assert!(
+        generated.contains("2026-01-01T00:00:00Z"),
+        "datetime fixture stays valid RFC3339:\n{generated}"
+    );
+    // WHY (Rule 9): a v4-validating handler requires the version nibble = 4 and the
+    // variant nibble in 8..=b. The generated literal must satisfy both or the
+    // endpoint's own 2xx probe can never pass.
+    let b = V4.as_bytes();
+    assert_eq!(b[14], b'4', "uuid v4 version nibble");
+    assert!(
+        matches!(b[19], b'8' | b'9' | b'a' | b'b'),
+        "uuid v4 variant nibble"
+    );
+}
