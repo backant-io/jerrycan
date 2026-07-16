@@ -89,19 +89,22 @@ fn endpoint_is_tenant_owned(m: &ModuleDesign, ep: &Endpoint, design: &Design) ->
         .is_some_and(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity))
 }
 
-/// The server-owned-FK rule (issue #34) at the Rust layer: a GUARDED endpoint
-/// whose body entity carries an identity FK takes `Json<{Entity}Request>` (the
-/// DTO without `user_id` — see `request_dto_rs`) instead of `Json<{Entity}>`;
-/// the handler injects the session user's id. db-gated on top of the design
-/// rule because only `model_rs_db` structs surface fk columns at all (the
-/// memory-mode entity has none, so its plain body already omits `user_id`).
+/// The request-DTO rule (issues #34 + #53) at the Rust layer: an endpoint whose
+/// body entity has a field the wire contract drops takes `Json<{Entity}Request>`
+/// (the trimmed DTO — see `request_dto_rs`) instead of `Json<{Entity}>`. Three
+/// drop reasons: the server-owned identity fk (#34, guarded+auth — server injects
+/// the session user's id), a `default` field (#53a — server applies the declared
+/// value), or a path-redundant parent fk (#53b — the handler injects the path
+/// value). db-gated because only `model_rs_db` structs surface these columns at
+/// all (the memory-mode entity has no fk columns, and defaults there stay
+/// required — the DTO lives in db mode alongside the SeaORM model).
 fn endpoint_takes_request_dto(
     m: &ModuleDesign,
     ep: &Endpoint,
     mode: GenMode,
     design: &Design,
 ) -> bool {
-    mode.db && mode.auth && design.endpoint_omits_identity_fk(m, ep)
+    mode.db && design.endpoint_uses_request_dto(m, ep, mode.auth)
 }
 
 /// True when this endpoint gets the server-side realtime publish wiring (issue
@@ -265,15 +268,51 @@ fn server_owned_fk_comment(
         return String::new();
     }
     let entity = &ep.request_body.as_ref().expect("dto implies body").entity;
-    if endpoint_is_tenant_owned(m, ep, design) {
-        format!(
-            "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Add a `user: CurrentUser` param and use `user.0.id` (the\n    // stringified user pk; parse it for an integer fk) when building the {entity}.\n"
-        )
-    } else {
-        format!(
-            "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Use `_user.0.id` (the stringified user pk; parse it for an\n    // integer fk) when building the {entity}.\n"
-        )
+    let Some(e) = m.entities.iter().find(|e| &e.name == entity) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    // Identity fk (#34): guarded + auth → the server injects the session user's id.
+    if mode.auth && design.endpoint_omits_identity_fk(m, ep) {
+        if endpoint_is_tenant_owned(m, ep, design) {
+            out.push_str(&format!(
+                "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Add a `user: CurrentUser` param and use `user.0.id` (the\n    // stringified user pk; parse it for an integer fk) when building the {entity}.\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Use `_user.0.id` (the stringified user pk; parse it for an\n    // integer fk) when building the {entity}.\n"
+            ));
+        }
     }
+    // Path-redundant parent fk (#53b): comes from the endpoint's own path param
+    // (`_{col}`), so the handler injects it instead of reading it from the body.
+    for col in design.entity_path_fk_columns(entity) {
+        out.push_str(&format!(
+            "    // path-owned fk: `{entity}Request` has NO `{col}` — inject the `_{col}` path\n    // value (the handler's Path param) when building the {entity}.\n"
+        ));
+    }
+    // Server-owned defaults (#53a): the DTO omits each default field; the handler
+    // writes the declared value into the NOT-NULL column.
+    let defaults: Vec<String> = e
+        .fields
+        .iter()
+        .filter_map(|f| {
+            f.default.as_ref().map(|v| {
+                format!(
+                    "`{}` = {}",
+                    f.name,
+                    serde_json::to_string(v).unwrap_or_else(|_| "…".into())
+                )
+            })
+        })
+        .collect();
+    if !defaults.is_empty() {
+        out.push_str(&format!(
+            "    // server-owned defaults: `{entity}Request` omits {} — set each to its\n    // declared default when building the {entity}.\n",
+            defaults.join(", ")
+        ));
+    }
+    out
 }
 
 /// The stub comment for server-side realtime publish (issue #50): shows the
@@ -518,17 +557,17 @@ pub use {snake}::Model as {entity};
 "#,
             entity = e.name,
         ));
-        // Server-owned FK (issue #34): an identity-FK entity that at least one
-        // GUARDED endpoint takes as its request body also gets the trimmed
-        // request DTO, emitted right after its entity block.
-        let needs_dto = auth
-            && m.endpoints.iter().any(|ep| {
-                design.endpoint_omits_identity_fk(m, ep)
-                    && ep
-                        .request_body
-                        .as_ref()
-                        .is_some_and(|rb| rb.entity == e.name)
-            });
+        // Request DTO (issues #34 + #53): an entity taken as a request body whose
+        // wire shape drops a server-owned field (identity fk, a `default` field,
+        // or a path-redundant parent fk) gets the trimmed `{Entity}Request`,
+        // emitted right after its entity block.
+        let needs_dto = m.endpoints.iter().any(|ep| {
+            design.endpoint_uses_request_dto(m, ep, auth)
+                && ep
+                    .request_body
+                    .as_ref()
+                    .is_some_and(|rb| rb.entity == e.name)
+        });
         if needs_dto {
             out.push_str(&request_dto_rs(e, design));
         }
@@ -537,11 +576,12 @@ pub use {snake}::Model as {entity};
     Some(out)
 }
 
-/// The `{Entity}Request` DTO for a guarded identity-FK request body (issue
-/// #34): the entity's deserialization shape MINUS the `user_id` fk — the server
-/// injects the session user's id, so the wire contract must not demand it.
+/// The `{Entity}Request` DTO (issues #34 + #53): the entity's deserialization
+/// shape MINUS every field the wire contract drops — the server-owned identity
+/// `user_id` fk (#34), any `default` field (#53a), and a path-redundant parent
+/// fk (#53b). The client never sends these; the server supplies each value.
 /// Everything else mirrors the Model: the pk `id` (synthetic → `#[serde(default)]`),
-/// the non-identity fk columns (SetNull → `Option` + default), then the declared
+/// the remaining fk columns (SetNull → `Option` + default), then the declared
 /// fields with the same optionality and keyword renames. Plain serde struct —
 /// only the Model touches SeaORM.
 fn request_dto_rs(e: &Entity, design: &Design) -> String {
@@ -552,8 +592,15 @@ fn request_dto_rs(e: &Entity, design: &Design) -> String {
     } else {
         "    #[serde(default)]\n"
     };
+    // Identity fk is dropped only under auth (#34 injects the session user's id);
+    // a path-redundant parent fk (#53b) is dropped regardless of auth.
+    let omit_identity = design.wants_auth();
+    let path_fks = design.entity_path_fk_columns(entity);
     let mut fields = String::new();
-    for b in e.belongs_to.iter().filter(|b| !Design::is_identity_fk(b)) {
+    for b in e.belongs_to.iter().filter(|b| {
+        !(omit_identity && Design::is_identity_fk(b))
+            && !path_fks.contains(&Design::fk_column(&b.entity))
+    }) {
         let col = Design::fk_column(&b.entity);
         let ty = design.target_key_rust_type(&b.entity);
         if b.on_delete == OnDelete::SetNull {
@@ -563,7 +610,12 @@ fn request_dto_rs(e: &Entity, design: &Design) -> String {
             fields.push_str(&format!("    pub {col}: {ty},\n"));
         }
     }
-    for f in e.fields.iter().filter(|f| f.name != "id") {
+    // A `default` field (#53a) is server-owned: it does not appear on the wire.
+    for f in e
+        .fields
+        .iter()
+        .filter(|f| f.name != "id" && f.default.is_none())
+    {
         let base = f.field_type.rust_type();
         fields.push_str(&keyword_field_attrs(&f.name, "    ", false));
         let ident = rust_ident(&f.name);
@@ -576,8 +628,38 @@ fn request_dto_rs(e: &Entity, design: &Design) -> String {
             fields.push_str(&format!("    pub {ident}: Option<{base}>,\n"));
         }
     }
+    let doc = request_dto_doc(e, &path_fks, omit_identity);
     format!(
-        "/// Request body for guarded `{entity}` endpoints — `user_id` is SERVER-OWNED:\n/// the handler injects the authenticated session user's id; clients never send it.\n#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\npub struct {entity}Request {{\n{id_default}    pub id: {key},\n{fields}}}\n\n"
+        "{doc}#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\npub struct {entity}Request {{\n{id_default}    pub id: {key},\n{fields}}}\n\n"
+    )
+}
+
+/// The doc comment for a `{Entity}Request` DTO — one `///` line per dropped
+/// server-owned field with its reason, so an agent reading the struct sees
+/// exactly which keys the server supplies. Ordered identity fk → path fk →
+/// defaults (the struct-field order the DTO omits them in).
+fn request_dto_doc(e: &Entity, path_fks: &[String], omit_identity: bool) -> String {
+    let mut reasons = Vec::new();
+    for b in &e.belongs_to {
+        let col = Design::fk_column(&b.entity);
+        if omit_identity && Design::is_identity_fk(b) {
+            reasons.push(format!("`{col}` (the authenticated session user's id)"));
+        } else if path_fks.contains(&col) {
+            reasons.push(format!("`{col}` (from the request path)"));
+        }
+    }
+    for f in e.fields.iter().filter(|f| f.default.is_some()) {
+        let v = f.default.as_ref().expect("filtered to Some");
+        reasons.push(format!(
+            "`{}` (server default {})",
+            f.name,
+            serde_json::to_string(v).unwrap_or_else(|_| "…".into())
+        ));
+    }
+    format!(
+        "/// Request body for `{}` — the wire input shape. These SERVER-OWNED fields\n/// are omitted (the client never sends them; the server supplies each):\n///   {}.\n",
+        e.name,
+        reasons.join(", ")
     )
 }
 
@@ -1657,6 +1739,7 @@ pub(crate) mod tests {
             unique: false,
             index: false,
             values: None,
+            default: None,
         });
         d.modules[1].entities[0].belongs_to[0].on_delete = OnDelete::SetNull;
         let ddl = migration_ddl(&d.modules[1], false, &d)
@@ -2216,6 +2299,7 @@ pub(crate) mod tests {
                 unique: false,
                 index: false,
                 values: None,
+                default: None,
             },
         );
         let ddl = migration_ddl(&m, false, &demo()).unwrap();
@@ -2251,6 +2335,7 @@ pub(crate) mod tests {
                 unique: false,
                 index: false,
                 values: None,
+                default: None,
             },
         );
         let ddl = migration_ddl(&m, false, &demo()).unwrap();
@@ -2448,6 +2533,134 @@ pub(crate) mod tests {
             "memory mode keeps the entity body: {h}"
         );
         assert!(!h.contains("CollectionRequest"), "{h}");
+    }
+
+    /// Issue #53a (defaulted fields): a db design whose body entity declares
+    /// server-owned `default` fields drops them from `{Entity}Request` and the
+    /// handler body type — a PUBLIC (unguarded, no-auth) create still uses the DTO,
+    /// so the minimal client body Just Works. The stub tells the agent the server
+    /// applies each default; the Model keeps the columns (NOT-NULL in the DB).
+    pub(crate) const DEFAULTS: &str = r#"{
+        "name": "news", "contract_version": 0, "dependencies": ["db"],
+        "modules": [{ "name": "subscribers",
+            "entities": [{ "name": "Subscriber", "fields": [
+                { "name": "email", "type": "string" },
+                { "name": "confirmed", "type": "boolean", "default": false },
+                { "name": "status", "type": "string", "values": ["active", "expired"], "default": "active" } ] }],
+            "endpoints": [{ "operation_id": "create_subscriber", "method": "POST", "path": "/",
+                "request_body": { "entity": "Subscriber" },
+                "success": { "status": 201, "entity": "Subscriber" } }] }]
+    }"#;
+
+    #[test]
+    fn defaulted_fields_are_dropped_from_the_request_dto() {
+        let d: Design = serde_json::from_str(DEFAULTS).unwrap();
+        let m = &d.modules[0];
+        // auth = false (a public, no-auth app): the DTO still exists for defaults.
+        let model = model_rs_db(m, &d, false).unwrap();
+        let dto = model
+            .split("pub struct SubscriberRequest {")
+            .nth(1)
+            .expect("SubscriberRequest emitted for a defaulted-field entity")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(dto.contains("pub email: String,"), "{dto}");
+        assert!(
+            !dto.contains("confirmed") && !dto.contains("status"),
+            "server-owned defaults must be omitted from the DTO: {dto}"
+        );
+        // The Model keeps the columns (NOT-NULL persisted server-side).
+        assert!(model.contains("pub confirmed: bool,"), "{model}");
+        assert!(model.contains("pub status: String,"), "{model}");
+
+        let mode = GenMode {
+            db: true,
+            auth: false,
+        };
+        let h = handlers_rs(m, mode, &d);
+        assert!(
+            h.contains("Json(_body): Json<SubscriberRequest>"),
+            "public create uses the trimmed DTO: {h}"
+        );
+        let stub = h
+            .split("async fn create_subscriber")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            stub.contains("server-owned defaults")
+                && stub.contains("`confirmed` = false")
+                && stub.contains("`status` = \"active\""),
+            "stub must name each default the server applies: {stub}"
+        );
+    }
+
+    /// Issue #53b (nested parent fk): a child created under `POST /{habit_id}/checkins`
+    /// gets `habit_id` from the PATH — the request DTO omits it and the handler
+    /// (which already binds `Path(_habit_id)`) injects it. The Model keeps the fk.
+    pub(crate) const NESTED_FK: &str = r#"{
+        "name": "habits", "contract_version": 0, "dependencies": ["db"],
+        "modules": [{ "name": "habits",
+            "entities": [
+                { "name": "Habit", "fields": [{ "name": "name", "type": "string" }] },
+                { "name": "Checkin", "belongs_to": [{ "entity": "Habit" }],
+                  "fields": [{ "name": "note", "type": "string" }] } ],
+            "endpoints": [
+                { "operation_id": "create_habit", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Habit" },
+                  "success": { "status": 201, "entity": "Habit" } },
+                { "operation_id": "create_checkin", "method": "POST", "path": "/{habit_id}/checkins",
+                  "request_body": { "entity": "Checkin" },
+                  "success": { "status": 201, "entity": "Checkin" } }] }]
+    }"#;
+
+    #[test]
+    fn path_redundant_parent_fk_is_dropped_from_the_request_dto() {
+        let d: Design = serde_json::from_str(NESTED_FK).unwrap();
+        let m = &d.modules[0];
+        let model = model_rs_db(m, &d, false).unwrap();
+        let dto = model
+            .split("pub struct CheckinRequest {")
+            .nth(1)
+            .expect("CheckinRequest emitted for a nested-fk entity")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(dto.contains("pub note: String,"), "{dto}");
+        assert!(
+            !dto.contains("habit_id"),
+            "path-redundant parent fk must be omitted from the DTO: {dto}"
+        );
+        // The Model keeps the fk column (the row still stores habit_id).
+        assert!(model.contains("pub habit_id: i64,"), "{model}");
+        // Habit (top-level create) is unaffected — no DTO.
+        assert!(!model.contains("HabitRequest"), "{model}");
+
+        let mode = GenMode {
+            db: true,
+            auth: false,
+        };
+        let h = handlers_rs(m, mode, &d);
+        assert!(
+            h.contains(
+                "pub(crate) async fn create_checkin(_repo: Dep<CheckinRepo>, Path(_habit_id): Path<i64>, Json(_body): Json<CheckinRequest>)"
+            ),
+            "handler binds the path param and the trimmed DTO: {h}"
+        );
+        let stub = h
+            .split("async fn create_checkin")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            stub.contains("path-owned fk") && stub.contains("_habit_id"),
+            "stub must say to inject the path fk: {stub}"
+        );
     }
 
     /// A guarded identity-FK design whose body carries an enum `values` field —

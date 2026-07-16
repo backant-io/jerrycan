@@ -62,11 +62,15 @@ fn fixture_json(
     // belongs_to fk columns first: a tenant-owned entity's body must carry the
     // fk (NOT NULL) so the handler's Json<Entity> deserializes (else 422 before
     // the stub), valued at the seeded tenant so a scoped query can resolve it.
-    // The identity fk (`user_id`) is dropped on guarded bodies (issue #34).
+    // The identity fk (`user_id`) is dropped on guarded bodies (issue #34); a
+    // path-redundant parent fk (`habit_id` under `/{habit_id}/checkins`) is
+    // dropped because the probe carries it in the URL, not the body (issue #53b).
+    let path_fks = design.entity_path_fk_columns(entity);
     let fks = e
         .belongs_to
         .iter()
         .filter(|b| !(omit_identity_fk && Design::is_identity_fk(b)))
+        .filter(|b| !path_fks.contains(&Design::fk_column(&b.entity)))
         .map(|b| {
             format!(
                 "\"{}\": {}",
@@ -74,7 +78,9 @@ fn fixture_json(
                 fk_fixture_value(design, &b.entity)
             )
         });
-    let cols = e.fields.iter().map(|f| {
+    // A `default` field (issue #53a) is server-owned: the probe omits it so the
+    // minimal client body proves the server applies the default (not a 422).
+    let cols = e.fields.iter().filter(|f| f.default.is_none()).map(|f| {
         // The reject probe (issue #47) corrupts ONE enum field to an out-of-range
         // sentinel; every other field keeps its valid fixture value so the ONLY
         // reason for a 422 is that enum.
@@ -289,13 +295,20 @@ struct TestOut {
 /// 422 (JC0422) before the DB (issue #47).
 const ENUM_REJECT_SENTINEL: &str = "__invalid_enum_value__";
 
-/// The first enum (`values`) field of an endpoint's request-body entity, if any —
-/// the field the reject probe corrupts to an out-of-range value.
+/// The first enum (`values`) field of an endpoint's request-body entity that is
+/// present on the wire — the field the reject probe corrupts to an out-of-range
+/// value. A defaulted enum field (issue #53a) is omitted from the request DTO, so
+/// a bad value would be ignored, not 422'd — skip it (there is nothing to reject
+/// at the boundary).
 fn first_enum_field<'a>(unit: &'a ModuleDesign, entity: &str) -> Option<&'a str> {
     unit.entities
         .iter()
         .find(|e| e.name == entity)
-        .and_then(|e| e.fields.iter().find(|f| f.values.is_some()))
+        .and_then(|e| {
+            e.fields
+                .iter()
+                .find(|f| f.values.is_some() && f.default.is_none())
+        })
         .map(|f| f.name.as_str())
 }
 

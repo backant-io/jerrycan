@@ -152,6 +152,9 @@ fn build_one(
                     unique: col.unique,
                     index: col.indexed,
                     values: col.check_in_values.clone().or(values),
+                    // Migration import derives no server-owned default from a
+                    // Postgres column default (that stays a run-time concern).
+                    default: None,
                 });
             }
             MappedType::Unmappable { pg_type, reason } => {

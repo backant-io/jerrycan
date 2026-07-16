@@ -74,10 +74,11 @@ fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
         op["parameters"] = Value::Array(params);
     }
     if let Some(ref rb) = ep.request_body {
-        // Server-owned FK (issue #34): a guarded identity-FK body advertises the
-        // `{Entity}Request` schema (no `user_id`) so generated clients never
-        // send a field the server injects from the session.
-        let schema = if design.endpoint_omits_identity_fk(m, ep) {
+        // Server-owned fields (issues #34 + #53): a body that drops the identity
+        // fk, a `default` field, or a path-redundant parent fk advertises the
+        // `{Entity}Request` schema so generated clients never send a field the
+        // server supplies (from the session, a declared default, or the path).
+        let schema = if design.endpoint_uses_request_dto(m, ep, design.wants_auth()) {
             entity_ref(&format!("{}Request", rb.entity))
         } else {
             entity_ref(&rb.entity)
@@ -129,12 +130,12 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
             e.name.clone(),
             json!({ "type": "object", "properties": properties, "required": required }),
         );
-        // Server-owned FK (issue #34): an identity-FK entity used as a GUARDED
-        // request body gets a `{Entity}Request` schema — the wire input shape:
-        // non-identity fk columns (required unless SetNull) + the declared
-        // fields, and NO `user_id` (the server injects the session user's id).
+        // Server-owned fields (issues #34 + #53): an entity used as a request body
+        // whose wire shape drops a field (identity fk, a `default` field, or a
+        // path-redundant parent fk) gets a `{Entity}Request` schema — the wire
+        // input shape with those fields removed.
         let needs_request_schema = m.endpoints.iter().any(|ep| {
-            design.endpoint_omits_identity_fk(m, ep)
+            design.endpoint_uses_request_dto(m, ep, design.wants_auth())
                 && ep
                     .request_body
                     .as_ref()
@@ -149,14 +150,21 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
     }
 }
 
-/// The `{Entity}Request` schema (issue #34): the entity's request shape minus
-/// the server-owned `user_id` fk. Unlike the entity component (declared fields
-/// only), the request shape must spell out the OTHER fk columns too — they ARE
-/// required client input, and a generated client needs their types.
+/// The `{Entity}Request` schema (issues #34 + #53): the entity's request shape
+/// minus every server-owned field — the identity `user_id` fk (#34), a path-
+/// redundant parent fk (#53b), and any `default` field (#53a). Unlike the entity
+/// component (declared fields only), the request shape must spell out the
+/// REMAINING fk columns too — they ARE required client input, and a generated
+/// client needs their types.
 fn request_schema(design: &Design, e: &Entity) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
-    for b in e.belongs_to.iter().filter(|b| !Design::is_identity_fk(b)) {
+    let omit_identity = design.wants_auth();
+    let path_fks = design.entity_path_fk_columns(&e.name);
+    for b in e.belongs_to.iter().filter(|b| {
+        !(omit_identity && Design::is_identity_fk(b))
+            && !path_fks.contains(&Design::fk_column(&b.entity))
+    }) {
         let col = Design::fk_column(&b.entity);
         let schema = match design.target_key_rust_type(&b.entity) {
             "String" => json!({ "type": "string" }),
@@ -167,7 +175,8 @@ fn request_schema(design: &Design, e: &Entity) -> Value {
             required.push(Value::String(col));
         }
     }
-    for f in &e.fields {
+    // A `default` field (#53a) is server-owned — not part of the wire input shape.
+    for f in e.fields.iter().filter(|f| f.default.is_none()) {
         properties.insert(f.name.clone(), field_schema(f.field_type));
         if f.required {
             required.push(Value::String(f.name.clone()));
@@ -385,6 +394,58 @@ mod tests {
         // The entity response schema itself is untouched.
         let entity = &d["components"]["schemas"]["Collection"];
         assert!(entity["properties"]["title"].is_object(), "{entity}");
+    }
+
+    /// Issue #53a: a `default` field is dropped from the `{Entity}Request` schema
+    /// (and its `required` list) so a generated client never sends a server-owned
+    /// value — even for a PUBLIC (no-auth) create. The entity RESPONSE schema keeps
+    /// every field (the server returns them).
+    #[test]
+    fn defaulted_fields_omitted_from_request_schema() {
+        let d = document(
+            &serde_json::from_str::<Design>(crate::platform::genroute::tests::DEFAULTS).unwrap(),
+        );
+        let create = &d["paths"]["/subscribers/"]["post"];
+        assert_eq!(
+            create["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SubscriberRequest"
+        );
+        let req = &d["components"]["schemas"]["SubscriberRequest"];
+        assert!(req["properties"]["email"].is_object(), "{req}");
+        assert!(
+            req["properties"].get("confirmed").is_none()
+                && req["properties"].get("status").is_none(),
+            "request schema must omit server-owned defaults: {req}"
+        );
+        // The entity response schema is untouched — it carries the defaulted fields.
+        let entity = &d["components"]["schemas"]["Subscriber"]["properties"];
+        assert!(entity["confirmed"].is_object() && entity["status"].is_object());
+    }
+
+    /// Issue #53b: a path-redundant parent fk is dropped from the `{Entity}Request`
+    /// schema — the client sends it in the URL, not the body.
+    #[test]
+    fn nested_parent_fk_omitted_from_request_schema() {
+        let d = document(
+            &serde_json::from_str::<Design>(crate::platform::genroute::tests::NESTED_FK).unwrap(),
+        );
+        let create = &d["paths"]["/habits/{habit_id}/checkins"]["post"];
+        assert_eq!(
+            create["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/CheckinRequest"
+        );
+        let req = &d["components"]["schemas"]["CheckinRequest"];
+        assert!(req["properties"]["note"].is_object(), "{req}");
+        assert!(
+            req["properties"].get("habit_id").is_none(),
+            "path-redundant fk must not be in the request schema: {req}"
+        );
+        // Habit (top-level create) advertises the plain entity — no Request schema.
+        assert!(
+            d["components"]["schemas"].get("HabitRequest").is_none(),
+            "a top-level create needs no Request schema: {}",
+            d["components"]["schemas"]
+        );
     }
 
     #[test]

@@ -168,6 +168,16 @@ pub struct Field {
     pub index: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
+    /// A server-owned default value (issue #53): a field that carries a `default`
+    /// is dropped from the generated request DTO / OpenAPI request schema and the
+    /// happy-path probe body — the client never sends it, the server applies the
+    /// declared value. Lets a design express `confirmed (bool, default false)` /
+    /// `status (enum, default "active")` without forcing the client to POST a
+    /// server-controlled key (the field stays required NOT-NULL in the entity/DB).
+    /// Validation type-checks the value against `field_type` (and enum `values`
+    /// membership when present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
 }
 
 fn default_true() -> bool {
@@ -659,6 +669,84 @@ impl Design {
                     .find(|e| e.name == rb.entity)
                     .is_some_and(Self::has_identity_fk)
             })
+    }
+
+    /// The body entity of this endpoint that lives in `m`, if any (the request DTO
+    /// is per-entity, so every request-shape decision resolves the entity here).
+    fn request_entity<'a>(&self, m: &'a ModuleDesign, ep: &Endpoint) -> Option<&'a Entity> {
+        let rb = ep.request_body.as_ref()?;
+        m.entities.iter().find(|e| e.name == rb.entity)
+    }
+
+    /// The defaulted-field rule (issue #53a): this endpoint's request-body entity
+    /// carries at least one `default` field, so the wire contract drops it (the
+    /// server applies the declared value). Independent of auth — a public create
+    /// (`POST /subscribers`) still omits `confirmed`/`status`.
+    pub(crate) fn endpoint_omits_defaulted_field(&self, m: &ModuleDesign, ep: &Endpoint) -> bool {
+        self.request_entity(m, ep)
+            .is_some_and(|e| e.fields.iter().any(|f| f.default.is_some()))
+    }
+
+    /// The nested-route parent-FK rule (issue #53b): the fk columns this entity's
+    /// belongs_to derive that ALSO appear as a `{param}` in some endpoint whose
+    /// body is this entity (`Checkin belongs_to Habit` + `POST /{habit_id}/checkins`
+    /// → `habit_id`). Those come from the PATH, so the request DTO omits them and
+    /// the handler injects the path value. Entity-scoped (the DTO struct is
+    /// per-entity): an entity created only under its parent's path always omits the
+    /// parent fk. Empty for a top-level create (`POST /leads` — no matching param),
+    /// which keeps every default-free non-nested design byte-identical.
+    pub(crate) fn entity_path_fk_columns(&self, entity_name: &str) -> Vec<String> {
+        let Some(e) = self.find_entity(entity_name) else {
+            return Vec::new();
+        };
+        e.belongs_to
+            .iter()
+            .map(|b| Self::fk_column(&b.entity))
+            .filter(|col| self.any_body_endpoint_path_has(entity_name, col))
+            .collect()
+    }
+
+    /// True when some endpoint whose request body is `entity_name` has a path
+    /// segment `{col}` (the parent fk the path already carries). Walks the whole
+    /// design tree (modules + subroutes).
+    fn any_body_endpoint_path_has(&self, entity_name: &str, col: &str) -> bool {
+        fn walk(m: &ModuleDesign, entity_name: &str, token: &str) -> bool {
+            m.endpoints.iter().any(|ep| {
+                ep.request_body
+                    .as_ref()
+                    .is_some_and(|rb| rb.entity == entity_name)
+                    && ep.path.contains(token)
+            }) || m.subroutes.iter().any(|s| walk(s, entity_name, token))
+        }
+        let token = format!("{{{col}}}");
+        self.modules.iter().any(|m| walk(m, entity_name, &token))
+    }
+
+    /// True when this endpoint's request-body entity has a path-redundant parent fk
+    /// (issue #53b) — the entity-scoped rule, so it fires for every endpoint that
+    /// creates the nested entity.
+    pub(crate) fn endpoint_omits_path_fk(&self, m: &ModuleDesign, ep: &Endpoint) -> bool {
+        self.request_entity(m, ep)
+            .is_some_and(|e| !self.entity_path_fk_columns(&e.name).is_empty())
+    }
+
+    /// The generalized request-DTO trigger (issue #53): a db-mode endpoint whose
+    /// body entity has ANY field the wire contract drops — the server-owned
+    /// identity fk (#34, guarded+auth), a `default` field (#53a), or a
+    /// path-redundant parent fk (#53b) — takes `Json<{Entity}Request>` instead of
+    /// the full entity. `auth` is the GENERATION mode flag (the identity-fk leg is
+    /// meaningful only with the session guard wired); the default/path legs are
+    /// auth-independent. Every one-shape design (no defaults, no nested fk, no
+    /// identity fk) returns false, so its output is byte-identical.
+    pub(crate) fn endpoint_uses_request_dto(
+        &self,
+        m: &ModuleDesign,
+        ep: &Endpoint,
+        auth: bool,
+    ) -> bool {
+        (auth && self.endpoint_omits_identity_fk(m, ep))
+            || self.endpoint_omits_defaulted_field(m, ep)
+            || self.endpoint_omits_path_fk(m, ep)
     }
 
     /// snake_case a validated PascalCase entity name. Entity names are validated
@@ -1229,6 +1317,81 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn field_default_round_trips_and_defaults_to_none() {
+        // Issue #53a: a field may carry a server-owned `default`; it survives a
+        // round trip, an absent `default` is None and is not serialized (so every
+        // existing design's bytes are unchanged).
+        let f: Field =
+            serde_json::from_str(r#"{ "name": "confirmed", "type": "boolean", "default": false }"#)
+                .unwrap();
+        assert_eq!(f.default, Some(serde_json::json!(false)));
+        let back = serde_json::to_value(&f).unwrap();
+        assert_eq!(back["default"], serde_json::json!(false));
+
+        let plain: Field =
+            serde_json::from_str(r#"{ "name": "title", "type": "string" }"#).unwrap();
+        assert!(plain.default.is_none());
+        let back = serde_json::to_value(&plain).unwrap();
+        assert!(
+            back.get("default").is_none(),
+            "absent default is not serialized: {back}"
+        );
+    }
+
+    #[test]
+    fn endpoint_omits_defaulted_field_detects_a_default() {
+        // A create whose body entity has a `default` field takes the request DTO
+        // (issue #53a); the same entity with no default field does not.
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "news", "contract_version": 0, "dependencies": ["db"],
+                "modules": [{ "name": "subs",
+                    "entities": [{ "name": "Subscriber", "fields": [
+                        { "name": "email", "type": "string" },
+                        { "name": "confirmed", "type": "boolean", "default": false } ] }],
+                    "endpoints": [{ "operation_id": "create_subscriber", "method": "POST", "path": "/",
+                        "request_body": { "entity": "Subscriber" },
+                        "success": { "status": 201, "entity": "Subscriber" } }] }] }"#,
+        )
+        .unwrap();
+        let m = &d.modules[0];
+        let ep = &m.endpoints[0];
+        assert!(d.endpoint_omits_defaulted_field(m, ep));
+        assert!(
+            d.endpoint_uses_request_dto(m, ep, false),
+            "auth-independent"
+        );
+    }
+
+    #[test]
+    fn entity_path_fk_columns_finds_the_path_redundant_parent() {
+        // Issue #53b: `Checkin belongs_to Habit` created under `POST /{habit_id}/checkins`
+        // → `habit_id` comes from the path, so it is a path-redundant fk. A
+        // top-level `POST /leads` on a belongs_to entity yields no such column.
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "habits", "contract_version": 0, "dependencies": ["db"],
+                "modules": [{ "name": "habits",
+                    "entities": [
+                        { "name": "Habit", "fields": [{ "name": "name", "type": "string" }] },
+                        { "name": "Checkin", "belongs_to": [{ "entity": "Habit" }],
+                          "fields": [{ "name": "note", "type": "string" }] } ],
+                    "endpoints": [
+                        { "operation_id": "create_habit", "method": "POST", "path": "/",
+                          "request_body": { "entity": "Habit" },
+                          "success": { "status": 201, "entity": "Habit" } },
+                        { "operation_id": "create_checkin", "method": "POST", "path": "/{habit_id}/checkins",
+                          "request_body": { "entity": "Checkin" },
+                          "success": { "status": 201, "entity": "Checkin" } }] }] }"#,
+        )
+        .unwrap();
+        assert_eq!(d.entity_path_fk_columns("Checkin"), vec!["habit_id"]);
+        assert!(d.entity_path_fk_columns("Habit").is_empty());
+        let m = &d.modules[0];
+        let create_checkin = &m.endpoints[1];
+        assert!(d.endpoint_omits_path_fk(m, create_checkin));
+        assert!(d.endpoint_uses_request_dto(m, create_checkin, false));
+    }
+
+    #[test]
     fn table_name_snake_cases_and_pluralizes_by_default() {
         // The default table name is snake_case(entity) + proper English
         // pluralization — the old `lowercase + "s"` mangled multi-word names
@@ -1386,6 +1549,12 @@ pub(crate) mod tests {
             s.contains("\"storage\"")
                 && s.contains("\"buckets\"")
                 && s.contains("\"owner_prefix\"")
+        );
+        // Issue #53a: the field schema advertises the server-owned `default` key
+        // (distinct from JSON-Schema's own `default` on required/unique/index).
+        assert!(
+            s.contains("A server-owned default value"),
+            "published schema must document the `default` field key"
         );
     }
 }

@@ -162,6 +162,20 @@ Every entity has an `id` primary key. You usually do NOT declare it:
   it reaches the database — on every write path (create AND update), and the same
   422 in memory mode (which has no DB). There is NO separate `enum` field type —
   enums are always `string` + `values`.
+- `default?` — a SERVER-OWNED default value. A field with a `default` is dropped
+  from the generated request DTO / OpenAPI request schema and the happy-path probe
+  body: the client never sends it, and the SERVER supplies this value. The field
+  stays **required NOT-NULL** in the entity and the table (the default is a wire
+  concern, not a schema-nullability one), so the create handler must write the
+  declared value when building the entity (the generated stub names each one).
+  This is how you express `confirmed` (`boolean`, default `false`) or `status`
+  (`string` enum, default `"active"`) WITHOUT forcing a clean client to POST a
+  server-controlled key. The value must type-check against `type` (and be a member
+  of `values` when present), and the design must depend on `db` — the default is
+  applied through the db-mode request DTO, so it is inert (and a validation error)
+  in memory mode. It is NOT `required: false` — that would make the column
+  nullable (`Option<T>`) and the value `null`, not the default; `default` keeps a
+  solid NOT-NULL column with a server-chosen fallback.
 
 ## Endpoint
 ```json
@@ -209,13 +223,25 @@ Every entity has an `id` primary key. You usually do NOT declare it:
   DTO in the design — for an endpoint that takes untrusted public input, defend
   it IN-HANDLER (parse a hand-written input type, validate, then map to the
   entity).
-  - **Server-owned fk on guarded endpoints:** if the body entity `belongs_to`
-    the auth identity entity (derived fk column `user_id`) AND the endpoint is
-    guarded, the generated request body is a `{Entity}Request` DTO WITHOUT
-    `user_id` (the OpenAPI request schema omits it too) — the handler injects
-    the authenticated session user's id; clients never send it. Every other
-    `belongs_to` fk stays required client input, and an unguarded endpoint
-    keeps `user_id` (no session to inject).
+  - **Server-owned fields → a `{Entity}Request` DTO.** When the body entity has a
+    field the SERVER owns, the generated body type is a trimmed `{Entity}Request`
+    DTO (the OpenAPI request schema and the happy-path probe body drop the same
+    fields); the entity RESPONSE shape is unchanged. Three drop reasons — a body
+    can hit several at once:
+    1. **Identity fk (guarded):** the body `belongs_to` the auth identity entity
+       (derived fk `user_id`) AND the endpoint is guarded → `user_id` is omitted;
+       the handler injects the session user's id. An unguarded endpoint keeps it
+       (no session to inject).
+    2. **`default` field:** any field with a `default` is omitted; the server
+       applies the declared value. Works on unguarded/public creates too — this is
+       what lets `POST /subscribers { "email": … }` succeed while `confirmed` and
+       `status` default server-side.
+    3. **Path-redundant parent fk:** if the entity `belongs_to` a parent and the
+       create route already carries that parent's id as a path param whose name
+       equals the fk column (`Checkin belongs_to Habit` + `POST /{habit_id}/checkins`),
+       `habit_id` is omitted; the handler injects the path value, so the row
+       attaches to the path's parent. Every other `belongs_to` fk stays required
+       client input.
 - `success` (REQUIRED) — `{ "status": <2xx-or-3xx>, "entity"?: "<Name>", "list"?: bool }`.
   - `status` must be in 200–399 (2xx OR 3xx — 3xx is valid for redirects like an
     OAuth connect).

@@ -595,6 +595,220 @@ fn second_entity_id_probes_go_green_on_a_correct_scaffold() {
     );
 }
 
+/// Issue #53 end-to-end: body-omittable server-owned fields. J4's shape (a public
+/// `POST /subscribers` whose `confirmed`/`status` default server-side) AND J2's
+/// shape (a nested `POST /habits/{habit_id}/checkins` whose parent fk comes from
+/// the path). Both are UN-buildable before #53 (the minimal body 422s / the fk is
+/// body-required); here the generated probe omits those fields and a correct
+/// handler goes GREEN.
+const OMITTABLE_DESIGN: &str = r#"{
+  "name": "body-omittables",
+  "contract_version": 0,
+  "auth": { "model": "none" },
+  "dependencies": ["db"],
+  "modules": [
+    {
+      "name": "subscribers",
+      "entities": [
+        { "name": "Subscriber", "fields": [
+          { "name": "email", "type": "string" },
+          { "name": "confirmed", "type": "boolean", "default": false },
+          { "name": "status", "type": "string", "values": ["active", "expired"], "default": "active" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_subscribers", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Subscriber", "list": true } },
+        { "operation_id": "create_subscriber", "method": "POST", "path": "/",
+          "request_body": { "entity": "Subscriber" },
+          "success": { "status": 201, "entity": "Subscriber" } }
+      ]
+    },
+    {
+      "name": "habits",
+      "entities": [
+        { "name": "Habit", "fields": [{ "name": "name", "type": "string" }] },
+        { "name": "Checkin", "belongs_to": [{ "entity": "Habit" }],
+          "fields": [{ "name": "note", "type": "string" }] }
+      ],
+      "endpoints": [
+        { "operation_id": "list_habits", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Habit", "list": true } },
+        { "operation_id": "create_habit", "method": "POST", "path": "/",
+          "request_body": { "entity": "Habit" },
+          "success": { "status": 201, "entity": "Habit" } },
+        { "operation_id": "create_checkin", "method": "POST", "path": "/{habit_id}/checkins",
+          "request_body": { "entity": "Checkin" },
+          "success": { "status": 201, "entity": "Checkin" } }
+      ]
+    }
+  ]
+}"#;
+
+/// Correct subscribers handlers: `SubscriberRequest` has NO `confirmed`/`status`,
+/// so the handler MUST supply the server defaults (it can't even name them from
+/// the body — a compile-time forcing function).
+const OMITTABLE_SUBSCRIBERS_HANDLERS: &str = r#"//! Correct subscribers handlers.
+use super::model::*;
+use super::repo::*;
+use jerrycan::prelude::*;
+
+pub(crate) async fn list_subscribers(repo: Dep<SubscriberRepo>) -> Result<Json<Vec<Subscriber>>> {
+    Ok(Json(repo.all().await?))
+}
+
+pub(crate) async fn create_subscriber(repo: Dep<SubscriberRepo>, Json(body): Json<SubscriberRequest>) -> Result<Created<Subscriber>> {
+    let mut sub = Subscriber { id: 0, email: body.email, confirmed: false, status: "active".into() };
+    sub.id = repo.insert(sub.clone()).await?;
+    Ok(Created(sub))
+}
+"#;
+
+/// Correct habits handlers: `create_checkin` injects the `habit_id` PATH param
+/// (the DTO omits it), so the checkin attaches to the path's habit.
+const OMITTABLE_HABITS_HANDLERS: &str = r#"//! Correct habits handlers.
+use super::model::*;
+use super::repo::*;
+use jerrycan::prelude::*;
+
+pub(crate) async fn list_habits(repo: Dep<HabitRepo>) -> Result<Json<Vec<Habit>>> {
+    Ok(Json(repo.all().await?))
+}
+
+pub(crate) async fn create_habit(repo: Dep<HabitRepo>, Json(body): Json<Habit>) -> Result<Created<Habit>> {
+    let mut habit = body.clone();
+    habit.id = repo.insert(body).await?;
+    Ok(Created(habit))
+}
+
+pub(crate) async fn create_checkin(repo: Dep<CheckinRepo>, Path(habit_id): Path<i64>, Json(body): Json<CheckinRequest>) -> Result<Created<Checkin>> {
+    let mut checkin = Checkin { id: 0, habit_id, note: body.note };
+    checkin.id = repo.insert(checkin.clone()).await?;
+    Ok(Created(checkin))
+}
+"#;
+
+/// Overwrite a handler file and bump its mtime so cargo's mtime fingerprint
+/// recompiles it (RED's `cargo test` and this write share a wall-clock second).
+fn install_handler(app: &Path, rel: &str, contents: &str) {
+    let dest = app.join(rel);
+    std::fs::write(&dest, contents).unwrap();
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(&dest)
+        .unwrap()
+        .set_modified(future)
+        .unwrap();
+}
+
+#[test]
+#[ignore = "heavy: scaffold + gen-tests + red run + implement + green run (#53 body-omittables)"]
+fn body_omittable_fields_go_green_on_a_correct_scaffold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, OMITTABLE_DESIGN).unwrap();
+    let app = tmp.path().join("body-omittables");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .args(["new"])
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "design must scaffold");
+
+    // gen-tests both modules; capture the generated probe bodies.
+    for module in ["subscribers", "habits"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+            .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
+            .args(["--json", "gen-tests", "--module", module])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "gen-tests {module}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The generated probe bodies OMIT the server-owned fields (contract on the wire).
+    let subs =
+        std::fs::read_to_string(app.join("crates/routes/subscribers/tests/acceptance.rs")).unwrap();
+    assert!(
+        subs.contains("create_subscriber_returns_201")
+            && !subs.contains("\"confirmed\"")
+            && !subs.contains("\"status\""),
+        "subscriber probe must omit defaulted fields:\n{subs}"
+    );
+    let habits =
+        std::fs::read_to_string(app.join("crates/routes/habits/tests/acceptance.rs")).unwrap();
+    assert!(
+        habits.contains("post_json(\"/habits/1/checkins\"") && !habits.contains("\"habit_id\""),
+        "checkin probe must post under the path habit and omit habit_id:\n{habits}"
+    );
+
+    // RED: stubs (500) fail the generated suite.
+    let red = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace", "--no-fail-fast"])
+        .output()
+        .unwrap();
+    assert!(!red.status.success(), "stub handlers must fail the suite");
+
+    // Implement the correct handlers.
+    install_handler(
+        &app,
+        "crates/routes/subscribers/src/handlers.rs",
+        OMITTABLE_SUBSCRIBERS_HANDLERS,
+    );
+    install_handler(
+        &app,
+        "crates/routes/habits/src/handlers.rs",
+        OMITTABLE_HABITS_HANDLERS,
+    );
+
+    // Append value assertions that reuse each module's tool-owned `app()` helper:
+    // the minimal body 201s AND the server-owned values are readable server-side.
+    let subs_test = "\n#[tokio::test]\nasync fn create_subscriber_applies_server_defaults() {\n    let t = app().await;\n    let res = t.post_json(\"/subscribers/\", &serde_json::json!({\"email\": \"a@b.c\"})).await;\n    assert_eq!(res.status().as_u16(), 201, \"minimal body must 201; body: {}\", res.text());\n    let body: serde_json::Value = serde_json::from_str(&res.text()).expect(\"json\");\n    assert_eq!(body[\"confirmed\"], serde_json::json!(false), \"server default confirmed=false; body: {}\", res.text());\n    assert_eq!(body[\"status\"], serde_json::json!(\"active\"), \"server default status=active; body: {}\", res.text());\n}\n";
+    let habits_test = "\n#[tokio::test]\nasync fn create_checkin_attaches_to_path_habit() {\n    let t = app().await;\n    let h = t.post_json(\"/habits/\", &serde_json::json!({\"name\": \"run\"})).await;\n    assert_eq!(h.status().as_u16(), 201, \"seed habit; body: {}\", h.text());\n    let res = t.post_json(\"/habits/1/checkins\", &serde_json::json!({\"note\": \"did it\"})).await;\n    assert_eq!(res.status().as_u16(), 201, \"checkin without habit_id must 201; body: {}\", res.text());\n    let body: serde_json::Value = serde_json::from_str(&res.text()).expect(\"json\");\n    assert_eq!(body[\"habit_id\"], serde_json::json!(1), \"checkin attaches to the path's habit; body: {}\", res.text());\n}\n";
+    for (rel, extra) in [
+        ("crates/routes/subscribers/tests/acceptance.rs", subs_test),
+        ("crates/routes/habits/tests/acceptance.rs", habits_test),
+    ] {
+        let path = app.join(rel);
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(extra);
+        std::fs::write(&path, &content).unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+    }
+
+    // GREEN: the generated probes AND the value assertions pass.
+    let green = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace"])
+        .status()
+        .unwrap();
+    assert!(
+        green.success(),
+        "correct handlers must satisfy the body-omittable contract (defaults applied, path fk injected)"
+    );
+}
+
 /// The Phase 2 TDD loop: gen-tests makes the design executable and FAILING,
 /// the agent implements, the same tests go green, the gate stays green.
 #[test]
