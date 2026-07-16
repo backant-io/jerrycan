@@ -78,11 +78,16 @@ fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
         // fk, a `default` field, or a path-redundant parent fk advertises the
         // `{Entity}Request` schema so generated clients never send a field the
         // server supplies (from the session, a declared default, or the path).
-        let schema = if design.endpoint_uses_request_dto(m, ep, design.wants_auth()) {
-            entity_ref(&format!("{}Request", rb.entity))
-        } else {
-            entity_ref(&rb.entity)
-        };
+        // db-gated (issue #43) to stay in lockstep with genroute: the request DTO
+        // only exists in db mode (memory-mode structs carry no fk columns), so a
+        // memory-mode contract advertises the plain entity — never over-specifying
+        // fk columns the memory struct doesn't have.
+        let schema =
+            if design.wants_db() && design.endpoint_uses_request_dto(m, ep, design.wants_auth()) {
+                entity_ref(&format!("{}Request", rb.entity))
+            } else {
+                entity_ref(&rb.entity)
+            };
         op["requestBody"] = json!({
             "required": true,
             "content": { "application/json": { "schema": schema } },
@@ -134,13 +139,14 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
         // whose wire shape drops a field (identity fk, a `default` field, or a
         // path-redundant parent fk) gets a `{Entity}Request` schema — the wire
         // input shape with those fields removed.
-        let needs_request_schema = m.endpoints.iter().any(|ep| {
-            design.endpoint_uses_request_dto(m, ep, design.wants_auth())
-                && ep
-                    .request_body
-                    .as_ref()
-                    .is_some_and(|rb| rb.entity == e.name)
-        });
+        let needs_request_schema = design.wants_db()
+            && m.endpoints.iter().any(|ep| {
+                design.endpoint_uses_request_dto(m, ep, design.wants_auth())
+                    && ep
+                        .request_body
+                        .as_ref()
+                        .is_some_and(|rb| rb.entity == e.name)
+            });
         if needs_request_schema {
             schemas.insert(format!("{}Request", e.name), request_schema(design, e));
         }
@@ -444,6 +450,58 @@ mod tests {
         assert!(
             d["components"]["schemas"].get("HabitRequest").is_none(),
             "a top-level create needs no Request schema: {}",
+            d["components"]["schemas"]
+        );
+    }
+
+    /// Issue #43: the request-DTO omission is db-gated, so a MEMORY-mode design (no
+    /// `db` dependency) with an identity-FK entity advertises the PLAIN entity as its
+    /// request body — never a `{Entity}Request` component. WHY: in memory mode
+    /// genroute keeps `Json<Entity>` (the memory struct carries no fk columns at all),
+    /// so a `{Entity}Request` schema spelling out `folder_id` would over-specify a
+    /// column the server never deserializes — the OpenAPI contract and the handler
+    /// signature would disagree. All three surfaces (genroute/openapi/testgen) now
+    /// gate the DTO on db mode identically.
+    #[test]
+    fn memory_mode_request_schema_is_the_plain_entity_not_a_dto() {
+        const MEMORY_IDENTITY_FK: &str = r#"{
+            "name": "memnotes", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin"] },
+            "dependencies": ["auth"],
+            "modules": [{
+                "name": "notes",
+                "entities": [
+                    { "name": "User", "fields": [{ "name": "email", "type": "string" }] },
+                    { "name": "Folder", "fields": [{ "name": "title", "type": "string" }] },
+                    { "name": "Note",
+                      "belongs_to": [
+                          { "entity": "User", "on_delete": "cascade" },
+                          { "entity": "Folder", "on_delete": "cascade" }
+                      ],
+                      "fields": [{ "name": "body", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_note", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Note" },
+                      "success": { "status": 201, "entity": "Note" } }
+                ]
+            }]
+        }"#;
+        let design: Design = serde_json::from_str(MEMORY_IDENTITY_FK).unwrap();
+        assert!(!design.wants_db(), "fixture must be memory mode");
+        let d = document(&design);
+        // The request body $refs the PLAIN entity, not NoteRequest.
+        assert_eq!(
+            d["paths"]["/notes/"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/Note",
+            "memory-mode request body is the plain entity: {}",
+            d["paths"]["/notes/"]["post"]
+        );
+        // No {Entity}Request component is minted in memory mode.
+        assert!(
+            d["components"]["schemas"].get("NoteRequest").is_none(),
+            "memory mode mints no request DTO component: {}",
             d["components"]["schemas"]
         );
     }

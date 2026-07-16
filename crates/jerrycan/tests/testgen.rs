@@ -13,6 +13,53 @@ fn golden(db: bool) -> Design {
     serde_json::from_value(v).unwrap()
 }
 
+/// Issue #43: the identity-FK omission is db-gated in testgen too, so a MEMORY-mode
+/// design's probe body KEEPS `user_id` (there is no `{Entity}Request` DTO to drop it
+/// into — the memory struct has no fk columns and serde ignores the extra key). WHY
+/// (Rule 9): the omission is a db-mode contract; in memory mode the probe, the
+/// OpenAPI request schema, and genroute's `Json<Entity>` must all agree, and genroute
+/// keeps the plain entity. The DB-mode twin of the SAME design drops `user_id`.
+#[test]
+fn memory_mode_probe_body_keeps_the_identity_fk() {
+    const IDENTITY_FK: &str = r#"{
+        "name": "notes-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["admin"] },
+        "dependencies": ["auth"],
+        "modules": [{
+            "name": "notes",
+            "entities": [
+                { "name": "User", "fields": [{ "name": "email", "type": "string" }] },
+                { "name": "Note",
+                  "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                  "fields": [{ "name": "body", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_note", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "Note" },
+                  "success": { "status": 201, "entity": "Note" } }
+            ]
+        }]
+    }"#;
+    let mut v: serde_json::Value = serde_json::from_str(IDENTITY_FK).unwrap();
+    // Memory mode (no `db`): the probe keeps user_id.
+    let mem: Design = serde_json::from_value(v.clone()).unwrap();
+    assert!(!mem.wants_db());
+    let mem_gen = testgen::acceptance_rs(&mem, &mem.modules[0]);
+    assert!(
+        mem_gen.contains("\"user_id\": 1"),
+        "memory-mode probe body must keep the identity fk (no DTO to drop it): {mem_gen}"
+    );
+    // DB mode (same design + `db`): the probe drops user_id (the #34 DTO omission).
+    v["dependencies"] = serde_json::json!(["db", "auth"]);
+    let dbm: Design = serde_json::from_value(v).unwrap();
+    let db_gen = testgen::acceptance_rs(&dbm, &dbm.modules[0]);
+    assert!(
+        !db_gen.contains("\"user_id\":"),
+        "db-mode probe body omits the server-owned identity fk: {db_gen}"
+    );
+}
+
 #[test]
 fn memory_mode_tests_cover_success_and_listed_errors() {
     let design = golden(false);

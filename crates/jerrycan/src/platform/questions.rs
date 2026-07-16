@@ -133,6 +133,49 @@ pub fn design_conflict(d: &Design) -> Option<DesignConflict> {
             ),
         });
     }
+    // JC0541 (#44): an entity literally named `{X}Request` collides with the
+    // `{X}Request` DTO/OpenAPI component generated for an entity `X` that omits a
+    // server-owned field. Two `struct XRequest` would fail to compile in genroute and
+    // silently overwrite each other in the OpenAPI schema map. Only a REAL collision
+    // fires — `X` must actually mint the DTO (db mode + a server-owned omission) — so
+    // an ordinary `*Request` name that shadows nothing is never rejected.
+    if let Some(conflict) = request_dto_name_collision(d) {
+        return Some(conflict);
+    }
+    None
+}
+
+/// The JC0541 check (issue #44): find an entity literally named `{base}Request`
+/// whose `{base}` sibling generates a `{base}Request` DTO. Returns the collision, or
+/// `None` when no `*Request` entity shadows a generated DTO name.
+fn request_dto_name_collision(d: &Design) -> Option<DesignConflict> {
+    fn collect<'a>(m: &'a ModuleDesign, out: &mut Vec<&'a str>) {
+        out.extend(m.entities.iter().map(|e| e.name.as_str()));
+        for sub in &m.subroutes {
+            collect(sub, out);
+        }
+    }
+    let mut names = Vec::new();
+    for m in &d.modules {
+        collect(m, &mut names);
+    }
+    for name in &names {
+        let Some(base) = name.strip_suffix("Request") else {
+            continue;
+        };
+        if base.is_empty() || !names.contains(&base) || !d.entity_generates_request_dto(base) {
+            continue;
+        }
+        return Some(DesignConflict {
+            code: "JC0541",
+            message: format!(
+                "entity `{name}` collides with the request DTO generated for entity `{base}`: a `{base}` request body that omits a server-owned field (an identity fk, a `default`, or a path-redundant parent fk) emits a `{base}Request` type — a Rust struct AND an OpenAPI `{base}Request` component. With an entity also literally named `{name}`, genroute would define `struct {name}` twice (a compile error) and the OpenAPI document would clobber one schema with the other. Rename the entity (e.g. `{base}Payload` or `{base}Submission`) so it no longer shadows the generated DTO. See `jerrycan explain JC0541`."
+            ),
+            hint: format!(
+                "rename `{name}` (e.g. `{base}Payload`/`{base}Submission`) — the `{base}Request` name is reserved for the generated request DTO"
+            ),
+        });
+    }
     None
 }
 
@@ -1602,6 +1645,141 @@ mod tests {
         let plain: Design = serde_json::from_str(MINIMAL).unwrap();
         assert!(design_conflict(&plain).is_none());
     }
+
+    /// Issue #44 (positive): an entity literally named `{X}Request` alongside an
+    /// entity `X` whose guarded body omits the identity fk generates two `XRequest`
+    /// definitions (Rust struct + OpenAPI component). `design_conflict` rejects it up
+    /// front with JC0541 and names the rename fix — cheap insurance for agent-authored
+    /// designs, since genroute would otherwise die with a duplicate-struct compile
+    /// error mid-scaffold.
+    #[test]
+    fn entity_shadowing_a_generated_request_dto_is_a_conflict() {
+        // Collection (db + auth + identity fk) mints a `CollectionRequest` DTO; an
+        // entity literally named `CollectionRequest` collides with it.
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "clash", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin"] },
+            "dependencies": ["db", "auth"],
+            "modules": [{
+                "name": "collections",
+                "entities": [
+                    { "name": "User", "fields": [{ "name": "email", "type": "string" }] },
+                    { "name": "Collection",
+                      "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                      "fields": [{ "name": "title", "type": "string" }] },
+                    { "name": "CollectionRequest", "fields": [{ "name": "note", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_collection", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Collection" },
+                      "success": { "status": 201, "entity": "Collection" } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let conflict = design_conflict(&d).expect("XRequest shadowing a DTO must be a conflict");
+        assert_eq!(conflict.code, "JC0541");
+        assert!(
+            conflict.message.contains("CollectionRequest")
+                && conflict.message.contains("Collection")
+                && conflict.message.to_lowercase().contains("rename"),
+            "message names the collision and the rename fix: {}",
+            conflict.message
+        );
+        assert!(conflict.hint.contains("rename"), "{}", conflict.hint);
+    }
+
+    /// Issue #44 (negative): the lint fires ONLY on a REAL collision, not on any
+    /// `*Request` suffix. (a) A `{X}Request` entity whose `X` sibling generates NO DTO
+    /// (memory mode, no omission) is fine — nothing is shadowed. (b) A `*Request`
+    /// entity with no matching base entity is fine. (c) A base `X` that mints a DTO
+    /// but has no `XRequest` sibling is fine.
+    #[test]
+    fn request_suffix_without_a_real_collision_is_not_flagged() {
+        // (a) Same names, but MEMORY mode → Collection mints no DTO → no collision.
+        let mem: Design = serde_json::from_str(
+            r#"{
+            "name": "ok-mem", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin"] },
+            "dependencies": ["auth"],
+            "modules": [{
+                "name": "collections",
+                "entities": [
+                    { "name": "User", "fields": [{ "name": "email", "type": "string" }] },
+                    { "name": "Collection",
+                      "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                      "fields": [{ "name": "title", "type": "string" }] },
+                    { "name": "CollectionRequest", "fields": [{ "name": "note", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_collection", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Collection" },
+                      "success": { "status": 201, "entity": "Collection" } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            design_conflict(&mem).is_none(),
+            "memory mode mints no DTO — no collision"
+        );
+        // (b) A lone `*Request` entity with no matching base entity is fine.
+        let orphan: Design = serde_json::from_str(
+            r#"{
+            "name": "ok-orphan", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{
+                "name": "audit",
+                "entities": [
+                    { "name": "AuditRequest", "fields": [{ "name": "note", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_audit", "method": "POST", "path": "/",
+                      "request_body": { "entity": "AuditRequest" },
+                      "success": { "status": 201, "entity": "AuditRequest" } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            design_conflict(&orphan).is_none(),
+            "a `*Request` name shadowing nothing is fine"
+        );
+        // (c) A base that mints a DTO but has no `XRequest` sibling is fine.
+        let d: Design = serde_json::from_str(SERVER_FK_LITE).unwrap();
+        assert!(
+            design_conflict(&d).is_none(),
+            "a generated DTO with no shadowing entity is fine"
+        );
+    }
+
+    /// A minimal db+auth+identity-fk design (Collection mints CollectionRequest) with
+    /// NO shadowing entity — the JC0541 negative control.
+    const SERVER_FK_LITE: &str = r#"{
+        "name": "lite", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["admin"] },
+        "dependencies": ["db", "auth"],
+        "modules": [{
+            "name": "collections",
+            "entities": [
+                { "name": "User", "fields": [{ "name": "email", "type": "string" }] },
+                { "name": "Collection",
+                  "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                  "fields": [{ "name": "title", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_collection", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "Collection" },
+                  "success": { "status": 201, "entity": "Collection" } }
+            ]
+        }]
+    }"#;
 
     #[test]
     fn jobs_validate_name_uniqueness_and_cron_shape() {

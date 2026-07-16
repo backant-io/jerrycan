@@ -195,6 +195,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs tenancy",
     },
     CodeInfo {
+        code: "JC0541",
+        title: "entity name shadows a generated request DTO",
+        cause: "an entity is literally named `{X}Request` while another entity `X` omits a server-owned field (an identity fk, a `default`, or a path-redundant parent fk) and so generates a `{X}Request` DTO — the Rust struct and the OpenAPI component would be defined twice, a compile error plus a silently clobbered schema",
+        fix: "rename the `{X}Request` entity (e.g. `{X}Payload` or `{X}Submission`); the `{X}Request` name is reserved for the generated request DTO of entity `X`",
+        doc: "jerrycan docs validation",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
