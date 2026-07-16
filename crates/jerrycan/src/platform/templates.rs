@@ -120,7 +120,8 @@ serde.workspace = true
 "#;
 
 /// Auth mode: the shared crate also depends on `jerrycan` (workspace, carrying
-/// the app's `auth` feature) so the `CurrentUser = Session<SessionUser>` alias
+/// the app's `auth` feature) so the `CurrentUser` alias — `Session<SessionUser>`
+/// (cookie) or `Bearer<SessionUser>` (jwt), per the design's auth model —
 /// resolves and every module's guard agrees on one session type.
 pub const SHARED_CARGO_AUTH: &str = r#"[package]
 name = "shared"

@@ -79,4 +79,43 @@ fn current_user_type_alias_is_generated_in_shared() {
     let shared = fs::read_to_string(root.join("crates/shared/src/lib.rs")).unwrap();
     // The app's notion of the session user lives in shared so guards across modules agree.
     assert!(shared.contains("pub type CurrentUser"), "{shared}");
+    // The SESSION model resolves to the cookie `Session` guard (unchanged).
+    assert!(
+        shared.contains("pub type CurrentUser = jerrycan::auth::Session<SessionUser>;"),
+        "session model uses the Session (cookie) guard: {shared}"
+    );
+}
+
+/// A `jwt` auth model must emit a `Bearer<SessionUser>` alias so guarded REST
+/// routes get REAL `Authorization: Bearer` guards, not silent session cookies
+/// (issue #29). The `SessionUser` payload (String `id`) is identical to the
+/// session model so tenant `user_id`/storage `owner_id` still line up.
+#[test]
+fn jwt_model_emits_bearer_guard_alias() {
+    let mut v: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    v["dependencies"] = serde_json::json!(["auth"]);
+    v["auth"] = serde_json::json!({ "model": "jwt", "roles": ["admin"] });
+    for ep in v["modules"][0]["endpoints"].as_array_mut().unwrap() {
+        if ep["operation_id"] == "create_todo" {
+            ep["auth_required"] = serde_json::json!(true);
+        }
+    }
+    let design: Design = serde_json::from_value(v).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("jwt-api");
+    scaffold::scaffold(&root, &design).unwrap();
+    let shared = fs::read_to_string(root.join("crates/shared/src/lib.rs")).unwrap();
+    assert!(
+        shared.contains("pub type CurrentUser = jerrycan::auth::Bearer<SessionUser>;"),
+        "jwt model must alias CurrentUser to the Bearer guard: {shared}"
+    );
+    assert!(
+        !shared.contains("jerrycan::auth::Session<SessionUser>"),
+        "jwt model must NOT emit the Session (cookie) guard: {shared}"
+    );
+    // The payload struct is shared verbatim across models (String id).
+    assert!(
+        shared.contains("pub struct SessionUser") && shared.contains("pub id: String,"),
+        "SessionUser payload is unchanged: {shared}"
+    );
 }

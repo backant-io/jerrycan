@@ -184,7 +184,7 @@ fn public_endpoints_get_no_401_test_and_no_cookie() {
         "public route request must carry no cookie: {generated}"
     );
 
-    // The ordinary guarded endpoint still gets BOTH a cookied success request
+    // The ordinary guarded endpoint still gets BOTH a credentialed success request
     // and a 401 test — the carve-out is narrow to public routes.
     assert!(
         generated.contains("create_account_without_auth_is_401"),
@@ -192,7 +192,25 @@ fn public_endpoints_get_no_401_test_and_no_cookie() {
     );
     assert!(
         generated.contains("t.post_json_with(\"/accounts/\""),
-        "a guarded route still threads the cookie: {generated}"
+        "a guarded route still threads the credential: {generated}"
+    );
+
+    // JWT model (issue #29): the credential is a `Authorization: Bearer <jwt>`
+    // header minted with `jwt::encode` + `Auth::jwt_key()`, NOT a session cookie —
+    // this is what proves the generated tests exercise the REAL Bearer guard.
+    assert!(
+        generated.contains("(\"authorization\", &test_cookie())"),
+        "jwt guarded request threads the Authorization header, not a cookie: {generated}"
+    );
+    assert!(
+        generated.contains("jerrycan::auth::jwt::encode(&shared::SessionUser")
+            && generated.contains("auth.jwt_key())")
+            && generated.contains("format!(\"Bearer {token}\")"),
+        "jwt preamble mints a Bearer token via jwt::encode + jwt_key: {generated}"
+    );
+    assert!(
+        !generated.contains("jerrycan_session=") && !generated.contains("(\"cookie\","),
+        "jwt model must not mint or thread a session cookie: {generated}"
     );
 }
 

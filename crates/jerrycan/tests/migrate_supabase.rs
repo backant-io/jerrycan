@@ -35,6 +35,32 @@ fn the_reference_export_yields_a_green_v2_design() {
     );
 }
 
+/// Regression for issue #29: a Supabase-migrated app declares `auth.model = jwt`
+/// (authmap forces it — Supabase auth IS JWT), so its scaffolded `shared` crate
+/// MUST alias `CurrentUser` to the `Bearer<SessionUser>` guard. Before #29 the
+/// migrated app silently got the cookie `Session` guard, so REST routes rejected
+/// a real Bearer token. This pins the migrated tree ON DISK to the Bearer alias.
+#[test]
+fn migrated_jwt_app_scaffolds_the_bearer_guard_alias() {
+    use jerrycan::platform::design::AuthModel;
+    let tmp = tempfile::tempdir().unwrap();
+    let out = migrate_into(tmp.path());
+    assert_eq!(
+        out.design.auth_model(),
+        AuthModel::Jwt,
+        "Supabase auth is JWT"
+    );
+    let shared = std::fs::read_to_string(tmp.path().join("crates/shared/src/lib.rs")).unwrap();
+    assert!(
+        shared.contains("pub type CurrentUser = jerrycan::auth::Bearer<SessionUser>;"),
+        "migrated jwt app must emit the Bearer guard alias, not cookies: {shared}"
+    );
+    assert!(
+        !shared.contains("jerrycan::auth::Session<SessionUser>"),
+        "migrated jwt app must NOT emit the cookie Session guard: {shared}"
+    );
+}
+
 #[test]
 fn expected_gaps_exactly_no_more_no_less_by_kind() {
     use jerrycan::platform::migrate::gaps::GapKind::*;
