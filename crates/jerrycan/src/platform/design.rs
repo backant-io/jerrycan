@@ -499,6 +499,34 @@ impl Design {
         }
     }
 
+    /// The role the generated test credential (`test_cookie_for`) is minted with
+    /// (issue #67). A `require_role`-guarded handler 403s a credential whose
+    /// `SessionUser.role` doesn't match, so a hardcoded `"admin"` made every
+    /// role-gated probe un-greenable for a design whose roles don't include it
+    /// (HelpDesk: agent/customer). The rule: the first `required_roles` entry any
+    /// endpoint declares (the role a correct handler will demand — first listed),
+    /// else the design's first declared `auth.roles`, else `"admin"` only when the
+    /// design declares no roles at all (keeps roleless output byte-identical).
+    pub(crate) fn test_credential_role(&self) -> &str {
+        fn first_gate(m: &ModuleDesign) -> Option<&str> {
+            m.endpoints
+                .iter()
+                .find_map(|ep| ep.required_roles.first())
+                .map(String::as_str)
+                .or_else(|| m.subroutes.iter().find_map(first_gate))
+        }
+        self.modules
+            .iter()
+            .find_map(first_gate)
+            .or_else(|| {
+                self.auth
+                    .as_ref()
+                    .and_then(|a| a.roles.first())
+                    .map(String::as_str)
+            })
+            .unwrap_or("admin")
+    }
+
     /// Reserved dependency name `observe` wires logging + the metrics/health
     /// extension. Pure extension wiring — no per-route codegen.
     pub fn wants_observe(&self) -> bool {

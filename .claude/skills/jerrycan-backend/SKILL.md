@@ -217,11 +217,19 @@ contract has no field-format declaration, so this lives in a hand-written `Valid
 impl), a CORRECT handler rejects the fixture and the 2xx probe is un-greenable —
 mark that endpoint **`probe: "skip"`** and write its success test with a real
 value yourself. (Declared `uuid`/`datetime` fields already get format-valid
-fixtures; only constraints invisible to the design need `skip`.) (One further
-known generator rough edge: a `unique` non-PK field on the tenant entity collides
-in the two-tenant isolation seed — make it a plain `index` instead. Enum `values`
-fields now get a generated "out-of-range → 422" reject test that passes on stubs —
-the request validator refuses the bad value before the handler; keep it.)
+fixtures; only constraints invisible to the design need `skip`.) **Two more
+un-greenable shapes:** (1) **role-mismatch** — the generated credential carries ONE
+role (the design's role gate: an endpoint's first `required_roles`, else the first
+declared `auth.roles`); if two guarded endpoints in one module require **different**
+roles, the credential satisfies only one and a correct `require_role` handler 403s
+the other's probe — cover it with your own credential minting that role. (2)
+**cross-module `belongs_to` parent-existence** — a body fk pointing at a parent in
+another module (no DB FK, no auto-seed) fills with `1`, but a handler that checks the
+parent exists rejects it — mark `probe: "skip"`, seed the parent yourself, and test
+it. (One further known generator rough edge: a `unique` non-PK field on the tenant
+entity collides in the two-tenant isolation seed — make it a plain `index` instead.
+Enum `values` fields now get a generated "out-of-range → 422" reject test that passes
+on stubs — the request validator refuses the bad value before the handler; keep it.)
 
 ## Phase 6 — Verify
 
