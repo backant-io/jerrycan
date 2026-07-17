@@ -29,9 +29,13 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 if [ "${SKIP_EVAL_GATE:-0}" != "1" ]; then
   echo "=== pre-publish eval gate: reference live battery + scripted conformance/eval ==="
-  cargo test -p jerrycan --all-features --test reference_eval -- --include-ignored --nocapture
-  cargo test -p jerrycan --all-features --test conformance -- --include-ignored
-  cargo test -p jerrycan --test eval -- --include-ignored
+  # --test-threads=1: every scaffolded app emits the SAME shared-target binary
+  # path (target/conformance-apps/debug/app); parallel build+serve races serve a
+  # stale binary from another test's design (the exact flake heavy.yml
+  # serializes away — and which aborted the first 0.4.1 publish attempt here).
+  cargo test -p jerrycan --all-features --test reference_eval -- --include-ignored --nocapture --test-threads=1
+  cargo test -p jerrycan --all-features --test conformance -- --include-ignored --test-threads=1
+  cargo test -p jerrycan --test eval -- --include-ignored --test-threads=1
   echo "=== eval gate GREEN — proceeding to publish ==="
 else
   echo "!!! SKIP_EVAL_GATE=1 — skipping the eval gate (emergency republish only) !!!"
