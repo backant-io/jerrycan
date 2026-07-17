@@ -1,13 +1,36 @@
 # Changelog
 
-## 0.4.0 — unreleased
+## 0.4.1 — 2026-07-17
 
-Fail-loud CLI hardening from the multi-model agent eval (issues #27–#35):
-`--json` failures now emit a machine envelope (`{ok:false, code, error, hint}`),
-and the tenancy=identity design trap is rejected at validation time (JC0540).
-Carrying the envelope on `Failure` broke 0.3.0's struct-literal contract, hence
-the 0.x-major bump; `Failure` is `#[non_exhaustive]` from here on so future
-fields stay non-breaking.
+The agent-eval release: two 10-agent evaluation rounds (vs FastAPI, paired
+apps, adversarially audited) drove three fix waves. First publish of
+jerrycan-jobs, jerrycan-ratelimit, jerrycan-storage, and jerrycan-realtime.
+
+### Fail-loud (round 1, issues #27–#35)
+- `--json` failures emit one machine envelope (`{ok:false, code, error, hint}`).
+- Tenancy=identity designs rejected at validation (JC0540) instead of dying at
+  migrate with a raw SQLite error. `{X}Request` name collisions rejected (JC0541).
+- Carrying the envelope on `Failure` broke 0.3.0's struct-literal contract —
+  hence 0.4.x; `Failure` is `#[non_exhaustive]` so future fields stay minor.
+
+### Generator & contract correctness (rounds 1–2, issues #42–#53)
+- `auth.model: "jwt"` now generates real `Bearer` guards for REST routes
+  (Supabase-migrated apps regression-tested); OpenAPI carries `securitySchemes`.
+- Enum `values` reject out-of-range input with 422 at extraction, not 500 at
+  the DB; enum value content constrained to identifier shape (JC0543).
+- Request bodies: server-owned identity FKs, design-defaulted fields (new
+  `default` key), and path-redundant parent FKs are omitted and injected
+  server-side; schema allows 3xx successes; 3xx endpoints get Redirect stubs.
+- Cron fires on SQLite via the in-process leader (silent no-op path removed);
+  realtime gains a server-side `RealtimeHandle::publish` for REST handlers.
+- gen-tests: entity-aware `/{id}` seeding, format-valid fixtures, design-derived
+  credential roles, probe:"skip"-aware seeding, extension-wired TestApp harness.
+- Router param-name conflicts and dual-create path-FK shapes are caught at
+  validation (JC0542/JC0544) instead of panicking at runtime.
+- `add`/`generate route` (CLI and MCP) warn loudly when regeneration drops
+  agent-added lines from tool-owned files; no-body stubs bind the route's
+  entity; mandated first-read docs split (−32% tokens); cross-module data
+  access documented.
 
 ## 0.2.0 — unreleased
 
