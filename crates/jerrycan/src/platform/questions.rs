@@ -37,6 +37,17 @@ fn is_pascal(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// An enum `values` entry that is safe to interpolate unescaped into generated
+/// Rust (issue #54): `^[A-Za-z0-9_-]+$`. Values reach a `"..."` string literal in
+/// the generated deserialize allow-list, the 422 error text, and the testgen
+/// fixture with no escaping, so anything with a quote/backslash/space would break
+/// the generated crate at build time — validate the shape at design time instead.
+fn is_enum_value(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+
 /// A validation message when a field's server-owned `default` (issue #53a) is
 /// invalid, or `None` when the default is absent or valid. Three ways to be
 /// wrong: (1) declared without a `db` dependency — the default is applied via the
@@ -141,6 +152,67 @@ pub fn design_conflict(d: &Design) -> Option<DesignConflict> {
     // an ordinary `*Request` name that shadows nothing is never rejected.
     if let Some(conflict) = request_dto_name_collision(d) {
         return Some(conflict);
+    }
+    // JC0542 (#65): sibling routes that name a shared path position's `{param}`
+    // differently panic at `App::build` (JC0500), a clean-scaffold-then-mid-test
+    // failure. Caught here as a fatal conflict — it needs a rename or a restructure.
+    if let Some(conflict) = router_param_conflict(d) {
+        return Some(conflict);
+    }
+    None
+}
+
+/// The JC0542 check (issue #65): the runtime router keys each path segment
+/// position by a SINGLE `{param}` name (see `jerrycan-core` `router::Trie::insert`
+/// — one global trie backs the whole app, so this spans every module + subroute).
+/// Two routes that reach the same position through an identical static/param
+/// prefix but name that position's parameter differently (`/tickets/{id}` vs
+/// `/tickets/{ticket_id}/comments`) make `App::build` abort with JC0500
+/// `conflicting path parameters` — after a clean scaffold, mid-test.
+///
+/// This is a structure-only twin of `router::Trie`, mirroring its insert EXACTLY
+/// so the validator neither rejects a design the router accepts nor accepts one it
+/// panics on: a static segment and a param segment DIVERGE into different children
+/// (`/users/me` + `/users/{id}` is fine), two DIFFERENT literals diverge, the SAME
+/// param name at a position agrees (`/{id}` + `/{id}/comments` is fine), and only
+/// two DIFFERENT param names at the same node conflict. Analyzed over the
+/// mount-resolved route table (`genroute::route_map`), so subroute-mount params
+/// (which occupy real positions) are included.
+fn router_param_conflict(d: &Design) -> Option<DesignConflict> {
+    /// A structure-only twin of `router::Node`: static children keyed by literal,
+    /// plus at most ONE param slot carrying its name and the first route to set it.
+    #[derive(Default)]
+    struct Node {
+        statics: std::collections::HashMap<String, Node>,
+        param: Option<(String, String, Box<Node>)>,
+    }
+    let mut root = Node::default();
+    for entry in super::genroute::route_map(d) {
+        let path = entry.path;
+        let mut node = &mut root;
+        for seg in path.split('/').filter(|s| !s.is_empty()) {
+            if let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                // Mirror router.rs: ensure the param slot, then compare its name.
+                if node.param.is_none() {
+                    node.param = Some((name.to_string(), path.clone(), Box::default()));
+                }
+                let (existing, first_route, child) = node.param.as_mut().expect("just ensured");
+                if existing != name {
+                    return Some(DesignConflict {
+                        code: "JC0542",
+                        message: format!(
+                            "routes `{first_route}` and `{path}` both take a path parameter at the same position but name it differently (`{{{existing}}}` vs `{{{name}}}`) — the router keys each path position by a single parameter name, so registering both aborts `App::build` at startup with JC0500 `conflicting path parameters` (after a clean scaffold, mid-test). Unify the name (use `{{{existing}}}` in BOTH routes, or `{{{name}}}` in both), or restructure so the position is not shared (mount the diverging routes under distinct static prefixes). See `jerrycan explain JC0542`."
+                        ),
+                        hint: format!(
+                            "give the shared segment ONE parameter name across every sibling route (rename `{{{name}}}`→`{{{existing}}}` or vice versa), or restructure the nesting so the position is not shared"
+                        ),
+                    });
+                }
+                node = child;
+            } else {
+                node = node.statics.entry(seg.to_string()).or_default();
+            }
+        }
     }
     None
 }
@@ -424,6 +496,20 @@ pub fn validate(d: &Design) -> Vec<Question> {
                                 f.name
                             ),
                         ));
+                    } else if let Some(bad) = values.iter().find(|v| !is_enum_value(v)) {
+                        // JC0543 (#54): enum values are interpolated UNESCAPED into
+                        // generated Rust (the deserialize allow-list + 422 text in
+                        // genroute, the testgen fixture), so a quote or backslash
+                        // emits a crate that won't compile far from the design.
+                        // Constrain to an identifier-ish shape (which also excludes
+                        // spaces etc. under the same interpolation-safety rule).
+                        qs.push(q(
+                            format!("{ptr}/entities/{i}/fields/{j}/values"),
+                            format!(
+                                "Field `{}` enum value `{bad}` is not an identifier (^[A-Za-z0-9_-]+$) — enum values are interpolated unescaped into generated Rust (the deserialize allow-list, the 422 error text, and the test fixtures), so a quote or backslash emits a crate that fails to compile; other non-identifier characters are rejected under the same rule. Use identifier-shaped values (letters, digits, `_`, `-`). See `jerrycan explain JC0543`.",
+                                f.name
+                            ),
+                        ));
                     }
                 }
                 // A server-owned `default` (issue #53a) must type-check against the
@@ -454,6 +540,47 @@ pub fn validate(d: &Design) -> Vec<Question> {
             wants_db,
             &mut qs,
         );
+    }
+
+    // JC0544 (#60): a body-carrying create/update endpoint whose entity has a
+    // path-redundant parent fk (R5's `entity_path_fk_columns`) but whose OWN path
+    // lacks the matching `{param}`. The request DTO is per-entity, so the fk is
+    // dropped for EVERY create of the entity; on a route that doesn't carry it in
+    // the path the NOT-NULL column can be set from neither the body nor the path —
+    // the route is un-implementable (the stub even references a `_{col}` binding
+    // that doesn't exist). Reuses the R5 resolution — no duplicated fk logic.
+    fn check_dual_create_path_fk(d: &Design, m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+        for (i, ep) in m.endpoints.iter().enumerate() {
+            let Some(rb) = ep.request_body.as_ref() else {
+                continue;
+            };
+            if !matches!(
+                ep.method,
+                HttpMethod::POST | HttpMethod::PUT | HttpMethod::PATCH
+            ) {
+                continue;
+            }
+            let token = |col: &str| ep.path.contains(&format!("{{{col}}}"));
+            if let Some(col) = d
+                .entity_path_fk_columns(&rb.entity)
+                .into_iter()
+                .find(|col| !token(col))
+            {
+                qs.push(q(
+                    format!("{ptr}/endpoints/{i}"),
+                    format!(
+                        "Endpoint `{}` ({:?} {}) creates `{}`, whose parent foreign key `{col}` is supplied by a path parameter on a sibling nested route — so the generated `{}Request` body drops `{col}`, but this route's own path has no `{{{col}}}` to inject it from. The NOT-NULL `{col}` can be set from neither the body nor the path, so the route is un-implementable. Add `{{{col}}}` to this endpoint's path (mount it under the parent), or split `{}` into a separate entity for the standalone create so its request body keeps `{col}`. See `jerrycan explain JC0544`.",
+                        ep.operation_id, ep.method, ep.path, rb.entity, rb.entity, rb.entity
+                    ),
+                ));
+            }
+        }
+        for (i, sub) in m.subroutes.iter().enumerate() {
+            check_dual_create_path_fk(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
+        }
+    }
+    for (i, m) in d.modules.iter().enumerate() {
+        check_dual_create_path_fk(d, m, &format!("/modules/{i}"), &mut qs);
     }
 
     // Tenancy: the named entity must resolve, and the Tenant guard needs an
@@ -2005,4 +2132,288 @@ mod tests {
             "reference-slice must validate question-free; public users endpoints must not false-positive: {qs:?}"
         );
     }
+
+    // ---- #65 (JC0542): sibling routes with conflicting path-param names -------
+
+    const CONFORMANCE_REFERENCE: &str =
+        include_str!("../../../../conformance/designs/reference-slice.design.json");
+    const CONFORMANCE_TODO: &str =
+        include_str!("../../../../conformance/designs/todo-api.design.json");
+
+    /// The HelpDesk repro (hit by 4/5 eval builds): `/{id}` and `/{ticket_id}/comments`
+    /// in one module share segment position 2 but name its param differently. The
+    /// runtime router (one global trie) aborts `App::build` with JC0500 after a clean
+    /// scaffold; `design_conflict` must reject it up front with JC0542 naming BOTH
+    /// routes, BOTH names, and BOTH remedies (unify / restructure).
+    #[test]
+    fn sibling_routes_with_different_param_names_are_a_conflict() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "helpdesk", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{
+                "name": "tickets",
+                "entities": [
+                    { "name": "Ticket", "fields": [{ "name": "subject", "type": "string" }] },
+                    { "name": "Comment", "fields": [{ "name": "body", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "show_ticket", "method": "GET", "path": "/{id}",
+                      "success": { "status": 200, "entity": "Ticket" } },
+                    { "operation_id": "list_comments", "method": "GET", "path": "/{ticket_id}/comments",
+                      "success": { "status": 200, "entity": "Comment", "list": true } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let c = design_conflict(&d).expect("mismatched sibling param names must be a conflict");
+        assert_eq!(c.code, "JC0542");
+        assert!(
+            c.message.contains("/tickets/{id}")
+                && c.message.contains("/tickets/{ticket_id}/comments"),
+            "names both conflicting routes: {}",
+            c.message
+        );
+        assert!(
+            c.message.contains("{id}") && c.message.contains("{ticket_id}"),
+            "names both param names: {}",
+            c.message
+        );
+        assert!(
+            c.message.to_lowercase().contains("unify")
+                && c.message.to_lowercase().contains("restructure"),
+            "names both remedies: {}",
+            c.message
+        );
+        assert!(!c.hint.is_empty());
+    }
+
+    /// The router accepts several sibling shapes the validator must NOT reject:
+    /// (a) the SAME param name at a shared position (`/{id}` + `/{id}/comments`),
+    /// (b) a literal vs a param at a position (`/{id}` + `/archive` — distinct trie
+    /// children), and (c) a param-carrying subroute mount whose name is consistent
+    /// with the parent. Plus BOTH shipped conformance designs.
+    #[test]
+    fn consistent_and_divergent_sibling_paths_are_not_conflicts() {
+        // (a) same param name at the shared position.
+        let same: Design = serde_json::from_str(
+            r#"{
+            "name": "ok-same", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{ "name": "tickets",
+                "entities": [{ "name": "Ticket", "fields": [{ "name": "s", "type": "string" }] }],
+                "endpoints": [
+                    { "operation_id": "show_ticket", "method": "GET", "path": "/{id}",
+                      "success": { "status": 200, "entity": "Ticket" } },
+                    { "operation_id": "list_comments", "method": "GET", "path": "/{id}/comments",
+                      "success": { "status": 200 } }
+                ] }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            design_conflict(&same).is_none(),
+            "identical param names at the shared position are fine"
+        );
+        // (b) a literal segment vs a param at the same position diverges.
+        let literal: Design = serde_json::from_str(
+            r#"{
+            "name": "ok-literal", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{ "name": "tickets",
+                "entities": [{ "name": "Ticket", "fields": [{ "name": "s", "type": "string" }] }],
+                "endpoints": [
+                    { "operation_id": "show_ticket", "method": "GET", "path": "/{id}",
+                      "success": { "status": 200, "entity": "Ticket" } },
+                    { "operation_id": "list_archived", "method": "GET", "path": "/archive",
+                      "success": { "status": 200 } }
+                ] }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            design_conflict(&literal).is_none(),
+            "a literal and a param at the same position are distinct trie children"
+        );
+        // (c) a param-carrying subroute mount whose param agrees with the parent.
+        let mounted: Design = serde_json::from_str(
+            r#"{
+            "name": "ok-mount", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{ "name": "workspaces", "mount": "/ws",
+                "entities": [{ "name": "Ws", "fields": [{ "name": "s", "type": "string" }] }],
+                "endpoints": [
+                    { "operation_id": "show_ws", "method": "GET", "path": "/{id}",
+                      "success": { "status": 200, "entity": "Ws" } }
+                ],
+                "subroutes": [{ "name": "leads", "mount": "/{id}/leads",
+                    "endpoints": [
+                        { "operation_id": "show_lead", "method": "GET", "path": "/{lead_id}",
+                          "success": { "status": 200 } }
+                    ] }]
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            design_conflict(&mounted).is_none(),
+            "a param-mount child consistent with the parent must not be flagged: {:?}",
+            design_conflict(&mounted).map(|c| c.message)
+        );
+        // Both shipped conformance designs (params all named `id`) stay clean.
+        for src in [CONFORMANCE_REFERENCE, CONFORMANCE_TODO] {
+            let d: Design = serde_json::from_str(src).unwrap();
+            assert!(
+                design_conflict(&d).is_none(),
+                "conformance design must not trip JC0542: {:?}",
+                design_conflict(&d).map(|c| c.message)
+            );
+        }
+    }
+
+    // ---- #54 (JC0543): enum value content ------------------------------------
+
+    /// An enum value with a space (or quote/backslash) breaks the UNESCAPED
+    /// interpolation into generated Rust; validation rejects it at design time with
+    /// JC0543 guidance, naming the offending value. Identifier-shaped values
+    /// (letters, digits, `_`, `-`) pass.
+    #[test]
+    fn enum_values_must_be_identifier_shaped() {
+        // V1_FULL module[0]=workspaces, entity[0]=Workspace, field[1]=plan (string enum).
+        let mut bad: Design = serde_json::from_str(V1_FULL).unwrap();
+        bad.modules[0].entities[0].fields[1].values = Some(vec!["in progress".into()]);
+        assert!(
+            validate(&bad)
+                .iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/1/values"
+                    && q.question.contains("JC0543")
+                    && q.question.contains("in progress")),
+            "a space-bearing enum value must be rejected: {:?}",
+            validate(&bad)
+        );
+        // A quote is rejected too (the direct interpolation footgun).
+        let mut quoted: Design = serde_json::from_str(V1_FULL).unwrap();
+        quoted.modules[0].entities[0].fields[1].values = Some(vec!["a\"b".into()]);
+        assert!(
+            validate(&quoted)
+                .iter()
+                .any(|q| q.id.ends_with("/values") && q.question.contains("JC0543"))
+        );
+        // `-` and `_` and mixed case are legitimate identifier shapes.
+        let mut ok: Design = serde_json::from_str(V1_FULL).unwrap();
+        ok.modules[0].entities[0].fields[1].values =
+            Some(vec!["in-progress".into(), "on_hold".into(), "Done2".into()]);
+        assert!(
+            !validate(&ok).iter().any(|q| q.id.ends_with("/values")),
+            "identifier-shaped values must pass: {:?}",
+            validate(&ok)
+        );
+        // Both shipped conformance designs' enum values stay clean.
+        for src in [CONFORMANCE_REFERENCE, CONFORMANCE_TODO] {
+            let d: Design = serde_json::from_str(src).unwrap();
+            assert!(
+                !validate(&d).iter().any(|q| q.question.contains("JC0543")),
+                "conformance enum values must not trip JC0543"
+            );
+        }
+    }
+
+    // ---- #60 (JC0544): dual-create path-fk omission --------------------------
+
+    /// The dual-create shape from issue #60: `Checkin belongs_to Habit`, with a
+    /// nested `POST /{habit_id}/checkins` AND a standalone `POST /checkins`. The
+    /// per-entity `CheckinRequest` drops `habit_id` for both, so the standalone
+    /// route can set the NOT-NULL fk from neither the body nor the path — it is
+    /// un-implementable. Validation flags ONLY the standalone route with JC0544,
+    /// naming the route and BOTH fixes; the nested route (which carries the param)
+    /// is left alone.
+    #[test]
+    fn dual_create_standalone_route_missing_path_fk_is_flagged() {
+        let d: Design = serde_json::from_str(DUAL_CREATE).unwrap();
+        let qs = validate(&d);
+        let flagged: Vec<&Question> = qs
+            .iter()
+            .filter(|q| q.question.contains("JC0544"))
+            .collect();
+        assert_eq!(
+            flagged.len(),
+            1,
+            "only the standalone POST /checkins is un-implementable: {qs:?}"
+        );
+        let f = flagged[0];
+        assert!(
+            f.question.contains("create_checkin_flat") && f.question.contains("habit_id"),
+            "names the un-implementable route and the fk: {}",
+            f.question
+        );
+        assert!(
+            f.question.to_lowercase().contains("split") && f.question.contains("{habit_id}"),
+            "names both fixes (add the path param / split the entity): {}",
+            f.question
+        );
+    }
+
+    /// A nested-ONLY create (`POST /{habit_id}/checkins`, no standalone) carries the
+    /// fk in its path, so it is implementable and must NOT be flagged — and both
+    /// shipped conformance designs (no dual-create shape) stay JC0544-free.
+    #[test]
+    fn nested_only_create_and_conformance_shapes_do_not_trip_dual_create() {
+        let nested: Design = serde_json::from_str(NESTED_ONLY).unwrap();
+        assert!(
+            !validate(&nested)
+                .iter()
+                .any(|q| q.question.contains("JC0544")),
+            "a nested-only create carries its fk in the path: {:?}",
+            validate(&nested)
+        );
+        for src in [CONFORMANCE_REFERENCE, CONFORMANCE_TODO] {
+            let d: Design = serde_json::from_str(src).unwrap();
+            assert!(
+                !validate(&d).iter().any(|q| q.question.contains("JC0544")),
+                "conformance design must not trip JC0544"
+            );
+        }
+    }
+
+    /// The #60 repro: one entity created both nested and standalone.
+    const DUAL_CREATE: &str = r#"{
+        "name": "habits", "contract_version": 1, "dependencies": ["db"],
+        "modules": [{
+            "name": "habits",
+            "entities": [
+                { "name": "Habit", "fields": [
+                    { "name": "id", "type": "integer" }, { "name": "title", "type": "string" } ] },
+                { "name": "Checkin",
+                  "belongs_to": [{ "entity": "Habit", "on_delete": "cascade" }],
+                  "fields": [
+                    { "name": "id", "type": "integer" }, { "name": "note", "type": "string" } ] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_checkin_nested", "method": "POST", "path": "/{habit_id}/checkins",
+                  "request_body": { "entity": "Checkin" },
+                  "success": { "status": 201, "entity": "Checkin" } },
+                { "operation_id": "create_checkin_flat", "method": "POST", "path": "/checkins",
+                  "request_body": { "entity": "Checkin" },
+                  "success": { "status": 201, "entity": "Checkin" } }
+            ]
+        }]
+    }"#;
+
+    /// The same entity created ONLY under its parent's path — implementable.
+    const NESTED_ONLY: &str = r#"{
+        "name": "habits", "contract_version": 1, "dependencies": ["db"],
+        "modules": [{
+            "name": "habits",
+            "entities": [
+                { "name": "Habit", "fields": [
+                    { "name": "id", "type": "integer" }, { "name": "title", "type": "string" } ] },
+                { "name": "Checkin",
+                  "belongs_to": [{ "entity": "Habit", "on_delete": "cascade" }],
+                  "fields": [
+                    { "name": "id", "type": "integer" }, { "name": "note", "type": "string" } ] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_checkin_nested", "method": "POST", "path": "/{habit_id}/checkins",
+                  "request_body": { "entity": "Checkin" },
+                  "success": { "status": 201, "entity": "Checkin" } }
+            ]
+        }]
+    }"#;
 }

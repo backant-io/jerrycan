@@ -202,6 +202,27 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs validation",
     },
     CodeInfo {
+        code: "JC0542",
+        title: "conflicting path parameters across sibling routes",
+        cause: "two routes reach the same path segment position through an identical prefix but name that position's `{param}` differently (e.g. `/tickets/{id}` and `/tickets/{ticket_id}/comments`) — the router keys each position by a SINGLE parameter name, so registering both aborts `App::build` at startup with JC0500 `conflicting path parameters` (after a clean scaffold, mid-test)",
+        fix: "give the shared segment ONE parameter name in every route that reaches it (rename `{ticket_id}`→`{id}` or vice versa), or restructure the nesting so the position is not shared (mount the diverging routes under distinct static prefixes)",
+        doc: "jerrycan docs app",
+    },
+    CodeInfo {
+        code: "JC0543",
+        title: "enum value is not an identifier",
+        cause: "a string field's enum `values` entry contains a character outside ^[A-Za-z0-9_-]+$ — values are interpolated UNESCAPED into generated Rust (the deserialize allow-list, the 422 error text, and the test fixtures), so a quote or backslash emits a crate that fails to compile far from the design (other non-identifier characters are rejected for the same interpolation-safety rule)",
+        fix: "use identifier-shaped enum values (ASCII letters, digits, `_`, `-`); keep any human display label out of the stored value",
+        doc: "jerrycan docs validation",
+    },
+    CodeInfo {
+        code: "JC0544",
+        title: "nested-entity create route cannot supply its path-owned foreign key",
+        cause: "an entity has a parent foreign key another route supplies from a path parameter, so the shared per-entity request DTO drops it for EVERY create of the entity — but this body-carrying create/update route's own path has no matching `{param}`, so the NOT-NULL column can be set from neither the body nor the path and the route is un-implementable",
+        fix: "add the parent's `{fk}` path parameter to this route (mount it under the parent), or split the entity so the standalone route uses its own request body that keeps the fk",
+        doc: "jerrycan docs validation",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -273,6 +294,34 @@ mod tests {
             info.fix.contains("belongs_to") && info.fix.contains("tenant entity"),
             "fix must name both remedies: {}",
             info.fix
+        );
+    }
+
+    #[test]
+    fn design_time_codes_542_543_544_are_registered_and_name_their_remedies() {
+        // WHY: JC0542/JC0543/JC0544 are the P-A validator's design-time fail-loud
+        // codes (#65/#54/#60). `jerrycan explain <code>` reads this registry, so
+        // each must be present and each explanation must name the concrete fix(es).
+        for code in ["JC0542", "JC0543", "JC0544"] {
+            let info = lookup(code).unwrap_or_else(|| panic!("{code} must be registered"));
+            assert!(
+                !info.title.is_empty() && !info.cause.is_empty() && !info.fix.is_empty(),
+                "{code} needs a full explanation"
+            );
+        }
+        // JC0542 names BOTH remedies: unify the name, or restructure the nesting.
+        let router = lookup("JC0542").unwrap();
+        assert!(
+            router.fix.contains("ONE parameter name") && router.fix.contains("restructure"),
+            "JC0542 must name both remedies: {}",
+            router.fix
+        );
+        // JC0544 names BOTH remedies: add the path param, or split the entity.
+        let dual = lookup("JC0544").unwrap();
+        assert!(
+            dual.fix.contains("path parameter") && dual.fix.contains("split"),
+            "JC0544 must name both remedies: {}",
+            dual.fix
         );
     }
 
