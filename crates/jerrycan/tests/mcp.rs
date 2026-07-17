@@ -269,6 +269,76 @@ fn partial_slice_replacement_warns_about_dropped_routes() {
     c.shutdown();
 }
 
+/// Issue #69: regenerating a tool-owned `lib.rs` over the MCP channel must NOT
+/// silently drop an agent's hand-added `mod`/`use` wiring — the exact #69 failure,
+/// live on the primary agent surface. The MCP twin of `generate route` must carry
+/// the dropped line loudly (structured `warnings` + `next_step`), like the CLI does.
+/// WHY (Rule 9): without this, JR4-style cross-module wiring vanishes unnoticed on
+/// the surface agents actually use.
+#[test]
+fn generate_route_over_mcp_warns_about_dropped_agent_mod_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("design.json"), GOLDEN).unwrap();
+    let mut c = McpClient::start_in(tmp.path());
+    let app_dir = tmp.path().join("todo-api");
+    let (err, _) = c.call_tool(
+        "jerrycan_scaffold",
+        serde_json::json!({
+            "design_path": tmp.path().join("design.json").to_str().unwrap(),
+            "directory": app_dir.to_str().unwrap(),
+        }),
+    );
+    assert!(!err);
+
+    // Agent hand-adds a cross-module sweep to the TOOL-OWNED lib.rs.
+    let lib = app_dir.join("crates/routes/todos/src/lib.rs");
+    let orig = std::fs::read_to_string(&lib).unwrap();
+    std::fs::write(&lib, format!("{orig}mod cross_sweep;\n")).unwrap();
+
+    // Regenerate the SAME module (no slice → design unchanged, so no route drops):
+    // the only thing lost is the agent's `mod cross_sweep;`.
+    let (err, payload) = c.call_tool(
+        "jerrycan_generate",
+        serde_json::json!({
+            "kind": "route",
+            "path": "todos",
+            "directory": app_dir.to_str().unwrap(),
+        }),
+    );
+    assert!(!err, "{payload}");
+
+    // Structured `warnings` mirrors the CLI envelope: [{file, dropped_lines}].
+    let warnings = payload["warnings"]
+        .as_array()
+        .expect("dropped agent lines must surface in a `warnings` array");
+    let hit = warnings
+        .iter()
+        .find(|w| {
+            w["file"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("todos/src/lib.rs"))
+        })
+        .expect("the dropped lib.rs must be named in warnings");
+    assert!(
+        hit["dropped_lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == "mod cross_sweep;"),
+        "the exact dropped line must be named: {hit}"
+    );
+    // And it must be impossible to miss for a next_step-only reader.
+    assert!(
+        payload["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("cross_sweep"),
+        "next_step must also name the dropped wiring: {}",
+        payload["next_step"]
+    );
+    c.shutdown();
+}
+
 #[test]
 fn slice_name_path_mismatch_gets_a_pointed_hint() {
     let tmp = tempfile::tempdir().unwrap();

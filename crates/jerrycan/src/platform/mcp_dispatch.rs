@@ -216,13 +216,17 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                         db: design.wants_db(),
                         auth: design.wants_auth(),
                     };
-                    let created = match genroute::write_module(
+                    // #69: use the reporting variant so agent-added `mod`/`use`
+                    // wiring dropped from the tool-owned lib.rs/mod.rs is surfaced
+                    // loudly on the MCP channel too — never silently lost (the CLI
+                    // already does this; the MCP twin must match).
+                    let (created, dropped) = match genroute::write_module_reporting(
                         &root.join("crates/routes"),
                         top,
                         mode,
                         &design,
                     ) {
-                        Ok(c) => c,
+                        Ok(cd) => cd,
                         Err(e) => return err_payload(e),
                     };
                     let modified = match mounting::regenerate(&root, &design) {
@@ -238,14 +242,33 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                             " — warning: route count dropped {routes_before} → {routes_after}; a partial design_slice REPLACES the whole module (stale agent files are not deleted)"
                         ));
                     }
-                    (
-                        false,
-                        json!({
-                            "created": created,
-                            "modified": modified,
-                            "next_step": next_step,
-                        }),
-                    )
+                    // Append each dropped-wiring warning to next_step so an agent
+                    // reading only that field can't miss it.
+                    for (file, lines) in &dropped {
+                        next_step.push_str(&format!(
+                            " — warning: regenerating tool-owned {file} dropped {} agent-added line(s) NOT preserved ({}); re-home this wiring in an AGENT-owned file (handlers.rs, or a module's model.rs) — see `jerrycan_docs_get page=database`. lib.rs/mod.rs are tool-owned and rewritten on every generate.",
+                            lines.len(),
+                            lines.join(", ")
+                        ));
+                    }
+                    let mut payload = json!({
+                        "created": created,
+                        "modified": modified,
+                        "next_step": next_step,
+                    });
+                    // Structured mirror of the CLI `--json` envelope: an array of
+                    // { file, dropped_lines }. Omitted entirely when nothing dropped.
+                    if !dropped.is_empty() {
+                        payload["warnings"] = Value::Array(
+                            dropped
+                                .iter()
+                                .map(
+                                    |(file, lines)| json!({ "file": file, "dropped_lines": lines }),
+                                )
+                                .collect(),
+                        );
+                    }
+                    (false, payload)
                 }
                 "dependency" => {
                     let Some(module) = args["module"].as_str() else {

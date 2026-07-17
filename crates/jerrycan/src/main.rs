@@ -376,6 +376,31 @@ fn emit(json_mode: bool, payload: &serde_json::Value, human: &str) {
     eprintln!("{human}");
 }
 
+/// Surface issue #69a: agent-authored `mod`/`use` wiring that regenerating a
+/// tool-owned file (lib.rs/mod.rs) DROPPED. Prints a loud stderr warning naming
+/// each dropped line and its file (in EVERY mode — stderr is not the `--json`
+/// channel), and returns the machine-readable list for the envelope's `warnings`.
+/// The lines are gone from the rewritten file; the agent must re-home them. Empty
+/// input prints nothing and returns `[]`, so a clean regeneration is unchanged.
+fn dropped_warnings(dropped: &[(String, Vec<String>)]) -> Vec<serde_json::Value> {
+    for (file, lines) in dropped {
+        eprintln!(
+            "warning: regenerating tool-owned {file} dropped {} agent-added line(s) it does not re-emit — NOT preserved:",
+            lines.len()
+        );
+        for l in lines {
+            eprintln!("  - {l}");
+        }
+        eprintln!(
+            "  re-home this wiring in an AGENT-owned file (handlers.rs, or a module's model.rs) — see `jerrycan docs database` (Cross-module data access). lib.rs/mod.rs are tool-owned and rewritten on every `generate`."
+        );
+    }
+    dropped
+        .iter()
+        .map(|(file, lines)| serde_json::json!({ "file": file, "dropped_lines": lines }))
+        .collect()
+}
+
 fn load_design(path: &Path) -> Result<Design, Failure> {
     Design::from_path(path).map_err(Failure::usage)
 }
@@ -472,14 +497,19 @@ fn cmd_generate_route(module_path: &str, json_mode: bool) -> Result<(), Failure>
         db: design.wants_db(),
         auth: design.wants_auth(),
     };
-    let created = genroute::write_module(&root.join("crates/routes"), top_module, mode, &design)
-        .map_err(Failure::gate)?;
+    let (created, dropped) =
+        genroute::write_module_reporting(&root.join("crates/routes"), top_module, mode, &design)
+            .map_err(Failure::gate)?;
     let modified = mounting::regenerate(&root, &design).map_err(Failure::gate)?;
-    let payload = serde_json::json!({
+    let warnings = dropped_warnings(&dropped);
+    let mut payload = serde_json::json!({
         "created": created,
         "modified": modified,
         "next_step": format!("implement crates/routes/{top}/src/handlers.rs, then jerrycan check --module {top} — note: regeneration mirrors design.json exactly; routes removed there are removed here (stale agent files are not deleted)"),
     });
+    if !warnings.is_empty() {
+        payload["warnings"] = serde_json::Value::Array(warnings);
+    }
     emit(
         json_mode,
         &payload,
@@ -565,9 +595,12 @@ fn cmd_add(extension: &str, json_mode: bool) -> Result<(), Failure> {
         db: design.wants_db(),
         auth: design.wants_auth(),
     };
+    let mut all_dropped = Vec::new();
     for m in &design.modules {
-        genroute::write_module(&root.join("crates/routes"), m, mode, &design)
-            .map_err(Failure::gate)?;
+        let (_created, dropped) =
+            genroute::write_module_reporting(&root.join("crates/routes"), m, mode, &design)
+                .map_err(Failure::gate)?;
+        all_dropped.extend(dropped);
     }
     let mut modified = mounting::regenerate(&root, &design).map_err(Failure::gate)?;
     // Policy files are mode-dependent supply-chain gates; flipping the mode must
@@ -582,11 +615,15 @@ fn cmd_add(extension: &str, json_mode: bool) -> Result<(), Failure> {
     } else {
         format!("`{extension}` wired — review the regenerated mounting, then jerrycan check")
     };
-    let payload = serde_json::json!({
+    let warnings = dropped_warnings(&all_dropped);
+    let mut payload = serde_json::json!({
         "created": [],
         "modified": modified,
         "next_step": next_step,
     });
+    if !warnings.is_empty() {
+        payload["warnings"] = serde_json::Value::Array(warnings);
+    }
     emit(json_mode, &payload, &format!("added `{extension}`"));
     Ok(())
 }

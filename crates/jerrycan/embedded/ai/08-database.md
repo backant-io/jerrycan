@@ -226,6 +226,22 @@ add any `pub` item beyond `module()` to a route crate's `lib.rs` — JL0001 flag
 it, and the next `jerrycan generate` clobbers the edit (`lib.rs` is tool-owned).
 `model.rs` is agent-owned; the second entity belongs there.
 
+### Where it lives in an ENTITY-LESS module (an admin sweep with no table)
+An admin/webhook module that declares **no entity of its own** has **no
+`model.rs`** — the generator only writes `model.rs`/`repo.rs` for modules that
+declare an entity, and such a module's `lib.rs` only carries `mod deps;` and
+`mod handlers;`. So there is no natural `model.rs` home for the narrow second
+entity. Put it **inline in that module's agent-owned `handlers.rs`** — the
+`mod subscriber { … }` block above the sweep handler, exactly as shown above,
+just in `handlers.rs` instead of `model.rs`. `handlers.rs` is agent-owned and
+always present, so the inline entity survives regeneration.
+
+Do **not** work around the missing `model.rs` by creating one and hand-adding
+`mod model;` to `lib.rs`: `lib.rs` is tool-owned, so the next `jerrycan add` or
+`jerrycan generate route <module>` rewrites it and your `mod` line is dropped
+(the command now WARNS by name when this happens — but the line is still gone).
+Keep cross-module entities in `handlers.rs` and the regeneration never touches them.
+
 **The tradeoff — you now keep two entity definitions of one table in sync.** The
 OWNING module's migration is the single source of truth for that table's schema;
 your second entity is a hand-maintained view of it. If the owner adds or renames
