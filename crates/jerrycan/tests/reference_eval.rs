@@ -54,8 +54,10 @@ fn framework_dep() -> String {
     )
 }
 
-/// The fixed test secret the live app signs sessions with, matched in-test where
-/// we need to read a cookie. Long enough for the auth secret floor.
+/// The fixed test secret the live app signs JWTs with (passed as
+/// `JERRYCAN_SECRET`); the login handler mints bearer tokens with the key derived
+/// from it and the `Bearer<SessionUser>` guard verifies against the same key.
+/// Long enough for the auth secret floor.
 const SECRET: &str = "reference-battery-secret-string-very-long-1234";
 
 /// The README battery hooks: the webhook signing secret default and the fixed
@@ -263,7 +265,7 @@ fn scaffold_and_apply_fixtures(app: &Path) {
 
 /// Drive every v2 feature over raw HTTP against the live server, asserting each.
 fn run_http_battery(addr: &str) {
-    // -- a. register two users; login each → capture session cookies ----------
+    // -- a. register two users; login each → capture bearer JWTs --------------
     // The generated `User` DTO requires every field (no serde defaults), and the
     // generated repo `insert`s the body's `id` literally — so each user gets a
     // DISTINCT id (else the second collides on the PK, not the email). This is a
@@ -301,11 +303,14 @@ fn run_http_battery(addr: &str) {
         "duplicate email → 409",
     );
 
-    let cookie_a = login(addr, "a@reference.test", "pwAAAA123");
-    let cookie_b = login(addr, "b@reference.test", "pwBBBB123");
+    // The `jwt` design guards on `Bearer<SessionUser>`, so login mints a signed
+    // HS256 JWT (header.payload.signature) — NOT a session cookie — which every
+    // guarded request below sends as `Authorization: Bearer <token>`.
+    let token_a = login(addr, "a@reference.test", "pwAAAA123");
+    let token_b = login(addr, "b@reference.test", "pwBBBB123");
     assert!(
-        cookie_a.starts_with("jerrycan_session=") && cookie_b.starts_with("jerrycan_session="),
-        "login must mint jerrycan_session cookies (A={cookie_a}, B={cookie_b})"
+        token_a.split('.').count() == 3 && token_b.split('.').count() == 3,
+        "login must mint 3-part bearer JWTs (A={token_a}, B={token_b})"
     );
 
     // -- b. tenant isolation: A creates ws A, B creates ws B, A creates a lead -
@@ -313,7 +318,7 @@ fn run_http_battery(addr: &str) {
         post_json(
             addr,
             "/workspaces/",
-            &cookie_a,
+            &token_a,
             r#"{"id":1,"name":"Acme","plan":"trial"}"#,
         ),
         201,
@@ -323,7 +328,7 @@ fn run_http_battery(addr: &str) {
         post_json(
             addr,
             "/workspaces/",
-            &cookie_b,
+            &token_b,
             r#"{"id":2,"name":"Beta","plan":"trial"}"#,
         ),
         201,
@@ -335,7 +340,7 @@ fn run_http_battery(addr: &str) {
         post_json(
             addr,
             "/leads/",
-            &cookie_a,
+            &token_a,
             r#"{"id":1,"workspace_id":1,"phone":"+15550001111","name":"Lead One","status":"new","custom":null}"#,
         ),
         201,
@@ -343,17 +348,13 @@ fn run_http_battery(addr: &str) {
     );
     // Live cross-tenant isolation: A reads its lead (200); B cannot (404) and the
     // lead is absent from B's list.
+    assert_status(get(addr, "/leads/1", &token_a), 200, "A reads its own lead");
     assert_status(
-        get(addr, "/leads/1", &cookie_a),
-        200,
-        "A reads its own lead",
-    );
-    assert_status(
-        get(addr, "/leads/1", &cookie_b),
+        get(addr, "/leads/1", &token_b),
         404,
         "B cannot read A's lead (cross-tenant 404)",
     );
-    let b_list = get(addr, "/leads/", &cookie_b);
+    let b_list = get(addr, "/leads/", &token_b);
     assert_status(b_list.clone(), 200, "B lists its (empty) leads");
     assert!(
         b_list.body.trim() == "[]",
@@ -390,11 +391,11 @@ fn run_http_battery(addr: &str) {
     // -- d. multipart CSV import (2 rows) → 202; rows appear in A's list ------
     let csv = "phone,name,status\n+15551112222,CsvOne,new\n+15553334444,CsvTwo,called\n";
     assert_status(
-        post_multipart(addr, "/leads/import", &cookie_a, "file", "leads.csv", csv),
+        post_multipart(addr, "/leads/import", &token_a, "file", "leads.csv", csv),
         202,
         "multipart CSV import → 202",
     );
-    let a_list = get(addr, "/leads/", &cookie_a);
+    let a_list = get(addr, "/leads/", &token_a);
     assert_status(a_list.clone(), 200, "A lists leads after import");
     assert!(
         a_list.body.contains("+15551112222") && a_list.body.contains("+15553334444"),
@@ -403,20 +404,23 @@ fn run_http_battery(addr: &str) {
     );
 
     // -- e. API-key scopes: with-scope 200, wrong-scope 403, unknown 401 -----
-    let key_with = create_api_key(addr, &cookie_a, 11, "battery-read", "leads:read");
+    // The API-key path also rides `Authorization: Bearer <credential>`, but the
+    // credential is the minted `sk_live_…` key (checked by the `usage` handler),
+    // NOT the user's JWT — a distinct credential on the same header.
+    let key_with = create_api_key(addr, &token_a, 11, "battery-read", "leads:read");
     assert_status(
-        get_bearer(addr, "/api-keys/usage", &key_with),
+        get(addr, "/api-keys/usage", &key_with),
         200,
         "scoped key WITH leads:read → 200",
     );
-    let key_without = create_api_key(addr, &cookie_a, 12, "battery-noscope", "billing:read");
+    let key_without = create_api_key(addr, &token_a, 12, "battery-noscope", "billing:read");
     assert_status(
-        get_bearer(addr, "/api-keys/usage", &key_without),
+        get(addr, "/api-keys/usage", &key_without),
         403,
         "scoped key LACKING leads:read → 403",
     );
     assert_status(
-        get_bearer(
+        get(
             addr,
             "/api-keys/usage",
             "sk_live_totally-bogus-not-a-real-key",
@@ -459,21 +463,26 @@ fn run_http_battery(addr: &str) {
     );
 }
 
-/// POST /users/login and return the `jerrycan_session=…` cookie pair.
+/// POST /users/login and return the freshly minted bearer JWT (the `token`
+/// field of the JSON response body).
 fn login(addr: &str, email: &str, password: &str) -> String {
     let body = format!(r#"{{"email":"{email}","password":"{password}"}}"#);
     let res = post_json(addr, "/users/login", "", &body);
     assert_status(res.clone(), 200, "login must succeed for valid credentials");
-    res.set_cookie()
-        .unwrap_or_else(|| panic!("login for {email} must set a session cookie:\n{}", res.raw))
+    let v: serde_json::Value = serde_json::from_str(&res.body).expect("login returns a JSON body");
+    v["token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("login for {email} must return a bearer token:\n{}", res.raw))
+        .to_string()
 }
 
-/// POST /api-keys/ and return the one-time plaintext key.
-fn create_api_key(addr: &str, cookie: &str, id: i64, label: &str, scopes: &str) -> String {
+/// POST /api-keys/ (authenticated with the caller's bearer JWT) and return the
+/// one-time plaintext key.
+fn create_api_key(addr: &str, token: &str, id: i64, label: &str, scopes: &str) -> String {
     let body = format!(
         r#"{{"id":{id},"workspace_id":1,"prefix":"ignored","label":"{label}","scopes":"{scopes}"}}"#
     );
-    let res = post_json(addr, "/api-keys/", cookie, &body);
+    let res = post_json(addr, "/api-keys/", token, &body);
     assert_status(res.clone(), 201, "create_api_key must mint a key");
     let v: serde_json::Value =
         serde_json::from_str(&res.body).expect("create_api_key returns JSON");
@@ -663,7 +672,7 @@ fn schema_answers_structural_questions(app: &Path) {
 // ============================ raw HTTP plumbing =============================
 
 /// A parsed HTTP response: status line, raw text, and a lowercased header map for
-/// the headers we assert on (Set-Cookie, Location).
+/// the headers we assert on (Location).
 #[derive(Clone)]
 struct HttpResponse {
     status: u16,
@@ -701,13 +710,6 @@ impl HttpResponse {
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     }
-    /// The `jerrycan_session=…` cookie pair from Set-Cookie (attributes stripped).
-    fn set_cookie(&self) -> Option<String> {
-        let raw = self.header("set-cookie")?;
-        let pair = raw.split(';').next()?.trim();
-        pair.starts_with("jerrycan_session=")
-            .then(|| pair.to_string())
-    }
 }
 
 /// Assert a response's status, with a labelled message carrying the raw response.
@@ -739,34 +741,29 @@ fn send(addr: &str, request: &[u8]) -> HttpResponse {
     HttpResponse::parse(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// GET with an optional `Cookie:` header (pass "" for none).
-fn get(addr: &str, path: &str, cookie: &str) -> HttpResponse {
-    let cookie_line = if cookie.is_empty() {
+/// GET with an optional `Authorization: Bearer <token>` header (pass "" for
+/// none). The token is either the caller's login JWT (guarded routes) or a
+/// minted API key (the `usage` path) — both authenticate on this header.
+fn get(addr: &str, path: &str, bearer: &str) -> HttpResponse {
+    let auth_line = if bearer.is_empty() {
         String::new()
     } else {
-        format!("Cookie: {cookie}\r\n")
+        format!("Authorization: Bearer {bearer}\r\n")
     };
-    let req = format!("GET {path} HTTP/1.1\r\nHost: l\r\n{cookie_line}Connection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: l\r\n{auth_line}Connection: close\r\n\r\n");
     send(addr, req.as_bytes())
 }
 
-/// GET with an `Authorization: Bearer <key>` header (the API-key path).
-fn get_bearer(addr: &str, path: &str, key: &str) -> HttpResponse {
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: l\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n"
-    );
-    send(addr, req.as_bytes())
-}
-
-/// POST a JSON body with an optional `Cookie:` header (pass "" for none).
-fn post_json(addr: &str, path: &str, cookie: &str, body: &str) -> HttpResponse {
-    let cookie_line = if cookie.is_empty() {
+/// POST a JSON body with an optional `Authorization: Bearer <token>` header (pass
+/// "" for none).
+fn post_json(addr: &str, path: &str, bearer: &str, body: &str) -> HttpResponse {
+    let auth_line = if bearer.is_empty() {
         String::new()
     } else {
-        format!("Cookie: {cookie}\r\n")
+        format!("Authorization: Bearer {bearer}\r\n")
     };
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_line}Connection: close\r\n\r\n{body}",
         body.len()
     );
     send(addr, req.as_bytes())
@@ -782,11 +779,12 @@ fn post_raw(addr: &str, path: &str, body: &str, extra: &[(&str, &str)]) -> HttpR
     send(addr, req.as_bytes())
 }
 
-/// POST a `multipart/form-data` body with a single file part.
+/// POST a `multipart/form-data` body with a single file part, authenticated with
+/// the caller's bearer JWT.
 fn post_multipart(
     addr: &str,
     path: &str,
-    cookie: &str,
+    bearer: &str,
     field: &str,
     filename: &str,
     content: &str,
@@ -796,7 +794,7 @@ fn post_multipart(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\nContent-Type: text/csv\r\n\r\n{content}\r\n--{boundary}--\r\n"
     );
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: l\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: l\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     send(addr, req.as_bytes())

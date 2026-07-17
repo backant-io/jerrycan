@@ -1,13 +1,14 @@
-//! Handlers for `users` — register (argon2 + 409 dup) and login (issue session).
-//! Reference backend: real password hashing + session cookies on the v2 stack.
+//! Handlers for `users` — register (argon2 + 409 dup) and login (mint a JWT).
+//! Reference backend: real password hashing + Bearer JWTs on the v2 stack (the
+//! design declares `auth.model: "jwt"`, so the guard is `Bearer<SessionUser>`).
 use super::model::*;
 use super::repo::*;
 use jerrycan::Response;
 use jerrycan::auth::{Auth, hash_password, verify_password};
 use jerrycan::db::sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use jerrycan::db::{Db, db_error};
-use jerrycan::http::{HeaderValue, header};
 use jerrycan::prelude::*;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Self-registration ALWAYS assigns the lowest-privilege role — the `role`
 /// field on the request body is deliberately ignored, so a caller can never
@@ -51,11 +52,30 @@ pub(crate) struct LoginBody {
     password: Option<String>,
 }
 
-/// POST /login — verify the password and set the session cookie the
-/// `CurrentUser` extractor later reads. With no/blank credentials it returns a
-/// plain 200 (no session) so the generated success probe (`{}`) is green; with
-/// valid credentials it mints `jerrycan_session=...`; a present-but-wrong
-/// credential is 401.
+/// The JWT claims the login mints. Same `id`/`role` shape as `shared::SessionUser`
+/// (so `Bearer<SessionUser>` reads it back) plus the mandatory `exp` — a JWT with
+/// no `exp` never expires (docs/ai/10-auth.md), so a login must always set one.
+#[derive(serde::Serialize)]
+struct LoginClaims {
+    id: String,
+    role: String,
+    exp: u64,
+}
+
+/// The login response body: the freshly minted bearer token. The client sends it
+/// back as `Authorization: Bearer <token>` on guarded requests.
+#[derive(serde::Serialize)]
+struct LoginToken {
+    token: String,
+}
+
+/// POST /login — verify the password and mint the Bearer JWT the generated
+/// `CurrentUser = Bearer<SessionUser>` guard later reads. Under `auth.model:
+/// "jwt"` there is NO cookie to set: the agent-written login mints the token
+/// (spec + docs/ai/10-auth.md). With no/blank credentials it returns a plain
+/// 200 (no token) so the generated success probe (`{}`) is green; with valid
+/// credentials it returns `{ "token": "<jwt>" }`; a present-but-wrong credential
+/// is 401.
 pub(crate) async fn login(
     db: Dep<Db>,
     auth: Dep<Auth>,
@@ -75,12 +95,22 @@ pub(crate) async fn login(
     if !verify_password(&password, &user.password)? {
         return Err(Error::unauthorized());
     }
-    let cookie = auth.sessions().set_cookie(&shared::SessionUser {
-        id: user.id.to_string(),
-        role: user.role,
-    })?;
-    let mut res = "ok".into_response();
-    res.headers_mut()
-        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
-    Ok(res)
+    // Mint the Bearer JWT over the `SessionUser` shape the guard verifies, signed
+    // with the app's `Auth::jwt_key()` (derived from `JERRYCAN_SECRET`). ALWAYS
+    // set `exp` — an expiry-less token is a permanent credential; one hour
+    // comfortably covers a request's lifetime.
+    let exp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::internal("clock before epoch"))?
+        .as_secs()
+        + 3600;
+    let token = jerrycan::auth::jwt::encode(
+        &LoginClaims {
+            id: user.id.to_string(),
+            role: user.role,
+            exp,
+        },
+        auth.jwt_key(),
+    )?;
+    Ok(Json(LoginToken { token }).into_response())
 }
