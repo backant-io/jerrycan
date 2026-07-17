@@ -70,7 +70,19 @@
         "properties": {
           "created": { "type": "array", "items": { "type": "string" } },
           "modified": { "type": "array", "items": { "type": "string" } },
-          "next_step": { "type": "string" }
+          "next_step": { "type": "string" },
+          "warnings": {
+            "type": "array",
+            "description": "Present only when regenerating a tool-owned lib.rs/mod.rs dropped agent-added mod/use wiring it does not re-emit. Each entry names the file and the exact lines NOT preserved; re-home that wiring in an agent-owned file.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": { "type": "string" },
+                "dropped_lines": { "type": "array", "items": { "type": "string" } }
+              },
+              "required": ["file", "dropped_lines"]
+            }
+          }
         },
         "required": ["created", "modified", "next_step"]
       }

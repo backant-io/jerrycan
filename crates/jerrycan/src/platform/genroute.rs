@@ -2563,6 +2563,67 @@ pub(crate) mod tests {
         );
     }
 
+    /// Linking guard for the #69a drift detector: EVERY salient `mod`/`use` decl
+    /// the generator itself emits (`mod_decls`, `lib_rs`, `subroute_mod_rs`, and the
+    /// subroutes `pub(crate) mod <sub>;` list) MUST satisfy `is_tool_decl`. If a
+    /// future generator change emits a new tool decl that `is_tool_decl` doesn't
+    /// recognize, a clean regeneration would FALSELY report it as dropped agent
+    /// work — this test fails the moment the two drift apart (kills the
+    /// cross-version false-positive risk). WHY (Rule 9): the detector's whole value
+    /// is that it fires ONLY on real agent loss, never on the tool's own output.
+    #[test]
+    fn every_generator_emitted_decl_is_recognized_as_tool_owned() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let m = todos(); // has entities + a `comments` subroute
+        let comments = &m.subroutes[0];
+
+        // The subroutes decls file (`pub(crate) mod <sub>;`) is emitted inline in
+        // `write_subroutes`; reproduce that line so this guard covers it too.
+        let sub_decl = format!("pub(crate) mod {};\n", comments.name.replace('-', "_"));
+
+        let emissions = [
+            mod_decls(&m),
+            lib_rs(&m, mode),
+            subroute_mod_rs(comments, mode),
+            mod_decls(comments),
+            sub_decl,
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for emitted in &emissions {
+            for line in emitted.lines() {
+                let t = line.trim();
+                if is_salient_decl(t) {
+                    seen.insert(t.to_string());
+                    assert!(
+                        is_tool_decl(t),
+                        "generator emits salient decl `{t}` that is_tool_decl does not \
+                         recognize — clean regen would falsely flag it as dropped agent work"
+                    );
+                }
+            }
+        }
+        // Non-vacuous: the fixture must actually exercise every is_tool_decl branch,
+        // so the assertion above had real work to do.
+        for expected in [
+            "mod deps;",
+            "mod handlers;",
+            "mod model;",
+            "mod repo;",
+            "mod subroutes;",
+            "use jerrycan::prelude::*;",
+            "pub(crate) mod comments;",
+        ] {
+            assert!(
+                seen.contains(expected),
+                "fixture should have emitted `{expected}` — otherwise this guard is vacuous"
+            );
+        }
+    }
+
     /// Issue #56: in a multi-entity module where the `/{id}`-bearing entity is NOT
     /// first, a no-request-body endpoint (`DELETE /tasks/{id}`, 204) must bind the
     /// repo of the entity its COLLECTION creates (Task, via `POST /tasks`), NOT the
