@@ -37,6 +37,38 @@ fn key_rust_type(e: &Entity) -> &'static str {
     }
 }
 
+/// The bare collection path a parameterized endpoint acts under: its path with the
+/// trailing `/{param}` removed (`/tasks/{id}` → `/tasks`, `/{id}` → `/`). None when
+/// the path carries no `{param}` (nothing to strip). Mirrors testgen's
+/// `collection_path`, kept local so the two generators stay decoupled.
+fn collection_path(ep: &Endpoint) -> Option<String> {
+    let p = ep.path.as_str();
+    let brace = p.rfind('{')?;
+    let cut = p[..brace].rfind('/').unwrap_or(0);
+    Some(if cut == 0 {
+        "/".to_string()
+    } else {
+        p[..cut].to_string()
+    })
+}
+
+/// The POST creator (with a body) mounted at a bare collection `path` in this
+/// module — the route whose entity owns the rows addressable under `path/{id}`.
+fn creator_at<'a>(m: &'a ModuleDesign, path: &str) -> Option<&'a Endpoint> {
+    m.endpoints
+        .iter()
+        .find(|ep| ep.method == HttpMethod::POST && ep.path == path && ep.request_body.is_some())
+}
+
+/// The entity whose repo/model a route's handler binds. Resolution order: the
+/// request body's entity, then the success entity, then — for a no-body endpoint
+/// like `DELETE /{id}` that names neither (issue #56) — the entity of the
+/// COLLECTION it acts under (its parent path's POST creator), so a multi-entity
+/// module's `/tasks/{id}` stub binds `TaskRepo`, not the module's FIRST entity.
+/// Falls back to the first entity only when path-based resolution finds nothing
+/// (a bare `/import`, or a module with no matching creator) — byte-identical to
+/// the pre-#56 behavior for every single-entity module (the collection creator IS
+/// the sole entity there).
 fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a str> {
     if m.entities.is_empty() {
         return None;
@@ -45,6 +77,12 @@ fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a
         .as_ref()
         .map(|rb| rb.entity.as_str())
         .or(ep.success.entity.as_deref())
+        .or_else(|| {
+            collection_path(ep)
+                .and_then(|coll| creator_at(m, &coll))
+                .and_then(|c| c.request_body.as_ref())
+                .map(|rb| rb.entity.as_str())
+        })
         .or_else(|| m.entities.first().map(|e| e.name.as_str()))
 }
 
@@ -1383,12 +1421,76 @@ fn subroute_mod_rs(m: &ModuleDesign, mode: GenMode) -> String {
     )
 }
 
+/// Per-file report of the salient AGENT declarations a tool-owned rewrite dropped
+/// (issue #69a): `(relative_path, dropped_lines)` entries. Threaded through the
+/// write helpers and returned by `write_module_reporting`.
+type DroppedDecls = Vec<(String, Vec<String>)>;
+
+/// A "salient" top-level item declaration for #69a drift detection: a `mod` or
+/// `use` line — the cross-module wiring an agent hand-adds to a tool-owned
+/// lib.rs/mod.rs (e.g. `mod cross_sweep;`). Trimmed before matching; a regenerated
+/// file that no longer contains this exact line is DROPPING that line.
+fn is_salient_decl(trimmed: &str) -> bool {
+    trimmed.starts_with("mod ")
+        || trimmed.starts_with("pub mod ")
+        || trimmed.starts_with("pub(crate) mod ")
+        || trimmed.starts_with("pub(super) mod ")
+        || trimmed.starts_with("use ")
+}
+
+/// Does the generator ITSELF emit this decl for some design? The fixed tool-owned
+/// `mod`/`use` lines (`mod deps;` … `use jerrycan::prelude::*;`) plus the
+/// `pub(crate) mod <sub>;` shape of the subroutes decls file. A dropped salient
+/// line that is NOT one of these is agent-authored wiring — so a design-driven
+/// change (an entity or subroute removed from design.json) never masquerades as
+/// lost agent work.
+fn is_tool_decl(trimmed: &str) -> bool {
+    matches!(
+        trimmed,
+        "mod deps;" | "mod handlers;" | "mod model;" | "mod repo;" | "mod subroutes;"
+    ) || trimmed == "use jerrycan::prelude::*;"
+        || trimmed
+            .strip_prefix("pub(crate) mod ")
+            .and_then(|r| r.strip_suffix(';'))
+            .is_some_and(|id| {
+                !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+}
+
+/// Salient AGENT declarations (`mod`/`use`) present in `old` but absent from the
+/// fresh `new` emission — the lines a tool-owned rewrite would DROP (issue #69a).
+/// Tool-emitted decls are excluded so only genuine agent wiring is reported;
+/// deduped, source order preserved.
+fn dropped_agent_decls(old: &str, new: &str) -> Vec<String> {
+    let kept: std::collections::HashSet<&str> = new
+        .lines()
+        .map(str::trim)
+        .filter(|l| is_salient_decl(l))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    old.lines()
+        .map(str::trim)
+        .filter(|l| is_salient_decl(l) && !is_tool_decl(l) && !kept.contains(l) && seen.insert(*l))
+        .map(str::to_string)
+        .collect()
+}
+
 fn write_tool_owned(
     path: &Path,
     content: &str,
     created: &mut Vec<String>,
     root: &Path,
+    dropped: &mut DroppedDecls,
 ) -> Result<(), String> {
+    // #69a: before overwriting a tool-owned file, detect agent-authored `mod`/`use`
+    // wiring the fresh emission would drop — regeneration must WARN loudly, never
+    // silently lose an agent's cross-module wiring.
+    if let Ok(old) = fs::read_to_string(path) {
+        let lost = dropped_agent_decls(&old, content);
+        if !lost.is_empty() {
+            dropped.push((rel(path, root), lost));
+        }
+    }
     fs::create_dir_all(path.parent().expect("file path has parent")).map_err(|e| e.to_string())?;
     fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
     created.push(rel(path, root));
@@ -1404,7 +1506,9 @@ fn write_agent_owned(
     if path.exists() {
         return Ok(()); // never clobber agent work
     }
-    write_tool_owned(path, content, created, root)
+    // The file is absent, so `write_tool_owned` reads no prior content and can
+    // drop nothing — a local throwaway drop-sink keeps the signature clean.
+    write_tool_owned(path, content, created, root, &mut Vec::new())
 }
 
 fn rel(path: &Path, root: &Path) -> String {
@@ -1424,6 +1528,22 @@ pub fn write_module(
     mode: GenMode,
     design: &Design,
 ) -> Result<Vec<String>, String> {
+    write_module_reporting(routes_dir, m, mode, design).map(|(created, _dropped)| created)
+}
+
+/// Like `write_module`, but also returns, per tool-owned file, the salient
+/// AGENT declarations (`mod`/`use` lines) the regeneration DROPPED — present on
+/// disk, absent from the fresh emission (issue #69a): `(relative_path, lines)`.
+/// The generator NEVER silently drops them; the CLI surfaces this list loudly
+/// (stderr + the `--json` envelope) so an agent's hand-added cross-module wiring
+/// can't vanish unnoticed. Empty in the common case (fresh scaffold, or an
+/// unedited regeneration), so a no-drift run reports nothing.
+pub fn write_module_reporting(
+    routes_dir: &Path,
+    m: &ModuleDesign,
+    mode: GenMode,
+    design: &Design,
+) -> Result<(Vec<String>, DroppedDecls), String> {
     let root = routes_dir
         .ancestors()
         .nth(2)
@@ -1432,17 +1552,30 @@ pub fn write_module(
     let crate_dir = routes_dir.join(&m.name);
     let src = crate_dir.join("src");
     let mut created = Vec::new();
+    let mut dropped = Vec::new();
 
     let cargo = render(ROUTE_CARGO, &[("name", &m.name)])?;
-    write_tool_owned(&crate_dir.join("Cargo.toml"), &cargo, &mut created, &root)?;
-    write_tool_owned(&src.join("lib.rs"), &lib_rs(m, mode), &mut created, &root)?;
+    write_tool_owned(
+        &crate_dir.join("Cargo.toml"),
+        &cargo,
+        &mut created,
+        &root,
+        &mut dropped,
+    )?;
+    write_tool_owned(
+        &src.join("lib.rs"),
+        &lib_rs(m, mode),
+        &mut created,
+        &root,
+        &mut dropped,
+    )?;
     write_unit_files(&src, m, mode, design, &mut created, &root)?;
-    write_subroutes(&src, m, mode, design, &mut created, &root)?;
+    write_subroutes(&src, m, mode, design, &mut created, &root, &mut dropped)?;
     // db mode: agent-owned create-once migrations for this crate (module + subroutes).
     if mode.db {
         write_module_migrations(&crate_dir, m, &mut created, &root, design)?;
     }
-    Ok(created)
+    Ok((created, dropped))
 }
 
 /// The agent-owned file set shared by modules and subroutes.
@@ -1483,6 +1616,7 @@ fn write_subroutes(
     design: &Design,
     created: &mut Vec<String>,
     root: &Path,
+    dropped: &mut DroppedDecls,
 ) -> Result<(), String> {
     if m.subroutes.is_empty() {
         return Ok(());
@@ -1492,7 +1626,7 @@ fn write_subroutes(
     for sub in &m.subroutes {
         decls.push_str(&format!("pub(crate) mod {};\n", sub.name.replace('-', "_")));
     }
-    write_tool_owned(&sub_root.join("mod.rs"), &decls, created, root)?;
+    write_tool_owned(&sub_root.join("mod.rs"), &decls, created, root, dropped)?;
     for sub in &m.subroutes {
         let dir = sub_root.join(sub.name.replace('-', "_"));
         write_tool_owned(
@@ -1500,9 +1634,10 @@ fn write_subroutes(
             &subroute_mod_rs(sub, mode),
             created,
             root,
+            dropped,
         )?;
         write_unit_files(&dir, sub, mode, design, created, root)?;
-        write_subroutes(&dir, sub, mode, design, created, root)?; // arbitrary depth
+        write_subroutes(&dir, sub, mode, design, created, root, dropped)?; // arbitrary depth
     }
     Ok(())
 }
@@ -2380,6 +2515,112 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("pub fn module()"),
             "tool-owned: restored"
+        );
+    }
+
+    /// Issue #69a: regeneration REWRITES tool-owned lib.rs, and before this an
+    /// agent's hand-added `mod` wiring (a cross-module sweep) vanished silently.
+    /// `write_module_reporting` now reports every salient AGENT line the fresh
+    /// emission drops so the CLI can warn loudly — while the tool's OWN decls
+    /// (`mod handlers;` …) and design-driven churn are never mistaken for agent
+    /// work. WHY (Rule 9): the loss is invisible without this report, which is
+    /// exactly how JR4 lost its cross-module wiring.
+    #[test]
+    fn regeneration_reports_dropped_agent_mod_lines_never_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let routes = tmp.path().join("crates/routes");
+        let d = demo();
+        let m = &d.modules[0];
+
+        // Fresh generation: the file did not exist, so nothing is dropped.
+        let (_c, dropped) = write_module_reporting(&routes, m, GenMode::default(), &d).unwrap();
+        assert!(
+            dropped.is_empty(),
+            "fresh scaffold drops nothing: {dropped:?}"
+        );
+
+        // Agent wires a cross-module sweep by hand-adding a `mod` line to lib.rs.
+        let lib = routes.join("todos/src/lib.rs");
+        let orig = fs::read_to_string(&lib).unwrap();
+        fs::write(&lib, format!("{orig}mod cross_sweep;\n")).unwrap();
+
+        // Regeneration reports the dropped line instead of silently losing it.
+        let (_c, dropped) = write_module_reporting(&routes, m, GenMode::default(), &d).unwrap();
+        let (file, lines) = dropped
+            .iter()
+            .find(|(f, _)| f.ends_with("todos/src/lib.rs"))
+            .expect("the dropped lib.rs line must be reported");
+        assert!(
+            lines.iter().any(|l| l == "mod cross_sweep;"),
+            "the exact dropped agent line must be named: {file} {lines:?}"
+        );
+        // The tool's own decls are NOT reported as agent drops.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l == "mod handlers;" || l == "mod deps;"),
+            "tool decls must not be flagged as lost agent work: {lines:?}"
+        );
+    }
+
+    /// Issue #56: in a multi-entity module where the `/{id}`-bearing entity is NOT
+    /// first, a no-request-body endpoint (`DELETE /tasks/{id}`, 204) must bind the
+    /// repo of the entity its COLLECTION creates (Task, via `POST /tasks`), NOT the
+    /// module's first entity (Project). The body-bearing `PUT /tasks/{id}` already
+    /// resolves via its request body — this pins the no-body path the scaffold used
+    /// to mis-wire, handing the agent a misleading `ProjectRepo` starting point.
+    #[test]
+    fn no_body_id_route_binds_its_collection_entity_not_the_first() {
+        let m: ModuleDesign = serde_json::from_str(
+            r#"{
+                "name": "projects",
+                "entities": [
+                    { "name": "Project", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Task", "fields": [{ "name": "title", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_project", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Project" }, "success": { "status": 201, "entity": "Project" } },
+                    { "operation_id": "create_task", "method": "POST", "path": "/tasks",
+                      "request_body": { "entity": "Task" }, "success": { "status": 201, "entity": "Task" } },
+                    { "operation_id": "delete_task", "method": "DELETE", "path": "/tasks/{id}",
+                      "success": { "status": 204 } },
+                    { "operation_id": "update_task", "method": "PUT", "path": "/tasks/{id}",
+                      "request_body": { "entity": "Task" }, "success": { "status": 200, "entity": "Task" } }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let h = handlers_rs(&m, GenMode::default(), &demo());
+        // The no-body DELETE binds the Task repo (its collection's entity), not Project.
+        assert!(
+            h.contains("pub(crate) async fn delete_task(_repo: Dep<TaskRepo>, Path(_id): Path<i64>) -> Result<NoContent>"),
+            "no-body /{{id}} must bind its collection entity's repo (#56): {h}"
+        );
+        // Control: the body-bearing PUT already resolves via its request body.
+        assert!(
+            h.contains("pub(crate) async fn update_task(_repo: Dep<TaskRepo>"),
+            "{h}"
+        );
+        // The old bug bound the module's FIRST entity (Project) — must not recur.
+        assert!(
+            !h.contains("delete_task(_repo: Dep<ProjectRepo>"),
+            "regression: no-body route must not bind the first entity's repo: {h}"
+        );
+    }
+
+    /// #56 no-drift: a SINGLE-entity module's no-body `/{id}` route is unchanged —
+    /// path-based resolution and the first-entity fallback name the SAME (sole)
+    /// entity, so every conformance module (all single-entity) stays byte-identical.
+    #[test]
+    fn single_entity_module_no_body_route_is_unchanged_by_56() {
+        let m = todos(); // one entity (Todo); delete_todo is DELETE /{id}, no body
+        let h = handlers_rs(&m, GenMode::default(), &demo());
+        assert!(
+            h.contains(
+                "pub(crate) async fn delete_todo(_repo: Dep<TodoRepo>, Path(_id): Path<i64>) -> Result<NoContent>"
+            ),
+            "single-entity no-body /{{id}} unchanged: {h}"
         );
     }
 

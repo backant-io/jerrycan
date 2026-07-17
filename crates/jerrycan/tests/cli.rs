@@ -47,6 +47,93 @@ const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.
 /// generated membership table would declare `user_id` twice.
 const TENANT_IS_IDENTITY: &str = include_str!("fixtures/tenant-is-identity.design.json");
 
+/// Issue #69a: `jerrycan add` and `generate route` REWRITE tool-owned lib.rs, and
+/// before this an agent's hand-added `mod` wiring (a cross-module sweep) vanished
+/// silently — exactly how JR4 lost its wiring. The command must WARN loudly:
+/// stderr AND the `--json` envelope must NAME the dropped line. It still succeeds
+/// (warn, not refuse) so the rest of the regeneration proceeds.
+#[test]
+fn add_and_generate_route_warn_loudly_about_dropped_agent_mod_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, GOLDEN).unwrap(); // todo-api (memory mode; no build needed)
+    let app = tmp.path().join("todo-api");
+    let st = jerrycan()
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "scaffold must succeed");
+
+    // The agent wires a cross-module sweep by hand-adding a `mod` line to the
+    // TOOL-owned lib.rs (the file jerrycan regenerates).
+    let lib = app.join("crates/routes/todos/src/lib.rs");
+    let sweep = "mod cross_sweep;\n";
+    let readd = || {
+        let orig = std::fs::read_to_string(&lib).unwrap();
+        std::fs::write(&lib, format!("{orig}{sweep}")).unwrap();
+    };
+
+    // (1) `jerrycan add validate --json` regenerates every module → would drop it.
+    readd();
+    let out = jerrycan()
+        .current_dir(&app)
+        .args(["--json", "add", "validate"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "add still succeeds (warn, not refuse)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("warning") && stderr.contains("mod cross_sweep;"),
+        "stderr must warn and NAME the dropped line: {stderr}"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is one JSON envelope");
+    let warnings = payload["warnings"].to_string();
+    assert!(
+        warnings.contains("mod cross_sweep;") && warnings.contains("lib.rs"),
+        "--json envelope must carry the dropped line + file: {payload}"
+    );
+
+    // (2) `jerrycan generate route todos --json` regenerates the module the same way.
+    readd();
+    let out = jerrycan()
+        .current_dir(&app)
+        .args(["--json", "generate", "route", "todos"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mod cross_sweep;"),
+        "generate route must warn too: {stderr}"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is one JSON envelope");
+    assert!(
+        payload["warnings"].to_string().contains("mod cross_sweep;"),
+        "generate route --json envelope must carry the dropped line: {payload}"
+    );
+
+    // No-drift control: a clean regeneration (no agent edits) reports NO warnings.
+    let out = jerrycan()
+        .current_dir(&app)
+        .args(["--json", "generate", "route", "todos"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        payload.get("warnings").is_none(),
+        "a clean regeneration carries no `warnings` key: {payload}"
+    );
+}
+
 /// #27 fail-loud: `tenancy.entity` naming the auth identity must be rejected
 /// BEFORE any file is written, with the JC0540 code and a message naming both
 /// fixes — not die mid-scaffold with a raw SQLite `duplicate column name`.

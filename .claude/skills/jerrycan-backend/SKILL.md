@@ -250,8 +250,13 @@ env vars), how to test (`jerrycan test`), and how to package (`jerrycan package`
 To ship it: `jerrycan deploy render` generates `deploy/render/deploy.sh`; run it
 with `RENDER_API_KEY` for a live, secure URL (see `jerrycan docs packaging`).
 Get feedback and iterate from the relevant phase. To change the data model or
-endpoints, edit `design.json` and regenerate (tool-owned files refresh;
-agent-owned handlers are untouched — re-implement only new stubs).
+endpoints, edit `design.json` and run **`jerrycan generate route <module>`** to
+regenerate that module (tool-owned files refresh; agent-owned handlers are
+untouched — re-implement only new stubs). This IS the regen command — it rewrites
+the tool-owned `lib.rs`/subroute `mod.rs` from `design.json`; if you hand-added a
+`mod`/`use` line to a tool-owned file, it WARNS by name that the line was dropped
+(keep such wiring in agent-owned `handlers.rs`/`model.rs` — see
+`jerrycan docs database`, Cross-module data access).
 
 ---
 
