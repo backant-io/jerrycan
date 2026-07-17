@@ -269,6 +269,19 @@ Every entity has an `id` primary key; you usually do NOT declare it:
 > rejected by a CORRECT handler, and that endpoint's 2xx probe is un-greenable too. Mark
 > such an endpoint **`probe: "skip"`** and write its success test with a real value
 > yourself.
+>
+> **A module with endpoints requiring DIFFERENT roles is a partial case.** The generated
+> credential carries ONE role, drawn from the design's role gate (the first
+> `required_roles` a handler will demand, else the first declared `auth.roles`). If two
+> guarded endpoints in the SAME module require **different** roles, that single credential
+> satisfies only one — a CORRECT `require_role` handler 403s the other's happy-path probe.
+> Cover the un-satisfied one in your own test with a credential minting that role.
+>
+> **A cross-module `belongs_to` parent that a handler checks exists is the same case.**
+> A create/update body carries an fk to a parent in **another module** (a cross-module
+> `belongs_to` — no DB FK, so the generator can't auto-seed it). The fixture uses `1`, but
+> a CORRECT handler that verifies the parent exists rejects it (that parent row was never
+> seeded). Mark the endpoint **`probe: "skip"`**, seed the parent yourself, and test it.
 
 ## Worked examples
 `jerrycan docs designing-examples` ships seven complete, copy-ready designs — each

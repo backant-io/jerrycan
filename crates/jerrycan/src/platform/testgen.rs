@@ -234,6 +234,16 @@ fn seed_for_id_probe(
     Some((seed, seed_id))
 }
 
+/// True when the POST creator that would seed this `/{id}` endpoint's row is
+/// marked `probe: skip` (issue #68). A hand-written validator on that creator
+/// rejects the generated seed fixture, so seeding a sibling `/{id}` probe through
+/// it would 404 on a CORRECT handler. Only valid for a parameterized path (the
+/// caller gates on `param_count(ep) == 1`). Mirrors `seed_for_id_probe`'s creator
+/// lookup so the two never disagree about which creator seeds the probe.
+fn seed_creator_is_skipped(unit: &ModuleDesign, ep: &Endpoint) -> bool {
+    creator_at(unit, &collection_path(ep)).is_some_and(|c| c.probe == ProbePolicy::Skip)
+}
+
 /// Append seed lines for `entity`'s belongs_to PARENTS (grandparents first), so a
 /// dependent row's fk points at a real parent row. Skips the identity fk (the
 /// handler injects it), the tenancy entity (already seeded), a parent with no
@@ -454,6 +464,18 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             {
                 push_enum_reject_test(design, out, unit, ep, &full_path, guarded, field);
             }
+        } else if param_count(ep) == 1 && seed_creator_is_skipped(unit, ep) {
+            // Issue #68: the creator that would seed this `/{id}` probe is marked
+            // `probe: skip` — a hand-written validator on it rejects the generated
+            // fixture (JR4: url must start http/https), so the seed POST would fail
+            // and every downstream sibling probe would 404 on a CORRECT handler.
+            // Emit an AGENT TODO instead of a guaranteed-red probe (excluded from
+            // expected_failing). The missing-id 404 probe below needs no seed, so it
+            // still emits — the creator's validator never touches the getter.
+            out.todos.push(format!(
+                "// AGENT TODO: {fn_base} ({:?} {full_path}) — its seed creator is `probe: skip` (a hand-written validator rejects the generated fixture), so an auto-seeded {{id}} would 404. Seed a valid row and encode its success case in your own test file.",
+                ep.method
+            ));
         } else if param_count(ep) == 1 {
             // Issue #51: seed the row THIS `/{id}` endpoint addresses via ITS OWN
             // entity's creator (`POST /tasks` for `/tasks/{id}`), walking belongs_to
@@ -591,10 +613,19 @@ const TEST_SECRET: &str = "a-very-long-development-secret-string!!";
 /// time-dependent — a "helpfully" added `exp` would make the isolation tests expire
 /// and flake. Keep it exp-free.
 fn auth_preamble_login(design: &Design) -> String {
+    // The minted `SessionUser.role` is drawn from the design (issue #67): a
+    // `require_role`-guarded handler 403s a credential whose role doesn't satisfy
+    // the gate, so a hardcoded "admin" left role-gated probes un-greenable for any
+    // design whose roles exclude it. `test_credential_role` picks the gate's role.
+    let role = design.test_credential_role();
     let mint = if design.auth_model() == AuthModel::Jwt {
-        "let token = jerrycan::auth::jwt::encode(&shared::SessionUser { id: user_id.to_string(), role: \"admin\".into() }, auth.jwt_key()).expect(\"encode\");\n    format!(\"Bearer {token}\")"
+        format!(
+            "let token = jerrycan::auth::jwt::encode(&shared::SessionUser {{ id: user_id.to_string(), role: \"{role}\".into() }}, auth.jwt_key()).expect(\"encode\");\n    format!(\"Bearer {{token}}\")"
+        )
     } else {
-        "let token = auth.sessions().encode(&shared::SessionUser { id: user_id.to_string(), role: \"admin\".into() }).expect(\"encode\");\n    format!(\"jerrycan_session={token}\")"
+        format!(
+            "let token = auth.sessions().encode(&shared::SessionUser {{ id: user_id.to_string(), role: \"{role}\".into() }}).expect(\"encode\");\n    format!(\"jerrycan_session={{token}}\")"
+        )
     };
     format!(
         "fn test_cookie_for(user_id: i64) -> String {{\n    let auth = jerrycan::auth::Auth::with_secret(\"{TEST_SECRET}\");\n    {mint}\n}}\n\nfn test_cookie() -> String {{\n    test_cookie_for(1)\n}}\n\n"
@@ -940,6 +971,48 @@ fn seed_sql_value_n(f: &Field, n: u32) -> String {
     }
 }
 
+/// The mirrored-extension wiring for the db-mode `app()` harness (issue #66):
+/// `(comment, extends)`. `extends` is the `.extend(...)` chain for the design's
+/// declared storage/jobs/realtime extensions (in mounting.rs's order: storage,
+/// jobs, realtime — all before `.extend(db)`), each test-env-safe. `comment` is a
+/// documented header (only emitted when something is wired) recording the wired
+/// set AND the deliberately-excluded extensions. Both are empty for a design that
+/// declares none of these — that harness stays byte-identical (no-drift).
+fn extension_wiring(design: &Design) -> (String, String) {
+    let mut extends = String::new();
+    if design.wants_storage() {
+        // In-memory store + a fixed dev sign key: no `from_env`/secret env needed.
+        extends.push_str(&format!(
+            ".extend(jerrycan::storage::Storage::memory().with_sign_secret(\"{TEST_SECRET}\"))"
+        ));
+    }
+    if design.wants_jobs() {
+        // The worker/cron `on_serve` loops don't spawn under `into_test()`.
+        extends.push_str(".extend(jerrycan::jobs::Jobs::postgres(db.clone()))");
+    }
+    if design.wants_realtime() {
+        // Resolves `Dep<RealtimeHandle>` for realtime handlers (no JC1001). The
+        // base extension is enough for the harness — stub probes never publish, so
+        // the design's channels (wired in the realtime crate at serve time) aren't
+        // needed here.
+        extends.push_str(".extend(jerrycan::realtime::Realtime::new(db.clone()))");
+    }
+    if extends.is_empty() {
+        return (String::new(), String::new());
+    }
+    let comment =
+        "// TestApp extension wiring (issue #66) mirrors main.rs so the generated probes\n\
+        // exercise the SAME app the framework builds: the design's declared\n\
+        // storage/jobs/realtime extensions are wired below (jobs/realtime take\n\
+        // db.clone() before `.extend(db)` moves db; jobs' worker/cron loops are\n\
+        // on_serve tasks that into_test() never spawns). EXCLUDED here: observe\n\
+        // (no handler resolves it — only /healthz, /metrics, access-log middleware)\n\
+        // and validate (its OpenApi extension include_str!s an absent openapi.json,\n\
+        // and probes send valid fixtures). Cover any excluded surface yourself.\n"
+            .to_string();
+    (comment, extends)
+}
+
 fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool) -> String {
     let mount = module.effective_mount();
     // The cookie helpers (`test_cookie`/`test_cookie_for`) are only emitted when
@@ -992,8 +1065,23 @@ fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool) -> Strin
         } else {
             "use jerrycan::db::sea_orm::ConnectionTrait;\n\n".to_string()
         };
+        // Issue #66: the TestApp must wire the SAME design-declared extensions
+        // main.rs does (mounting.rs's `extension_block`), so the generated probes
+        // exercise the app the framework actually builds — a realtime handler's
+        // `Dep<RealtimeHandle>` resolves (no JC1001 500) and a jobs design's app
+        // constructs. Order + `db.clone()` mirror mounting.rs (extensions precede
+        // `.extend(db)`, which moves `db`). Test-env realities: storage uses an
+        // in-memory store (no `from_env`/secret env), and the jobs worker/cron
+        // loops are `on_serve` tasks that `into_test()` never spawns, so wiring
+        // Jobs starts no background loop. EXCLUDED, by design: `observe` (adds only
+        // /healthz + /metrics + an access-log middleware — no handler resolves it,
+        // so its absence never 500s a probe) and `validate` (its OpenApi extension
+        // `include_str!`s app/openapi.json, which does not exist relative to a
+        // route crate's test; and probes send valid fixtures, so wire-level
+        // validation is not needed). See the harness comment emitted below.
+        let (ext_comment, ext_extends) = extension_wiring(design);
         format!(
-            "{seed_use}{auth_login}{second_seed_fn}async fn app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n{seed}{second_seed_call}    App::new(){auth_extend}.extend(db){tenant_dep}.mount(\"{mount}\", module()).into_test()\n}}\n"
+            "{seed_use}{auth_login}{second_seed_fn}{ext_comment}async fn app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n{seed}{second_seed_call}    App::new(){auth_extend}{ext_extends}.extend(db){tenant_dep}.mount(\"{mount}\", module()).into_test()\n}}\n"
         )
     } else {
         format!(

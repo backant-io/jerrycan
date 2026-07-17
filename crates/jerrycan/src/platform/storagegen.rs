@@ -410,10 +410,19 @@ pub fn acceptance_rs(design: &Design) -> String {
     // claim. These are test-only, in-process credentials and must NOT be
     // time-dependent — a "helpfully" added `exp` would make the isolation suite
     // expire and flake. Keep it exp-free.
+    // The minted `SessionUser.role` is drawn from the design (issue #67), matching
+    // testgen's `auth_preamble_login`: a role-gated handler 403s a credential whose
+    // role doesn't satisfy the gate. Storage buckets aren't role-gated, so this is
+    // the design's first declared role (fallback "admin" only for a roleless design).
+    let role = design.test_credential_role();
     let mint = if design.auth_model() == AuthModel::Jwt {
-        "    let token = jerrycan::auth::jwt::encode(&shared::SessionUser { id: user_id.to_string(), role: \"admin\".into() }, auth.jwt_key()).expect(\"encode\");\n    format!(\"Bearer {token}\")"
+        format!(
+            "    let token = jerrycan::auth::jwt::encode(&shared::SessionUser {{ id: user_id.to_string(), role: \"{role}\".into() }}, auth.jwt_key()).expect(\"encode\");\n    format!(\"Bearer {{token}}\")"
+        )
     } else {
-        "    let token = auth.sessions().encode(&shared::SessionUser { id: user_id.to_string(), role: \"admin\".into() }).expect(\"encode\");\n    format!(\"jerrycan_session={token}\")"
+        format!(
+            "    let token = auth.sessions().encode(&shared::SessionUser {{ id: user_id.to_string(), role: \"{role}\".into() }}).expect(\"encode\");\n    format!(\"jerrycan_session={{token}}\")"
+        )
     };
 
     format!(

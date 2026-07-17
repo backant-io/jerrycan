@@ -1209,3 +1209,250 @@ fn nested_parent_fk_is_omitted_from_the_probe_body_and_taken_from_the_path() {
         "path-redundant fk must not appear in the body: {generated}"
     );
 }
+
+/// Issue #67: the minted test credential's `SessionUser.role` must satisfy the
+/// design's role gate. A HelpDesk-shaped design (roles agent/customer, an
+/// `agent`-gated endpoint) must mint role `"agent"` — a hardcoded `"admin"`
+/// (never a declared role) makes a CORRECT `require_role("agent")` handler 403 the
+/// happy-path probe, un-greenable by construction. WHY (Rule 9): the credential
+/// role is the difference between a green and a 403 on a role-gated endpoint.
+#[test]
+fn credential_role_is_drawn_from_the_designs_role_gate() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "helpdesk",
+        "contract_version": 1,
+        "dependencies": ["db", "auth"],
+        "auth": { "model": "jwt", "roles": ["agent", "customer"] },
+        "modules": [{
+            "name": "tickets",
+            "entities": [{ "name": "Ticket", "fields": [{ "name": "subject", "type": "string" }] }],
+            "endpoints": [
+                { "operation_id": "resolve_ticket", "method": "POST", "path": "/resolve",
+                  "auth_required": true, "required_roles": ["agent"],
+                  "request_body": { "entity": "Ticket" },
+                  "success": { "status": 200, "entity": "Ticket" } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        generated.contains("role: \"agent\".into()"),
+        "the minted credential must carry the gate's role `agent`, not a hardcoded `admin`: {generated}"
+    );
+    assert!(
+        !generated.contains("role: \"admin\""),
+        "no hardcoded admin role when the design declares none: {generated}"
+    );
+}
+
+/// Issue #67: a design that declares roles but gates no endpoint mints the
+/// design's FIRST declared role; only a design that declares NO roles at all
+/// falls back to `"admin"`. Guards the derivation's two lower rungs.
+#[test]
+fn credential_role_falls_back_to_first_declared_then_admin() {
+    // Declares roles, gates nothing -> first declared role ("owner").
+    let roled: Design = serde_json::from_value(serde_json::json!({
+        "name": "roled", "contract_version": 1, "dependencies": ["db", "auth"],
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "modules": [{ "name": "notes",
+            "entities": [{ "name": "Note", "fields": [{ "name": "body", "type": "string" }] }],
+            "endpoints": [{ "operation_id": "create_note", "method": "POST", "path": "/",
+                "auth_required": true, "request_body": { "entity": "Note" },
+                "success": { "status": 201, "entity": "Note" } }] }]
+    }))
+    .unwrap();
+    let g = testgen::acceptance_rs(&roled, &roled.modules[0]);
+    assert!(
+        g.contains("role: \"owner\".into()"),
+        "first declared role: {g}"
+    );
+
+    // Declares no roles -> "admin" fallback (byte-identical to the pre-#67 output).
+    let roleless: Design = serde_json::from_value(serde_json::json!({
+        "name": "roleless", "contract_version": 1, "dependencies": ["db", "auth"],
+        "auth": { "model": "session" },
+        "modules": [{ "name": "notes",
+            "entities": [{ "name": "Note", "fields": [{ "name": "body", "type": "string" }] }],
+            "endpoints": [{ "operation_id": "create_note", "method": "POST", "path": "/",
+                "auth_required": true, "request_body": { "entity": "Note" },
+                "success": { "status": 201, "entity": "Note" } }] }]
+    }))
+    .unwrap();
+    let g2 = testgen::acceptance_rs(&roleless, &roleless.modules[0]);
+    assert!(
+        g2.contains("role: \"admin\".into()"),
+        "no roles -> admin fallback: {g2}"
+    );
+}
+
+/// Issue #66: the TestApp harness must wire the design's declared extensions
+/// (mirroring mounting.rs) so the generated probes exercise the SAME app main.rs
+/// builds. Without the realtime extension a handler's `Dep<RealtimeHandle>` fails
+/// to resolve → JC1001 500 → the happy-path probe is un-greenable until the agent
+/// hand-patches the harness. WHY (Rule 9): a probe that 500s on a MISSING
+/// extension is testing the harness, not the contract.
+#[test]
+fn testapp_wires_declared_realtime_and_jobs_extensions() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "live",
+        "contract_version": 1,
+        "dependencies": ["db", "auth"],
+        "auth": { "model": "jwt", "roles": ["admin"] },
+        "realtime": { "broadcast": [{ "name": "feed", "scope": "auth" }] },
+        "jobs": [{ "name": "sweep", "schedule": "0 * * * *", "queue": "default" }],
+        "modules": [{
+            "name": "posts",
+            "entities": [{ "name": "Post", "fields": [{ "name": "title", "type": "string" }] }],
+            "endpoints": [
+                { "operation_id": "create_post", "method": "POST", "path": "/",
+                  "auth_required": true, "request_body": { "entity": "Post" },
+                  "success": { "status": 201, "entity": "Post" } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        generated.contains(".extend(jerrycan::realtime::Realtime::new(db.clone()))"),
+        "realtime design's TestApp must wire the realtime extension (else JC1001): {generated}"
+    );
+    assert!(
+        generated.contains(".extend(jerrycan::jobs::Jobs::postgres(db.clone()))"),
+        "jobs design's TestApp must wire the jobs extension: {generated}"
+    );
+    // The extensions take db.clone() and precede `.extend(db)` (which moves db),
+    // matching mounting.rs's order. Scope the check to the builder line so the doc
+    // comment (which mentions `.extend(db)` in prose) doesn't confuse the search.
+    let builder = generated
+        .lines()
+        .find(|l| l.contains("App::new()"))
+        .expect("app() builder line");
+    let realtime_at = builder.find(".extend(jerrycan::realtime").unwrap();
+    let db_at = builder.find(".extend(db)").unwrap();
+    assert!(
+        realtime_at < db_at,
+        "extensions must precede .extend(db): {builder}"
+    );
+    // The deliberately EXCLUDED extensions are documented in the harness comment.
+    assert!(
+        generated.contains("issue #66")
+            && generated.contains("observe")
+            && generated.contains("validate"),
+        "the harness must document which extensions it excludes and why: {generated}"
+    );
+}
+
+/// Issue #66: a storage design's TestApp wires the storage extension with a
+/// test-env-safe in-memory store (no `from_env`/secrets), mirroring storagegen.
+#[test]
+fn testapp_wires_declared_storage_extension() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "files",
+        "contract_version": 2,
+        "dependencies": ["db", "auth"],
+        "auth": { "model": "session", "roles": ["admin"] },
+        "storage": { "buckets": [{ "name": "avatars", "visibility": "public" }] },
+        "modules": [{
+            "name": "profiles",
+            "entities": [{ "name": "Profile", "fields": [{ "name": "handle", "type": "string" }] }],
+            "endpoints": [
+                { "operation_id": "create_profile", "method": "POST", "path": "/",
+                  "auth_required": true, "request_body": { "entity": "Profile" },
+                  "success": { "status": 201, "entity": "Profile" } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        generated.contains(".extend(jerrycan::storage::Storage::memory().with_sign_secret("),
+        "storage design's TestApp must wire an in-memory Storage extension: {generated}"
+    );
+}
+
+/// Issue #66: a plain db(+validate) design declares none of storage/jobs/realtime,
+/// so the harness stays byte-for-byte as before — no new extension extends, no
+/// exclusion comment. This is the no-drift guard for todo-api's generated bytes.
+#[test]
+fn plain_db_design_harness_is_unchanged_by_extension_wiring() {
+    let design = golden(true); // todo-api, db mode, no extensions
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        !generated.contains("issue #66"),
+        "no extension-wiring comment for a design that declares no extensions: {generated}"
+    );
+    assert!(
+        !generated.contains("jerrycan::jobs::")
+            && !generated.contains("jerrycan::realtime::")
+            && !generated.contains("jerrycan::storage::"),
+        "no extension extends for a plain db design: {generated}"
+    );
+}
+
+/// Issue #68: when the creator that seeds a sibling `/{id}` probe is marked
+/// `probe: "skip"` (a hand-written validator rejects the generated fixture), the
+/// seed POST would 404 every downstream probe. The generator must NOT emit those
+/// guaranteed-red sibling probes — it emits an AGENT TODO instead, and the doomed
+/// probes are excluded from `expected_failing`. This is JR4's exact shape.
+#[test]
+fn skipped_creator_suppresses_sibling_id_probes() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "sitemonitor",
+        "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "monitors",
+            "entities": [{ "name": "Monitor",
+                "fields": [{ "name": "url", "type": "string" }] }],
+            "endpoints": [
+                // The creator rejects the generated fixture (url must be http/https),
+                // so it is marked probe: skip. It must not seed sibling /{id} probes.
+                { "operation_id": "create_monitor", "method": "POST", "path": "/",
+                  "probe": "skip", "request_body": { "entity": "Monitor" },
+                  "success": { "status": 201, "entity": "Monitor" } },
+                { "operation_id": "get_monitor", "method": "GET", "path": "/{id}",
+                  "success": { "status": 200, "entity": "Monitor" },
+                  "errors": [{ "status": 404, "when": "unknown id" }] },
+                { "operation_id": "delete_monitor", "method": "DELETE", "path": "/{id}",
+                  "success": { "status": 204 } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let module = &design.modules[0];
+    let generated = testgen::acceptance_rs(&design, module);
+    // No guaranteed-red sibling success probes seeded through the skipped creator.
+    assert!(
+        !generated.contains("async fn get_monitor_returns_200"),
+        "a probe:skip creator must not seed a sibling GET /{{id}} success probe: {generated}"
+    );
+    assert!(
+        !generated.contains("async fn delete_monitor_returns_204"),
+        "a probe:skip creator must not seed a sibling DELETE /{{id}} success probe: {generated}"
+    );
+    // It emits an AGENT TODO naming the skipped-creator reason instead.
+    assert!(
+        generated.contains("// AGENT TODO: get_monitor") && generated.contains("probe: skip"),
+        "must emit an AGENT TODO explaining the skipped seed creator: {generated}"
+    );
+    // The 404 missing-id probe does NOT need a seed (it hits a missing id), so it
+    // stays — the creator's validator never touches the getter.
+    assert!(
+        generated.contains("async fn get_monitor_missing_id_is_404"),
+        "the missing-id 404 probe needs no seed and must remain greenable: {generated}"
+    );
+
+    // expected_failing counts only the emitted, greenable tests. The doomed sibling
+    // success probes are NOT counted.
+    let tmp = std::env::temp_dir().join(format!("jc68-{}", std::process::id()));
+    std::fs::create_dir_all(tmp.join("crates/routes/monitors/tests")).unwrap();
+    let (_rel, expected_failing) = testgen::write_acceptance(&tmp, &design, "monitors").unwrap();
+    // Only the create_monitor probe:skip TODO + the get/delete sibling TODOs remain;
+    // the sole greenable RED-on-stubs test is get_monitor_missing_id_is_404.
+    assert_eq!(
+        expected_failing, 1,
+        "only the 404 missing-id probe is a counted RED-on-stubs test: {generated}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
