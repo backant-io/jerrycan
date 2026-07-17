@@ -104,8 +104,9 @@ The generated success probes are tool-owned and cannot be edited, so several
 handlers accept the probe's shape AND the real flow:
 
 - **`users::login`** returns `200` for an empty `{}` body (the generated probe),
-  sets the `jerrycan_session` cookie for valid credentials, and `401`s a
-  present-but-wrong credential.
+  mints a Bearer JWT and returns it as `{ "token": "<jwt>" }` for valid
+  credentials — the design's `auth.model: "jwt"` guards on `Bearer<SessionUser>`,
+  so there is no cookie to set — and `401`s a present-but-wrong credential.
 - **`billing::stripe_webhook`** returns `200` when there is no
   `Stripe-Signature` header (the unsigned probe), verifies the HMAC-SHA256 hex
   signature over the **raw** body otherwise (`200` valid / `400` invalid). The
