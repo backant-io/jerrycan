@@ -67,6 +67,14 @@ jobs:
         # postgresql-client: `psql`, used by the conformance harness to reset the
         # test database's public schema before the Postgres-backed test.
         run: sudo apt-get update && sudo apt-get install -y musl-tools postgresql-client
+      - name: Install verification tools
+        # `jerrycan check`/`package` shell out to cargo-audit and cargo-deny for
+        # scaffolded apps — without them every conformance check stage fails
+        # (this exact gap made the first heavy dispatch red). Mirrors the gate's
+        # tool step minus cargo-semver-checks, which conformance never runs.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
       - uses: Swatinem/rust-cache@v2
       - name: "Conformance (heavy: generated apps must build, check, serve, and pass the scripted eval)"
         # --test-threads=1: every scaffolded app emits its runnable binary to the
