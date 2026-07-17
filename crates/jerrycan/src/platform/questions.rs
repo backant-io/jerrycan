@@ -499,14 +499,14 @@ pub fn validate(d: &Design) -> Vec<Question> {
                     } else if let Some(bad) = values.iter().find(|v| !is_enum_value(v)) {
                         // JC0543 (#54): enum values are interpolated UNESCAPED into
                         // generated Rust (the deserialize allow-list + 422 text in
-                        // genroute, the testgen fixture), so a value with a quote,
-                        // backslash, or space emits a crate that won't compile far
-                        // from the design. Constrain to an identifier-ish shape here,
-                        // mirroring the job-queue interpolation guard.
+                        // genroute, the testgen fixture), so a quote or backslash
+                        // emits a crate that won't compile far from the design.
+                        // Constrain to an identifier-ish shape (which also excludes
+                        // spaces etc. under the same interpolation-safety rule).
                         qs.push(q(
                             format!("{ptr}/entities/{i}/fields/{j}/values"),
                             format!(
-                                "Field `{}` enum value `{bad}` is not an identifier (^[A-Za-z0-9_-]+$) — enum values are interpolated unescaped into generated Rust (the deserialize allow-list, the 422 error text, and the test fixtures), so a value with a quote, backslash, or space emits a crate that fails to compile. Use identifier-shaped values (letters, digits, `_`, `-`). See `jerrycan explain JC0543`.",
+                                "Field `{}` enum value `{bad}` is not an identifier (^[A-Za-z0-9_-]+$) — enum values are interpolated unescaped into generated Rust (the deserialize allow-list, the 422 error text, and the test fixtures), so a quote or backslash emits a crate that fails to compile; other non-identifier characters are rejected under the same rule. Use identifier-shaped values (letters, digits, `_`, `-`). See `jerrycan explain JC0543`.",
                                 f.name
                             ),
                         ));

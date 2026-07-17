@@ -211,7 +211,7 @@ pub const REGISTRY: &[CodeInfo] = &[
     CodeInfo {
         code: "JC0543",
         title: "enum value is not an identifier",
-        cause: "a string field's enum `values` entry contains a character outside ^[A-Za-z0-9_-]+$ — values are interpolated UNESCAPED into generated Rust (the deserialize allow-list, the 422 error text, and the test fixtures), so a quote, backslash, or space emits a crate that fails to compile far from the design",
+        cause: "a string field's enum `values` entry contains a character outside ^[A-Za-z0-9_-]+$ — values are interpolated UNESCAPED into generated Rust (the deserialize allow-list, the 422 error text, and the test fixtures), so a quote or backslash emits a crate that fails to compile far from the design (other non-identifier characters are rejected for the same interpolation-safety rule)",
         fix: "use identifier-shaped enum values (ASCII letters, digits, `_`, `-`); keep any human display label out of the stored value",
         doc: "jerrycan docs validation",
     },

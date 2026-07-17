@@ -159,6 +159,10 @@ fn decode_segment(seg: &str) -> Option<String> {
 }
 
 impl Trie {
+    // NOTE: the design validator mirrors this walk line-for-line
+    // (jerrycan/src/platform/questions.rs `router_param_conflict`, JC0542) so
+    // param conflicts are caught at design time instead of panicking here. If
+    // the segment/param semantics below change, update the twin in lockstep.
     pub(crate) fn insert(&mut self, path: &str, endpoint: Endpoint) -> Result<()> {
         let mut node = &mut self.root;
         for seg in segments(path) {
