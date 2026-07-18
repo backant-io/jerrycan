@@ -741,7 +741,9 @@ impl Design {
         }
 
         // Tenant-owned routes: path-scoped when the URL carries the tenant fk
-        // (a nested mount like `/clubs/{club_id}`), else membership-scoped.
+        // (a nested mount like `/clubs/{club_id}`), else membership-scoped. A flat
+        // child `/{id}` (no tenant fk in the path) is MembershipSet, NOT PathScoped
+        // — so the conventional `{id}` shortcut is deliberately NOT applied here.
         if resolved.contains(&fk_token) {
             return TenantShape::PathScoped { fk_param };
         }
@@ -1478,7 +1480,9 @@ pub(crate) mod tests {
                           { "operation_id": "get_club", "method": "GET", "path": "/{club_id}",
                             "success": { "status": 200, "entity": "Club" } },
                           { "operation_id": "delete_club", "method": "DELETE", "path": "/{club_id}",
-                            "success": { "status": 204 } } ] },
+                            "success": { "status": 204 } },
+                          { "operation_id": "get_club_conventional", "method": "GET", "path": "/{id}",
+                            "success": { "status": 200, "entity": "Club" } } ] },
                     { "name": "books", "mount": "/clubs/{club_id}",
                       "entities": [{ "name": "Book",
                           "belongs_to": [{ "entity": "Club" }],
@@ -1527,6 +1531,13 @@ pub(crate) mod tests {
         assert!(matches!(
             d.endpoint_tenant_shape(clubs, &clubs.endpoints[3]),
             TenantShape::PathScoped { .. }
+        ));
+        // The tenant's OWN detail route using the conventional `/{id}` (not
+        // `/{club_id}`) must ALSO be PathScoped with the tenant fk — this is the
+        // load-bearing clause that lets a guard verify the tenant's own resource.
+        assert!(matches!(
+            d.endpoint_tenant_shape(clubs, &clubs.endpoints[4]),
+            TenantShape::PathScoped { fk_param } if fk_param == "club_id"
         ));
         assert!(matches!(
             d.endpoint_tenant_shape(books, &books.endpoints[2]),
