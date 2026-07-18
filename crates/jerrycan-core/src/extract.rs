@@ -271,6 +271,36 @@ fn take_params<const N: usize>(ctx: &RequestCtx) -> Result<[(String, String); N]
     Ok(std::array::from_fn(|i| ctx.params[i].clone()))
 }
 
+/// A by-name view of the request's captured path parameters. Where [`Path<T>`]
+/// binds positionally (the leaf-most segment, or a root→leaf tuple), `PathParams`
+/// reads a SPECIFIC mount param BY NAME — the accessor a DI factory needs, since
+/// a factory resolves each argument through [`FromRequest`] and cannot borrow
+/// `&RequestCtx` to call [`RequestCtx::param`]. The membership-verifying tenancy
+/// guard uses it to read the tenant fk `club_id` under `/clubs/{club_id}` even
+/// when a leaf `{id}` follows (issues #78/#79). Rejects a task context (JC1003),
+/// like every other HTTP-coupled extractor.
+pub struct PathParams(Vec<(String, String)>);
+
+impl PathParams {
+    /// The value of the named path parameter captured by the router, or `None`
+    /// if this route captured no param by that name.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+impl FromRequest for PathParams {
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
+        Ok(PathParams(ctx.params.clone()))
+    }
+}
+
 /// Typed query string: `Query<MyParams>` via serde.
 pub struct Query<T>(pub T);
 
@@ -392,6 +422,28 @@ mod tests {
         assert_eq!(c.param("club_id"), Some("42"));
         assert_eq!(c.param("id"), Some("7"));
         assert_eq!(c.param("missing"), None);
+    }
+
+    #[tokio::test]
+    async fn path_params_reads_named_and_rejects_task() {
+        // WHY: a DI factory resolves each arg via `FromRequest` (it cannot borrow
+        // `&RequestCtx`), and `Path<T>` binds only the leaf-most segment — so the
+        // membership-verifying tenancy guard (issues #78/#79) needs a by-NAME read
+        // of a specific mount param (the tenant fk `club_id` under `/clubs/{club_id}`,
+        // even when a leaf `{id}` follows). `PathParams` is that FromRequest accessor.
+        let mut c = ctx("/x", "");
+        c.params.push(("club_id".into(), "42".into()));
+        c.params.push(("id".into(), "7".into()));
+        let p = PathParams::from_request(&mut c).await.unwrap();
+        assert_eq!(p.get("club_id"), Some("42"));
+        assert_eq!(p.get("id"), Some("7"));
+        assert_eq!(p.get("missing"), None);
+
+        // A task context has no request path — reject like every HTTP extractor (JC1003).
+        let mut task = ctx("/x", "");
+        task.is_task = true;
+        let err = PathParams::from_request(&mut task).await.err().unwrap();
+        assert_eq!(err.code(), "JC1003");
     }
 
     #[tokio::test]

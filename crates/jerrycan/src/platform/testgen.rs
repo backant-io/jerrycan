@@ -658,6 +658,32 @@ fn module_needs_tenant(design: &Design, module: &ModuleDesign) -> bool {
     walk(module, &tenancy.entity)
 }
 
+/// True when this module's test app must REGISTER the `tenant` DI factory so a
+/// `Dep<Tenant>` handler resolves. This is broader than [`module_needs_tenant`]:
+/// besides a tenant-owned child (whose guarded handlers take `Dep<Tenant>`), the
+/// tenant module ITSELF needs the factory when its own detail route is a GUARDED
+/// path-scoped route (normalized `/{tenant_fk}`, issue #78) — its `get`/`delete`
+/// handler takes `Dep<Tenant>`. Kept SEPARATE from the membership-SEED gate
+/// (`module_needs_tenant`): the tenant module creates its own rows in-test, so it
+/// must not be pre-seeded (that would collide with the created id). An UNGUARDED
+/// detail route (no `Dep<Tenant>`) is excluded, so a design whose tenant module
+/// exposes only public reads stays byte-identical.
+fn module_provides_tenant_dep(design: &Design, module: &ModuleDesign) -> bool {
+    fn has_guarded_pathscoped(design: &Design, m: &ModuleDesign) -> bool {
+        m.endpoints.iter().any(|ep| {
+            ep.is_guarded()
+                && matches!(
+                    design.endpoint_tenant_shape(m, ep),
+                    TenantShape::PathScoped { .. }
+                )
+        }) || m
+            .subroutes
+            .iter()
+            .any(|s| has_guarded_pathscoped(design, s))
+    }
+    module_needs_tenant(design, module) || has_guarded_pathscoped(design, module)
+}
+
 /// A `migrate` entry for the tenant module's tables, referenced from THIS test
 /// crate (cross-crate relative include) so the `{tenant}_members` table the
 /// `tenant` guard queries exists. Empty if the tenant module IS this module
@@ -1043,7 +1069,7 @@ fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool) -> Strin
         let mut migration_items = String::new();
         collect_workspace_migration_items(design, module, &mut migration_items);
         let seed = tenant_seed(design, module);
-        let tenant_dep = if module_needs_tenant(design, module) {
+        let tenant_dep = if module_provides_tenant_dep(design, module) {
             ".provide_dep(shared::tenant)"
         } else {
             ""
