@@ -98,6 +98,16 @@ impl RequestCtx {
         &self.parts.headers
     }
 
+    /// The named path parameter captured by the router, if present. Unlike
+    /// `Path<T>` (which binds the leaf-most param), a guard can address a specific
+    /// mount param by name — e.g. the tenant fk `club_id` under `/clubs/{club_id}`.
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
     /// The remote peer's socket address, if the transport provided one. Set by the
     /// serve loop from `accept()`; absent for task contexts and synthetic requests.
     /// Rate limiting uses the IP here as its last-resort partition key; treat it as
@@ -368,6 +378,20 @@ mod tests {
         c.params.push(("id".into(), "42".into()));
         let Path(id): Path<i64> = Path::<i64>::from_request(&mut c).await.unwrap();
         assert_eq!(id, 42);
+    }
+
+    #[test]
+    fn ctx_param_reads_a_named_captured_param() {
+        // WHY: a tenancy/ownership guard must address a SPECIFIC mount param by
+        // name — the tenant fk `club_id` under `/clubs/{club_id}` — not just the
+        // leaf-most param that `Path<T>` binds. `param(name)` is that named read;
+        // it underpins membership verification (issues #78/#79). Absent → None.
+        let mut c = ctx("/x", "");
+        c.params.push(("club_id".into(), "42".into()));
+        c.params.push(("id".into(), "7".into()));
+        assert_eq!(c.param("club_id"), Some("42"));
+        assert_eq!(c.param("id"), Some("7"));
+        assert_eq!(c.param("missing"), None);
     }
 
     #[tokio::test]
