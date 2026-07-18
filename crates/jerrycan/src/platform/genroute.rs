@@ -351,6 +351,42 @@ fn tenant_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: 
     }
 }
 
+/// A stub comment steering the tenant's OWN collection handlers to the membership-
+/// lifecycle repo methods (issue #78, Task 3), so membership is correct-by-
+/// construction: a `POST /` create to `create_with_membership(_user.0.id, …)` — NOT
+/// the bare `insert`, which leaves the tenant memberless — and the tenant `GET /`
+/// list to `all_for_member(_user.0.id)` — NOT the unscoped `all()`, which leaks
+/// every tenant. Emitted only for a guarded db+auth `TenantShape::Collection`
+/// endpoint (the tenant's own root), so every other handler — and every non-tenancy
+/// design — stays byte-identical. Guarded is required: the methods key on the
+/// session user, which only a guarded handler's `_user: CurrentUser` provides.
+fn tenant_collection_comment(
+    m: &ModuleDesign,
+    ep: &Endpoint,
+    mode: GenMode,
+    design: &Design,
+) -> String {
+    if !(mode.db && mode.auth) || !ep.is_guarded() {
+        return String::new();
+    }
+    if !matches!(design.endpoint_tenant_shape(m, ep), TenantShape::Collection) {
+        return String::new();
+    }
+    let Some(entity) = endpoint_repo_entity(m, ep) else {
+        return String::new();
+    };
+    let snake = Design::to_snake(entity);
+    match ep.method {
+        HttpMethod::POST => format!(
+            "    // tenant create (issue #78): seed the creator's membership in the SAME\n    // transaction as the insert — call `{entity}Repo::create_with_membership(_user.0.id,\n    // {snake})` (NOT the bare `insert`), so a fresh {entity} is never memberless and the\n    // guard admits the creator on the next request.\n"
+        ),
+        HttpMethod::GET if ep.success.list => format!(
+            "    // tenant list (issue #78): return ONLY the caller's tenants — call\n    // `{entity}Repo::all_for_member(_user.0.id)` (NOT the unscoped `all()`), so a user\n    // sees just the {entity}s they belong to.\n"
+        ),
+        _ => String::new(),
+    }
+}
+
 pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     let mut uses = String::from("use jerrycan::prelude::*;\n");
     let mentions_entities = m
@@ -394,10 +430,11 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
             String::new()
         };
         let scope = tenant_scope_comment(m, ep, mode, design);
+        let collection = tenant_collection_comment(m, ep, mode, design);
         let server_owned = server_owned_fk_comment(m, ep, mode, design);
         let realtime = realtime_publish_comment(ep, design);
         out.push_str(&format!(
-            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{scope}{server_owned}{realtime}{body}\n}}\n\n",
+            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{scope}{collection}{server_owned}{realtime}{body}\n}}\n\n",
             op = ep.operation_id,
             params = handler_params(m, ep, mode, design),
             ret = return_type(ep),
@@ -1044,6 +1081,116 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     )
 }
 
+/// Membership-lifecycle accessors for the TENANT entity's OWN repo (issue #78,
+/// Task 3) — emitted only on the repo of the entity that DECLARES tenancy (empty
+/// for every other entity and every non-tenancy design, so output stays
+/// byte-identical there). Two methods make membership correct-by-construction:
+///
+/// - `create_with_membership(user_id, item)` inserts the tenant AND seeds the
+///   creator into `{tenant}_members` as the FIRST declared `member_role`, in ONE
+///   transaction — so a fresh tenant is never memberless and the membership-verified
+///   guard admits the creator on the next request (the seed can't be dropped the way
+///   a hand-written INSERT invited).
+/// - `all_for_member(user_id)` lists ONLY the tenants the caller belongs to
+///   (`JOIN {members} … WHERE user_id = ?`), never the unscoped `all()`.
+///
+/// The insert differs by pk type exactly as `insert` does (integer pk assigned by
+/// the DB and read back from the row; client-supplied text pk known up front and
+/// inserted via `Entity::insert(..).exec(..)`).
+fn tenant_own_methods(e: &Entity, design: &Design) -> String {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return String::new();
+    };
+    if e.name != tenancy.entity {
+        return String::new();
+    }
+    let entity = &e.name;
+    let snake = Design::to_snake(entity);
+    let key = key_rust_type(e);
+    let table = design.table_name(entity);
+    let members = format!("{}_members", snake);
+    let fk_col = Design::fk_column(&tenancy.entity);
+    // The seed role is the FIRST declared member_role ("creator becomes organizer");
+    // `member` is a safe fallback if a design declares tenancy with no roles.
+    let role = tenancy
+        .member_roles
+        .first()
+        .map(String::as_str)
+        .unwrap_or("member");
+    let insert_sets = active_sets(e, true);
+    // The membership INSERT is identical for both pk shapes; only the tenant insert
+    // (and how its id is obtained) differs, mirroring `insert`. A text pk is cloned
+    // into the bound value (it is also moved into the `Ok(id)` return); an integer
+    // pk is `Copy`, so cloning it would trip `clippy::clone_on_copy` in the app.
+    let id_bind = if key == "String" { "id.clone()" } else { "id" };
+    let seed = format!(
+        "        txn.execute(sea_orm::Statement::from_sql_and_values(\n\
+         \x20           txn.get_database_backend(),\n\
+         \x20           self.db.sql(\n\
+         \x20               \"INSERT INTO {members} (user_id, {fk_col}, role) VALUES (?, ?, ?)\",\n\
+         \x20           ),\n\
+         \x20           [user_id.into(), {id_bind}.into(), \"{role}\".into()],\n\
+         \x20       ))\n\
+         \x20       .await\n\
+         \x20       .map_err(db_error)?;"
+    );
+    let create_body = if key == "String" {
+        format!(
+            "    pub async fn create_with_membership(&self, user_id: String, item: {entity}) -> Result<{key}> {{\n\
+             \x20       use sea_orm::TransactionTrait;\n\
+             \x20       let id = item.id.clone();\n\
+             \x20       let txn = self.db.conn().begin().await.map_err(db_error)?;\n\
+             \x20       {snake}::Entity::insert({snake}::ActiveModel {{\n\
+             {insert_sets}        }})\n\
+             \x20       .exec(&txn)\n\
+             \x20       .await\n\
+             \x20       .map_err(db_error)?;\n\
+             {seed}\n\
+             \x20       txn.commit().await.map_err(db_error)?;\n\
+             \x20       Ok(id)\n\
+             \x20   }}"
+        )
+    } else {
+        format!(
+            "    pub async fn create_with_membership(&self, user_id: String, item: {entity}) -> Result<{key}> {{\n\
+             \x20       use sea_orm::TransactionTrait;\n\
+             \x20       let txn = self.db.conn().begin().await.map_err(db_error)?;\n\
+             \x20       let row = {snake}::ActiveModel {{\n\
+             {insert_sets}        }}\n\
+             \x20       .insert(&txn)\n\
+             \x20       .await\n\
+             \x20       .map_err(db_error)?;\n\
+             \x20       let id = row.id;\n\
+             {seed}\n\
+             \x20       txn.commit().await.map_err(db_error)?;\n\
+             \x20       Ok(id)\n\
+             \x20   }}"
+        )
+    };
+    format!(
+        r#"
+    // Membership lifecycle (issue #78) — the tenant entity's own repo. Create via
+    // `create_with_membership` so a fresh tenant is never memberless; list via
+    // `all_for_member` so a caller sees only the tenants they belong to.
+{create_body}
+
+    pub async fn all_for_member(&self, user_id: String) -> Result<Vec<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT c.* FROM {table} c JOIN {members} m ON m.{fk_col} = c.id WHERE m.user_id = ? ORDER BY c.id",
+                ),
+                [user_id.into()],
+            ))
+            .all(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}
+"#
+    )
+}
+
 fn sql_repo(e: &Entity, design: &Design) -> String {
     let entity = &e.name;
     let snake = Design::to_snake(entity);
@@ -1051,6 +1198,10 @@ fn sql_repo(e: &Entity, design: &Design) -> String {
     let insert_sets = active_sets(e, true);
     let update_sets = active_sets(e, false);
     let scoped = scoped_methods(e, design);
+    // The tenant entity's OWN membership-lifecycle methods (empty for every other
+    // entity); mutually exclusive with `scoped` (an entity can't be BOTH the tenant
+    // and belong_to the tenant).
+    let tenant_own = tenant_own_methods(e, design);
     // The insert differs by pk type. An auto-increment integer pk is assigned by
     // the DB, so `ActiveModel::insert` returns the persisted row (with its id).
     // A client-supplied text pk (string/uuid) is already known, and
@@ -1129,7 +1280,7 @@ impl {entity}Repo {{
             Err(e) => Err(db_error(e)),
         }}
     }}
-{scoped}}}
+{scoped}{tenant_own}}}
 
 "#,
     )
@@ -1150,11 +1301,23 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
         .entities
         .iter()
         .any(|e| !scoped_methods(e, design).is_empty());
+    // The TENANT entity's OWN repo (Task 3) also drives raw SQL — `create_with_membership`
+    // and `all_for_member` call `get_database_backend()`/`execute()` — so it needs
+    // `ConnectionTrait` even without the `.filter(..)` accessors a tenant-OWNED entity has.
+    let has_tenant_own = m
+        .entities
+        .iter()
+        .any(|e| !tenant_own_methods(e, design).is_empty());
     let filter_imports = if has_scoped {
         // `ConnectionTrait` backs `get_database_backend()` in the raw-SQL
         // membership-set accessors; the rest back the `.filter(Column::Fk.eq(..))`
         // path-scoped accessors. Only emitted when an entity is tenant-owned.
         "ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder"
+    } else if has_tenant_own {
+        // Pure tenant module (the tenant entity, no tenant-owned children): the
+        // membership-lifecycle methods need `ConnectionTrait`, but not the
+        // `ColumnTrait`/`QueryFilter` that only the `.filter(..)` accessors use.
+        "ActiveModelTrait, ActiveValue::Set, ConnectionTrait, EntityTrait, QueryOrder"
     } else {
         "ActiveModelTrait, ActiveValue::Set, EntityTrait, QueryOrder"
     };
@@ -2447,6 +2610,123 @@ pub(crate) mod tests {
                 "pub(crate) async fn get_club(_repo: Dep<ClubRepo>, _tenant: Dep<Tenant>, Path(_club_id): Path<i64>)"
             ),
             "the tenant's own detail route is path-scoped:\n{clubs}"
+        );
+    }
+
+    /// A tenant module carrying BOTH collection routes: the membership-filtered
+    /// list (`GET /`) and the auto-seeding create (`POST /`). CLUBS_TENANCY lacks
+    /// the list route, so Task 3 (issue #78) tests use this shape.
+    const CLUBS_LIFECYCLE: &str = r#"{ "name": "clubs-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "clubs",
+              "entities": [{ "name": "Club", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "list_clubs", "method": "GET", "path": "/", "auth_required": true,
+                    "success": { "status": 200, "entity": "Club", "list": true } },
+                  { "operation_id": "create_club", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Club" },
+                    "success": { "status": 201, "entity": "Club" } } ] }
+        ] }"#;
+
+    /// Task 3 / issue #78: the TENANT entity's own repo emits `create_with_membership`,
+    /// which seeds the creator into `{tenant}_members` as the FIRST declared member_role
+    /// in the SAME transaction as the tenant insert — so a freshly created tenant is
+    /// never memberless and the membership-verified guard admits the creator on the very
+    /// next request. The seed lives inside ONE generated method, so an agent can't drop
+    /// it the way a hand-written INSERT (the old docs pattern) invited.
+    #[test]
+    fn tenant_entity_repo_seeds_creator_membership_atomically_on_create() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains(
+                "pub async fn create_with_membership(&self, user_id: String, item: Club) -> Result<i64>"
+            ),
+            "tenant repo exposes create_with_membership:\n{src}"
+        );
+        // One transaction: the tenant insert and the membership seed commit together.
+        assert!(
+            src.contains("begin()") && src.contains("commit()"),
+            "atomic (begin/commit):\n{src}"
+        );
+        // The membership row: user_id + tenant fk + role, into the members table.
+        assert!(
+            src.contains("INSERT INTO club_members (user_id, club_id, role)"),
+            "seeds the membership row:\n{src}"
+        );
+        // role = member_roles[0] = "owner".
+        assert!(
+            src.contains("\"owner\""),
+            "role is the first member_role:\n{src}"
+        );
+    }
+
+    /// Task 3 / issue #78: the tenant entity's own repo emits `all_for_member`, a
+    /// membership-filtered list — a caller sees ONLY the tenants they belong to
+    /// (`JOIN {members} … WHERE user_id = ?`), never the unscoped `all()`.
+    #[test]
+    fn tenant_entity_repo_lists_only_the_callers_tenants() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains(
+                "pub async fn all_for_member(&self, user_id: String) -> Result<Vec<Club>>"
+            ),
+            "tenant repo exposes all_for_member:\n{src}"
+        );
+        assert!(
+            src.contains("JOIN club_members"),
+            "list joins the members table:\n{src}"
+        );
+        assert!(
+            src.contains("WHERE m.user_id = ?"),
+            "list filters by the caller:\n{src}"
+        );
+    }
+
+    /// The tenant's own COLLECTION handlers are steered to the membership-lifecycle
+    /// methods by construction: `create_*` to `create_with_membership` (never the bare
+    /// `insert`, which would leave the tenant memberless), and the tenant `list_*` to
+    /// `all_for_member` (never the unscoped `all()`), both keyed on `_user.0.id`.
+    #[test]
+    fn tenant_collection_handlers_are_steered_to_membership_methods() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = handlers_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        );
+        assert!(
+            src.contains("ClubRepo::create_with_membership(_user.0.id"),
+            "create handler names create_with_membership:\n{src}"
+        );
+        assert!(
+            src.contains("ClubRepo::all_for_member(_user.0.id)"),
+            "tenant list handler names all_for_member:\n{src}"
         );
     }
 
