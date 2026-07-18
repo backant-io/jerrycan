@@ -130,6 +130,19 @@ fn endpoint_is_tenant_owned(m: &ModuleDesign, ep: &Endpoint, design: &Design) ->
         .is_some_and(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity))
 }
 
+/// True when a guarded endpoint takes the membership-checked `Dep<Tenant>` — i.e.
+/// its route is PATH-SCOPED, so the guard verifies membership in the tenant NAMED
+/// IN THE PATH (a nested `/clubs/{club_id}/…`, or the tenant's own detail route)
+/// and 404s a non-member (issue #78). A MembershipSet (flat) or Collection
+/// endpoint takes a bare `CurrentUser` instead: a flat handler must not trust an
+/// arbitrary membership via `Dep<Tenant>` — it scopes to the membership SET.
+fn endpoint_uses_tenant_guard(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> bool {
+    matches!(
+        design.endpoint_tenant_shape(m, ep),
+        TenantShape::PathScoped { .. }
+    )
+}
+
 /// The request-DTO rule (issues #34 + #53) at the Rust layer: an endpoint whose
 /// body entity has a field the wire contract drops takes `Json<{Entity}Request>`
 /// (the trimmed DTO — see `request_dto_rs`) instead of `Json<{Entity}>`. Three
@@ -163,13 +176,14 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
     if let Some(e) = endpoint_repo_entity(m, ep) {
         params.push(format!("_repo: Dep<{e}Repo>"));
     }
-    // Guard param (order: repo, guard, path, body). A guarded endpoint on a
-    // tenant-owned entity takes the membership-checked `Dep<shared::Tenant>` (the
-    // Tenant factory consumes CurrentUser, so auth is still enforced: 401 from a
-    // missing session, 403 from no membership); other guarded endpoints take the
-    // bare authenticated session.
+    // Guard param (order: repo, guard, path, body). A guarded PATH-SCOPED endpoint
+    // takes the membership-checked `Dep<shared::Tenant>` — the factory verifies the
+    // caller belongs to the tenant NAMED IN THE PATH (401 from a missing session,
+    // 404 from a non-member of that tenant), closing the #78 cross-tenant leak. A
+    // flat (membership-set) or collection endpoint takes the bare authenticated
+    // session and scopes to the membership SET / body tenant fk instead.
     if mode.auth && ep.is_guarded() {
-        if endpoint_is_tenant_owned(m, ep, design) {
+        if endpoint_uses_tenant_guard(m, ep, design) {
             params.push("_tenant: Dep<Tenant>".to_string());
         } else {
             params.push("_user: CurrentUser".to_string());
@@ -221,7 +235,7 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
 
 /// A leading comment for role-guarded endpoints, reminding the agent how to
 /// enforce the role before proceeding (empty for unguarded / no-role endpoints).
-/// A tenant-owned endpoint carries `_tenant: Dep<Tenant>` and checks the role on
+/// A path-scoped endpoint carries `_tenant: Dep<Tenant>` and checks the role on
 /// the membership (`_tenant.require_role(...)?`); other endpoints take a bare
 /// `CurrentUser` and call `require_role(&_user.0.role, ...)` directly.
 fn guard_comment(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
@@ -229,7 +243,7 @@ fn guard_comment(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
         return String::new();
     }
     let roles = ep.required_roles.join("\", \"");
-    if endpoint_is_tenant_owned(m, ep, design) {
+    if endpoint_uses_tenant_guard(m, ep, design) {
         format!(
             "    // guard: requires role \"{roles}\" — call _tenant.require_role(\"{roles}\")? before proceeding\n"
         )
@@ -268,6 +282,52 @@ fn success_body(ep: &Endpoint) -> String {
     )
 }
 
+/// A stub comment naming the EXACT scoped repo method a tenant-owned READ handler
+/// must call for its route shape (issues #78/#79), so the agent scopes correctly
+/// by construction. Path-scoped reads (the guard already verified `_tenant`) use
+/// `all_for`/`get_for`; membership-set (flat) reads scope to the caller's
+/// memberships via `all_for_memberships`/`get_for_memberships`. Emitted only for
+/// GET handlers on a tenant-OWNED entity (the tenant's own routes and every
+/// non-tenant handler get nothing), so designs the rule doesn't touch — and every
+/// non-tenancy design — stay byte-identical.
+fn tenant_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> String {
+    if !(mode.db && mode.auth) || !matches!(ep.method, HttpMethod::GET) {
+        return String::new();
+    }
+    // Only a tenant-OWNED entity (belongs_to the tenant) has the scoped methods;
+    // the tenant's OWN routes use the plain repo scoped to the verified id.
+    if !endpoint_is_tenant_owned(m, ep, design) {
+        return String::new();
+    }
+    let Some(entity) = endpoint_repo_entity(m, ep) else {
+        return String::new();
+    };
+    let list = ep.success.list;
+    match design.endpoint_tenant_shape(m, ep) {
+        TenantShape::PathScoped { .. } => {
+            let call = if list {
+                format!("{entity}Repo::all_for(_tenant.id())")
+            } else {
+                format!("{entity}Repo::get_for(_tenant.id(), _id)")
+            };
+            format!(
+                "    // tenant scope (path): the guard verified membership in `_tenant`; scope this\n    // read to it via `{call}` — never the unscoped repo method (JL0006, issue #78).\n"
+            )
+        }
+        TenantShape::MembershipSet => {
+            let call = if list {
+                format!("{entity}Repo::all_for_memberships(_user.0.id)")
+            } else {
+                format!("{entity}Repo::get_for_memberships(_user.0.id, _id)")
+            };
+            format!(
+                "    // tenant scope (membership-set): this flat route has no tenant in the path —\n    // scope to the CALLER'S memberships via `{call}` so a multi-tenant user sees every\n    // tenant's rows they belong to and nothing outside the set (issues #78/#79).\n"
+            )
+        }
+        TenantShape::Collection | TenantShape::None => String::new(),
+    }
+}
+
 pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     let mut uses = String::from("use jerrycan::prelude::*;\n");
     let mentions_entities = m
@@ -288,11 +348,11 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
         let needs_tenant = m
             .endpoints
             .iter()
-            .any(|ep| ep.is_guarded() && endpoint_is_tenant_owned(m, ep, design));
+            .any(|ep| ep.is_guarded() && endpoint_uses_tenant_guard(m, ep, design));
         let needs_user = m
             .endpoints
             .iter()
-            .any(|ep| ep.is_guarded() && !endpoint_is_tenant_owned(m, ep, design));
+            .any(|ep| ep.is_guarded() && !endpoint_uses_tenant_guard(m, ep, design));
         if needs_tenant {
             uses.push_str("use shared::Tenant;\n");
         }
@@ -310,10 +370,11 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
         } else {
             String::new()
         };
+        let scope = tenant_scope_comment(m, ep, mode, design);
         let server_owned = server_owned_fk_comment(m, ep, mode, design);
         let realtime = realtime_publish_comment(ep, design);
         out.push_str(&format!(
-            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{server_owned}{realtime}{body}\n}}\n\n",
+            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{scope}{server_owned}{realtime}{body}\n}}\n\n",
             op = ep.operation_id,
             params = handler_params(m, ep, mode, design),
             ret = return_type(ep),
@@ -326,7 +387,7 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
 /// A leading comment for endpoints whose body DTO omits the identity FK (issue
 /// #34): tells the agent the SERVER injects the session user's id — the body
 /// (`{Entity}Request`) has no `user_id`, so the handler must set it when
-/// building the entity. Tenant-owned handlers take `Dep<Tenant>` (no session
+/// building the entity. Path-scoped handlers take `Dep<Tenant>` (no session
 /// param in the stub), so their variant says to add a `CurrentUser` param.
 fn server_owned_fk_comment(
     m: &ModuleDesign,
@@ -349,7 +410,9 @@ fn server_owned_fk_comment(
     // user's row silently take ownership. So split the note by method.
     if mode.auth && design.endpoint_omits_identity_fk(m, ep) {
         let is_create = matches!(ep.method, HttpMethod::POST);
-        let tenant_owned = endpoint_is_tenant_owned(m, ep, design);
+        // The stub wording references `_tenant` only when the handler actually has
+        // that param — i.e. a path-scoped guard; a flat handler has `_user`.
+        let tenant_owned = endpoint_uses_tenant_guard(m, ep, design);
         out.push_str(&match (is_create, tenant_owned) {
             (true, true) => format!(
                 "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Add a `user: CurrentUser` param and use `user.0.id` (the\n    // stringified user pk; parse it for an integer fk) when building the {entity}.\n"
@@ -859,6 +922,12 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     let fk_pascal = col_pascal(&fk_col);
     let fk_ty = design.target_key_rust_type(&tenancy.entity);
     let key = key_rust_type(e);
+    // The membership-set filter (issues #78/#79): a FLAT tenant-owned route scopes
+    // to the caller's memberships via raw SQL that mirrors the Supabase RLS policy
+    // the migrator recognizes — `{fk} IN (SELECT {fk} FROM {tenant}_members WHERE
+    // user_id = ?)`. `table`/`members` name the row table and the membership table.
+    let table = design.table_name(entity);
+    let members = format!("{}_members", Design::to_snake(&tenancy.entity));
     // The pk is `Set` from `item.id` (the synthetic pk also surfaces as a visible
     // `id` field), the rest from `item` (active_sets with the id line omitted) —
     // correct for both declared and synthetic primary keys, and `id` (the path
@@ -914,6 +983,39 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
             Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
             Err(e) => Err(db_error(e)),
         }}
+    }}
+
+    // Membership-set accessors (issues #78/#79) — a FLAT tenant-owned handler
+    // (no tenant fk in its path) scopes to the CALLER'S memberships, so a user in
+    // many tenants sees every tenant's rows they belong to and nothing outside the
+    // set (the Supabase RLS shape, restored). `user_id` is the stringified session
+    // user id (the membership table's `user_id` is TEXT). Raw SQL, entity-typed.
+    pub async fn all_for_memberships(&self, user_id: String) -> Result<Vec<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT * FROM {table} WHERE {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?) ORDER BY id",
+                ),
+                [user_id.into()],
+            ))
+            .all(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}
+
+    pub async fn get_for_memberships(&self, user_id: String, id: {key}) -> Result<Option<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT * FROM {table} WHERE id = ? AND {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?)",
+                ),
+                [id.into(), user_id.into()],
+            ))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)
     }}
 "#
     )
@@ -1026,7 +1128,10 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
         .iter()
         .any(|e| !scoped_methods(e, design).is_empty());
     let filter_imports = if has_scoped {
-        "ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder"
+        // `ConnectionTrait` backs `get_database_backend()` in the raw-SQL
+        // membership-set accessors; the rest back the `.filter(Column::Fk.eq(..))`
+        // path-scoped accessors. Only emitted when an entity is tenant-owned.
+        "ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder"
     } else {
         "ActiveModelTrait, ActiveValue::Set, EntityTrait, QueryOrder"
     };
@@ -2166,6 +2271,159 @@ pub(crate) mod tests {
         assert!(
             src.contains("Column::WorkspaceId.eq(workspace_id)"),
             "{src}"
+        );
+    }
+
+    /// A tenant-owned entity ALSO gets MEMBERSHIP-SET accessors (issues #78/#79) so
+    /// a FLAT route (no tenant fk in its path) scopes to the caller's memberships:
+    /// `all_for_memberships(user_id)` lists across every tenant the user belongs to;
+    /// `get_for_memberships(user_id, id)` bounds by the row id AND the set (404
+    /// outside it). The filter is the Supabase RLS shape — `{fk} IN (SELECT {fk} FROM
+    /// {members} WHERE user_id = ?)` — emitted as raw SQL so a multi-membership user
+    /// is served faithfully, not flattened to one arbitrary tenant.
+    #[test]
+    fn tenant_owned_entities_get_membership_set_methods() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let src = repo_rs(
+            &d.modules[1],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains(
+                "pub async fn all_for_memberships(&self, user_id: String) -> Result<Vec<Lead>>"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "pub async fn get_for_memberships(&self, user_id: String, id: i64) -> Result<Option<Lead>>"
+            ),
+            "{src}"
+        );
+        assert!(
+            src.contains(
+                "workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id"
+            ),
+            "membership-set filter is the RLS subquery: {src}"
+        );
+        // A flat get is bounded by the row id AND the membership set (404 outside it).
+        assert!(
+            src.contains(
+                "WHERE id = ? AND workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = ?)"
+            ),
+            "{src}"
+        );
+    }
+
+    /// A path-nested + flat tenancy design (BookClubs shape): nested books under
+    /// `/clubs/{club_id}`, flat customers, and the clubs collection root.
+    const CLUBS_TENANCY: &str = r#"{ "name": "clubs-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "clubs",
+              "entities": [{ "name": "Club", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_club", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Club" },
+                    "success": { "status": 201, "entity": "Club" } },
+                  { "operation_id": "get_club", "method": "GET", "path": "/{club_id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Club" } } ] },
+            { "name": "books", "mount": "/clubs/{club_id}",
+              "entities": [{ "name": "Book",
+                  "belongs_to": [{ "entity": "Club" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "list_books", "method": "GET", "path": "/", "auth_required": true,
+                    "success": { "status": 200, "entity": "Book", "list": true } },
+                  { "operation_id": "get_book", "method": "GET", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Book" } } ] },
+            { "name": "customers",
+              "entities": [{ "name": "Customer",
+                  "belongs_to": [{ "entity": "Club" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "email", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "list_customers", "method": "GET", "path": "/", "auth_required": true,
+                    "success": { "status": 200, "entity": "Customer", "list": true } },
+                  { "operation_id": "get_customer", "method": "GET", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Customer" } } ] }
+        ] }"#;
+
+    /// The guard PARAM and the read scope-hint comment follow `endpoint_tenant_shape`
+    /// (issue #78): PathScoped → `Dep<Tenant>` + name the path-scoped repo method;
+    /// MembershipSet → `CurrentUser` (never `Dep<Tenant>`) + name the membership-set
+    /// method; Collection → `CurrentUser` (create/list are Task 3). This is the whole
+    /// point of the fix — a flat tenant-owned handler must NOT trust an arbitrary
+    /// membership via `Dep<Tenant>`; it scopes to the membership SET.
+    #[test]
+    fn guard_param_and_scope_comment_follow_tenant_shape() {
+        let d: Design = serde_json::from_str(CLUBS_TENANCY).unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+
+        // PathScoped (nested) → Dep<Tenant>; scope comment names all_for / get_for.
+        let books = handlers_rs(&d.modules[1], mode, &d);
+        assert!(
+            books.contains(
+                "pub(crate) async fn list_books(_repo: Dep<BookRepo>, _tenant: Dep<Tenant>)"
+            ),
+            "path-scoped list takes Dep<Tenant>:\n{books}"
+        );
+        assert!(
+            books.contains("BookRepo::all_for(_tenant.id())"),
+            "path-scoped list comment names all_for:\n{books}"
+        );
+        assert!(
+            books.contains("BookRepo::get_for(_tenant.id(), _id)"),
+            "path-scoped detail comment names get_for:\n{books}"
+        );
+
+        // MembershipSet (flat) → CurrentUser, never Dep<Tenant>; comment names the set methods.
+        let customers = handlers_rs(&d.modules[2], mode, &d);
+        assert!(
+            customers.contains(
+                "pub(crate) async fn list_customers(_repo: Dep<CustomerRepo>, _user: CurrentUser)"
+            ),
+            "flat list takes CurrentUser, not Dep<Tenant>:\n{customers}"
+        );
+        assert!(
+            !customers.contains("Dep<Tenant>"),
+            "flat handlers must never take Dep<Tenant>:\n{customers}"
+        );
+        assert!(
+            customers.contains("CustomerRepo::all_for_memberships(_user.0.id)"),
+            "membership-set list comment names all_for_memberships:\n{customers}"
+        );
+        assert!(
+            customers.contains("CustomerRepo::get_for_memberships(_user.0.id, _id)"),
+            "membership-set detail comment names get_for_memberships:\n{customers}"
+        );
+
+        // Collection root → CurrentUser; the tenant's OWN detail route is path-scoped.
+        let clubs = handlers_rs(&d.modules[0], mode, &d);
+        assert!(
+            clubs.contains(
+                "pub(crate) async fn create_club(_repo: Dep<ClubRepo>, _user: CurrentUser"
+            ),
+            "collection create takes CurrentUser:\n{clubs}"
+        );
+        assert!(
+            clubs.contains(
+                "pub(crate) async fn get_club(_repo: Dep<ClubRepo>, _tenant: Dep<Tenant>, Path(_club_id): Path<i64>)"
+            ),
+            "the tenant's own detail route is path-scoped:\n{clubs}"
         );
     }
 

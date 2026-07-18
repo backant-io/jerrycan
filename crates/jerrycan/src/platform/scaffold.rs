@@ -47,6 +47,23 @@ fn shared_tenancy_types(design: &Design) -> String {
     } else {
         "self.id"
     };
+    // Parse the path fk into the tenant pk type, and bind it into the SQL. A text
+    // pk is the path segment verbatim (clone once for the bind, keep for the id);
+    // an integer pk parses (a non-numeric segment is a 404, not a 400 — no probing)
+    // and, being Copy, needs no clone.
+    let (fk_parse, fk_bind) = if id_ty == "String" {
+        (
+            format!("let {fk_col} = {fk_col}.to_string();"),
+            format!("{fk_col}.clone().into()"),
+        )
+    } else {
+        (
+            format!(
+                "let {fk_col}: {id_ty} = match {fk_col}.parse() {{\n            Ok(v) => v,\n            Err(_) => return Err(jerrycan::Error::not_found()),\n        }};"
+            ),
+            format!("{fk_col}.into()"),
+        )
+    };
     format!(
         r#"
 /// The authenticated tenant context: membership-checked {tenant} + role.
@@ -65,13 +82,45 @@ impl Tenant {{
     }}
 }}
 
-/// DI guard factory — registered app-wide; handlers take `Dep<Tenant>`.
-/// Resolves the caller's membership or rejects 403 before the handler runs.
+/// DI guard factory — registered app-wide; path-scoped handlers take `Dep<Tenant>`.
+///
+/// The tenant a request acts on comes from the ROUTE, and membership in THAT
+/// tenant is verified before the handler runs (issue #78): when the path names
+/// the tenant fk `{fk_col}` (a nested mount like `/{tenant_snake}s/{{{fk_col}}}`),
+/// the guard checks the caller belongs to the addressed tenant — a non-member is
+/// `404` (no existence leak), never an arbitrary "member of something". A route
+/// with NO tenant fk in its path (a storage bucket, or the tenant's own
+/// collection) falls back to the caller's first membership, preserving the
+/// pre-#78 scoping for those non-path-scoped consumers. 401 still comes from a
+/// missing session (the `CurrentUser` arg); `require_role` is the 403 role gate.
 pub async fn tenant(
     user: CurrentUser,
     db: jerrycan::Dep<jerrycan::db::Db>,
+    params: jerrycan::extract::PathParams,
 ) -> jerrycan::Result<Tenant> {{
     use jerrycan::db::sea_orm::{{ConnectionTrait, Statement}};
+    // Path-scoped: the URL carries the tenant fk — verify membership in it.
+    if let Some({fk_col}) = params.get("{fk_col}") {{
+        {fk_parse}
+        let row = db
+            .conn()
+            .query_one(Statement::from_sql_and_values(
+                db.conn().get_database_backend(),
+                db.sql("SELECT role FROM {tenant_snake}_members WHERE user_id = ? AND {fk_col} = ?"),
+                [user.0.id.into(), {fk_bind}],
+            ))
+            .await
+            .map_err(jerrycan::db::db_error)?;
+        let Some(row) = row else {{
+            return Err(jerrycan::Error::not_found());
+        }};
+        return Ok(Tenant {{
+            id: {fk_col},
+            role: row.try_get("", "role").map_err(jerrycan::db::db_error)?,
+        }});
+    }}
+    // No tenant fk in the path: resolve the caller's first membership (storage
+    // buckets, the tenant's own collection). Behavior-identical to the pre-#78 guard.
     let row = db
         .conn()
         .query_one(Statement::from_sql_and_values(
@@ -203,4 +252,63 @@ pub fn scaffold(target: &Path, design: &Design) -> Result<Vec<String>, String> {
     created.sort();
     created.dedup();
     Ok(created)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tenancy design (Club tenant, integer pk) — enough to render the guard.
+    fn clubs_design() -> Design {
+        serde_json::from_str(
+            r#"{ "name": "clubs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "clubs",
+                      "entities": [{ "name": "Club", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [
+                          { "operation_id": "get_club", "method": "GET", "path": "/{club_id}",
+                            "success": { "status": 200, "entity": "Club" } }] }
+                ] }"#,
+        )
+        .unwrap()
+    }
+
+    /// The generated `Tenant` guard must be MEMBERSHIP-VERIFIED against the ROUTE,
+    /// not resolved from an arbitrary first membership (issue #78). When the path
+    /// names the tenant fk it reads it BY NAME (via `PathParams`, not the leaf-only
+    /// `Path<T>`), queries the membership row for THAT tenant, and 404s on a miss
+    /// (no existence leak) — never 403. `require_role` stays the 403 role gate.
+    #[test]
+    fn tenant_guard_is_path_membership_verified_with_404() {
+        let guard = shared_tenancy_types(&clubs_design());
+        // The factory takes the additive `PathParams` extractor and reads the fk by name.
+        assert!(
+            guard.contains("params: jerrycan::extract::PathParams"),
+            "factory must take PathParams:\n{guard}"
+        );
+        assert!(
+            guard.contains("params.get(\"club_id\")"),
+            "guard reads the tenant fk from the path by name:\n{guard}"
+        );
+        // Membership is verified for the PATH tenant, not "member of anything".
+        assert!(
+            guard.contains("WHERE user_id = ? AND club_id = ?"),
+            "guard verifies membership in the path tenant:\n{guard}"
+        );
+        // A membership miss on the path tenant is 404 (no existence leak), not 403.
+        assert!(
+            guard.contains("Error::not_found()"),
+            "path-tenant miss is 404:\n{guard}"
+        );
+        // The role gate is unchanged (403 path).
+        assert!(
+            guard.contains("jerrycan::auth::require_role(&self.role, role)"),
+            "require_role stays the 403 gate:\n{guard}"
+        );
+    }
 }

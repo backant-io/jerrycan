@@ -23,7 +23,7 @@ pub use clock::Clock;
 pub use cors::{CorsConfig, CorsOrigins};
 pub use dep::{Dep, TaskContext};
 pub use error::{Error, Result};
-pub use extract::{FromRequest, Headers, Path, Query, RawBody, RequestCtx};
+pub use extract::{FromRequest, Headers, Path, PathParams, Query, RawBody, RequestCtx};
 pub use handler::Handler;
 pub use middleware::{Middleware, MiddlewareFuture, Next};
 pub use module::Module;
