@@ -445,6 +445,29 @@ impl ModuleDesign {
 /// column against it rather than against a hardcoded `User` string.
 pub(crate) const AUTH_IDENTITY_FK_COLUMN: &str = "user_id";
 
+/// How an endpoint binds the tenant, so an ownership guard (issues #78/#79) knows
+/// WHAT to verify before touching a row. Derived from the endpoint's resolved path
+/// (mount + `ep.path`) relative to the design's `tenancy` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TenantShape {
+    /// The resolved URL carries the tenant fk `{fk_param}` (e.g. `/clubs/{club_id}/…`,
+    /// or the tenant entity's own detail route `/{club_id}` / `/{id}`). The guard
+    /// verifies the caller belongs to the tenant named IN THE PATH — the cross-tenant
+    /// leak surface (#78).
+    PathScoped { fk_param: String },
+    /// A flat tenant-owned route whose URL carries NO tenant param (e.g. a
+    /// module mounted at `/customers`, not under `/clubs/{club_id}`). The set of
+    /// rows the caller may see is defined implicitly by their memberships — the
+    /// per-user leak surface (#79).
+    MembershipSet,
+    /// The tenant entity's own collection root (`POST "/"` / `GET "/"` on the
+    /// tenant module): create a new tenant, or list the caller's tenants.
+    Collection,
+    /// Not a tenant-scoped endpoint (no `tenancy` block, or a module that is
+    /// neither the tenant module nor owns a tenant-owned entity).
+    None,
+}
+
 impl Design {
     /// The normalized app-level mount prefix: the `base_path` override, or `""`
     /// when absent / `/` / empty (a no-op). Prepended to every module and bucket
@@ -664,6 +687,70 @@ impl Design {
     /// The fk column a belongs_to derives: snake_case(target) + "_id".
     pub fn fk_column(target: &str) -> String {
         format!("{}_id", Self::to_snake(target))
+    }
+
+    /// Classify how `ep` (in `module`) binds the tenant, so an ownership guard
+    /// knows what to verify (issues #78/#79). Resolves the endpoint's full path
+    /// (`module.effective_mount()`, trailing `/` trimmed, + `ep.path`) against the
+    /// design's `tenancy` block. Classes (first match wins):
+    ///   - no `tenancy`, or a module that neither declares the tenant entity nor
+    ///     owns a tenant-owned entity → [`TenantShape::None`];
+    ///   - the tenant entity's OWN module, `ep.path == "/"` (POST or GET) →
+    ///     [`TenantShape::Collection`];
+    ///   - the resolved path carries the tenant fk `{fk_param}` — OR the tenant
+    ///     entity's own detail route `/{id}` — → [`TenantShape::PathScoped`]
+    ///     (`fk_param` is always the tenant fk, even when the route param is `id`,
+    ///     so callers scope on the tenant without a route-param rename);
+    ///   - a tenant-owned entity whose resolved path carries no tenant param →
+    ///     [`TenantShape::MembershipSet`].
+    // Scaffolding: the membership-verifying guard codegen (issues #78/#79) is the
+    // consumer, landing in a later task; remove this allow once it is wired in.
+    #[allow(dead_code)]
+    pub(crate) fn endpoint_tenant_shape(
+        &self,
+        module: &ModuleDesign,
+        ep: &Endpoint,
+    ) -> TenantShape {
+        let Some(tenancy) = self.tenancy.as_ref() else {
+            return TenantShape::None;
+        };
+        let is_tenant_module = module.entities.iter().any(|e| e.name == tenancy.entity);
+        let owns_tenant_entity = module
+            .entities
+            .iter()
+            .any(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity));
+        if !is_tenant_module && !owns_tenant_entity {
+            return TenantShape::None;
+        }
+
+        let fk_param = Self::fk_column(&tenancy.entity);
+        let mount = module.effective_mount();
+        let mount = mount.strip_suffix('/').unwrap_or(&mount);
+        let resolved = format!("{mount}{}", ep.path);
+        let fk_token = format!("{{{fk_param}}}");
+
+        // The tenant entity's own module: collection root, then its detail route
+        // (`/{club_id}` matched below via fk_token, or the conventional `/{id}`).
+        if is_tenant_module {
+            if ep.path == "/" && matches!(ep.method, HttpMethod::POST | HttpMethod::GET) {
+                return TenantShape::Collection;
+            }
+            if resolved.contains(&fk_token) || ep.path.contains("{id}") {
+                return TenantShape::PathScoped { fk_param };
+            }
+        }
+
+        // Tenant-owned routes: path-scoped when the URL carries the tenant fk
+        // (a nested mount like `/clubs/{club_id}`), else membership-scoped. A flat
+        // child `/{id}` (no tenant fk in the path) is MembershipSet, NOT PathScoped
+        // — so the conventional `{id}` shortcut is deliberately NOT applied here.
+        if resolved.contains(&fk_token) {
+            return TenantShape::PathScoped { fk_param };
+        }
+        if owns_tenant_entity {
+            return TenantShape::MembershipSet;
+        }
+        TenantShape::None
     }
 
     /// True when this belongs_to targets the AUTH IDENTITY entity: its derived
@@ -1364,6 +1451,111 @@ pub(crate) mod tests {
         // fk_column derives from the shared to_snake (DRY); both must agree.
         assert_eq!(Design::to_snake("ApiKey"), "api_key");
         assert_eq!(Design::to_snake("Lead"), "lead");
+    }
+
+    #[test]
+    fn tenant_shape_classifies_by_route() {
+        // WHY: ownership scoping (issues #78/#79) needs, per endpoint, HOW the
+        // tenant is bound so a guard can verify it. PathScoped: the URL carries
+        // the tenant fk `{club_id}` — verify the caller belongs to THAT tenant.
+        // Collection: create/list at the tenant module root — scope to the caller's
+        // memberships. MembershipSet: a flat tenant-owned route with NO tenant
+        // param in the URL (the #79 per-user leak surface). None: non-tenant routes.
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "clubs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "clubs",
+                      "entities": [{ "name": "Club", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [
+                          { "operation_id": "create_club", "method": "POST", "path": "/",
+                            "request_body": { "entity": "Club" },
+                            "success": { "status": 201, "entity": "Club" } },
+                          { "operation_id": "list_clubs", "method": "GET", "path": "/",
+                            "success": { "status": 200, "entity": "Club", "list": true } },
+                          { "operation_id": "get_club", "method": "GET", "path": "/{club_id}",
+                            "success": { "status": 200, "entity": "Club" } },
+                          { "operation_id": "delete_club", "method": "DELETE", "path": "/{club_id}",
+                            "success": { "status": 204 } },
+                          { "operation_id": "get_club_conventional", "method": "GET", "path": "/{id}",
+                            "success": { "status": 200, "entity": "Club" } } ] },
+                    { "name": "books", "mount": "/clubs/{club_id}",
+                      "entities": [{ "name": "Book",
+                          "belongs_to": [{ "entity": "Club" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "title", "type": "string" }] }],
+                      "endpoints": [
+                          { "operation_id": "create_book", "method": "POST", "path": "/",
+                            "request_body": { "entity": "Book" },
+                            "success": { "status": 201, "entity": "Book" } },
+                          { "operation_id": "list_books", "method": "GET", "path": "/",
+                            "success": { "status": 200, "entity": "Book", "list": true } },
+                          { "operation_id": "get_book", "method": "GET", "path": "/{id}",
+                            "success": { "status": 200, "entity": "Book" } } ] },
+                    { "name": "customers",
+                      "entities": [{ "name": "Customer",
+                          "belongs_to": [{ "entity": "Club" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "email", "type": "string" }] }],
+                      "endpoints": [
+                          { "operation_id": "list_customers", "method": "GET", "path": "/",
+                            "success": { "status": 200, "entity": "Customer", "list": true } },
+                          { "operation_id": "get_customer", "method": "GET", "path": "/{id}",
+                            "success": { "status": 200, "entity": "Customer" } } ] }
+                ] }"#,
+        )
+        .unwrap();
+        let clubs = &d.modules[0];
+        let books = &d.modules[1];
+        let customers = &d.modules[2];
+
+        // Collection: the tenant entity's own POST "/" and GET "/".
+        assert!(matches!(
+            d.endpoint_tenant_shape(clubs, &clubs.endpoints[0]),
+            TenantShape::Collection
+        ));
+        assert!(matches!(
+            d.endpoint_tenant_shape(clubs, &clubs.endpoints[1]),
+            TenantShape::Collection
+        ));
+        // PathScoped: the tenant's own detail routes + a nested tenant-owned
+        // detail route, all carrying the tenant fk `club_id` in the resolved path.
+        assert!(matches!(
+            d.endpoint_tenant_shape(clubs, &clubs.endpoints[2]),
+            TenantShape::PathScoped { fk_param } if fk_param == "club_id"
+        ));
+        assert!(matches!(
+            d.endpoint_tenant_shape(clubs, &clubs.endpoints[3]),
+            TenantShape::PathScoped { .. }
+        ));
+        // The tenant's OWN detail route using the conventional `/{id}` (not
+        // `/{club_id}`) must ALSO be PathScoped with the tenant fk — this is the
+        // load-bearing clause that lets a guard verify the tenant's own resource.
+        assert!(matches!(
+            d.endpoint_tenant_shape(clubs, &clubs.endpoints[4]),
+            TenantShape::PathScoped { fk_param } if fk_param == "club_id"
+        ));
+        assert!(matches!(
+            d.endpoint_tenant_shape(books, &books.endpoints[2]),
+            TenantShape::PathScoped { fk_param } if fk_param == "club_id"
+        ));
+        // MembershipSet: a flat tenant-owned route with NO tenant param in the URL.
+        assert!(matches!(
+            d.endpoint_tenant_shape(customers, &customers.endpoints[1]),
+            TenantShape::MembershipSet
+        ));
+
+        // A design with NO tenancy → every endpoint is None.
+        let plain: Design = serde_json::from_str(MINIMAL).unwrap();
+        let m = &plain.modules[0];
+        assert!(matches!(
+            plain.endpoint_tenant_shape(m, &m.endpoints[0]),
+            TenantShape::None
+        ));
     }
 
     #[test]
