@@ -54,7 +54,7 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                     }),
                 );
             };
-            let design: Design = match serde_json::from_value(draft.clone()) {
+            let mut design: Design = match serde_json::from_value(draft.clone()) {
                 Ok(d) => d,
                 Err(e) => {
                     return (
@@ -67,6 +67,9 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                     );
                 }
             };
+            // Match `from_path`: the tenant entity's own detail route is stored
+            // (and generated) as `/{tenant_fk}`, so the guard path-verifies it (#78).
+            design.normalize_tenant_detail_routes();
             let qs = questions::validate(&design);
             if !qs.is_empty() {
                 return (
@@ -189,6 +192,11 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                             parent.subroutes.push(module);
                         }
                     }
+                    // A merged design_slice can carry the tenant module's own
+                    // `/{id}` detail route un-normalized (it's parsed by
+                    // `from_value`, not `from_path`); re-normalize so the slice
+                    // path can't reopen the #78 leak.
+                    design.normalize_tenant_detail_routes();
                     let qs = questions::validate(&design);
                     if !qs.is_empty() {
                         return (

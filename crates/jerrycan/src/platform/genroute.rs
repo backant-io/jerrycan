@@ -143,6 +143,26 @@ fn endpoint_uses_tenant_guard(m: &ModuleDesign, ep: &Endpoint, design: &Design) 
     )
 }
 
+/// The path-param name that keys THIS endpoint's own entity (so it takes the
+/// entity key type instead of `i64`). Conventionally `id`; but the tenant
+/// entity's OWN detail route is normalized to `/{tenant_fk}` (issue #78), so on
+/// the tenant module the tenant fk param IS the entity key. Returns `id` for
+/// every other endpoint — byte-identical to the pre-#78 `p == "id"` rule for all
+/// non-tenancy designs and all tenant-owned children (whose leaf param stays
+/// `id`).
+fn entity_key_param(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
+    if let Some(tenancy) = design.tenancy.as_ref() {
+        let fk = Design::fk_column(&tenancy.entity);
+        if m.entities.iter().any(|e| e.name == tenancy.entity)
+            && endpoint_repo_entity(m, ep) == Some(tenancy.entity.as_str())
+            && path_params(ep) == [fk.clone()]
+        {
+            return fk;
+        }
+    }
+    "id".to_string()
+}
+
 /// The request-DTO rule (issues #34 + #53) at the Rust layer: an endpoint whose
 /// body entity has a field the wire contract drops takes `Json<{Entity}Request>`
 /// (the trimmed DTO — see `request_dto_rs`) instead of `Json<{Entity}>`. Three
@@ -197,13 +217,16 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
         params.push("_rt: Dep<jerrycan::realtime::RealtimeHandle>".to_string());
     }
     let params_in_path = path_params(ep);
-    // A param named `id` keys the endpoint's entity, so it takes that entity's
-    // key type (String for text pks); other params stay i64.
+    // The param that keys the endpoint's entity takes that entity's key type
+    // (String for text pks); other params stay i64. Conventionally `id`, but the
+    // tenant entity's OWN detail route is normalized to `/{tenant_fk}` (#78), so
+    // there the tenant fk param — not `id` — is the entity key.
     let key = endpoint_repo_entity(m, ep)
         .and_then(|name| m.entities.iter().find(|e| e.name == name))
         .map(key_rust_type)
         .unwrap_or("i64");
-    let param_type = |p: &str| if p == "id" { key } else { "i64" };
+    let key_param = entity_key_param(m, ep, design);
+    let param_type = |p: &str| if p == key_param.as_str() { key } else { "i64" };
     match params_in_path.len() {
         0 => {}
         1 => params.push(format!(
@@ -2424,6 +2447,80 @@ pub(crate) mod tests {
                 "pub(crate) async fn get_club(_repo: Dep<ClubRepo>, _tenant: Dep<Tenant>, Path(_club_id): Path<i64>)"
             ),
             "the tenant's own detail route is path-scoped:\n{clubs}"
+        );
+    }
+
+    /// Issue #78 (the cross-tenant leak this fix closes): a tenant module authored
+    /// with the CONVENTIONAL `/{id}` detail route is normalized to `/{club_id}`, and
+    /// that rename must ripple through BOTH the route table (so the router captures
+    /// `club_id` and the guard's path branch fires) AND the handler param (name +
+    /// type). Without the ripple the guard reads `params.get("club_id") == None`,
+    /// falls back to an arbitrary first membership, and the handler reads another
+    /// tenant's row.
+    #[test]
+    fn tenant_own_conventional_id_route_is_normalized_through_route_and_handler() {
+        let conventional = r#"{ "name": "clubs-api", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "clubs",
+                  "entities": [{ "name": "Club", "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "name", "type": "string" } ]}],
+                  "endpoints": [
+                      { "operation_id": "create_club", "method": "POST", "path": "/", "auth_required": true,
+                        "request_body": { "entity": "Club" },
+                        "success": { "status": 201, "entity": "Club" } },
+                      { "operation_id": "get_club", "method": "GET", "path": "/{id}", "auth_required": true,
+                        "success": { "status": 200, "entity": "Club" } },
+                      { "operation_id": "delete_club", "method": "DELETE", "path": "/{id}", "auth_required": true,
+                        "success": { "status": 204 } } ] }
+            ] }"#;
+        let mut d: Design = serde_json::from_str(conventional).unwrap();
+        // The design as-loaded still carries the raw `/{id}` (the parser doesn't
+        // normalize; `from_path`/the MCP entry points do). Normalize as a real load
+        // would.
+        d.normalize_tenant_detail_routes();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+
+        // Route table: the router now captures `club_id`, so the guard verifies it.
+        let lib = lib_rs(&d.modules[0], mode);
+        assert!(
+            lib.contains(
+                ".route(\"/{club_id}\", get(handlers::get_club).delete(handlers::delete_club))"
+            ),
+            "tenant-own detail route must register /{{club_id}}:\n{lib}"
+        );
+        assert!(
+            !lib.contains("/{id}"),
+            "no `/{{id}}` may survive on the tenant module:\n{lib}"
+        );
+
+        // Handler: the path param is renamed AND keeps the tenant entity key type.
+        let clubs = handlers_rs(&d.modules[0], mode, &d);
+        assert!(
+            clubs.contains(
+                "pub(crate) async fn get_club(_repo: Dep<ClubRepo>, _tenant: Dep<Tenant>, Path(_club_id): Path<i64>)"
+            ),
+            "tenant-own detail handler binds Dep<Tenant> + Path(_club_id):\n{clubs}"
+        );
+
+        // Ripple check for a TEXT-pk tenant: the renamed param must type as the
+        // tenant entity KEY (String), not a blind i64 — `entity_key_param`.
+        let text_pk = conventional.replace(
+            r#"{ "name": "id", "type": "integer" }"#,
+            r#"{ "name": "id", "type": "string" }"#,
+        );
+        let mut dt: Design = serde_json::from_str(&text_pk).unwrap();
+        dt.normalize_tenant_detail_routes();
+        let clubs_text = handlers_rs(&dt.modules[0], mode, &dt);
+        assert!(
+            clubs_text.contains("Path(_club_id): Path<String>"),
+            "text-pk tenant-own detail param must be Path<String>:\n{clubs_text}"
         );
     }
 

@@ -668,7 +668,54 @@ impl Design {
     pub fn from_path(path: &std::path::Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("invalid design.json: {e}"))
+        let mut design: Self =
+            serde_json::from_str(&raw).map_err(|e| format!("invalid design.json: {e}"))?;
+        design.normalize_tenant_detail_routes();
+        Ok(design)
+    }
+
+    /// Rewrite the tenant entity's OWN detail-route param `{id}` → `{tenant_fk}`
+    /// (e.g. `GET /clubs/{id}` → `GET /clubs/{club_id}`) before any generation, so
+    /// the membership-verifying `tenant()` guard reads the tenant fk BY NAME from
+    /// the path and 404s a non-member — closing the #78 cross-tenant leak on the
+    /// tenant's own conventional `GET`/`PUT`/`PATCH`/`DELETE /{id}` route (whose
+    /// router previously captured `id`, so the guard's path branch missed and fell
+    /// back to an arbitrary first membership, reading/deleting a tenant the caller
+    /// isn't a member of).
+    ///
+    /// Scoped to the module that DECLARES the tenant entity. A nested tenant-owned
+    /// child (`/clubs/{club_id}/books/{id}` — `{id}` is the BOOK) and a storage
+    /// bucket `/{id}` (the object KEY, generated outside `modules`) are NOT modules
+    /// of the tenant entity, so they are untouched. Idempotent: a path already
+    /// carrying `{club_id}` has no `{id}` token to rewrite. Applied at every design
+    /// load (`from_path`) and after in-memory design-slice merges (the MCP
+    /// `jerrycan_generate` route path), so no generation path can reopen the leak.
+    pub(crate) fn normalize_tenant_detail_routes(&mut self) {
+        let Some(tenancy) = self.tenancy.as_ref() else {
+            return;
+        };
+        let entity = tenancy.entity.clone();
+        let fk_token = format!("{{{}}}", Self::fk_column(&entity));
+        for m in &mut self.modules {
+            Self::normalize_own_detail_routes(m, &entity, &fk_token);
+        }
+    }
+
+    /// Rename `{id}` → `fk_token` in the OWN endpoints of the module that declares
+    /// `entity` (the tenant module); recurse so a tenant entity declared in a
+    /// subroute is still found. Never touches a module that merely OWNS a
+    /// tenant-owned child.
+    fn normalize_own_detail_routes(m: &mut ModuleDesign, entity: &str, fk_token: &str) {
+        if m.entities.iter().any(|e| e.name == entity) {
+            for ep in &mut m.endpoints {
+                if ep.path.contains("{id}") {
+                    ep.path = ep.path.replace("{id}", fk_token);
+                }
+            }
+        }
+        for sub in &mut m.subroutes {
+            Self::normalize_own_detail_routes(sub, entity, fk_token);
+        }
     }
 
     /// Entities owned by the tenant: any entity (in any module or subroute)
@@ -1556,6 +1603,93 @@ pub(crate) mod tests {
             plain.endpoint_tenant_shape(m, &m.endpoints[0]),
             TenantShape::None
         ));
+    }
+
+    #[test]
+    fn normalize_renames_only_the_tenant_module_own_detail_route() {
+        // Issue #78: the tenant entity's OWN `/{id}` detail route is normalized to
+        // `/{club_id}` so the guard reads the tenant fk by name and 404s a
+        // non-member. A nested tenant-owned child (`books/{id}` — the BOOK) and a
+        // flat tenant-owned child (`customers/{id}`) MUST stay `{id}`; the tenant
+        // collection root (`POST`/`GET "/"`) is unaffected. This is the security
+        // fix: without the rename the guard's path branch misses and leaks another
+        // tenant's row.
+        let mut d: Design = serde_json::from_str(
+            r#"{ "name": "clubs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "clubs",
+                      "entities": [{ "name": "Club", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [
+                          { "operation_id": "create_club", "method": "POST", "path": "/",
+                            "request_body": { "entity": "Club" },
+                            "success": { "status": 201, "entity": "Club" } },
+                          { "operation_id": "get_club", "method": "GET", "path": "/{id}",
+                            "success": { "status": 200, "entity": "Club" } },
+                          { "operation_id": "delete_club", "method": "DELETE", "path": "/{id}",
+                            "success": { "status": 204 } } ] },
+                    { "name": "books", "mount": "/clubs/{club_id}",
+                      "entities": [{ "name": "Book",
+                          "belongs_to": [{ "entity": "Club" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "title", "type": "string" }] }],
+                      "endpoints": [
+                          { "operation_id": "get_book", "method": "GET", "path": "/{id}",
+                            "success": { "status": 200, "entity": "Book" } } ] },
+                    { "name": "customers",
+                      "entities": [{ "name": "Customer",
+                          "belongs_to": [{ "entity": "Club" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "email", "type": "string" }] }],
+                      "endpoints": [
+                          { "operation_id": "get_customer", "method": "GET", "path": "/{id}",
+                            "success": { "status": 200, "entity": "Customer" } } ] }
+                ] }"#,
+        )
+        .unwrap();
+        d.normalize_tenant_detail_routes();
+        // The tenant module's OWN detail routes are renamed to the tenant fk.
+        assert_eq!(
+            d.modules[0].endpoints[1].path, "/{club_id}",
+            "GET tenant detail"
+        );
+        assert_eq!(
+            d.modules[0].endpoints[2].path, "/{club_id}",
+            "DELETE tenant detail"
+        );
+        // The collection root is untouched.
+        assert_eq!(d.modules[0].endpoints[0].path, "/");
+        // The nested child (`books/{id}` — the BOOK) and the flat child
+        // (`customers/{id}`) keep `{id}` — normalizing them would misname a
+        // non-tenant key.
+        assert_eq!(
+            d.modules[1].endpoints[0].path, "/{id}",
+            "nested child untouched"
+        );
+        assert_eq!(
+            d.modules[2].endpoints[0].path, "/{id}",
+            "flat child untouched"
+        );
+        // Idempotent: a second pass is a no-op.
+        let before = d.clone();
+        d.normalize_tenant_detail_routes();
+        assert_eq!(
+            d.modules[0].endpoints[1].path,
+            before.modules[0].endpoints[1].path
+        );
+
+        // A non-tenancy design is entirely untouched.
+        let mut plain: Design = serde_json::from_str(MINIMAL).unwrap();
+        let snapshot = plain.clone();
+        plain.normalize_tenant_detail_routes();
+        assert_eq!(
+            plain.modules[0].endpoints[0].path,
+            snapshot.modules[0].endpoints[0].path
+        );
     }
 
     #[test]
