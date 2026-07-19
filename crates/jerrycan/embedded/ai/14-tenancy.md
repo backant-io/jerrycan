@@ -305,7 +305,10 @@ the flat `create`/`update`/`delete` stubs are steered to them:
   set (outside it, `0` rows → `404`), never a cross-tenant delete.
 
 So a user in workspace 1 who `POST`s `{workspace_id: 2}` — a tenant they don't belong
-to — gets `403`: the flat cross-tenant write is closed by construction, not left to you.
+to — gets `403` from `create_for_memberships`. The flat cross-tenant write is closed
+when the create goes through that generated checked method: the handler is steered to
+it, and `JL0006` flags a bare `insert` that skips it — steer + lint, not a suppressed
+method.
 
 The example below is the generated create's `WITH CHECK`, standalone (user `7` is a
 member of workspace 1, not 3):

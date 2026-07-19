@@ -1030,7 +1030,7 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
 /// `update_for`/`remove_for`), so it gets NONE of these and stays byte-identical.
 /// Conservative: ANY path-scoped route on the entity ⇒ not flat (no mixed-shape
 /// design exists today, and a path-scoped write is already covered).
-fn entity_is_flat_tenant_owned(e: &Entity, design: &Design) -> bool {
+pub(crate) fn entity_is_flat_tenant_owned(e: &Entity, design: &Design) -> bool {
     let Some(tenancy) = design.tenancy.as_ref() else {
         return false;
     };
@@ -1096,6 +1096,12 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
         // The tenant fk value is read out of `item` before the insert consumes it: a
         // text fk must be cloned (it is also moved into the row); an integer fk is Copy.
         let fk_clone = if fk_ty == "String" { ".clone()" } else { "" };
+        // The UPDATE must target the row we authorized — the PATH `id`, NEVER the body
+        // `item.id` (issue #92): a body id could point at a victim row in another
+        // tenant. For a text pk, `id` is moved into `get_for_memberships`, so clone it
+        // there and keep the owned `id` to pin the ActiveModel pk below; an integer pk
+        // is Copy, so `id` survives the call unchanged.
+        let pk_clone = if key == "String" { ".clone()" } else { "" };
         // `create_for_memberships` differs by pk type exactly as `insert` does: a
         // client-supplied text pk is known up front (captured, inserted via
         // `Entity::insert(..).exec`); an integer pk is DB-assigned and read back.
@@ -1146,7 +1152,7 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     pub async fn update_for_memberships(&self, user_id: String, id: {key}, item: {entity}) -> Result<bool> {{
         // Load the row scoped to the caller's memberships: a row whose CURRENT tenant
         // is outside the set is invisible → false → 404 (no existence leak).
-        let Some(existing) = self.get_for_memberships(user_id, id).await? else {{
+        let Some(existing) = self.get_for_memberships(user_id, id{pk_clone}).await? else {{
             return Ok(false);
         }};
         // WITH CHECK: forbid relocating the row to another tenant — the simplest safe
@@ -1154,8 +1160,11 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
         if item.{fk_col} != existing.{fk_col} {{
             return Err(Error::forbidden());
         }}
+        // Pin the pk to the CHECKED PATH `id`, NOT `item.id`: the row authorized above
+        // is `id`, so the UPDATE can only ever write that row (issue #92 — a body id
+        // pointing at another tenant's row must not be reachable here).
         let m = {snake}::ActiveModel {{
-            id: Set(item.id),
+            id: Set(id),
 {update_sets}        }};
         match m.update(self.db.conn()).await {{
             Ok(_) => Ok(true),

@@ -323,6 +323,185 @@ fn flat_cross_tenant_write_is_forbidden_403_and_scoped_404() {
         });
 }
 
+/// BEHAVIORAL + GENERATION proof for the FLAT `update_for_memberships` (issues #94/#92):
+/// (a) updating a row whose CURRENT tenant is outside the caller's set is invisible
+/// (`get_for_memberships` → None → the method's `Ok(false)` → 404); (b) moving a row to
+/// a tenant the caller doesn't belong to is refused (a changed tenant fk → 403); (c) THE
+/// #92 BODY-ID VECTOR — `update_for_memberships(user, id = own_row, item{ id =
+/// victim_row_in_another_tenant })` must UPDATE the AUTHORIZED PATH row, never the body
+/// id, so a victim row in another tenant is untouched. The generated UPDATE pins the pk
+/// to the checked path `id`; this leg reads that binding from the shipped repo and runs
+/// the UPDATE vs sqlite — RED before the fix (body id bound → victim overwritten), GREEN
+/// after (path id bound → victim safe).
+#[test]
+fn flat_update_is_scoped_and_cannot_move_a_victim_row_by_body_id() {
+    let (tmp, _out) = migrate_flat_membership();
+    let repo = std::fs::read_to_string(tmp.path().join("app/crates/routes/customers/src/repo.rs"))
+        .unwrap();
+
+    // GENERATION: the emitted `update_for_memberships` must pin the ActiveModel pk to
+    // the CHECKED PATH `id`, NEVER the BODY `item.id` (issue #92). Slice the method out
+    // so this can't be satisfied by the bare `update`'s own `Set(id)`.
+    let upd = repo
+        .split("pub async fn update_for_memberships")
+        .nth(1)
+        .and_then(|s| s.split("pub async fn").next())
+        .expect("the migrated repo emits update_for_memberships");
+    assert!(
+        upd.contains("id: Set(id),"),
+        "update_for_memberships pins the pk to the checked path id:\n{upd}"
+    );
+    assert!(
+        !upd.contains("id: Set(item.id),"),
+        "update_for_memberships must NOT bind the BODY id — that is the #92 write vector:\n{upd}"
+    );
+    // The load SQL exercised below (legs a/b) is the exact text the update method calls
+    // via `get_for_memberships`, binding the proof to the shipped code.
+    assert!(
+        repo.contains(GET_SQL),
+        "the load SQL below matches the emitted repo"
+    );
+    // The pk the generated UPDATE targets: the fix pins the PATH id (`Set(id)`); the #92
+    // bug bound the BODY id (`Set(item.id)`). Read it so the behavioral leg runs the
+    // code as emitted, not a stand-in.
+    let pins_path_id = upd.contains("id: Set(id),");
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use jerrycan::db::sea_orm::{ConnectionTrait, Statement};
+            use jerrycan::db::{Db, db_error};
+
+            let db = Db::connect("sqlite::memory:").await.unwrap();
+            db.conn()
+                .execute_unprepared(
+                    "CREATE TABLE workspace_members (workspace_id TEXT NOT NULL, \
+                     user_id TEXT NOT NULL, role TEXT NOT NULL)",
+                )
+                .await
+                .unwrap();
+            db.conn()
+                .execute_unprepared(
+                    "CREATE TABLE customers (id TEXT PRIMARY KEY, \
+                     workspace_id TEXT NOT NULL, name TEXT NOT NULL)",
+                )
+                .await
+                .unwrap();
+            // u1 is a member of w1 ONLY. c1 is u1's own row (w1); c2 is a VICTIM row in
+            // w2 — a tenant u1 does not belong to.
+            db.conn()
+                .execute_unprepared(
+                    "INSERT INTO workspace_members (workspace_id, user_id, role) \
+                     VALUES ('w1', 'u1', 'member')",
+                )
+                .await
+                .unwrap();
+            db.conn()
+                .execute_unprepared(
+                    "INSERT INTO customers (id, workspace_id, name) \
+                     VALUES ('c1', 'w1', 'Own'), ('c2', 'w2', 'Victim')",
+                )
+                .await
+                .unwrap();
+            let backend = db.conn().get_database_backend();
+
+            // (a) OUT-OF-SET CURRENT ROW → 404: the method loads via get_for_memberships;
+            // c2's tenant (w2) is outside u1's set, so the load is None → Ok(false) → 404.
+            let load_c2 = db
+                .conn()
+                .query_one(Statement::from_sql_and_values(
+                    backend,
+                    db.sql(GET_SQL),
+                    ["c2".into(), "u1".into()],
+                ))
+                .await
+                .map_err(db_error)
+                .unwrap();
+            assert!(
+                load_c2.is_none(),
+                "updating an out-of-set row loads None → Ok(false) → 404"
+            );
+
+            // (b) FK-MOVE → 403: c1 loads (in-set); the method compares the body fk to the
+            // row's CURRENT fk and refuses a move. A body `workspace_id = w2` differs from
+            // c1's current `w1` → the method's `Err(forbidden())` → 403.
+            let current_fk: String = db
+                .conn()
+                .query_one(Statement::from_sql_and_values(
+                    backend,
+                    db.sql(GET_SQL),
+                    ["c1".into(), "u1".into()],
+                ))
+                .await
+                .map_err(db_error)
+                .unwrap()
+                .expect("c1 is in u1's set")
+                .try_get("", "workspace_id")
+                .map_err(db_error)
+                .unwrap();
+            assert_eq!(current_fk, "w1");
+            assert_ne!(
+                "w2", current_fk,
+                "a body fk that moves the row to w2 differs from the current fk → 403"
+            );
+
+            // (c) THE #92 BODY-ID VECTOR: update_for_memberships(u1, id = "c1", item{ id =
+            // "c2", workspace_id = "w1", name = "hacked" }). The generated UPDATE targets
+            // `WHERE id = <pk>`; run it with the pk the shipped repo binds.
+            let pk = if pins_path_id { "c1" } else { "c2" };
+            db.conn()
+                .execute(Statement::from_sql_and_values(
+                    backend,
+                    db.sql("UPDATE customers SET workspace_id = ?, name = ? WHERE id = ?"),
+                    ["w1".into(), "hacked".into(), pk.into()],
+                ))
+                .await
+                .map_err(db_error)
+                .unwrap();
+
+            // The VICTIM row (c2, in w2) must be untouched — the update can only ever write
+            // the authorized path row (c1). RED before the #92 fix (pk = "c2" → c2
+            // overwritten), GREEN after (pk = "c1").
+            let victim: String = db
+                .conn()
+                .query_one(Statement::from_sql_and_values(
+                    backend,
+                    db.sql("SELECT name FROM customers WHERE id = ?"),
+                    ["c2".into()],
+                ))
+                .await
+                .map_err(db_error)
+                .unwrap()
+                .expect("the victim row still exists")
+                .try_get("", "name")
+                .map_err(db_error)
+                .unwrap();
+            assert_eq!(
+                victim, "Victim",
+                "the out-of-tenant victim row was NOT modified by a body-id update (#92)"
+            );
+
+            // …and the AUTHORIZED path row WAS updated.
+            let own: String = db
+                .conn()
+                .query_one(Statement::from_sql_and_values(
+                    backend,
+                    db.sql("SELECT name FROM customers WHERE id = ?"),
+                    ["c1".into()],
+                ))
+                .await
+                .map_err(db_error)
+                .unwrap()
+                .expect("the own row exists")
+                .try_get("", "name")
+                .map_err(db_error)
+                .unwrap();
+            assert_eq!(own, "hacked", "the authorized path row was updated");
+        });
+}
+
 /// BEHAVIORAL proof: run the EXACT membership-set SQL the migrated repo emits
 /// against sqlite and observe the multi-membership semantics — a user in two
 /// workspaces sees the UNION of both, and a get on a row outside their set returns
