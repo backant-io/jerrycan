@@ -23,10 +23,14 @@ leads with that line, and a prioritized burn-down of the open quality issues.
   (Claude Code, Cursor, Codex CLI, Windsurf, …). The runbook must not depend on
   Claude-specific features; Claude Code gets the native skill as a bonus.
 - **Interactivity lives in the agent, not the script.** `install.sh` is
-  non-interactive and idempotent; the *runbook/skill* instructs the agent to ask
-  the user the scoping questions (matches the existing skill's golden rule 1).
-- **No Rust toolchain required.** Primary audience includes zero-knowledge
-  vibecoders; the installer ships prebuilt binaries, `cargo install` is the fallback.
+  flag-driven and idempotent (`--agent` selects targets; TTY prompt only as a
+  human fallback); the *runbook/skill* instructs the agent to ask the user the
+  scoping questions (matches the existing skill's golden rule 1).
+- **No pre-installed Rust required.** Primary audience includes zero-knowledge
+  vibecoders; the installer ships a prebuilt CLI binary, `cargo install` is the
+  fallback. But generated apps are Rust workspaces — `jerrycan check` needs
+  cargo — so the installer bootstraps rustup non-interactively
+  (`rustup-init -y`, pinned toolchain per `rust-toolchain.toml`) when cargo is absent.
 - **"Migrate from other framework"**: v1 supports **Supabase only** (the path that
   exists: `jerrycan migrate --from supabase`). Other sources are named as a scope
   wall in the flow, not silently promised. Generic-Postgres import is a follow-up.
@@ -53,30 +57,46 @@ script + cargo-dist covers the same ground with less surface. Rejected.
 
 ### 4.1 Prebuilt binaries (the pipe)
 
-Release workflow (cargo-dist or an equivalent GH Actions matrix) building
-`jerrycan` for macOS arm64/x64, Linux x64/arm64 (musl), Windows x64 on tag push;
-artifacts + checksums on GitHub Releases. Stays compatible with the existing
-3-tier CI and the publish gate; the release workflow runs *after* the
-crates.io publish gate, never instead of it.
+Release workflow building `jerrycan` for macOS arm64/x64 and Linux x64/arm64
+(musl) on tag push; artifacts + checksums on GitHub Releases. **Recommended
+tooling: `taiki-e/create-gh-release-action` + `taiki-e/upload-rust-binary-action`**
+(hand-written matrix, no framework) rather than cargo-dist — because our
+`install.sh` is custom anyway (skills, MCP, rustup, agent selection),
+cargo-dist's main value (generated installers) is redundant, and post-axo its
+maintenance is community-run. Add `[package.metadata.binstall]` so
+`cargo binstall jerrycan` works for Rust-havers at near-zero cost. Stays
+compatible with the existing 3-tier CI and the publish gate; the release
+workflow runs *after* the crates.io publish gate, never instead of it.
 
 ### 4.2 `install.sh` — one script, three jobs
 
-Hosted at `https://jerrycan.cc/install.sh` (redirect/alias: `/install`), also in
-repo under `scripts/`. Non-interactive, idempotent, `set -euo pipefail`:
+Hosted at `https://jerrycan.cc/install.sh` (redirect/alias: `/install`), served
+by the existing wrangler-deployed Cloudflare site; source of truth lives in this
+repo under `scripts/`. Idempotent, `set -euo pipefail`, **agent-targeted**:
 
+0. **Agent selection:** `--agent <id>[,<id>…]` with ids
+   `claude-code | cursor | codex | windsurf | generic`. The `/start` runbook
+   tells the calling agent to self-identify and pass its own id; on a TTY with
+   no flag, prompt the human; non-TTY with no flag → `generic` (binary only,
+   print per-agent instructions).
 1. **Binary install:** detect OS/arch → download release binary → verify
    checksum → install to `~/.jerrycan/bin` (PATH hint printed, shell rc line
    appended only with an explicit marker comment, never duplicated).
    Fallback: `cargo install jerrycan` if platform unmatched and cargo exists.
-2. **Skill install:** write the `jerrycan-backend` skill to
-   `~/.claude/skills/jerrycan-backend/` (create-or-update by content compare).
-   The skill files ship inside the release artifact so script and skill
-   versions can never diverge (`jerrycan onboard --emit-skill` writes them; the
-   script just calls it).
-3. **MCP wiring (best-effort, detect-only):** if `claude` CLI exists →
-   `claude mcp add jerrycan -- jerrycan mcp` (skip if already present); else
-   print the stdio JSON snippet for Cursor/other clients. Never edits foreign
-   config files.
+2. **Toolchain:** if cargo absent, bootstrap rustup non-interactively
+   (generated apps need it to build).
+3. **Per-agent skill/config install** (create-or-update by content compare,
+   never replace foreign files wholesale):
+   - `claude-code`: skill → `~/.claude/skills/jerrycan-backend/`;
+     `claude mcp add jerrycan -- jerrycan mcp` (skip if present).
+   - `cursor`: rules file (`.cursor/rules/` or `AGENTS.md` append with
+     markers) + `mcp.json` stdio snippet.
+   - `codex` / `windsurf`: `AGENTS.md` append with markers + their MCP config
+     snippet.
+   - `generic`: print the AGENTS.md block + MCP snippet to stdout.
+   The skill/rules content ships inside the release artifact so script and
+   skill versions can never diverge (`jerrycan onboard --emit-skill --agent <id>`
+   writes them; the script just calls it).
 
 Exit summary is machine-readable (`--json` flag) so agents can verify success.
 
@@ -89,12 +109,16 @@ The one-liner (README hero, landing page, llms.txt):
 
 `/start` serves markdown (agent-readable, human-tolerable) containing:
 
-1. Run `curl -fsSL https://jerrycan.cc/install.sh | sh` and verify with
-   `jerrycan --version`.
-2. Run `jerrycan onboard` and follow its output exactly.
+1. Identify which agent you are; on Windows, confirm you are inside WSL first
+   (native Windows is not supported — see §4.5).
+2. Run `curl -fsSL https://jerrycan.cc/install.sh | sh -s -- --agent <your-id>`
+   and verify with `jerrycan --version`.
+3. Run `jerrycan onboard` and follow its output exactly.
 
 That's the whole file — thin by design; all process content lives versioned in
-the CLI, so `/start` never rots.
+the CLI, so `/start` never rots. Both routes (`/start`, `/install.sh`) are
+served by the wrangler-deployed Cloudflare site, synced from this repo at site
+deploy time.
 
 ### 4.4 `jerrycan onboard` — the guided flow, embedded
 
@@ -116,7 +140,25 @@ scaffold → implement → check → hand off). Deliverable includes updating
 `docs/SKILL.md` + `.claude/skills/jerrycan-backend/SKILL.md` twins with the
 three-way branching and the migration phase.
 
-### 4.5 README overhaul
+### 4.5 Windows strategy: WSL-first, deliberately
+
+How comparable tools handle Windows splits by whether they are self-contained:
+runtimes like **bun, deno, uv, rustup** ship native binaries plus a
+`install.ps1` twin because installing the binary IS the whole story. Frameworks
+whose projects need a native build toolchain — **Rails is the canonical case,
+Jekyll likewise** — officially route Windows users through **WSL**, because the
+native toolchain story (for us: rustup + MSVC Build Tools, multi-GB, license
+prompts, linker quirks) is where onboarding dies, not the CLI binary itself.
+
+jerrycan is in the second camp: generated apps are cargo workspaces, and prod
+targets are Linux servers anyway. **Strategy: WSL is the supported Windows
+path.** The `/start` runbook has agents detect Windows and set up/enter WSL
+before installing; docs say the same. A thin `install.ps1` whose only job is to
+bootstrap WSL and re-run `install.sh` inside it is a named follow-up, not v1.
+(A native Windows CLI binary from the release matrix stays cheap to add later
+if demand appears; the e2e story would still be WSL.)
+
+### 4.6 README overhaul
 
 - **Hero:** the pasteable one-liner first; `cargo install` demoted to
   "For humans / from source".
@@ -131,14 +173,14 @@ three-way branching and the migration phase.
   locks CTA copy to "GitHub + `cargo install`" — supersede it with the
   one-liner and note the change in that doc.
 
-### 4.6 Onboarding eval (measured, not asserted)
+### 4.7 Onboarding eval (measured, not asserted)
 
 A manual heavy-tier check mirroring the conformance ethos: clean container
 without Rust → run `install.sh` → `jerrycan onboard` runbook parsed → scaffold
 a reference design → `jerrycan check` green. Wired as a job in `heavy.yml`,
 not per-PR.
 
-### 4.7 Code-quality burn-down (parallel track)
+### 4.8 Code-quality burn-down (parallel track)
 
 The concrete backlog is the open issues, ordered:
 
@@ -157,9 +199,9 @@ The concrete backlog is the open issues, ordered:
 
 | # | Deliverable | Depends on |
 |---|---|---|
-| 1 | Release pipeline: prebuilt binaries on tag (cargo-dist or matrix) | — |
-| 2 | `jerrycan onboard` + `--emit-skill`; skill twins get 3-way branching + migration phase | — |
-| 3 | `install.sh` (binary + skill + MCP wiring, `--json`) in `scripts/`, then hosted | 1, 2 |
+| 1 | Release pipeline: prebuilt binaries on tag (taiki-e actions matrix + binstall metadata) | — |
+| 2 | `jerrycan onboard` + `--emit-skill --agent <id>`; skill twins get 3-way branching + migration phase | — |
+| 3 | `install.sh` (agent-targeted: binary + rustup + per-agent skill/MCP, `--json`) in `scripts/`, hosted via wrangler | 1, 2 |
 | 4 | `/start` runbook + one-liner on jerrycan.cc + llms.txt | 3 |
 | 5 | README overhaul (hero one-liner, staleness fixes, restructure) | 3 |
 | 6 | Onboarding eval job in heavy.yml | 3 |
@@ -180,19 +222,19 @@ Each row = its own branch/PR through the existing gate; 1–6 are sequential-ish
 - Onboarding eval green in heavy.yml.
 - #102 closed before the one-liner is promoted anywhere public.
 
-## 7. Open questions (for Pavel)
+## 7. Decisions (resolved in review, 2026-07-19)
 
-1. **Where does jerrycan.cc deploy from?** No site repo found under backant-io
-   (only `jerrycan-design`, the design system). Hosting `/install.sh` + `/start`
-   needs that repo or a Cloudflare Worker route — which?
-2. **cargo-dist vs hand-rolled matrix?** cargo-dist generates installer +
-   updater for free but adds a tool to the release path. Default: cargo-dist
-   unless you veto.
-3. **Skill install scope:** user-level `~/.claude/skills` (works across
-   projects) vs per-project `.claude/skills`. Default: user-level, with the
-   onboard runbook offering to copy per-project.
-4. **Windows:** binary yes, but `install.sh` is sh-only. Ship `install.ps1` in
-   v1 or defer? Default: defer, document WSL.
+1. **Hosting:** jerrycan.cc deploys via wrangler on Cloudflare; `/install.sh`
+   and `/start` become routes there, content synced from this repo. (Pin the
+   exact site/worker source location at implementation time.)
+2. **Release tooling:** taiki-e actions matrix + custom `install.sh` +
+   cargo-binstall metadata (see §4.1 for why not cargo-dist). *Awaiting final
+   confirm from Pavel.*
+3. **Skill install is agent-targeted:** the user (via the agent) selects which
+   agent(s) to install for; `install.sh --agent <ids>` does exactly those
+   (see §4.2 step 0/3).
+4. **Windows = WSL, prod = Linux** (see §4.5); no `install.ps1` in v1 beyond
+   the named follow-up.
 
 ## 8. Out of scope (this cycle)
 
