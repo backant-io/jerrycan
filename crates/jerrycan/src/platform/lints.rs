@@ -9,7 +9,7 @@
 use super::checkpipe::Diagnostic;
 use super::design::{Design, HttpMethod, ModuleDesign};
 use super::mounting;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 fn d(
@@ -117,8 +117,9 @@ fn lint_boundary_escapes(root: &Path, design: &Design, out: &mut Vec<Diagnostic>
 }
 
 /// JL0006: a handler in an OWNER-SCOPED module calls an UNSCOPED repo method
-/// (`repo.all()`, `repo.get(`, `repo.remove(`, `repo.update(`). Those read/delete
-/// across ALL owners, leaking rows:
+/// (`repo.all()`, `repo.get(`, `repo.remove(`, `repo.update(`, and — on a FLAT
+/// tenant module only — `repo.insert(`). Those read/write/delete across ALL owners,
+/// leaking rows:
 ///   - a TENANT-owned module (an entity belongs_to the tenancy entity) → another
 ///     tenant's rows;
 ///   - a per-user IDENTITY-owned module (#79 — an entity belongs_to the auth
@@ -127,8 +128,16 @@ fn lint_boundary_escapes(root: &Path, design: &Design, out: &mut Vec<Diagnostic>
 ///     lint is belt-and-suspenders: it gives a precise, actionable fix instead of a
 ///     raw `no method all` compile error.
 ///
+/// `repo.insert(` is flagged ONLY on a FLAT (membership-set) tenant module (#94):
+/// there the create reads the tenant fk from the request BODY, so a bare insert
+/// trusts it (the create leak); the fix is `create_for_memberships`. A path-scoped
+/// create pins the fk to the verified tenant, and a per-user create gets the
+/// server-injected identity fk — both safe — so insert is not flagged there.
+///
 /// The scoped accessors (`all_for`/`get_for`/`remove_for`) are excluded by the `(`
-/// anchor (e.g. `repo.get_for(` has `_` not `(` after `get`).
+/// anchor (e.g. `repo.get_for(` has `_` not `(` after `get`). A line ending in
+/// `// jerrycan:allow JL0006` is an explicit, line-scoped opt-out (e.g. a create
+/// that pins the fk to a membership-verified value) — same hatch JL0007 offers.
 ///
 /// We scan ONLY the agent-owned handlers.rs (where the call happens), never
 /// repo.rs: the generated repo's own scoped methods call `Entity::...` directly,
@@ -137,21 +146,37 @@ fn lint_boundary_escapes(root: &Path, design: &Design, out: &mut Vec<Diagnostic>
 fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diagnostic>) {
     // Tenant-owned modules leak ACROSS TENANTS; a per-user identity-owned module
     // (#79) leaks ACROSS USERS. An entity is one or the other, so scan the tenant
-    // set first and skip any module it already covered.
-    let tenant_modules: BTreeSet<&str> =
-        design.tenant_owned().into_iter().map(|(m, _)| m).collect();
-    for module in &tenant_modules {
+    // set first and skip any module it already covered. A tenant module is FLAT when
+    // it owns a membership-set entity — only there is a bare `repo.insert` a create
+    // leak (#94: the flat create reads the tenant fk from the BODY). A path-scoped
+    // create pins the fk to the verified tenant, so its insert is not flagged.
+    let mut tenant_modules: BTreeMap<&str, bool> = BTreeMap::new();
+    for (module, entity) in design.tenant_owned() {
+        let is_flat = design
+            .modules
+            .iter()
+            .find(|m| m.name == module)
+            .and_then(|m| m.entities.iter().find(|e| e.name == entity))
+            .is_some_and(|e| super::genroute::entity_is_flat_tenant_owned(e, design));
+        let flat = tenant_modules.entry(module).or_insert(false);
+        *flat = *flat || is_flat;
+    }
+    for (&module, &is_flat) in &tenant_modules {
         scan_unscoped(
             root,
             module,
             "a tenant-owned",
             "another tenant's rows",
-            "call the tenant-scoped accessor (all_for/get_for/remove_for) with the current tenant's id",
+            // One message, both route shapes (issue #94): a FLAT handler cannot call
+            // the path-scoped `*_for` accessors (there is no tenant-id arg), so the
+            // membership-set methods are named too.
+            "call a scoped accessor instead — path-scoped routes: all_for/get_for/remove_for with the tenant id; flat (membership-set) routes: all_for_memberships/get_for_memberships/update_for_memberships/remove_for_memberships (and create_for_memberships) with the session user's id (_user.0.id)",
+            is_flat,
             out,
         );
     }
     for module in identity_owned_modules(design) {
-        if tenant_modules.contains(module) {
+        if tenant_modules.contains_key(module) {
             continue;
         }
         scan_unscoped(
@@ -160,6 +185,7 @@ fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diag
             "an identity-owned",
             "another user's rows",
             "call the owner-scoped accessor (all_for/get_for/remove_for) with the session user's id (_user.0.id)",
+            false,
             out,
         );
     }
@@ -173,24 +199,42 @@ fn scan_unscoped(
     owned_desc: &str,
     leak_desc: &str,
     suggestion: &str,
+    flag_insert: bool,
     out: &mut Vec<Diagnostic>,
 ) {
     // `repo.all()` takes no args; the others anchor on `(` so `*_for(` is excluded.
-    const PATTERNS: [&str; 4] = ["repo.all()", "repo.get(", "repo.remove(", "repo.update("];
+    // `repo.insert(` is a CREATE leak only on a FLAT tenant module (#94: the flat
+    // create takes the tenant fk from the BODY, so a bare insert trusts it) — a
+    // path-scoped create pins the fk to the verified tenant and a per-user create
+    // gets the server-injected identity fk, both safe — so it is flagged only when
+    // `flag_insert`.
+    const BASE: [&str; 4] = ["repo.all()", "repo.get(", "repo.remove(", "repo.update("];
+    const ALLOW: &str = "// jerrycan:allow JL0006";
     let rel = format!("crates/routes/{module}/src/handlers.rs");
     let Ok(content) = std::fs::read_to_string(root.join(&rel)) else {
         return;
     };
     for (i, line) in content.lines().enumerate() {
-        let Some(hit) = PATTERNS.iter().find(|p| line.contains(**p)) else {
+        let hit = BASE
+            .iter()
+            .copied()
+            .find(|&p| line.contains(p))
+            .or_else(|| (flag_insert && line.contains("repo.insert(")).then_some("repo.insert("));
+        let Some(hit) = hit else {
             continue;
         };
+        // A line-scoped, explicit opt-out — e.g. a create that pins the tenant fk to a
+        // membership-verified value before inserting is safe despite the bare call.
+        // Mirrors JL0007's allow-hatch.
+        if line.trim_end().ends_with(ALLOW) {
+            continue;
+        }
         out.push(d(
             "JL0006",
             Some(rel.clone()),
             Some(i as u64 + 1),
             format!(
-                "handler in module `{module}` calls the unscoped `{hit}` on {owned_desc} repo — it can read or delete {leak_desc}"
+                "handler in module `{module}` calls the unscoped `{hit}` on {owned_desc} repo — it can read, write, or delete {leak_desc}"
             ),
             suggestion,
             "jerrycan docs database",
@@ -522,6 +566,82 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
         assert!(
             jl0006_only(root, &per_user_design()).is_empty(),
             "owner-scoped per-user handler is clean"
+        );
+    }
+
+    /// JL0006 flags a bare `repo.insert(` on a FLAT tenant module (#94): the flat create
+    /// takes the tenant fk from the BODY, so an unchecked insert is a cross-tenant WRITE
+    /// leak. WHY (Rule 9): this backstops the create steer the same way the lint already
+    /// backstops read/update/delete — the fix is `create_for_memberships`. `leads` in
+    /// V1_FULL is flat tenant-owned (no tenant fk in its path).
+    #[test]
+    fn jl0006_flags_bare_insert_on_a_flat_tenant_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/leads/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn create_lead(repo: Dep<LeadRepo>, Json(body): Json<Lead>) -> Result<()> {\n    let _ = repo.insert(body).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &tenant_design());
+        assert_eq!(
+            hits.len(),
+            1,
+            "bare insert on a flat tenant module: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.insert(` line");
+        assert!(
+            hits[0]
+                .suggestion
+                .as_deref()
+                .unwrap()
+                .contains("create_for_memberships"),
+            "names the membership-checked create as the fix: {:?}",
+            hits[0]
+        );
+    }
+
+    /// The line-scoped `// jerrycan:allow JL0006` hatch is an explicit opt-out (e.g. a
+    /// create that pins the tenant fk to a membership-verified value before inserting).
+    /// WHY: the reference `leads`/`api-keys` create handlers do exactly that; the hatch
+    /// keeps them lint-clean without suppressing the backstop for genuinely-leaky calls.
+    #[test]
+    fn jl0006_insert_allow_hatch_suppresses_the_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/leads/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn create_lead(repo: Dep<LeadRepo>, tenant: Dep<Tenant>) -> Result<()> {\n    let _ = repo.insert(row).await?; // jerrycan:allow JL0006\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        assert!(
+            jl0006_only(root, &tenant_design()).is_empty(),
+            "an explicit allow-hatch suppresses the JL0006 insert flag"
+        );
+    }
+
+    /// JL0006 does NOT flag a bare `repo.insert(` on a per-user IDENTITY-owned module:
+    /// a per-user create is scoped by the SERVER-injected identity fk (the DTO drops it),
+    /// so the insert is safe. Flagging it would be a false positive — insert is a leak
+    /// only on a FLAT tenant module, where the fk comes from the body.
+    #[test]
+    fn jl0006_does_not_flag_insert_on_a_per_user_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/workouts/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn create_workout(repo: Dep<WorkoutRepo>, Json(body): Json<Workout>) -> Result<()> {\n    let _ = repo.insert(body).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        assert!(
+            jl0006_only(root, &per_user_design()).is_empty(),
+            "a per-user create insert is server-scoped — not a JL0006 leak"
         );
     }
 

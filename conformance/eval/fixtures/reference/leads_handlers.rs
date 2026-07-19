@@ -44,7 +44,10 @@ pub(crate) async fn create_lead(
         status: status.clone(),
         custom: body.custom.clone(),
     };
-    let id = repo.insert(to_store).await?;
+    // `workspace_id` is pinned to the membership-verified `tenant.id()` above (never
+    // the body), so this bare insert cannot write into a non-member tenant — the flat
+    // create leak (#94) does not apply here.
+    let id = repo.insert(to_store).await?; // jerrycan:allow JL0006
     Ok(Created(Lead {
         id,
         workspace_id: tenant.id(),

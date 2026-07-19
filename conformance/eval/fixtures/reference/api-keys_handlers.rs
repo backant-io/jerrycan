@@ -59,7 +59,10 @@ pub(crate) async fn create_api_key(
         label: body.label,
         scopes: granted_csv.clone(),
     };
-    let id = repo.insert(row.clone()).await?;
+    // `workspace_id` is pinned to the membership-verified `tenant.id()` above (never
+    // the body), so this bare insert cannot write into a non-member tenant — the flat
+    // create leak (#94) does not apply here.
+    let id = repo.insert(row.clone()).await?; // jerrycan:allow JL0006
     // Register the lookup record (hash → scopes) in the shared store the `usage`
     // authenticator reads. We persist only the hash, never the plaintext.
     store.0.insert(ApiKeyRecord {

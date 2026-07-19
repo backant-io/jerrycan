@@ -22,13 +22,13 @@ tenant, never resolved to one arbitrary "membership of something".
 > membership miss on a **read** is `404` (no existence leak); a wrong role is `403`.
 > A list with no specific tenant returns the caller's whole membership set.
 >
-> **What the generator verifies for you, and what it doesn't (yet):** on a
-> **path-scoped** route the guard verifies the path tenant before the handler runs,
-> and reads on a **flat** route go through generated membership-set methods
-> (`all_for_memberships`/`get_for_memberships`). But a **flat write** (create/update
-> /delete whose tenant fk comes from the body) is NOT yet verified by generated
-> code — you must check `body.{fk}` is in the caller's membership set before the
-> write and reject a non-member tenant with `403`. See "Flat writes" below.
+> **What the generator verifies for you:** on a **path-scoped** route the guard
+> verifies the path tenant before the handler runs; on a **flat** route both reads
+> AND writes go through generated membership-checked methods — reads via
+> `all_for_memberships`/`get_for_memberships`, writes via `create_for_memberships`/
+> `update_for_memberships`/`remove_for_memberships`, which verify `body.{fk}` is in
+> the caller's membership set (RLS `WITH CHECK`) and reject a non-member tenant with
+> `403`. You don't hand-write the membership check on any shape. See "Flat writes".
 
 Two route shapes specialize that rule, and the generator picks the right one per
 endpoint:
@@ -289,30 +289,92 @@ assert!(owner.require_role("owner").is_ok());
 # let _ = list_customers; }); }
 ```
 
-### Flat writes — you verify the body tenant fk (for now)
+### Flat writes — the body tenant fk is verified for you (`WITH CHECK`)
 
-Reads on a flat route are scoped for you by `*_for_memberships`. **Writes are not yet:**
-the generated `create`/`update`/`delete` stub for a flat tenant-owned entity takes the
-tenant fk from the request body and does **not** check it against your membership set.
-Until the generator emits that check, verify it yourself before writing — otherwise a
-client can create or move a row into a tenant they don't belong to:
+Writes on a flat route are membership-checked by generated code, just like reads — you
+do **not** hand-write the check. The generated repo emits three checked accessors, and
+the flat `create`/`update`/`delete` stubs are steered to them:
 
-```rust,ignore
-// AGENT: on a flat create/update, the body carries the tenant fk (e.g. workspace_id).
-// Confirm the caller belongs to that tenant before writing — else 403.
-async fn create_customer(repo: Dep<CustomerRepo>, user: CurrentUser, Json(body): Json<Customer>)
-    -> Result<Created<Customer>>
-{
-    if !repo.is_member(&user.0.id, body.workspace_id).await? {
-        return Err(Error::forbidden()); // 403: writing into a non-member tenant
+- `create_for_memberships(user_id, item)` — the body carries the tenant fk; it is
+  verified `∈` your membership set before the insert (`403` otherwise), exactly the
+  RLS `WITH CHECK` the read side mirrors.
+- `update_for_memberships(user_id, id, item)` — updates only a row whose current
+  tenant is in your set (a row outside it is `404`), and refuses to move the row to
+  another tenant (a changed tenant fk is `403`).
+- `remove_for_memberships(user_id, id)` — deletes only a row whose tenant is in your
+  set (outside it, `0` rows → `404`), never a cross-tenant delete.
+
+So a user in workspace 1 who `POST`s `{workspace_id: 2}` — a tenant they don't belong
+to — gets `403` from `create_for_memberships`. The flat cross-tenant write is closed
+when the create goes through that generated checked method: the handler is steered to
+it, and `JL0006` flags a bare `insert` that skips it — steer + lint, not a suppressed
+method.
+
+The example below is the generated create's `WITH CHECK`, standalone (user `7` is a
+member of workspace 1, not 3):
+```rust
+# use jerrycan::prelude::*;
+# use jerrycan::auth::Session;
+# use jerrycan::db::sea_orm::{ConnectionTrait, Statement};
+# use jerrycan::db::{db_error, Db};
+# use serde::{Deserialize, Serialize};
+# #[derive(Serialize, Deserialize, Clone)]
+# struct SessionUser { id: String, role: String }
+# type CurrentUser = Session<SessionUser>;
+// A repo over a flat tenant-owned table; the create verifies the BODY tenant fk.
+struct CustomerRepo { db: Db }
+impl CustomerRepo {
+    // The generated `create_for_memberships` shape: the body's tenant fk MUST be in
+    // the caller's membership set (RLS `WITH CHECK`) — a non-member tenant is 403.
+    async fn create_for_memberships(&self, user_id: String, workspace_id: i64, name: String) -> Result<i64> {
+        let member = self.db.conn().query_one(Statement::from_sql_and_values(
+            self.db.conn().get_database_backend(),
+            self.db.sql("SELECT 1 FROM workspace_members WHERE user_id = ? AND workspace_id = ? LIMIT 1"),
+            [user_id.into(), workspace_id.into()],
+        )).await.map_err(db_error)?;
+        if member.is_none() {
+            return Err(Error::forbidden()); // 403: writing into a non-member tenant
+        }
+        self.db.conn().execute(Statement::from_sql_and_values(
+            self.db.conn().get_database_backend(),
+            self.db.sql("INSERT INTO customers (workspace_id, name) VALUES (?, ?)"),
+            [workspace_id.into(), name.into()],
+        )).await.map_err(db_error)?;
+        Ok(workspace_id)
     }
-    // ... insert ...
 }
+
+// The flat create handler takes the session guard and passes `user.0.id` — the checked
+// method does the `WITH CHECK`, so the handler never trusts the body tenant fk itself.
+async fn create_customer(repo: Dep<CustomerRepo>, user: CurrentUser, workspace_id: i64) -> Result<i64> {
+    repo.create_for_memberships(user.0.id, workspace_id, "Alice".into()).await
+}
+
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+let db = Db::connect("sqlite::memory:").await.unwrap();
+db.conn().execute_unprepared(
+    "CREATE TABLE workspace_members (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+     user_id TEXT NOT NULL, workspace_id BIGINT NOT NULL, role TEXT NOT NULL)",
+).await.unwrap();
+db.conn().execute_unprepared(
+    "CREATE TABLE customers (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+     workspace_id BIGINT NOT NULL, name TEXT NOT NULL)",
+).await.unwrap();
+// User 7 belongs to workspace 1 — NOT 3.
+db.conn().execute_unprepared(
+    "INSERT INTO workspace_members (user_id, workspace_id, role) VALUES ('7', 1, 'member')",
+).await.unwrap();
+let repo = CustomerRepo { db };
+
+// Creating in your OWN tenant works; creating in a tenant you don't belong to is 403.
+assert!(repo.create_for_memberships("7".into(), 1, "Alice".into()).await.is_ok());
+assert!(repo.create_for_memberships("7".into(), 3, "Mallory".into()).await.is_err());
+# let _ = create_customer; }); }
 ```
 
-(Tracked: the generator will grow a membership-checked write path — `WITH CHECK` parity
-with the read side — so this becomes automatic. Path-scoped writes are already covered:
-the guard verified the tenant, and `update_for`/`remove_for` key on `tenant.id()`.)
+(Path-scoped writes are covered differently: the guard verified the path tenant, and
+`update_for`/`remove_for` key on `tenant.id()` — so those never read a tenant fk from
+the body at all.)
 
 ## Creating a tenant auto-seeds membership + membership-filtered list
 There is **no hand-written membership INSERT**. The tenant entity's own repo gets two
@@ -356,8 +418,9 @@ above work end to end: the create is what puts the membership row in place.
 - Don't trust a client-sent tenant id in a body or a header as the scope. On reads
   and path-scoped routes the scope comes from the verified guard or the
   membership-set methods, never from unverified request data. On a **flat write**
-  (see "Flat writes"), the body's tenant fk is NOT yet verified for you — check it
-  is in the caller's membership set before writing, or a client sets any tenant.
+  (see "Flat writes") the body's tenant fk IS verified for you — route the write
+  through `create_for_memberships`/`update_for_memberships`/`remove_for_memberships`,
+  never the unscoped `insert`/`update`/`remove`, which would trust the body fk.
 - Don't hand-write the membership seed on tenant create. `create_with_membership`
   does it in one transaction; a hand-rolled INSERT is the thing that gets dropped and
   locks the creator out of their own tenant.
