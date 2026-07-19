@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.0 — 2026-07-19
+
+The ownership-safety release. Tenancy and per-user scoping are now
+**membership-verified and correct-by-construction** — the tenant a request acts
+on comes from the route and must be in the caller's membership set, verified by
+generated code before the handler scopes. Closes two cross-tenant/cross-user
+leak classes surfaced by the agent evals. The framework's Rust API is additive
+only (no breaking change), but generated apps behave materially differently, so
+this is a 0.x-major bump.
+
+### Security & scoping
+- **Path-scoped tenant guard** reads the tenant fk from the route and verifies
+  membership for *that* tenant — a non-member gets `404` (no existence leak),
+  a wrong role `403`. Many-tenants-per-user (Slack/GitHub-org shape) is now a
+  first-class, safe capability. Closes the cross-tenant read leak (#78).
+- **Membership-set (RLS-faithful) reads** for flat routes (`{fk} IN (SELECT …
+  WHERE user_id=?)`) — the **Supabase migration is lossless** for multi-workspace
+  users; the migrator normalizes tenant-own detail routes so they're verified too.
+- **Per-user scoping is make-impossible** (#79): a guarded identity-owned entity
+  emits only owner-scoped repo methods — the unscoped leak won't compile.
+- **Membership-checked flat writes** (#94): create/update/delete verify the body
+  tenant fk against the set (`403` on a non-member tenant); JL0006 flags a bare
+  unchecked write.
+- **Scoped updates pin the ownership-checked path id** (#92) — a client-supplied
+  body `id` can no longer redirect a write to another scope's row.
+- Membership is **auto-seeded** on tenant create (one transaction); the tenant
+  list is membership-filtered; isolation tests are generated for every shape.
+- `docs/ai/14-tenancy.md` rewritten — the "`tenant.id()` is trusted" model that
+  taught the leak is gone.
+
+Known limitation (tracked, #97): the reference-slice example still uses the
+single-membership fallback for its flat modules, so heavy conformance proves the
+membership-set path at the unit level only. Safe (no leak), but lossy for a
+multi-workspace user in that specific example.
+
 ## 0.4.1 — 2026-07-17
 
 The agent-eval release: two 10-agent evaluation rounds (vs FastAPI, paired
