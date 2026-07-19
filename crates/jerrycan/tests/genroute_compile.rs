@@ -1068,15 +1068,22 @@ pub(crate) async fn create_collection(
     let id = repo
         .insert(Collection { id: body.id, user_id, title: body.title })
         .await?;
-    let row = repo.get(id).await?.ok_or_else(Error::not_found)?;
+    // Owner-scoped read: the per-user repo emits only *_for(user_id) accessors
+    // (the unscoped get/all are not generated — #79 make-impossible).
+    let row = repo.get_for(user_id, id).await?.ok_or_else(Error::not_found)?;
     Ok(Created(row))
 }
 
 pub(crate) async fn list_collections(
     repo: Dep<CollectionRepo>,
-    _user: CurrentUser,
+    user: CurrentUser,
 ) -> Result<Json<Vec<Collection>>> {
-    Ok(Json(repo.all().await?))
+    let user_id: i64 = user
+        .0
+        .id
+        .parse()
+        .map_err(|_| Error::internal("session id is not an integer"))?;
+    Ok(Json(repo.all_for(user_id).await?))
 }
 "#;
 
