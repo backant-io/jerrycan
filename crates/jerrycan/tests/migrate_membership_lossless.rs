@@ -45,6 +45,13 @@ create policy customers_membership on public.customers using
 /// contain — binding the behavioral proof to the generated code.
 const LIST_SQL: &str = "SELECT * FROM customers WHERE workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = ?) ORDER BY id";
 const GET_SQL: &str = "SELECT * FROM customers WHERE id = ? AND workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = ?)";
+/// The EXACT membership `WITH CHECK` the generator emits for a FLAT create (issue #94,
+/// `genroute.rs` `create_for_memberships`) and the scoped DELETE (`remove_for_memberships`).
+/// Kept as constants so the behavioral leg runs the same text the generated repo is
+/// asserted to contain — binding the 403/404 proof to the shipped generated code.
+const CREATE_CHECK_SQL: &str =
+    "SELECT 1 FROM workspace_members WHERE user_id = ? AND workspace_id = ? LIMIT 1";
+const DELETE_SQL: &str = "DELETE FROM customers WHERE id = ? AND workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = ?)";
 
 /// Write the export + migrate into `app/`. Returns the tempdir (kept alive so the
 /// scaffolded tree survives) and the migrate output.
@@ -152,6 +159,168 @@ fn recognized_membership_policy_migrates_to_flat_membership_set_methods() {
             && handlers.contains("CustomerRepo::get_for_memberships(_user.0.id, _id)"),
         "scope hints name the membership-set methods:\n{handlers}"
     );
+}
+
+/// GENERATION-LEVEL proof for the FLAT cross-tenant WRITE fix (issue #94, spec §C
+/// `WITH CHECK`): the migrated flat entity's repo emits the membership-CHECKED write
+/// accessors, and its flat `POST`/`PUT`/`DELETE` handlers are steered to them (never
+/// the unscoped `insert`/`update`/`remove`). This is what makes a `POST {other_ws}`
+/// into a non-member tenant a 403 instead of a silent cross-tenant write.
+#[test]
+fn migrated_flat_entity_gets_membership_checked_write_methods() {
+    let (tmp, _out) = migrate_flat_membership();
+    let app = tmp.path().join("app");
+    let repo = std::fs::read_to_string(app.join("crates/routes/customers/src/repo.rs")).unwrap();
+
+    // uuid pks → the tenant fk and the row id are both `String` in the emitted methods.
+    assert!(
+        repo.contains(
+            "pub async fn create_for_memberships(&self, user_id: String, item: Customer) -> Result<String>"
+        ),
+        "flat create is membership-checked:\n{repo}"
+    );
+    assert!(
+        repo.contains(
+            "pub async fn update_for_memberships(&self, user_id: String, id: String, item: Customer) -> Result<bool>"
+        ) && repo.contains(
+            "pub async fn remove_for_memberships(&self, user_id: String, id: String) -> Result<bool>"
+        ),
+        "flat update/delete are membership-checked:\n{repo}"
+    );
+    // The create's `WITH CHECK` probe and the 403 branch; the scoped DELETE subquery.
+    assert!(
+        repo.contains(CREATE_CHECK_SQL) && repo.contains("return Err(Error::forbidden());"),
+        "create verifies the body tenant fk ∈ memberships (403 else):\n{repo}"
+    );
+    assert!(
+        repo.contains(DELETE_SQL),
+        "delete is scoped to the membership set (404 outside it):\n{repo}"
+    );
+
+    // The flat mutation handlers are STEERED to the checked methods and take the
+    // session guard — a flat write must never trust the body tenant fk directly.
+    let handlers =
+        std::fs::read_to_string(app.join("crates/routes/customers/src/handlers.rs")).unwrap();
+    assert!(
+        handlers.contains("CustomerRepo::create_for_memberships(_user.0.id, customer)")
+            && handlers.contains("CustomerRepo::update_for_memberships(_user.0.id, _id, customer)")
+            && handlers.contains("CustomerRepo::remove_for_memberships(_user.0.id, _id)"),
+        "flat mutation stubs are steered to the membership-checked methods:\n{handlers}"
+    );
+}
+
+/// BEHAVIORAL e2e-lite proof for the flat cross-tenant WRITE (issue #94): run the EXACT
+/// `WITH CHECK` / scoped-DELETE SQL the migrated repo emits against sqlite and observe
+/// the HTTP-status semantics the generated method maps to. A user in w1 creating in w1
+/// passes the check (→ 201); the SAME user creating in w2 (not a member) FAILS the
+/// check (→ the method's `Err(forbidden)` → 403); deleting a w2 row is scoped out
+/// (0 rows → false → 404). The SQL executed is asserted to match the generated repo.
+#[test]
+fn flat_cross_tenant_write_is_forbidden_403_and_scoped_404() {
+    let (tmp, _out) = migrate_flat_membership();
+    let repo = std::fs::read_to_string(tmp.path().join("app/crates/routes/customers/src/repo.rs"))
+        .unwrap();
+    assert!(
+        repo.contains(CREATE_CHECK_SQL) && repo.contains(DELETE_SQL),
+        "the SQL exercised below is the exact text the migrated repo emits"
+    );
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use jerrycan::db::sea_orm::{ConnectionTrait, Statement};
+            use jerrycan::db::{Db, db_error};
+
+            let db = Db::connect("sqlite::memory:").await.unwrap();
+            db.conn()
+                .execute_unprepared(
+                    "CREATE TABLE workspace_members (workspace_id TEXT NOT NULL, \
+                     user_id TEXT NOT NULL, role TEXT NOT NULL)",
+                )
+                .await
+                .unwrap();
+            db.conn()
+                .execute_unprepared(
+                    "CREATE TABLE customers (id TEXT PRIMARY KEY, \
+                     workspace_id TEXT NOT NULL, name TEXT NOT NULL)",
+                )
+                .await
+                .unwrap();
+            // user `u1` is a member of w1 only (NOT w2). A seed row in w2 lets us prove
+            // the scoped delete can't reach it.
+            db.conn()
+                .execute_unprepared(
+                    "INSERT INTO workspace_members (workspace_id, user_id, role) \
+                     VALUES ('w1', 'u1', 'member')",
+                )
+                .await
+                .unwrap();
+            db.conn()
+                .execute_unprepared(
+                    "INSERT INTO customers (id, workspace_id, name) VALUES ('c2', 'w2', 'Bob')",
+                )
+                .await
+                .unwrap();
+            let backend = db.conn().get_database_backend();
+
+            // The generated `create_for_memberships` WITH CHECK: present for the caller's
+            // own tenant (→ create proceeds, 201), ABSENT for a tenant they don't belong
+            // to (→ the method returns Err(forbidden) → 403 — the leak, closed).
+            let check = |ws: &'static str| {
+                let db = db.clone();
+                async move {
+                    db.conn()
+                        .query_one(Statement::from_sql_and_values(
+                            backend,
+                            db.sql(CREATE_CHECK_SQL),
+                            ["u1".into(), ws.into()],
+                        ))
+                        .await
+                        .map_err(db_error)
+                        .unwrap()
+                        .is_some()
+                }
+            };
+            assert!(
+                check("w1").await,
+                "POST {{workspace_id: w1}} as a w1 member passes WITH CHECK → 201"
+            );
+            assert!(
+                !check("w2").await,
+                "POST {{workspace_id: w2}} as a NON-member fails WITH CHECK → 403 (was a silent cross-tenant write)"
+            );
+
+            // The generated scoped DELETE: a w2 row is outside u1's set → 0 rows → 404.
+            let del = db
+                .conn()
+                .execute(Statement::from_sql_and_values(
+                    backend,
+                    db.sql(DELETE_SQL),
+                    ["c2".into(), "u1".into()],
+                ))
+                .await
+                .map_err(db_error)
+                .unwrap();
+            assert_eq!(
+                del.rows_affected(),
+                0,
+                "DELETE of a w2 row by a non-member touches 0 rows → false → 404"
+            );
+            // The row is still there (proof the delete was genuinely scoped out).
+            let still = db
+                .conn()
+                .query_one(Statement::from_sql_and_values(
+                    backend,
+                    db.sql("SELECT 1 FROM customers WHERE id = ?"),
+                    ["c2".into()],
+                ))
+                .await
+                .map_err(db_error)
+                .unwrap();
+            assert!(still.is_some(), "the out-of-set row was NOT deleted");
+        });
 }
 
 /// BEHAVIORAL proof: run the EXACT membership-set SQL the migrated repo emits

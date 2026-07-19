@@ -314,7 +314,7 @@ fn success_body(ep: &Endpoint) -> String {
 /// non-tenant handler get nothing), so designs the rule doesn't touch — and every
 /// non-tenancy design — stay byte-identical.
 fn tenant_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> String {
-    if !(mode.db && mode.auth) || !matches!(ep.method, HttpMethod::GET) {
+    if !(mode.db && mode.auth) {
         return String::new();
     }
     // Only a tenant-OWNED entity (belongs_to the tenant) has the scoped methods;
@@ -326,8 +326,12 @@ fn tenant_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: 
         return String::new();
     };
     let list = ep.success.list;
+    let snake = Design::to_snake(entity);
     match design.endpoint_tenant_shape(m, ep) {
-        TenantShape::PathScoped { .. } => {
+        // Path-scoped WRITES are scoped by the verified path tenant (T2
+        // `update_for`/`remove_for`); only READS get a scope hint here, so the write
+        // stubs stay byte-identical to pre-#94 for path-scoped/nested designs.
+        TenantShape::PathScoped { .. } if matches!(ep.method, HttpMethod::GET) => {
             let call = if list {
                 format!("{entity}Repo::all_for(_tenant.id())")
             } else {
@@ -337,7 +341,8 @@ fn tenant_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: 
                 "    // tenant scope (path): the guard verified membership in `_tenant`; scope this\n    // read to it via `{call}` — never the unscoped repo method (JL0006, issue #78).\n"
             )
         }
-        TenantShape::MembershipSet => {
+        // Flat (membership-set) READS scope to the caller's memberships.
+        TenantShape::MembershipSet if matches!(ep.method, HttpMethod::GET) => {
             let call = if list {
                 format!("{entity}Repo::all_for_memberships(_user.0.id)")
             } else {
@@ -347,7 +352,25 @@ fn tenant_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: 
                 "    // tenant scope (membership-set): this flat route has no tenant in the path —\n    // scope to the CALLER'S memberships via `{call}` so a multi-tenant user sees every\n    // tenant's rows they belong to and nothing outside the set (issues #78/#79).\n"
             )
         }
-        TenantShape::Collection | TenantShape::None => String::new(),
+        // Flat (membership-set) WRITES take the tenant fk from the BODY, so they MUST
+        // verify it against the caller's memberships (RLS `WITH CHECK`, issue #94) —
+        // steer to the membership-CHECKED method, never the unscoped `insert`/`update`/
+        // `remove` which would let a caller write into a tenant they don't belong to.
+        TenantShape::MembershipSet => match ep.method {
+            HttpMethod::POST => format!(
+                "    // tenant create (membership-set, issue #94): this flat create reads the tenant\n    // fk from the BODY — call `{entity}Repo::create_for_memberships(_user.0.id, {snake})`\n    // so that fk is verified ∈ your memberships (403 otherwise), NEVER the bare `insert`,\n    // which would write into a tenant the caller doesn't belong to.\n"
+            ),
+            HttpMethod::PUT | HttpMethod::PATCH => format!(
+                "    // tenant update (membership-set, issue #94): scope the write to the caller's\n    // memberships — call `{entity}Repo::update_for_memberships(_user.0.id, _id, {snake})`\n    // (NEVER `update`); a row outside your set is 404 and moving it to another tenant is 403.\n"
+            ),
+            HttpMethod::DELETE => format!(
+                "    // tenant delete (membership-set, issue #94): scope the delete to the caller's\n    // memberships — call `{entity}Repo::remove_for_memberships(_user.0.id, _id)` (NEVER\n    // the unscoped `remove`); a row outside your set is 404, never a cross-tenant delete.\n"
+            ),
+            HttpMethod::GET => String::new(),
+        },
+        TenantShape::PathScoped { .. } | TenantShape::Collection | TenantShape::None => {
+            String::new()
+        }
     }
 }
 
@@ -996,6 +1019,45 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
     out
 }
 
+/// True when a tenant-owned entity's routes are FLAT (MembershipSet) — none of its
+/// endpoints carry the tenant fk in the path (the Supabase-migrated shape, and any
+/// authored flat design). Such an entity takes the tenant fk from the request BODY on
+/// a write, so that fk MUST be verified against the caller's membership set (RLS
+/// `WITH CHECK`, spec §C, issue #94) — its repo therefore emits the membership-CHECKED
+/// `create_for_memberships`/`update_for_memberships`/`remove_for_memberships`
+/// accessors and its flat mutation stubs are steered to them. A PATH-SCOPED (nested)
+/// tenant-owned entity is scoped by the verified path tenant instead (T2
+/// `update_for`/`remove_for`), so it gets NONE of these and stays byte-identical.
+/// Conservative: ANY path-scoped route on the entity ⇒ not flat (no mixed-shape
+/// design exists today, and a path-scoped write is already covered).
+fn entity_is_flat_tenant_owned(e: &Entity, design: &Design) -> bool {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return false;
+    };
+    if !e.belongs_to.iter().any(|b| b.entity == tenancy.entity) {
+        return false;
+    }
+    let Some(m) = design
+        .modules
+        .iter()
+        .find(|m| m.entities.iter().any(|x| x.name == e.name))
+    else {
+        return false;
+    };
+    let mut flat = false;
+    for ep in &m.endpoints {
+        if endpoint_repo_entity(m, ep) != Some(e.name.as_str()) {
+            continue;
+        }
+        match design.endpoint_tenant_shape(m, ep) {
+            TenantShape::PathScoped { .. } => return false,
+            TenantShape::MembershipSet => flat = true,
+            _ => {}
+        }
+    }
+    flat
+}
+
 /// Tenant-scoped accessors for an entity that belongs_to the design's tenancy
 /// entity (empty otherwise). Keyed on the fk column so a tenant can only reach
 /// its own rows: `all_for` filters the fk, `get_for` adds the id, `remove_for`
@@ -1024,6 +1086,106 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     // correct for both declared and synthetic primary keys, and `id` (the path
     // param) is consumed once by the ownership check, so no clone for text pks.
     let update_sets = active_sets(e, false);
+    let insert_sets = active_sets(e, true);
+    // Membership-CHECKED writes for a FLAT tenant-owned entity (issue #94, spec §C).
+    // A flat route takes the tenant fk from the BODY, so — unlike a path-scoped write,
+    // where `Dep<Tenant>` already verified the path tenant — the body fk MUST be
+    // verified against the caller's membership set (RLS `WITH CHECK`) before the write.
+    // Emitted ONLY for a flat entity; a path-scoped (nested) entity stays byte-identical.
+    let membership_writes = if entity_is_flat_tenant_owned(e, design) {
+        // The tenant fk value is read out of `item` before the insert consumes it: a
+        // text fk must be cloned (it is also moved into the row); an integer fk is Copy.
+        let fk_clone = if fk_ty == "String" { ".clone()" } else { "" };
+        // `create_for_memberships` differs by pk type exactly as `insert` does: a
+        // client-supplied text pk is known up front (captured, inserted via
+        // `Entity::insert(..).exec`); an integer pk is DB-assigned and read back.
+        let id_capture = if key == "String" {
+            "        let id = item.id.clone();\n"
+        } else {
+            ""
+        };
+        let create_return_insert = if key == "String" {
+            format!(
+                "        {snake}::Entity::insert({snake}::ActiveModel {{\n{insert_sets}        }})\n        .exec(&txn)\n        .await\n        .map_err(db_error)?;\n        txn.commit().await.map_err(db_error)?;\n        Ok(id)"
+            )
+        } else {
+            format!(
+                "        let row = {snake}::ActiveModel {{\n{insert_sets}        }}\n        .insert(&txn)\n        .await\n        .map_err(db_error)?;\n        txn.commit().await.map_err(db_error)?;\n        Ok(row.id)"
+            )
+        };
+        format!(
+            r#"
+    // Membership-CHECKED writes for a FLAT tenant-owned route (issue #94, spec §C):
+    // the tenant fk comes from the request BODY, so it is verified against the caller's
+    // membership set (RLS `WITH CHECK`) — a create into a tenant the caller doesn't
+    // belong to is 403; an update/delete of a row outside the set is 404; moving a row
+    // across the tenant boundary is 403. A path-scoped (nested) entity is scoped by the
+    // verified path tenant instead, so it never gets these (JL0006 / issue #78).
+    pub async fn create_for_memberships(&self, user_id: String, item: {entity}) -> Result<{key}> {{
+        use sea_orm::TransactionTrait;
+{id_capture}        let tenant_fk = item.{fk_col}{fk_clone};
+        let txn = self.db.conn().begin().await.map_err(db_error)?;
+        // WITH CHECK: the body's tenant fk must be in the caller's membership set.
+        if txn
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                self.db.sql(
+                    "SELECT 1 FROM {members} WHERE user_id = ? AND {fk_col} = ? LIMIT 1",
+                ),
+                [user_id.into(), tenant_fk.into()],
+            ))
+            .await
+            .map_err(db_error)?
+            .is_none()
+        {{
+            return Err(Error::forbidden());
+        }}
+{create_return_insert}
+    }}
+
+    pub async fn update_for_memberships(&self, user_id: String, id: {key}, item: {entity}) -> Result<bool> {{
+        // Load the row scoped to the caller's memberships: a row whose CURRENT tenant
+        // is outside the set is invisible → false → 404 (no existence leak).
+        let Some(existing) = self.get_for_memberships(user_id, id).await? else {{
+            return Ok(false);
+        }};
+        // WITH CHECK: forbid relocating the row to another tenant — the simplest safe
+        // rule pins the tenant fk to its current value (a changed fk → 403).
+        if item.{fk_col} != existing.{fk_col} {{
+            return Err(Error::forbidden());
+        }}
+        let m = {snake}::ActiveModel {{
+            id: Set(item.id),
+{update_sets}        }};
+        match m.update(self.db.conn()).await {{
+            Ok(_) => Ok(true),
+            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
+            Err(e) => Err(db_error(e)),
+        }}
+    }}
+
+    pub async fn remove_for_memberships(&self, user_id: String, id: {key}) -> Result<bool> {{
+        // Scope the DELETE to the membership set: a row whose tenant is outside the
+        // set matches nothing → 0 rows → false → 404.
+        let r = self
+            .db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "DELETE FROM {table} WHERE id = ? AND {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?)",
+                ),
+                [id.into(), user_id.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected() > 0)
+    }}
+"#
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"
     // Tenant-scoped accessors — handlers must use these for tenant-owned data (JL0006).
@@ -1108,7 +1270,7 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
             .await
             .map_err(db_error)
     }}
-"#
+{membership_writes}"#
     )
 }
 
@@ -2762,7 +2924,15 @@ pub(crate) mod tests {
                   { "operation_id": "list_customers", "method": "GET", "path": "/", "auth_required": true,
                     "success": { "status": 200, "entity": "Customer", "list": true } },
                   { "operation_id": "get_customer", "method": "GET", "path": "/{id}", "auth_required": true,
-                    "success": { "status": 200, "entity": "Customer" } } ] }
+                    "success": { "status": 200, "entity": "Customer" } },
+                  { "operation_id": "create_customer", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Customer" },
+                    "success": { "status": 201, "entity": "Customer" } },
+                  { "operation_id": "update_customer", "method": "PUT", "path": "/{id}", "auth_required": true,
+                    "request_body": { "entity": "Customer" },
+                    "success": { "status": 200, "entity": "Customer" } },
+                  { "operation_id": "delete_customer", "method": "DELETE", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 204 } } ] }
         ] }"#;
 
     /// The guard PARAM and the read scope-hint comment follow `endpoint_tenant_shape`
@@ -2830,6 +3000,89 @@ pub(crate) mod tests {
                 "pub(crate) async fn get_club(_repo: Dep<ClubRepo>, _tenant: Dep<Tenant>, Path(_club_id): Path<i64>)"
             ),
             "the tenant's own detail route is path-scoped:\n{clubs}"
+        );
+    }
+
+    /// The flat cross-tenant WRITE leak fix (issue #94, spec §C `WITH CHECK`). A FLAT
+    /// tenant-owned entity's repo emits membership-CHECKED write accessors so a user
+    /// can't `POST {tenant_fk: not-mine}` into a tenant they don't belong to: the
+    /// create verifies the BODY fk ∈ the caller's memberships (403 otherwise), and
+    /// update/delete are scoped to the set (404 outside it, 403 on a cross-tenant move).
+    /// A PATH-SCOPED (nested) entity is scoped by the verified path tenant instead, so
+    /// it must NOT get these methods — that write path stays byte-identical (T2).
+    #[test]
+    fn flat_tenant_owned_entity_gets_membership_checked_write_methods() {
+        let d: Design = serde_json::from_str(CLUBS_TENANCY).unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+
+        // FLAT `customers`: the repo emits the three membership-CHECKED writes.
+        let customers = repo_rs(&d.modules[2], mode, &d).unwrap();
+        assert!(
+            customers.contains(
+                "pub async fn create_for_memberships(&self, user_id: String, item: Customer) -> Result<i64>"
+            ),
+            "flat create is membership-checked:\n{customers}"
+        );
+        assert!(
+            customers.contains(
+                "pub async fn update_for_memberships(&self, user_id: String, id: i64, item: Customer) -> Result<bool>"
+            ),
+            "flat update is membership-checked:\n{customers}"
+        );
+        assert!(
+            customers.contains(
+                "pub async fn remove_for_memberships(&self, user_id: String, id: i64) -> Result<bool>"
+            ),
+            "flat delete is membership-checked:\n{customers}"
+        );
+        // The create's WITH CHECK is the membership EXISTS probe; out-of-set → 403.
+        assert!(
+            customers
+                .contains("SELECT 1 FROM club_members WHERE user_id = ? AND club_id = ? LIMIT 1")
+                && customers.contains("return Err(Error::forbidden());"),
+            "create verifies the body fk against the caller's memberships (403 else):\n{customers}"
+        );
+        // Delete is scoped to the set by the RLS subquery (0 rows outside it → 404).
+        assert!(
+            customers.contains(
+                "DELETE FROM customers WHERE id = ? AND club_id IN (SELECT club_id FROM club_members WHERE user_id = ?)"
+            ),
+            "delete is scoped to the membership set:\n{customers}"
+        );
+
+        // The flat mutation handlers are STEERED to the checked methods (never the
+        // unscoped insert/update/remove), and still take `CurrentUser` — not `Dep<Tenant>`.
+        let handlers = handlers_rs(&d.modules[2], mode, &d);
+        assert!(
+            handlers.contains("CustomerRepo::create_for_memberships(_user.0.id, customer)"),
+            "flat create stub is steered to create_for_memberships:\n{handlers}"
+        );
+        assert!(
+            handlers.contains("CustomerRepo::update_for_memberships(_user.0.id, _id, customer)"),
+            "flat update stub is steered to update_for_memberships:\n{handlers}"
+        );
+        assert!(
+            handlers.contains("CustomerRepo::remove_for_memberships(_user.0.id, _id)"),
+            "flat delete stub is steered to remove_for_memberships:\n{handlers}"
+        );
+        assert!(
+            handlers.contains(
+                "pub(crate) async fn create_customer(_repo: Dep<CustomerRepo>, _user: CurrentUser"
+            ),
+            "flat create handler takes CurrentUser, not Dep<Tenant>:\n{handlers}"
+        );
+
+        // NO-DRIFT: the PATH-SCOPED nested `books` entity must NOT gain these methods —
+        // its writes are scoped by the verified path tenant (byte-identical to pre-#94).
+        let books = repo_rs(&d.modules[1], mode, &d).unwrap();
+        assert!(
+            !books.contains("create_for_memberships")
+                && !books.contains("update_for_memberships")
+                && !books.contains("remove_for_memberships"),
+            "path-scoped entity must not get membership-checked writes:\n{books}"
         );
     }
 
