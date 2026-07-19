@@ -847,7 +847,39 @@ fn seed_second_tenant_fn(design: &Design, module: &ModuleDesign) -> String {
 /// (POST "/" with a body). With a GET "/{id}" it runs the full get/list/delete
 /// legs; without one it degrades to a list-only variant asserting the foreign row
 /// is absent from user 2's list. Empty when there's no usable creator.
+/// Every applicable isolation test for a module, concatenated (issue #78/#79,
+/// spec §F). One design shape ⇒ one emitter fires; each returns "" when N/A, so
+/// composing is safe. The four shapes:
+///   - tenant-owned (flat MembershipSet, and nested path-scoped) — a member of
+///     tenant A cannot reach tenant B's rows;
+///   - per-user identity-owned — user B cannot reach user A's rows (#79);
+///   - tenant-collection-create (I1) — the creator's list-own returns the new
+///     tenant; a second user's list is empty (the backstop for an agent who calls
+///     the bare `insert` instead of `create_with_membership`).
 fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
+    let mut out = String::new();
+    out.push_str(&tenant_owned_isolation_test(design, module));
+    out.push_str(&per_user_isolation_test(design, module));
+    out.push_str(&tenant_collection_isolation_test(design, module));
+    out
+}
+
+/// The cross-tenant isolation test for a tenant-owned module: user 1 (tenant 1)
+/// creates a row; user 2 (tenant 2, seeded by app()) must not be able to read,
+/// list, or delete it. WHY this matters (Rule 9): it encodes the SECURITY
+/// contract — it fails on stubs (500), goes green only when the handler uses the
+/// SCOPED accessors (get_for/all_for/remove_for), and stays RED if the agent
+/// reaches for the unscoped all/get/remove (which would leak the foreign row).
+///
+/// Handles BOTH route shapes:
+///   - FLAT (MembershipSet, `/leads`): user 2 can list their own (empty) rows, so
+///     the list leg asserts the foreign row is absent — byte-identical to before;
+///   - NESTED path-scoped (`/clubs/{club_id}/books`, the #78 leak with no coverage
+///     today): the tenant fk in the mount is pinned to tenant 1, and user 2 (a
+///     member of tenant 2, NOT tenant 1) gets 404 on tenant 1's row. The list leg
+///     is SKIPPED — user 2 can't even reach tenant 1's collection (the guard 404s
+///     the whole path), so a "list 200, absent" assertion would false-fail.
+fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String {
     let Some(tenancy) = design.tenancy.as_ref() else {
         return String::new();
     };
@@ -874,6 +906,13 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
     };
     let base = module.effective_mount();
     let base = base.trim_end_matches('/');
+    // A NESTED mount carries the tenant fk (`/clubs/{club_id}/…`): pin it to tenant
+    // 1 so the probe URLs are concrete, and remember we're nested so the list leg
+    // (user 2 can't reach tenant 1's collection at all) is skipped. For a FLAT
+    // mount the token is absent, so `cbase == base` and every URL is byte-identical.
+    let fk_token = format!("{{{}}}", Design::fk_column(&tenancy.entity));
+    let is_nested = base.contains(&fk_token);
+    let cbase = base.replace(&fk_token, "1");
     let plural = module.name.replace('-', "_");
     let body = fixture_json(
         design,
@@ -882,7 +921,7 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
         omits_identity_fk(design, module, create),
         None,
     );
-    let create_path = format!("{base}/");
+    let create_path = format!("{cbase}/");
 
     // A GET "/{id}" lets us assert the foreign row 404s for user 2 and survives
     // for user 1; a DELETE "/{id}" (role-gated → user 2's membership carries the
@@ -897,10 +936,13 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
         .endpoints
         .iter()
         .find(|ep| ep.method == HttpMethod::DELETE && param_count(ep) == 1);
+    // The list leg only applies to a FLAT (MembershipSet) route: a nested route's
+    // list is itself tenant-path-guarded, so user 2 can't reach tenant 1's list.
     let list = module
         .endpoints
         .iter()
-        .find(|ep| ep.method == HttpMethod::GET && param_count(ep) == 0);
+        .find(|ep| ep.method == HttpMethod::GET && param_count(ep) == 0)
+        .filter(|_| !is_nested);
 
     // The credential header follows the auth model (cookie/session, Bearer/jwt —
     // issue #29); `test_cookie_for(n)` returns the matching header value.
@@ -931,28 +973,199 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
 
     if let Some(_get) = get_one {
         t.push_str(&format!(
-            "    let foreign = t.get_with(&format!(\"{base}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(foreign.status().as_u16(), 404, \"cross-tenant get must 404 (use get_for, not get); body: {{}}\", foreign.text());\n",
+            "    let foreign = t.get_with(&format!(\"{cbase}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(foreign.status().as_u16(), 404, \"cross-tenant get must 404 (use get_for, not get); body: {{}}\", foreign.text());\n",
         ));
     }
     if list.is_some() {
         // Always cookied: even an unguarded list is safe to call with a cookie,
         // and a guarded one needs it. user 2 sees only tenant 2's (empty) rows.
         t.push_str(&format!(
-            "    let listed = t.get_with(\"{base}/\", &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(listed.status().as_u16(), 200, \"user 2 lists their own {plural}; body: {{}}\", listed.text());\n    let rows: serde_json::Value = serde_json::from_str(&listed.text()).expect(\"list json\");\n    let absent = rows.as_array().map(|a| a.iter().all(|r| r[\"id\"] != id_value)).unwrap_or(true);\n    assert!(absent, \"cross-tenant list must NOT contain tenant 1's row (use all_for); body: {{}}\", listed.text());\n",
+            "    let listed = t.get_with(\"{cbase}/\", &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(listed.status().as_u16(), 200, \"user 2 lists their own {plural}; body: {{}}\", listed.text());\n    let rows: serde_json::Value = serde_json::from_str(&listed.text()).expect(\"list json\");\n    let absent = rows.as_array().map(|a| a.iter().all(|r| r[\"id\"] != id_value)).unwrap_or(true);\n    assert!(absent, \"cross-tenant list must NOT contain tenant 1's row (use all_for); body: {{}}\", listed.text());\n",
         ));
     }
     if let Some(_del) = delete_one {
         t.push_str(&format!(
-            "    let del = t.delete_with(&format!(\"{base}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(del.status().as_u16(), 404, \"cross-tenant delete must 404 (use remove_for, not remove); body: {{}}\", del.text());\n",
+            "    let del = t.delete_with(&format!(\"{cbase}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(del.status().as_u16(), 404, \"cross-tenant delete must 404 (use remove_for, not remove); body: {{}}\", del.text());\n",
         ));
         if get_one.is_some() {
             t.push_str(&format!(
-                "    let survives = t.get_with(&format!(\"{base}/{{id}}\"), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(survives.status().as_u16(), 200, \"tenant 1's row must survive a cross-tenant delete; body: {{}}\", survives.text());\n",
+                "    let survives = t.get_with(&format!(\"{cbase}/{{id}}\"), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(survives.status().as_u16(), 200, \"tenant 1's row must survive a cross-tenant delete; body: {{}}\", survives.text());\n",
             ));
         }
     }
     t.push_str("}\n\n");
     t
+}
+
+/// True when `e` is per-user identity-owned: it carries an identity fk (`user_id`,
+/// belongs_to the auth identity) and is NOT tenant-owned (a tenant-owned entity is
+/// scoped by the tenant instead). Mirrors genroute's `entity_is_per_user_owned`
+/// (the two must agree: genroute suppresses the unscoped methods for exactly the
+/// entities testgen writes an owner-isolation test for).
+fn entity_is_per_user_owned(design: &Design, e: &Entity) -> bool {
+    Design::has_identity_fk(e)
+        && !design
+            .tenancy
+            .as_ref()
+            .is_some_and(|t| e.belongs_to.iter().any(|b| b.entity == t.entity))
+}
+
+/// The per-user (#79) isolation test: user 1 creates a row (the server injects
+/// user 1's id); user 2 must not be able to read, list, or delete it. WHY (Rule 9):
+/// the identity-owned shape JC0540 steers agents toward had NO backstop — an
+/// unscoped `repo.all()` leaked every user's rows with `check` green. This test is
+/// that backstop; it passes ONLY when the handler scopes via the owner accessors
+/// (`all_for`/`get_for`/`remove_for`), which are now the ONLY methods generated
+/// (genroute suppresses the unscoped ones). No tenant seeding — two distinct user
+/// sessions (`test_cookie_for(1)`/`(2)`) are all it needs. db+auth only.
+fn per_user_isolation_test(design: &Design, module: &ModuleDesign) -> String {
+    if !(design.wants_db() && design.wants_auth()) {
+        return String::new();
+    }
+    let Some(entity) = module
+        .entities
+        .iter()
+        .find(|e| entity_is_per_user_owned(design, e))
+    else {
+        return String::new();
+    };
+    // A GUARDED creator at "/" with a body — the server injects the owner id from
+    // the session, so the created row is owned by user 1.
+    let Some(create) = module.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::POST
+            && ep.path == "/"
+            && ep.is_guarded()
+            && ep
+                .request_body
+                .as_ref()
+                .is_some_and(|rb| rb.entity == entity.name)
+    }) else {
+        return String::new();
+    };
+    let base = module.effective_mount();
+    let base = base.trim_end_matches('/');
+    let plural = module.name.replace('-', "_");
+    let body = fixture_json(
+        design,
+        module,
+        &entity.name,
+        omits_identity_fk(design, module, create),
+        None,
+    );
+    let create_path = format!("{base}/");
+    // Only GUARDED reads carry the owner scope — an unguarded read has no session to
+    // scope by, so it can't prove isolation. Gate every probe leg on a guard.
+    let guarded1 = |ep: &&Endpoint| ep.is_guarded();
+    let get_one = module
+        .endpoints
+        .iter()
+        .find(|ep| ep.method == HttpMethod::GET && param_count(ep) == 1 && guarded1(ep));
+    let delete_one = module
+        .endpoints
+        .iter()
+        .find(|ep| ep.method == HttpMethod::DELETE && param_count(ep) == 1 && guarded1(ep));
+    let list = module
+        .endpoints
+        .iter()
+        .find(|ep| ep.method == HttpMethod::GET && param_count(ep) == 0 && guarded1(ep));
+
+    let hk = design.test_auth_header();
+    let mut t = String::new();
+    t.push_str(&format!(
+        "/// SECURITY (#79): a user must not reach another user's {entity} rows. User 1\n/// creates a row (the server injects user 1's id); user 2 must be denied read/\n/// list/delete. Passes only with the owner-scoped accessors (all_for/get_for/\n/// remove_for) — the unscoped methods are NOT generated (genroute, #79).\n#[tokio::test]\nasync fn user_a_cannot_read_user_b_{plural}() {{\n    let t = app().await;\n",
+        entity = entity.name,
+    ));
+    t.push_str(&format!(
+        "    let created = t.post_json_with(\"{create_path}\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n    let cookie2 = test_cookie_for(2);\n",
+        status = create.success.status,
+        entity = entity.name,
+    ));
+    if list.is_some() {
+        t.push_str("    let id_value = row[\"id\"].clone();\n");
+    }
+    if get_one.is_some() || delete_one.is_some() {
+        t.push_str(
+            "    let id = row[\"id\"].as_str().map(str::to_string).unwrap_or_else(|| row[\"id\"].to_string());\n",
+        );
+    }
+    if get_one.is_some() {
+        t.push_str(&format!(
+            "    let foreign = t.get_with(&format!(\"{base}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(foreign.status().as_u16(), 404, \"cross-user get must 404 (use get_for(_user.0.id), not get); body: {{}}\", foreign.text());\n",
+        ));
+    }
+    if list.is_some() {
+        t.push_str(&format!(
+            "    let listed = t.get_with(\"{base}/\", &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(listed.status().as_u16(), 200, \"user 2 lists their own {plural}; body: {{}}\", listed.text());\n    let rows: serde_json::Value = serde_json::from_str(&listed.text()).expect(\"list json\");\n    let absent = rows.as_array().map(|a| a.iter().all(|r| r[\"id\"] != id_value)).unwrap_or(true);\n    assert!(absent, \"cross-user list must NOT contain user 1's row (use all_for(_user.0.id)); body: {{}}\", listed.text());\n",
+        ));
+    }
+    if delete_one.is_some() {
+        t.push_str(&format!(
+            "    let del = t.delete_with(&format!(\"{base}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(del.status().as_u16(), 404, \"cross-user delete must 404 (use remove_for(_user.0.id), not remove); body: {{}}\", del.text());\n",
+        ));
+        if get_one.is_some() {
+            t.push_str(&format!(
+                "    let survives = t.get_with(&format!(\"{base}/{{id}}\"), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(survives.status().as_u16(), 200, \"user 1's row must survive a cross-user delete; body: {{}}\", survives.text());\n",
+            ));
+        }
+    }
+    t.push_str("}\n\n");
+    t
+}
+
+/// The tenant-collection-create isolation/lifecycle test (REVIEWER I1): user 1
+/// creates a tenant; user 1's immediate list-own returns it; user 2's list is
+/// EMPTY of it. WHY (Rule 9): T3 left the bare `insert` reachable next to
+/// `create_with_membership`; an agent who calls `insert` (skipping the membership
+/// seed) leaves the tenant memberless — the creator is locked out and, worse, a
+/// membership-filtered list can silently diverge. This test makes that failure
+/// LOUD: it passes only when create seeds the creator's membership AND list scopes
+/// to `all_for_member`. Emitted only when the tenant module has BOTH a guarded
+/// `POST "/"` create and a guarded `GET "/"` list for the tenant entity — an
+/// unguarded list (e.g. reference-slice `list_workspaces`) can't be membership-
+/// scoped, so the test would be un-passable and is skipped.
+fn tenant_collection_isolation_test(design: &Design, module: &ModuleDesign) -> String {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return String::new();
+    };
+    // This module must DECLARE the tenant entity (be the tenant module).
+    let Some(entity) = module.entities.iter().find(|e| e.name == tenancy.entity) else {
+        return String::new();
+    };
+    let Some(create) = module.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::POST
+            && ep.path == "/"
+            && ep.is_guarded()
+            && ep
+                .request_body
+                .as_ref()
+                .is_some_and(|rb| rb.entity == entity.name)
+    }) else {
+        return String::new();
+    };
+    // A GUARDED list at "/" — an unguarded list has no session to membership-scope
+    // by, so it can't prove the second-user-empty contract; skip it there.
+    if !module.endpoints.iter().any(|ep| {
+        ep.method == HttpMethod::GET && ep.path == "/" && ep.is_guarded() && ep.success.list
+    }) {
+        return String::new();
+    }
+    let base = module.effective_mount();
+    let base = base.trim_end_matches('/');
+    let plural = module.name.replace('-', "_");
+    let body = fixture_json(
+        design,
+        module,
+        &entity.name,
+        omits_identity_fk(design, module, create),
+        None,
+    );
+    let hk = design.test_auth_header();
+    format!(
+        "/// SECURITY (#78, I1): creating a {entity} seeds ONLY the creator's membership.\n/// User 1 creates a {entity}; user 1's own list returns it; user 2's list is empty.\n/// Passes only when create uses `create_with_membership` (NOT the bare `insert`,\n/// which leaves the tenant memberless) and list uses `all_for_member`.\n#[tokio::test]\nasync fn creating_a_{plural2}_seeds_only_the_creators_membership() {{\n    let t = app().await;\n    let created = t.post_json_with(\"{base}/\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n    let id_value = row[\"id\"].clone();\n    let own = t.get_with(\"{base}/\", &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(own.status().as_u16(), 200, \"user 1 lists their own {plural}; body: {{}}\", own.text());\n    let own_rows: serde_json::Value = serde_json::from_str(&own.text()).expect(\"own list json\");\n    let present = own_rows.as_array().map(|a| a.iter().any(|r| r[\"id\"] == id_value)).unwrap_or(false);\n    assert!(present, \"the creator's list MUST contain the new {entity} (create_with_membership seeds membership); body: {{}}\", own.text());\n    let other = t.get_with(\"{base}/\", &[(\"{hk}\", &test_cookie_for(2))]).await;\n    assert_eq!(other.status().as_u16(), 200, \"user 2 lists their own {plural}; body: {{}}\", other.text());\n    let other_rows: serde_json::Value = serde_json::from_str(&other.text()).expect(\"other list json\");\n    let absent = other_rows.as_array().map(|a| a.iter().all(|r| r[\"id\"] != id_value)).unwrap_or(true);\n    assert!(absent, \"a non-creator's list must NOT contain the new {entity} (use all_for_member); body: {{}}\", other.text());\n}}\n\n",
+        entity = entity.name,
+        plural2 = Design::to_snake(&entity.name),
+        status = create.success.status,
+    )
 }
 
 /// A SQL literal for seeding a tenant-row column. Enum fields use their first

@@ -116,42 +116,110 @@ fn lint_boundary_escapes(root: &Path, design: &Design, out: &mut Vec<Diagnostic>
     }
 }
 
-/// JL0006: a handler in a module that owns tenant-owned entities calls an
-/// UNSCOPED repo method (`repo.all()`, `repo.get(`, `repo.remove(`, `repo.update(`).
-/// Those read/delete across ALL tenants, so a tenant could reach another tenant's
-/// rows. The scoped accessors (`all_for`/`get_for`/`remove_for`) are excluded by
-/// the `(` anchor (e.g. `repo.get_for(` has `_` not `(` after `get`).
+/// JL0006: a handler in an OWNER-SCOPED module calls an UNSCOPED repo method
+/// (`repo.all()`, `repo.get(`, `repo.remove(`, `repo.update(`). Those read/delete
+/// across ALL owners, leaking rows:
+///   - a TENANT-owned module (an entity belongs_to the tenancy entity) → another
+///     tenant's rows;
+///   - a per-user IDENTITY-owned module (#79 — an entity belongs_to the auth
+///     identity, not tenant-scoped) → another user's rows. For these the unscoped
+///     methods are additionally NOT generated (genroute make-impossible), so this
+///     lint is belt-and-suspenders: it gives a precise, actionable fix instead of a
+///     raw `no method all` compile error.
+///
+/// The scoped accessors (`all_for`/`get_for`/`remove_for`) are excluded by the `(`
+/// anchor (e.g. `repo.get_for(` has `_` not `(` after `get`).
 ///
 /// We scan ONLY the agent-owned handlers.rs (where the call happens), never
 /// repo.rs: the generated repo's own scoped methods call `Entity::...` directly,
 /// not `self.all()`, so repo.rs never legitimately matches — and scanning it
 /// would flag the unscoped methods the scoped ones are meant to replace.
 fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diagnostic>) {
-    // The set of modules that own at least one tenant-owned entity.
-    let modules: BTreeSet<&str> = design.tenant_owned().into_iter().map(|(m, _)| m).collect();
+    // Tenant-owned modules leak ACROSS TENANTS; a per-user identity-owned module
+    // (#79) leaks ACROSS USERS. An entity is one or the other, so scan the tenant
+    // set first and skip any module it already covered.
+    let tenant_modules: BTreeSet<&str> =
+        design.tenant_owned().into_iter().map(|(m, _)| m).collect();
+    for module in &tenant_modules {
+        scan_unscoped(
+            root,
+            module,
+            "a tenant-owned",
+            "another tenant's rows",
+            "call the tenant-scoped accessor (all_for/get_for/remove_for) with the current tenant's id",
+            out,
+        );
+    }
+    for module in identity_owned_modules(design) {
+        if tenant_modules.contains(module) {
+            continue;
+        }
+        scan_unscoped(
+            root,
+            module,
+            "an identity-owned",
+            "another user's rows",
+            "call the owner-scoped accessor (all_for/get_for/remove_for) with the session user's id (_user.0.id)",
+            out,
+        );
+    }
+}
+
+/// Scan one top-level module's `handlers.rs` for the unscoped repo patterns,
+/// pushing a JL0006 per hit with the caller-supplied ownership wording.
+fn scan_unscoped(
+    root: &Path,
+    module: &str,
+    owned_desc: &str,
+    leak_desc: &str,
+    suggestion: &str,
+    out: &mut Vec<Diagnostic>,
+) {
     // `repo.all()` takes no args; the others anchor on `(` so `*_for(` is excluded.
     const PATTERNS: [&str; 4] = ["repo.all()", "repo.get(", "repo.remove(", "repo.update("];
-    for module in modules {
-        let rel = format!("crates/routes/{module}/src/handlers.rs");
-        let Ok(content) = std::fs::read_to_string(root.join(&rel)) else {
+    let rel = format!("crates/routes/{module}/src/handlers.rs");
+    let Ok(content) = std::fs::read_to_string(root.join(&rel)) else {
+        return;
+    };
+    for (i, line) in content.lines().enumerate() {
+        let Some(hit) = PATTERNS.iter().find(|p| line.contains(**p)) else {
             continue;
         };
-        for (i, line) in content.lines().enumerate() {
-            let Some(hit) = PATTERNS.iter().find(|p| line.contains(**p)) else {
-                continue;
-            };
-            out.push(d(
-                "JL0006",
-                Some(rel.clone()),
-                Some(i as u64 + 1),
-                format!(
-                    "handler in module `{module}` calls the unscoped `{hit}` on a tenant-owned repo — it can read or delete another tenant's rows"
-                ),
-                "call the tenant-scoped accessor (all_for/get_for/remove_for) with the current tenant's id",
-                "jerrycan docs database",
-            ));
+        out.push(d(
+            "JL0006",
+            Some(rel.clone()),
+            Some(i as u64 + 1),
+            format!(
+                "handler in module `{module}` calls the unscoped `{hit}` on {owned_desc} repo — it can read or delete {leak_desc}"
+            ),
+            suggestion,
+            "jerrycan docs database",
+        ));
+    }
+}
+
+/// Top-level modules that own a per-user IDENTITY-owned entity (#79): an entity
+/// that belongs_to the auth identity (`user_id`) and is NOT tenant-owned. Empty
+/// unless the design wants auth. Mirrors genroute's `entity_is_per_user_owned` so
+/// the lint and the method-suppression agree on which modules are owner-scoped.
+fn identity_owned_modules(design: &Design) -> BTreeSet<&str> {
+    let mut out = BTreeSet::new();
+    if !design.wants_auth() {
+        return out;
+    }
+    for m in &design.modules {
+        let has_per_user = m.entities.iter().any(|e| {
+            e.belongs_to.iter().any(Design::is_identity_fk)
+                && !design
+                    .tenancy
+                    .as_ref()
+                    .is_some_and(|t| e.belongs_to.iter().any(|b| b.entity == t.entity))
+        });
+        if has_per_user {
+            out.insert(m.name.as_str());
         }
     }
+    out
 }
 
 /// JL0004: in an auth design, a mutating route (POST/PUT/PATCH/DELETE) whose
@@ -372,6 +440,89 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
             .into_iter()
             .filter(|d| d.code == "JL0006")
             .collect()
+    }
+
+    /// A per-user (identity-owned, no tenancy) auth design: Workout belongs_to the
+    /// auth identity (User → `user_id`), so its module is owner-scoped (#79).
+    fn per_user_design() -> Design {
+        serde_json::from_value(serde_json::json!({
+            "name": "fitness-api",
+            "contract_version": 1,
+            "auth": { "model": "session", "roles": ["user"] },
+            "dependencies": ["db", "auth"],
+            "modules": [{
+                "name": "workouts",
+                "entities": [{
+                    "name": "Workout",
+                    "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                    "fields": [{ "name": "distance", "type": "float" }]
+                }],
+                "endpoints": [{
+                    "operation_id": "list_workouts", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Workout", "list": true }
+                }]
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// JL0006 also flags the unscoped `repo.all()` on a per-user IDENTITY-owned
+    /// module (#79), naming a CROSS-USER (not cross-tenant) leak and the owner-
+    /// scoped fix. WHY (Rule 9): genroute already suppresses the unscoped method
+    /// (a compile error), but this belt-and-suspenders lint gives the agent a
+    /// precise, actionable diagnostic; the scoped `all_for(...)` stays clean.
+    #[test]
+    fn jl0006_flags_unscoped_call_on_a_per_user_identity_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/workouts/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn list_workouts(repo: Dep<WorkoutRepo>) -> Result<()> {\n    let _ = repo.all().await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &per_user_design());
+        assert_eq!(
+            hits.len(),
+            1,
+            "one unscoped call on a per-user repo: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.all()` line");
+        assert!(
+            hits[0].message.contains("another user's rows"),
+            "names the cross-USER leak, not cross-tenant: {:?}",
+            hits[0]
+        );
+        assert!(
+            hits[0]
+                .suggestion
+                .as_deref()
+                .unwrap()
+                .contains("_user.0.id"),
+            "carries the owner-scoped fix: {:?}",
+            hits[0]
+        );
+    }
+
+    /// The owner-scoped accessor on a per-user module is clean — no false positive
+    /// (the `(` anchor distinguishes `all_for(` from `all()`).
+    #[test]
+    fn jl0006_silent_on_owner_scoped_per_user_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/workouts/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn list_workouts(repo: Dep<WorkoutRepo>, _user: CurrentUser) -> Result<()> {\n    let _ = repo.all_for(_user.0.id).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        assert!(
+            jl0006_only(root, &per_user_design()).is_empty(),
+            "owner-scoped per-user handler is clean"
+        );
     }
 
     /// A minimal auth design with one mutating module endpoint; the test mutates
