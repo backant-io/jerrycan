@@ -18,11 +18,17 @@ tenant, never resolved to one arbitrary "membership of something".
 
 ## The rule
 > The tenant id for an operation comes from the **route** — a path param, or (on a
-> flat create) the request body — and it MUST be in the caller's membership set,
-> verified by generated code before the handler scopes to it. A list with no
-> specific tenant returns the caller's whole membership set. A membership miss on a
-> **read** is `404` (no existence leak); a **write** to a non-member tenant, or a
-> role the membership lacks, is `403`.
+> flat route) the request body — and it MUST be in the caller's membership set. A
+> membership miss on a **read** is `404` (no existence leak); a wrong role is `403`.
+> A list with no specific tenant returns the caller's whole membership set.
+>
+> **What the generator verifies for you, and what it doesn't (yet):** on a
+> **path-scoped** route the guard verifies the path tenant before the handler runs,
+> and reads on a **flat** route go through generated membership-set methods
+> (`all_for_memberships`/`get_for_memberships`). But a **flat write** (create/update
+> /delete whose tenant fk comes from the body) is NOT yet verified by generated
+> code — you must check `body.{fk}` is in the caller's membership set before the
+> write and reject a non-member tenant with `403`. See "Flat writes" below.
 
 Two route shapes specialize that rule, and the generator picks the right one per
 endpoint:
@@ -283,6 +289,31 @@ assert!(owner.require_role("owner").is_ok());
 # let _ = list_customers; }); }
 ```
 
+### Flat writes — you verify the body tenant fk (for now)
+
+Reads on a flat route are scoped for you by `*_for_memberships`. **Writes are not yet:**
+the generated `create`/`update`/`delete` stub for a flat tenant-owned entity takes the
+tenant fk from the request body and does **not** check it against your membership set.
+Until the generator emits that check, verify it yourself before writing — otherwise a
+client can create or move a row into a tenant they don't belong to:
+
+```rust,ignore
+// AGENT: on a flat create/update, the body carries the tenant fk (e.g. workspace_id).
+// Confirm the caller belongs to that tenant before writing — else 403.
+async fn create_customer(repo: Dep<CustomerRepo>, user: CurrentUser, Json(body): Json<Customer>)
+    -> Result<Created<Customer>>
+{
+    if !repo.is_member(&user.0.id, body.workspace_id).await? {
+        return Err(Error::forbidden()); // 403: writing into a non-member tenant
+    }
+    // ... insert ...
+}
+```
+
+(Tracked: the generator will grow a membership-checked write path — `WITH CHECK` parity
+with the read side — so this becomes automatic. Path-scoped writes are already covered:
+the guard verified the tenant, and `update_for`/`remove_for` key on `tenant.id()`.)
+
 ## Creating a tenant auto-seeds membership + membership-filtered list
 There is **no hand-written membership INSERT**. The tenant entity's own repo gets two
 generated methods, and its collection handlers are steered to them:
@@ -322,10 +353,11 @@ above work end to end: the create is what puts the membership row in place.
   whatever the **route** addresses; the guard verifies the caller belongs to that
   tenant before the handler scopes to it. `tenant.id()` is safe precisely because it
   is the verified path tenant — not an arbitrary "first membership".
-- Don't trust a client-sent tenant id in a body or a header as the scope. On a flat
-  create the body's tenant fk is verified against the membership set (RLS
-  `WITH CHECK` parity); everywhere else the scope comes from the verified guard or
-  the membership-set methods, never from unverified request data.
+- Don't trust a client-sent tenant id in a body or a header as the scope. On reads
+  and path-scoped routes the scope comes from the verified guard or the
+  membership-set methods, never from unverified request data. On a **flat write**
+  (see "Flat writes"), the body's tenant fk is NOT yet verified for you — check it
+  is in the caller's membership set before writing, or a client sets any tenant.
 - Don't hand-write the membership seed on tenant create. `create_with_membership`
   does it in one transaction; a hand-rolled INSERT is the thing that gets dropped and
   locks the creator out of their own tenant.
