@@ -434,7 +434,9 @@ fn tenant_owned_modules_get_isolation_tests() {
         "second tenant membership seeds the owner role: {out}"
     );
 
-    // The non-tenant-owned tenant module (workspaces) gets NO isolation test.
+    // The non-tenant-owned tenant module (workspaces) gets NO cross-tenant
+    // isolation test — AND, because its list is UNGUARDED, no I1 test either
+    // (an unguarded list can't be membership-scoped).
     let workspaces = d
         .modules
         .iter()
@@ -444,6 +446,145 @@ fn tenant_owned_modules_get_isolation_tests() {
     assert!(
         !ws_gen.contains("cannot_read_tenant_b"),
         "non-tenant-owned module gets no isolation test: {ws_gen}"
+    );
+    assert!(
+        !ws_gen.contains("seeds_only_the_creators_membership"),
+        "an UNGUARDED tenant list can't be membership-scoped, so no I1 test: {ws_gen}"
+    );
+}
+
+/// A per-user (identity-owned) module gets a #79 isolation test: user B cannot
+/// read/list/delete user A's row. WHY (Rule 9): the identity shape JC0540 steers
+/// toward had NO backstop; this is it. It passes only with the owner-scoped
+/// accessors — the unscoped repo methods are not even generated.
+#[test]
+fn per_user_identity_owned_modules_get_isolation_tests() {
+    const FITNESS: &str = r#"{
+        "name": "fitness-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["user"] },
+        "dependencies": ["db", "auth"],
+        "modules": [
+            { "name": "users",
+              "entities": [{ "name": "User", "fields": [{ "name": "email", "type": "string" }] }],
+              "endpoints": [] },
+            { "name": "workouts",
+              "entities": [{ "name": "Workout",
+                  "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "distance", "type": "float" }] }],
+              "endpoints": [
+                  { "operation_id": "create_workout", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Workout" },
+                    "success": { "status": 201, "entity": "Workout" } },
+                  { "operation_id": "list_workouts", "method": "GET", "path": "/", "auth_required": true,
+                    "success": { "status": 200, "entity": "Workout", "list": true } },
+                  { "operation_id": "get_workout", "method": "GET", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Workout" } },
+                  { "operation_id": "delete_workout", "method": "DELETE", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 204 } } ] }
+        ]
+    }"#;
+    let d: Design = serde_json::from_str(FITNESS).unwrap();
+    let workouts = d.modules.iter().find(|m| m.name == "workouts").unwrap();
+    let out = testgen::acceptance_rs(&d, workouts);
+    assert!(
+        out.contains("async fn user_a_cannot_read_user_b_workouts()"),
+        "per-user isolation test emitted: {out}"
+    );
+    // Two distinct user sessions, NO tenant seeding.
+    assert!(
+        out.contains("test_cookie_for(1)") && out.contains("test_cookie_for(2)"),
+        "acts as two distinct users: {out}"
+    );
+    assert!(
+        !out.contains("seed_second_tenant"),
+        "per-user isolation needs no tenant seed: {out}"
+    );
+    // Cross-user get + list + delete all assert 404/absent.
+    assert!(
+        out.contains("cross-user get must 404") && out.contains("cross-user delete must 404"),
+        "get + delete legs present: {out}"
+    );
+    assert!(
+        out.contains("cross-user list must NOT contain user 1's row"),
+        "list leg present: {out}"
+    );
+}
+
+/// A path-scoped NESTED tenant module (BookClubs `/clubs/{club_id}/books`) gets a
+/// cross-tenant isolation test with the mount pinned to tenant 1 — the exact #78
+/// nested-creator leak that had NO coverage before. A member of club 2 gets 404 on
+/// club 1's book; the list leg is skipped (user 2 can't reach club 1's collection).
+#[test]
+fn nested_path_scoped_module_gets_isolation_test_with_pinned_tenant() {
+    const CLUBS: &str = r#"{
+        "name": "clubs-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "clubs",
+              "entities": [{ "name": "Club", "fields": [
+                  { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_club", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Club" }, "success": { "status": 201, "entity": "Club" } },
+                  { "operation_id": "list_clubs", "method": "GET", "path": "/", "auth_required": true,
+                    "success": { "status": 200, "entity": "Club", "list": true } } ] },
+            { "name": "books", "mount": "/clubs/{club_id}",
+              "entities": [{ "name": "Book", "belongs_to": [{ "entity": "Club" }],
+                  "fields": [{ "name": "id", "type": "integer" }, { "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "create_book", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Book" }, "success": { "status": 201, "entity": "Book" } },
+                  { "operation_id": "get_book", "method": "GET", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Book" } } ] }
+        ]
+    }"#;
+    let d: Design = serde_json::from_str(CLUBS).unwrap();
+    let books = d.modules.iter().find(|m| m.name == "books").unwrap();
+    let out = testgen::acceptance_rs(&d, books);
+    assert!(
+        out.contains("async fn tenant_a_cannot_read_tenant_b_books()"),
+        "nested isolation test emitted: {out}"
+    );
+    // In the ISOLATION test the mount's tenant fk is pinned to tenant 1 (not the
+    // literal `{club_id}`): user 1 creates club 1's book, user 2 (a member of club 2
+    // only) reads it and 404s. (The per-endpoint success tests still carry the raw
+    // `{club_id}` mount — a separate mount-substitution gap, out of scope here.)
+    let iso = out
+        .split("async fn tenant_a_cannot_read_tenant_b_books()")
+        .nth(1)
+        .expect("isolation fn present");
+    assert!(
+        iso.contains("\"/clubs/1/\"") && iso.contains("/clubs/1/{id}"),
+        "isolation probe URLs pin the tenant fk to 1: {iso}"
+    );
+    assert!(
+        !iso.contains("{club_id}"),
+        "the isolation test carries no unsubstituted tenant param: {iso}"
+    );
+    assert!(
+        out.contains("cross-tenant get must 404"),
+        "get leg 404s: {out}"
+    );
+    // The list leg is skipped for a nested route (user 2 can't reach club 1's list).
+    assert!(
+        !out.contains("user 2 lists their own"),
+        "nested route emits no list leg: {out}"
+    );
+
+    // The tenant module (clubs) — guarded create AND guarded list — gets the I1 test.
+    let clubs = d.modules.iter().find(|m| m.name == "clubs").unwrap();
+    let clubs_out = testgen::acceptance_rs(&d, clubs);
+    assert!(
+        clubs_out.contains("async fn creating_a_club_seeds_only_the_creators_membership()"),
+        "I1 tenant-collection-create test emitted: {clubs_out}"
+    );
+    assert!(
+        clubs_out.contains("the creator's list MUST contain the new Club")
+            && clubs_out.contains("a non-creator's list must NOT contain the new Club"),
+        "I1 asserts creator-lists-own + second-user-empty: {clubs_out}"
     );
 }
 

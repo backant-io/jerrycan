@@ -387,6 +387,36 @@ fn tenant_collection_comment(
     }
 }
 
+/// A stub comment steering a per-user (identity-owned) READ handler to the
+/// owner-scoped repo method (issue #79), so a cross-user read is scoped by
+/// construction: a list to `all_for(_user.0.id)`, a `/{id}` read to
+/// `get_for(_user.0.id, _id)`. The unscoped `all()/get()` are NOT generated on a
+/// per-user repo (they don't compile), so this comment names the ONLY reachable
+/// accessor. Emitted only for a GET handler on a per-user entity in db+auth mode;
+/// every other handler — and every non-per-user design — stays byte-identical.
+fn owner_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> String {
+    if !(mode.db && mode.auth) || !matches!(ep.method, HttpMethod::GET) {
+        return String::new();
+    }
+    let Some(entity) = endpoint_repo_entity(m, ep) else {
+        return String::new();
+    };
+    let Some(e) = m.entities.iter().find(|e| e.name == entity) else {
+        return String::new();
+    };
+    if !entity_is_per_user_owned(e, mode, design) {
+        return String::new();
+    }
+    let call = if ep.success.list {
+        format!("{entity}Repo::all_for(_user.0.id)")
+    } else {
+        format!("{entity}Repo::get_for(_user.0.id, _id)")
+    };
+    format!(
+        "    // owner scope (issue #79): this {entity} belongs to the session user — scope this\n    // read via `{call}` (parse `_user.0.id`, the stringified session user id, for an\n    // integer fk). The unscoped repo method is NOT generated, so a cross-user read\n    // can't be written.\n"
+    )
+}
+
 pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     let mut uses = String::from("use jerrycan::prelude::*;\n");
     let mentions_entities = m
@@ -430,11 +460,12 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
             String::new()
         };
         let scope = tenant_scope_comment(m, ep, mode, design);
+        let owner_scope = owner_scope_comment(m, ep, mode, design);
         let collection = tenant_collection_comment(m, ep, mode, design);
         let server_owned = server_owned_fk_comment(m, ep, mode, design);
         let realtime = realtime_publish_comment(ep, design);
         out.push_str(&format!(
-            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{scope}{collection}{server_owned}{realtime}{body}\n}}\n\n",
+            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{scope}{owner_scope}{collection}{server_owned}{realtime}{body}\n}}\n\n",
             op = ep.operation_id,
             params = handler_params(m, ep, mode, design),
             ret = return_type(ep),
@@ -1191,13 +1222,119 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
     )
 }
 
-fn sql_repo(e: &Entity, design: &Design) -> String {
+/// True when this entity is OWNER-scoped by the AUTHENTICATED USER (issue #79):
+/// it carries an identity fk (`user_id` — a belongs_to aimed at the auth identity
+/// entity, the same COLUMN-name resolution JC0540/#34 use) in an auth design, and
+/// is NOT tenant-owned (a tenant-owned entity is scoped by the TENANT instead, via
+/// `scoped_methods`). Such an entity's repo emits ONLY the owner-scoped
+/// `all_for/get_for/remove_for/update_for` accessors; the unscoped
+/// `all/get/remove/update` are suppressed, so a cross-user read/delete cannot be
+/// written at all — the #79 leak is made impossible by construction, not merely
+/// linted. db-mode only (this is `sql_repo`'s concern; the memory-mode struct has
+/// no fk columns to scope by, so memory output stays byte-identical).
+fn entity_is_per_user_owned(e: &Entity, mode: GenMode, design: &Design) -> bool {
+    mode.auth
+        && Design::has_identity_fk(e)
+        && !design
+            .tenancy
+            .as_ref()
+            .is_some_and(|t| e.belongs_to.iter().any(|b| b.entity == t.entity))
+}
+
+/// Owner-scoped accessors for a per-user identity-owned entity (issue #79) — keyed
+/// on the fixed `user_id` fk column so a caller can only reach their OWN rows. The
+/// exact four `*_for` methods a tenant-owned entity's `scoped_methods` emit, but
+/// keyed on the identity fk (the session user) rather than the tenant fk, and
+/// WITHOUT the membership-set variants (per-user has no membership table). Empty
+/// unless the entity is per-user owned, so every other entity — tenant-owned,
+/// non-auth, or non-identity — stays byte-identical. The param type is the identity
+/// entity's key type (`i64` for an integer/synthetic user pk): the handler passes
+/// the parsed `_user.0.id` (the stringified session user id), mirroring the #34
+/// server-owned-fk guidance.
+fn owner_scoped_methods(e: &Entity, mode: GenMode, design: &Design) -> String {
+    if !entity_is_per_user_owned(e, mode, design) {
+        return String::new();
+    }
+    let Some(identity) = e.belongs_to.iter().find(|b| Design::is_identity_fk(b)) else {
+        return String::new();
+    };
+    let entity = &e.name;
+    let snake = Design::to_snake(entity);
+    let fk_col = Design::fk_column(&identity.entity);
+    let fk_pascal = col_pascal(&fk_col);
+    let fk_ty = design.target_key_rust_type(&identity.entity);
+    let key = key_rust_type(e);
+    let update_sets = active_sets(e, false);
+    format!(
+        r#"
+    // Owner-scoped accessors (issue #79) — this {entity} belongs to the authenticated
+    // user; handlers MUST scope to the session user (`_user.0.id`) via these. The
+    // unscoped all/get/remove/update are NOT generated, so a cross-user read/delete
+    // can't be written. `{fk_col}` is the session user's id.
+    pub async fn all_for(&self, {fk_col}: {fk_ty}) -> Result<Vec<{entity}>> {{
+        {snake}::Entity::find()
+            .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
+            .order_by_asc({snake}::Column::Id)
+            .all(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}
+
+    pub async fn get_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<Option<{entity}>> {{
+        {snake}::Entity::find_by_id(id)
+            .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}
+
+    pub async fn remove_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<bool> {{
+        let r = {snake}::Entity::delete_many()
+            .filter({snake}::Column::Id.eq(id))
+            .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
+            .exec(self.db.conn())
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected > 0)
+    }}
+
+    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
+        // Scope the write to the owner: only proceed if the row is already theirs
+        // (a foreign or unknown id is a no-op, returning false → 404).
+        if {snake}::Entity::find_by_id(id)
+            .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)?
+            .is_none()
+        {{
+            return Ok(false);
+        }}
+        let m = {snake}::ActiveModel {{
+            id: Set(item.id),
+{update_sets}        }};
+        match m.update(self.db.conn()).await {{
+            Ok(_) => Ok(true),
+            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
+            Err(e) => Err(db_error(e)),
+        }}
+    }}
+"#
+    )
+}
+
+fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
     let entity = &e.name;
     let snake = Design::to_snake(entity);
     let key = key_rust_type(e);
     let insert_sets = active_sets(e, true);
     let update_sets = active_sets(e, false);
     let scoped = scoped_methods(e, design);
+    // Per-user (issue #79): a guarded identity-owned entity emits ONLY owner-scoped
+    // accessors — the unscoped all/get/remove/update are suppressed so the leaky
+    // call can't be written. Mutually exclusive with `scoped` (tenant-owned).
+    let owner_scoped = owner_scoped_methods(e, mode, design);
+    let per_user = !owner_scoped.is_empty();
     // The tenant entity's OWN membership-lifecycle methods (empty for every other
     // entity); mutually exclusive with `scoped` (an entity can't be BOTH the tenant
     // and belong_to the tenant).
@@ -1232,6 +1369,23 @@ fn sql_repo(e: &Entity, design: &Design) -> String {
              \x20   }}"
         )
     };
+    // The unscoped read/write accessors. Suppressed for a per-user entity (#79) so
+    // the leaky cross-user call cannot be written — only the owner-scoped `*_for`
+    // methods remain. `insert` is always emitted (a create is scoped by the
+    // server-injected owner fk, not by the repo method). Non-per-user output stays
+    // byte-identical: `{reads}{insert_body}{writes}` reproduces the original layout.
+    let (reads, writes) = if per_user {
+        (String::new(), String::new())
+    } else {
+        (
+            format!(
+                "    pub async fn all(&self) -> Result<Vec<{entity}>> {{\n        {snake}::Entity::find()\n            .order_by_asc({snake}::Column::Id)\n            .all(self.db.conn())\n            .await\n            .map_err(db_error)\n    }}\n\n    pub async fn get(&self, id: {key}) -> Result<Option<{entity}>> {{\n        {snake}::Entity::find_by_id(id)\n            .one(self.db.conn())\n            .await\n            .map_err(db_error)\n    }}\n\n"
+            ),
+            format!(
+                "\n\n    pub async fn remove(&self, id: {key}) -> Result<bool> {{\n        let r = {snake}::Entity::delete_by_id(id)\n            .exec(self.db.conn())\n            .await\n            .map_err(db_error)?;\n        Ok(r.rows_affected > 0)\n    }}\n\n    pub async fn update(&self, id: {key}, item: {entity}) -> Result<bool> {{\n        let m = {snake}::ActiveModel {{\n            id: Set(id),\n{update_sets}        }};\n        match m.update(self.db.conn()).await {{\n            Ok(_) => Ok(true),\n            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),\n            Err(e) => Err(db_error(e)),\n        }}\n    }}"
+            ),
+        )
+    };
     format!(
         r#"pub struct {entity}Repo {{
     db: Db,
@@ -1245,42 +1399,8 @@ pub(crate) async fn {snake}_repo(db: Dep<Db>) -> Result<{entity}Repo> {{
 // Stub handlers don't call the repo yet; remove this allow as you implement them.
 #[allow(dead_code)]
 impl {entity}Repo {{
-    pub async fn all(&self) -> Result<Vec<{entity}>> {{
-        {snake}::Entity::find()
-            .order_by_asc({snake}::Column::Id)
-            .all(self.db.conn())
-            .await
-            .map_err(db_error)
-    }}
-
-    pub async fn get(&self, id: {key}) -> Result<Option<{entity}>> {{
-        {snake}::Entity::find_by_id(id)
-            .one(self.db.conn())
-            .await
-            .map_err(db_error)
-    }}
-
-{insert_body}
-
-    pub async fn remove(&self, id: {key}) -> Result<bool> {{
-        let r = {snake}::Entity::delete_by_id(id)
-            .exec(self.db.conn())
-            .await
-            .map_err(db_error)?;
-        Ok(r.rows_affected > 0)
-    }}
-
-    pub async fn update(&self, id: {key}, item: {entity}) -> Result<bool> {{
-        let m = {snake}::ActiveModel {{
-            id: Set(id),
-{update_sets}        }};
-        match m.update(self.db.conn()).await {{
-            Ok(_) => Ok(true),
-            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
-            Err(e) => Err(db_error(e)),
-        }}
-    }}
-{scoped}{tenant_own}}}
+{reads}{insert_body}{writes}
+{scoped}{tenant_own}{owner_scoped}}}
 
 "#,
     )
@@ -1308,19 +1428,33 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
         .entities
         .iter()
         .any(|e| !tenant_own_methods(e, design).is_empty());
-    let filter_imports = if has_scoped {
-        // `ConnectionTrait` backs `get_database_backend()` in the raw-SQL
-        // membership-set accessors; the rest back the `.filter(Column::Fk.eq(..))`
-        // path-scoped accessors. Only emitted when an entity is tenant-owned.
-        "ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder"
-    } else if has_tenant_own {
-        // Pure tenant module (the tenant entity, no tenant-owned children): the
-        // membership-lifecycle methods need `ConnectionTrait`, but not the
-        // `ColumnTrait`/`QueryFilter` that only the `.filter(..)` accessors use.
-        "ActiveModelTrait, ActiveValue::Set, ConnectionTrait, EntityTrait, QueryOrder"
-    } else {
-        "ActiveModelTrait, ActiveValue::Set, EntityTrait, QueryOrder"
-    };
+    // A per-user identity-owned entity (issue #79) gets `.filter(Column::UserId.eq(..))`
+    // owner-scoped accessors — so it needs `ColumnTrait`/`QueryFilter` (like a
+    // tenant-owned entity) but NOT `ConnectionTrait` (it has no raw-SQL
+    // membership-set method).
+    let has_owner_scoped = m
+        .entities
+        .iter()
+        .any(|e| !owner_scoped_methods(e, mode, design).is_empty());
+    // Build the trait-import list from what the emitted methods actually use, in the
+    // fixed alphabetical order the three pre-existing tiers used — so a
+    // tenant-owned, pure-tenant, or plain module stays byte-identical, and a per-user
+    // module gets `ColumnTrait`/`QueryFilter` WITHOUT the unused `ConnectionTrait`.
+    let needs_filter = has_scoped || has_owner_scoped; // ColumnTrait + QueryFilter
+    let needs_conn = has_scoped || has_tenant_own; // ConnectionTrait (raw SQL)
+    let mut imports = vec!["ActiveModelTrait", "ActiveValue::Set"];
+    if needs_filter {
+        imports.push("ColumnTrait");
+    }
+    if needs_conn {
+        imports.push("ConnectionTrait");
+    }
+    imports.push("EntityTrait");
+    if needs_filter {
+        imports.push("QueryFilter");
+    }
+    imports.push("QueryOrder");
+    let filter_imports = imports.join(", ");
     // The `use jerrycan::db::sea_orm;` alias resolves the bare `sea_orm::` paths
     // the repo writes (DbErr, ActiveValue::NotSet); the trait imports come through
     // the same facade so generated crates carry NO direct sea-orm dependency.
@@ -1328,7 +1462,7 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
         "//! Data access — SeaORM over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sea_orm;\nuse jerrycan::db::sea_orm::{{{filter_imports}}};\nuse jerrycan::db::{{db_error, Db}};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
     );
     for e in &m.entities {
-        out.push_str(&sql_repo(e, design));
+        out.push_str(&sql_repo(e, design, mode));
     }
     Some(out)
 }
@@ -2418,6 +2552,92 @@ pub(crate) mod tests {
         assert!(
             !src.contains("build_any_sqlx"),
             "repos are SeaORM now: {src}"
+        );
+    }
+
+    /// Issue #79 — MAKE THE PER-USER LEAK IMPOSSIBLE. A guarded entity that
+    /// belongs_to the auth identity (Collection/Bookmark → `user_id`), in a
+    /// non-tenancy auth design, gets ONLY the owner-scoped `*_for(user_id)`
+    /// accessors — the unscoped `all()/get()/remove()/update()` are NOT generated,
+    /// so a handler CANNOT write the leaky cross-user call (it would not compile).
+    /// A non-identity entity (User itself) is UNCHANGED — it still has `all()`.
+    /// WHY (Rule 9): the #79 leak had no backstop (no lint, no isolation test on
+    /// the identity shape JC0540 steers toward); removing the leaky method makes
+    /// the leak impossible by construction, not merely discouraged.
+    #[test]
+    fn per_user_identity_owned_entity_suppresses_unscoped_methods() {
+        let d: Design = serde_json::from_str(SERVER_FK).unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let collections = repo_rs(&d.modules[1], mode, &d).unwrap();
+        // Collection belongs_to User (identity) → owner-scoped, unscoped suppressed.
+        assert!(
+            collections
+                .contains("pub async fn all_for(&self, user_id: i64) -> Result<Vec<Collection>>"),
+            "owner-scoped all_for keyed on user_id: {collections}"
+        );
+        assert!(
+            collections.contains(
+                "pub async fn get_for(&self, user_id: i64, id: i64) -> Result<Option<Collection>>"
+            ),
+            "owner-scoped get_for: {collections}"
+        );
+        assert!(
+            collections.contains("pub async fn remove_for(&self, user_id: i64, id: i64)"),
+            "owner-scoped remove_for: {collections}"
+        );
+        assert!(
+            collections.contains(
+                "pub async fn update_for(&self, user_id: i64, id: i64, item: Collection)"
+            ),
+            "owner-scoped update_for: {collections}"
+        );
+        assert!(
+            collections.contains("Column::UserId.eq(user_id)"),
+            "owner-scoped filter keys on the identity fk column: {collections}"
+        );
+        // The insert stays (a create is scoped by the server-injected owner fk).
+        assert!(
+            collections.contains("pub async fn insert(&self, item: Collection)"),
+            "insert is retained: {collections}"
+        );
+        // The UNSCOPED leaky methods are GONE for Collection AND Bookmark.
+        assert!(
+            !collections.contains("pub async fn all(&self)"),
+            "unscoped all() must NOT be generated for a per-user entity: {collections}"
+        );
+        assert!(
+            !collections.contains("pub async fn get(&self, id: i64)"),
+            "unscoped get() must NOT be generated: {collections}"
+        );
+        assert!(
+            !collections.contains("pub async fn remove(&self, id: i64)"),
+            "unscoped remove() must NOT be generated: {collections}"
+        );
+        assert!(
+            !collections.contains("pub async fn update(&self, id: i64, item:"),
+            "unscoped update() must NOT be generated: {collections}"
+        );
+        // Bookmark (belongs_to User + Collection) is also per-user → same treatment.
+        assert!(
+            collections
+                .contains("pub async fn all_for(&self, user_id: i64) -> Result<Vec<Bookmark>>"),
+            "Bookmark also owner-scoped: {collections}"
+        );
+
+        // A NON-identity entity (User — it doesn't belong_to User) is UNCHANGED:
+        // it keeps its unscoped `all()` (the admin `list_users` legitimately lists
+        // all users; that is not a per-user leak).
+        let users = repo_rs(&d.modules[0], mode, &d).unwrap();
+        assert!(
+            users.contains("pub async fn all(&self) -> Result<Vec<User>>"),
+            "a non-identity entity keeps unscoped all(): {users}"
+        );
+        assert!(
+            !users.contains("pub async fn all_for("),
+            "User is not owner-scoped: {users}"
         );
     }
 
