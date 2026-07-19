@@ -642,6 +642,36 @@ pub fn validate(d: &Design) -> Vec<Question> {
         for (i, m) in d.modules.iter().enumerate() {
             check_public_on_tenant_owned(m, &format!("/modules/{i}"), &tenancy.entity, &mut qs);
         }
+
+        // JC0545 (#102): an entity that reaches the tenant through TWO or more
+        // distinct `belongs_to` chains (a diamond) is ambiguous — `tenant_path`
+        // resolves it to `None`, which would leave it UNSCOPED and re-open the
+        // cross-tenant leak. Generation is gated on validation, so rejecting the
+        // design here keeps a half-scoped entity from ever reaching the generator.
+        fn check_ambiguous_tenant_path(
+            d: &Design,
+            m: &ModuleDesign,
+            ptr: &str,
+            qs: &mut Vec<Question>,
+        ) {
+            for (i, e) in m.entities.iter().enumerate() {
+                if d.tenant_path_branch_count(&e.name) >= 2 {
+                    qs.push(q(
+                        format!("{ptr}/entities/{i}"),
+                        format!(
+                            "Entity `{}` reaches the tenant through more than one `belongs_to` path (a diamond graph), so jerrycan cannot decide which chain defines tenant ownership — guessing would scope its reads/writes to the wrong tenant and re-open the cross-tenant leak. Collapse its tenant ownership to a SINGLE `belongs_to` path (drop the redundant parent, or split the entity), so exactly one chain reaches the tenant. See `jerrycan explain JC0545`.",
+                            e.name
+                        ),
+                    ));
+                }
+            }
+            for (i, sub) in m.subroutes.iter().enumerate() {
+                check_ambiguous_tenant_path(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
+            }
+        }
+        for (i, m) in d.modules.iter().enumerate() {
+            check_ambiguous_tenant_path(d, m, &format!("/modules/{i}"), &mut qs);
+        }
     }
 
     // Jobs require a database: the engine's default store is Postgres and the

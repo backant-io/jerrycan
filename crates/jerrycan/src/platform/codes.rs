@@ -223,6 +223,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs validation",
     },
     CodeInfo {
+        code: "JC0545",
+        title: "entity reaches the tenant through more than one path",
+        cause: "an entity has two or more distinct `belongs_to` chains that each reach the tenant entity (a diamond graph), so jerrycan cannot decide which chain defines tenant ownership — guessing would scope reads/writes to the wrong tenant and re-open the cross-tenant leak",
+        fix: "collapse the entity's tenant ownership to a SINGLE `belongs_to` path (drop the redundant parent, or split the entity), so exactly one chain reaches the tenant",
+        doc: "jerrycan docs database",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
