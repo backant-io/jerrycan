@@ -372,9 +372,12 @@ assert!(repo.create_for_memberships("7".into(), 3, "Mallory".into()).await.is_er
 # let _ = create_customer; }); }
 ```
 
-(Path-scoped writes are covered differently: the guard verified the path tenant, and
-`update_for`/`remove_for` key on `tenant.id()` — so those never read a tenant fk from
-the body at all.)
+(Path-scoped and per-user writes are covered differently: the guard verified the path
+tenant (or the owner scope fixed the user), and `update_for`/`remove_for` key on that
+verified `tenant.id()`/session id — so those never read a tenant fk from the body at
+all, and they pin the row's pk to the PATH `id`, never the body `item.id`. A
+hand-written variant must pin the id to the path param too: a body id could address
+another tenant's or user's row (issue #92).)
 
 ## Creating a tenant auto-seeds membership + membership-filtered list
 There is **no hand-written membership INSERT**. The tenant entity's own repo gets two

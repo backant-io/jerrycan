@@ -161,6 +161,59 @@ fn recognized_membership_policy_migrates_to_flat_membership_set_methods() {
     );
 }
 
+/// Residual #78 on the MIGRATION path: unlike every AUTHORED load (which normalizes
+/// in `Design::from_path`), the migrator builds the design in memory and hands it
+/// straight to `scaffold`. So the tenant-declaring module's own conventional `/{id}`
+/// detail route was NOT rewritten to `/{workspace_id}`. That left the route
+/// classified `PathScoped` while the router captured `id`, so the membership guard's
+/// path branch missed (`params.get("workspace_id") == None`) and fell back to an
+/// arbitrary first membership: a member of workspace A could `GET /workspaces/B` and
+/// read workspace B. This proves the migrated tenant-own detail route is normalized —
+/// in the in-memory design AND the scaffolded route table (so design.json and the
+/// scaffold agree, no migrate-vs-regenerate drift) — restoring the by-name guard.
+#[test]
+fn migrated_tenant_own_detail_route_is_normalized_to_the_tenant_fk() {
+    let (tmp, out) = migrate_flat_membership();
+    let app = tmp.path().join("app");
+
+    // The module that DECLARES the tenant entity (Workspace) — its own detail route.
+    let workspaces = out
+        .design
+        .modules
+        .iter()
+        .find(|m| m.entities.iter().any(|e| e.name == "Workspace"))
+        .expect("a module declares the Workspace tenant entity");
+
+    // The conventional `/{id}` must be normalized to `/{workspace_id}`: the guard then
+    // reads the tenant fk BY NAME from the path and 404s a non-member (closing #78).
+    assert!(
+        workspaces
+            .endpoints
+            .iter()
+            .all(|ep| !ep.path.contains("{id}")),
+        "no tenant-own detail route may keep the raw `{{id}}` param:\n{:#?}",
+        workspaces.endpoints
+    );
+    assert!(
+        workspaces
+            .endpoints
+            .iter()
+            .any(|ep| ep.path.contains("{workspace_id}")),
+        "the tenant-own detail route is normalized to `{{workspace_id}}`:\n{:#?}",
+        workspaces.endpoints
+    );
+
+    // No migrate-vs-regenerate drift: the scaffolded route table must AGREE with the
+    // normalized design (the router captures `workspace_id`, so the guard fires).
+    let lib =
+        std::fs::read_to_string(app.join(format!("crates/routes/{}/src/lib.rs", workspaces.name)))
+            .unwrap();
+    assert!(
+        lib.contains("/{workspace_id}") && !lib.contains("/{id}"),
+        "scaffolded route table registers /{{workspace_id}}, never /{{id}}:\n{lib}"
+    );
+}
+
 /// GENERATION-LEVEL proof for the FLAT cross-tenant WRITE fix (issue #94, spec §C
 /// `WITH CHECK`): the migrated flat entity's repo emits the membership-CHECKED write
 /// accessors, and its flat `POST`/`PUT`/`DELETE` handlers are steered to them (never

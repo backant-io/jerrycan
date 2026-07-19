@@ -1075,6 +1075,10 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     let fk_pascal = col_pascal(&fk_col);
     let fk_ty = design.target_key_rust_type(&tenancy.entity);
     let key = key_rust_type(e);
+    // `update_for` pins the pk to the CHECKED PATH `id`, never the body `item.id`
+    // (issue #92): a text pk is moved into the ownership-check query, so clone it there
+    // and keep the owned `id` to `Set` below; an integer pk is `Copy` (empty suffix).
+    let pk_clone = if key == "String" { ".clone()" } else { "" };
     // The membership-set filter (issues #78/#79): a FLAT tenant-owned route scopes
     // to the caller's memberships via raw SQL that mirrors the Supabase RLS policy
     // the migrator recognizes — `{fk} IN (SELECT {fk} FROM {tenant}_members WHERE
@@ -1228,7 +1232,7 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
         // Scope the write to the tenant: only proceed if the row is already
         // theirs (a foreign or unknown id is a no-op, returning false → 404).
-        if {snake}::Entity::find_by_id(id)
+        if {snake}::Entity::find_by_id(id{pk_clone})
             .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
             .one(self.db.conn())
             .await
@@ -1237,8 +1241,11 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
         {{
             return Ok(false);
         }}
+        // Pin the pk to the CHECKED PATH `id`, NOT `item.id` (issue #92): the row
+        // authorized above is `id`, so the UPDATE can only ever write that row — a
+        // body id pointing at another tenant's row must not be reachable here.
         let m = {snake}::ActiveModel {{
-            id: Set(item.id),
+            id: Set(id),
 {update_sets}        }};
         match m.update(self.db.conn()).await {{
             Ok(_) => Ok(true),
@@ -1436,6 +1443,10 @@ fn owner_scoped_methods(e: &Entity, mode: GenMode, design: &Design) -> String {
     let fk_ty = design.target_key_rust_type(&identity.entity);
     let key = key_rust_type(e);
     let update_sets = active_sets(e, false);
+    // `update_for` pins the pk to the CHECKED PATH `id`, never the body `item.id`
+    // (issue #92): a text pk is moved into the ownership-check query, so clone it there
+    // and keep the owned `id` to `Set` below; an integer pk is `Copy` (empty suffix).
+    let pk_clone = if key == "String" { ".clone()" } else { "" };
     format!(
         r#"
     // Owner-scoped accessors (issue #79) — this {entity} belongs to the authenticated
@@ -1472,7 +1483,7 @@ fn owner_scoped_methods(e: &Entity, mode: GenMode, design: &Design) -> String {
     pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
         // Scope the write to the owner: only proceed if the row is already theirs
         // (a foreign or unknown id is a no-op, returning false → 404).
-        if {snake}::Entity::find_by_id(id)
+        if {snake}::Entity::find_by_id(id{pk_clone})
             .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
             .one(self.db.conn())
             .await
@@ -1481,8 +1492,11 @@ fn owner_scoped_methods(e: &Entity, mode: GenMode, design: &Design) -> String {
         {{
             return Ok(false);
         }}
+        // Pin the pk to the CHECKED PATH `id`, NOT `item.id` (issue #92): the row
+        // authorized above is `id`, so the UPDATE can only ever write that row — a
+        // body id pointing at another user's row must not be reachable here.
         let m = {snake}::ActiveModel {{
-            id: Set(item.id),
+            id: Set(id),
 {update_sets}        }};
         match m.update(self.db.conn()).await {{
             Ok(_) => Ok(true),
@@ -2848,6 +2862,62 @@ pub(crate) mod tests {
         assert!(
             src.contains("Column::WorkspaceId.eq(workspace_id)"),
             "{src}"
+        );
+    }
+
+    /// Slice the `update_for` method body out of a generated repo (from its signature
+    /// to the next `pub async fn`), so an `id: Set(...)` assertion targets `update_for`
+    /// alone — `insert` legitimately carries `id: Set(item.id)` for a declared pk, and
+    /// `update_for_memberships` is a distinct method. The `(` after `update_for`
+    /// disambiguates it from `update_for_memberships`.
+    fn update_for_body(repo: &str) -> String {
+        let start = repo
+            .find("pub async fn update_for(")
+            .expect("repo has an update_for method");
+        let rest = &repo[start..];
+        let end = rest[1..]
+            .find("    pub async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// Issue #92 (body-id cross-scope WRITE): both the path-scoped tenant `update_for`
+    /// and the per-user `update_for` authorize the row by the PATH `id` (the ownership
+    /// check `find_by_id(id).filter(scope)`), so the write MUST target that same `id`,
+    /// NEVER the client-controlled body `item.id`. A body id pointing at another
+    /// tenant's (or user's) row would otherwise be UPDATEd after the check authorized
+    /// only the caller's own row. Both families must pin `id: Set(id)` — mirroring the
+    /// flat `update_for_memberships` fix (T6). RED while either emits `id: Set(item.id)`.
+    #[test]
+    fn update_for_pins_pk_to_the_checked_path_id_not_the_body_id() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+
+        // Path-scoped tenant-owned entity (belongs_to the Workspace tenant).
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let scoped_update = update_for_body(&repo_rs(&d.modules[1], mode, &d).unwrap());
+        assert!(
+            scoped_update.contains("id: Set(id),"),
+            "path-scoped update_for must pin the pk to the checked PATH id:\n{scoped_update}"
+        );
+        assert!(
+            !scoped_update.contains("id: Set(item.id),"),
+            "path-scoped update_for must NOT write the client-controlled body id (#92):\n{scoped_update}"
+        );
+
+        // Per-user owner-scoped entity (Collection belongs_to the identity User).
+        let pu: Design = serde_json::from_str(SERVER_FK).unwrap();
+        let owner_update = update_for_body(&repo_rs(&pu.modules[1], mode, &pu).unwrap());
+        assert!(
+            owner_update.contains("id: Set(id),"),
+            "per-user update_for must pin the pk to the checked PATH id:\n{owner_update}"
+        );
+        assert!(
+            !owner_update.contains("id: Set(item.id),"),
+            "per-user update_for must NOT write the client-controlled body id (#92):\n{owner_update}"
         );
     }
 

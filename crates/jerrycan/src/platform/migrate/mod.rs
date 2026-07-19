@@ -491,7 +491,7 @@ fn emit_from_db(
         )
     });
 
-    let design = Design {
+    let mut design = Design {
         name,
         contract_version: 2,
         description: None,
@@ -508,6 +508,16 @@ fn emit_from_db(
         realtime,
         modules,
     };
+
+    // Normalize the tenant entity's own detail routes (`/{id}` → `/{tenant_fk}`) — the
+    // AUTHORED load paths do this in `Design::from_path`, but the migrator builds the
+    // design in memory and hands it straight to `scaffold`. Without it, a migrated
+    // tenant-declaring module's own `GET /workspaces/{id}` classifies `PathScoped` but
+    // the membership guard looks for `workspace_id` while the router captured `id` →
+    // first-membership fallback → a cross-tenant READ (residual #78 on the migration
+    // path). Idempotent, and MUST run before `scaffold` writes design.json so the file
+    // and the generated code agree (no migrate-vs-regenerate drift).
+    design.normalize_tenant_detail_routes();
 
     // Same gate `jerrycan new` runs — the translator must produce a valid design.
     let questions = crate::platform::questions::validate(&design);

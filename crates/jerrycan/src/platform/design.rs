@@ -750,9 +750,6 @@ impl Design {
     ///     so callers scope on the tenant without a route-param rename);
     ///   - a tenant-owned entity whose resolved path carries no tenant param →
     ///     [`TenantShape::MembershipSet`].
-    // Scaffolding: the membership-verifying guard codegen (issues #78/#79) is the
-    // consumer, landing in a later task; remove this allow once it is wired in.
-    #[allow(dead_code)]
     pub(crate) fn endpoint_tenant_shape(
         &self,
         module: &ModuleDesign,
