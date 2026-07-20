@@ -178,8 +178,11 @@ mod tests {
         );
         assert!(agents.contains("<!-- jerrycan-backend:start -->"));
         assert!(agents.contains("Phase 1c — Migrating from Supabase"));
-        // Re-run replaces the block instead of appending a second copy.
-        emit_skill(Agent::Cursor, proj.path(), home.path()).unwrap();
+        // Re-run replaces the block instead of appending a second copy, and
+        // reports the byte-stable file as unchanged, never re-written.
+        let second = emit_skill(Agent::Cursor, proj.path(), home.path()).unwrap();
+        assert!(second.written.is_empty());
+        assert_eq!(second.unchanged, vec![proj.path().join("AGENTS.md")]);
         let again = std::fs::read_to_string(proj.path().join("AGENTS.md")).unwrap();
         assert_eq!(again.matches("jerrycan-backend:start").count(), 1);
     }
