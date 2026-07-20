@@ -139,7 +139,11 @@ fn lint_boundary_escapes(root: &Path, design: &Design, out: &mut Vec<Diagnostic>
 /// [`Design::tenant_owned_handlers`], which nests `subroutes/{seg}` exactly as the
 /// scaffold writes them. A mention of `repo.all()` in a COMMENT is not a call, so
 /// the AST never flags it; the `*_for`/`*_for_memberships` scoped accessors are
-/// excluded for free (they are different method idents).
+/// excluded for free (they are different method idents). `syn::visit` does not
+/// descend into MACRO token streams, so the walk additionally scans each macro's
+/// raw tokens for those same needles (`UnscopedVisitor::scan_macro`) — otherwise an
+/// unscoped call wrapped in `json!`/`format!`/… would evade the lint (the pre-branch
+/// substring scanner caught single-line macro-wrapped calls; this restores that).
 ///
 /// `repo.insert(…)` is flagged ONLY on a FLAT (membership-set) tenant module (#94):
 /// there the create reads the tenant fk from the request BODY, so a bare insert
@@ -265,6 +269,12 @@ fn receiver_is_repo(expr: &syn::Expr) -> bool {
 /// (they are different idents). `insert` is flagged only on a FLAT tenant module
 /// (#94). Each hit records the call's real source line (via `span-locations`), and
 /// a `// jerrycan:allow JL0006` on that line is an explicit, line-scoped opt-out.
+///
+/// `syn::visit` does NOT descend into MACRO token streams, so an unscoped call
+/// wrapped in a macro (e.g. `Json(serde_json::json!({ "items": repo.all().await? }))`
+/// — a tenant-owned handler that returns every tenant's rows) is invisible to the
+/// method-call walk. The `visit_*_macro` arms below close that gap by scanning each
+/// macro's raw tokens for the same needles the pre-branch substring scanner caught.
 struct UnscopedVisitor<'a> {
     hits: Vec<(usize, &'static str)>,
     flag_insert: bool,
@@ -299,6 +309,70 @@ impl<'ast> syn::visit::Visit<'ast> for UnscopedVisitor<'_> {
         // Recurse so a chain (`repo.foo().all()`) and nested calls are all visited.
         syn::visit::visit_expr_method_call(self, c);
     }
+
+    // syn::visit stops at a macro boundary, so an unscoped `repo.<method>` call
+    // inside a macro body is not reached by `visit_expr_method_call`. Scan the
+    // macro's tokens for the same needles, then recurse (a macro node can itself
+    // contain further exprs/stmts in non-token positions we still want to walk).
+    fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+        self.scan_macro(&node.mac);
+        syn::visit::visit_expr_macro(self, node);
+    }
+    fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+        self.scan_macro(&node.mac);
+        syn::visit::visit_stmt_macro(self, node);
+    }
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        self.scan_macro(&node.mac);
+        syn::visit::visit_item_macro(self, node);
+    }
+}
+
+impl UnscopedVisitor<'_> {
+    /// Scan a macro's raw token stream for the unscoped `repo.<method>(` calls the
+    /// AST walk cannot see. `TokenStream::to_string()` inserts spacing between tokens
+    /// (`repo . all ()`), so we strip whitespace first and then substring-match the
+    /// SAME method set the method-call visitor flags — the trailing `(`/`()` excludes
+    /// the `*_for`/`*_for_memberships` accessors exactly as the AST idents do, and
+    /// `insert` is a leak only on a FLAT tenant module (#94). The macro's own source
+    /// line carries the `// jerrycan:allow JL0006` hatch, same as the non-macro path.
+    fn scan_macro(&mut self, mac: &syn::Macro) {
+        let tokens: String = mac.tokens.to_string().split_whitespace().collect();
+        // (needle, display) — mirrors the match arms of `visit_expr_method_call`.
+        let mut needles: Vec<(&str, &'static str)> = vec![
+            ("repo.all()", "all()"),
+            ("repo.get(", "get(...)"),
+            ("repo.remove(", "remove(...)"),
+            ("repo.update(", "update(...)"),
+        ];
+        if self.flag_insert {
+            needles.push(("repo.insert(", "insert(...)"));
+        }
+        let matched: Vec<&'static str> = needles
+            .iter()
+            .filter(|(needle, _)| tokens.contains(needle))
+            .map(|(_, display)| *display)
+            .collect();
+        if matched.is_empty() {
+            return;
+        }
+        // The macro's span line: where the invocation (`serde_json::json!`) sits.
+        let line = mac
+            .path
+            .segments
+            .last()
+            .map_or(1, |s| s.ident.span().start().line);
+        let allowed = self
+            .src
+            .get(line.saturating_sub(1))
+            .is_some_and(|l| l.trim_end().ends_with("// jerrycan:allow JL0006"));
+        if allowed {
+            return;
+        }
+        for display in matched {
+            self.hits.push((line, display));
+        }
+    }
 }
 
 /// Top-level modules that own a per-user IDENTITY-owned entity (#79): an entity
@@ -312,11 +386,7 @@ fn identity_owned_modules(design: &Design) -> BTreeSet<&str> {
     }
     for m in &design.modules {
         let has_per_user = m.entities.iter().any(|e| {
-            e.belongs_to.iter().any(Design::is_identity_fk)
-                && !design
-                    .tenancy
-                    .as_ref()
-                    .is_some_and(|t| e.belongs_to.iter().any(|b| b.entity == t.entity))
+            e.belongs_to.iter().any(Design::is_identity_fk) && design.tenant_path(&e.name).is_none()
         });
         if has_per_user {
             out.insert(m.name.as_str());
@@ -774,6 +844,72 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
                 .iter()
                 .any(|d| d.code == "JL0006" && d.file.as_deref() == Some(rel) && d.line == Some(2)),
             "JL0006 must reach the NESTED grandchild handler (was silently skipped, #103): {diags:?}"
+        );
+    }
+
+    /// JL0006 reaches an unscoped `repo.all()` wrapped in a `json!` MACRO inside a
+    /// NESTED tenant-owned (grandchild) handler. WHY (Rule 9, security regression):
+    /// the AST `Visit` walk does NOT descend into macro token streams, so a
+    /// tenant-owned handler returning `Json(json!({ "items": repo.all().await? }))`
+    /// leaks every tenant's rows while JL0006 stays silent — the coverage the
+    /// pre-branch substring scanner had for single-line macro-wrapped calls. RED
+    /// before the macro-token scan, GREEN after.
+    #[test]
+    fn jl0006_fires_on_unscoped_call_inside_a_macro_in_nested_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = "crates/routes/accounts/src/subroutes/contacts/handlers.rs";
+        let handlers = root.join(rel);
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        // The unscoped call lives inside the json! token stream — invisible to the
+        // AST method-call walk, visible only to the macro-token scan.
+        std::fs::write(
+            &handlers,
+            "async fn show_contact(repo: Dep<ContactRepo>) -> Result<()> {\n    Ok(Json(serde_json::json!({ \"items\": repo.all().await? })))\n}\n",
+        )
+        .unwrap();
+        // Parent `accounts` handler present + scoped, so its own scan is clean.
+        std::fs::write(
+            root.join("crates/routes/accounts/src/handlers.rs"),
+            "async fn list_accounts(repo: Dep<AccountRepo>) -> Result<()> {\n    let _ = repo.all_for(_tenant.id()).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+
+        let diags = run(root, &nested_grandchild_design());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == "JL0006" && d.file.as_deref() == Some(rel) && d.line == Some(2)),
+            "JL0006 must reach the unscoped repo.all() inside the json! macro — syn::visit does not descend into macro tokens: {diags:?}"
+        );
+    }
+
+    /// A SCOPED `repo.all_for_memberships(...)` inside the same macro does NOT fire:
+    /// the trailing-paren needles exclude the `*_for_memberships` accessor exactly as
+    /// the AST idents do. WHY (Rule 9): a false positive on the scoped call inside a
+    /// macro would make the correct fix un-passable.
+    #[test]
+    fn jl0006_silent_on_scoped_call_inside_a_macro() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = "crates/routes/accounts/src/subroutes/contacts/handlers.rs";
+        let handlers = root.join(rel);
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn show_contact(repo: Dep<ContactRepo>, u: CurrentUser) -> Result<()> {\n    Ok(Json(serde_json::json!({ \"items\": repo.all_for_memberships(u).await? })))\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/routes/accounts/src/handlers.rs"),
+            "async fn list_accounts(repo: Dep<AccountRepo>) -> Result<()> {\n    let _ = repo.all_for(_tenant.id()).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+
+        let diags = run(root, &nested_grandchild_design());
+        assert!(
+            !diags.iter().any(|d| d.code == "JL0006"),
+            "a scoped all_for_memberships inside a macro must not fire JL0006: {diags:?}"
         );
     }
 

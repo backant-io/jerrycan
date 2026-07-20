@@ -1031,8 +1031,10 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
         .endpoints
         .iter()
         .find(|ep| ep.method == HttpMethod::DELETE && param_count(ep) == 1);
-    // The list leg only applies to a FLAT (MembershipSet) route: a nested route's
-    // list is itself tenant-path-guarded, so user 2 can't reach tenant 1's list.
+    // The list leg only applies to a FLAT (MembershipSet) route. A nested route's
+    // list is scoped by construction — membership on the parent chain filters the
+    // rows, not a path guard (a grandchild's parent fk is never pinned in the path)
+    // — so there is no cross-tenant list leg to negative-test here.
     let list = module
         .endpoints
         .iter()
