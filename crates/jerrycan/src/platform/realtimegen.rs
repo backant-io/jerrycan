@@ -39,7 +39,8 @@ fn find_entity<'a>(design: &'a Design, name: &str) -> Option<&'a Entity> {
 
 /// Derive `(table, pk_column, tenant_column)` for a changes entity: the table is
 /// `snake_case(Entity)`, the pk is always `id`, and the tenant column is the
-/// tenancy fk when the entity `belongs_to` the tenancy entity, else None.
+/// tenancy fk when the entity `belongs_to` the tenancy entity, the pk itself
+/// when the entity IS the tenancy entity, else None.
 fn changes_spec(design: &Design, entity: &str) -> (String, String, Option<String>) {
     // The change-capture table name MUST match the migration/schema table name,
     // so it goes through the SAME `Design::table_name` (snake_case + proper
@@ -49,6 +50,18 @@ fn changes_spec(design: &Design, entity: &str) -> (String, String, Option<String
     let table = design.table_name(entity);
     let pk = "id".to_string();
     let tenant_column = design.tenancy.as_ref().and_then(|t| {
+        if entity == t.entity {
+            // #113 (CRITICAL): the tenant entity is its own tenant key. An
+            // entity never `belongs_to` itself, so the fk branch below would
+            // leave the channel UNSCOPED (`tenant_column: None`) — and the
+            // runtime's `change_visible` treats `None` as world-visible,
+            // broadcasting every tenant's row to every authenticated
+            // principal. The tenant's own pk closes the leak: CDC extracts
+            // `NEW."id"::text`, which equals `Principal.tenant_id` (the
+            // stringified tenant pk), so a member receives exactly their own
+            // tenant's row and non-members receive nothing.
+            return Some(pk.clone());
+        }
         find_entity(design, entity)
             .filter(|e| e.belongs_to.iter().any(|b| b.entity == t.entity))
             .map(|_| Design::fk_column(&t.entity))
@@ -411,6 +424,14 @@ mod tests {
 
     #[test]
     fn non_tenant_entity_gets_no_tenant_column_and_session_model_uses_current_user() {
+        // With tenancy PRESENT, a changes entity that neither IS the tenant nor
+        // directly belongs_to it stays unscoped — the #113 fix keys on the
+        // tenant entity itself, never blanket-scoping a tenancy design.
+        let mut owned = rt_design();
+        owned.modules[1].entities[0].belongs_to.clear();
+        let w = wiring_rs(&owned);
+        assert!(w.contains("tenant_column: None"), "{w}");
+
         let mut d = rt_design();
         d.tenancy = None;
         d.auth.as_mut().unwrap().model = crate::platform::design::AuthModel::Session;
@@ -419,6 +440,42 @@ mod tests {
         assert!(a.contains("tenant_column: None"), "{a}");
         assert!(a.contains("shared::CurrentUser"), "{a}");
         assert!(!a.contains("shared::Tenant"), "{a}");
+    }
+
+    /// #113 (CRITICAL): a `changes` channel on the tenancy entity itself is
+    /// scoped by the tenant's OWN pk. An entity never `belongs_to` itself, so
+    /// before the fix the channel got `tenant_column: None` — which the runtime
+    /// treats as world-visible, broadcasting every Workspace row to every
+    /// authenticated principal, member or not. With `Some("id")` CDC extracts
+    /// `NEW."id"::text`, matching the principal's stringified `tenant_id`, so a
+    /// member receives exactly their own tenant's row and non-members nothing.
+    #[test]
+    fn tenant_entity_changes_channel_is_scoped_by_its_own_pk() {
+        let mut d = rt_design();
+        d.realtime
+            .as_mut()
+            .unwrap()
+            .changes
+            .push("Workspace".to_string());
+        let a = wiring_rs(&d);
+        assert!(
+            a.contains(
+                r#"entity: "Workspace".to_string(), table: "workspaces".to_string(), pk_column: "id".to_string(), tenant_column: Some("id".to_string())"#
+            ),
+            "{a}"
+        );
+        // The direct-child channel is byte-identical to before the fix — the
+        // pk branch fires ONLY for the tenant entity itself.
+        assert!(
+            a.contains(
+                r#"entity: "Lead".to_string(), table: "leads".to_string(), pk_column: "id".to_string(), tenant_column: Some("workspace_id".to_string())"#
+            ),
+            "{a}"
+        );
+        assert!(
+            !a.contains("tenant_column: None"),
+            "no unscoped channel may remain in this tenancy design: {a}"
+        );
     }
 
     #[test]

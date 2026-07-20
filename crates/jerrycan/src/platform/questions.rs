@@ -975,6 +975,25 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 ));
             }
         }
+        // JC0547 (#102's realtime facet): a changes entity that reaches the
+        // tenant only TRANSITIVELY (a grandchild — its `tenant_path` carries
+        // joins) cannot be scoped by a single row-image column: the tenant key
+        // lives on an ancestor table neither CDC adapter can read from the row
+        // alone, so the channel would fall back to `tenant_column: None` —
+        // which the runtime treats as world-visible, broadcasting every
+        // tenant's rows to every authenticated principal. Refuse at design
+        // time rather than ship the silent leak. The tenant entity itself and
+        // direct children (zero joins) stay legal.
+        if d.tenancy.is_some() {
+            for (i, entity) in rt.changes.iter().enumerate() {
+                if d.tenant_path(entity).is_some_and(|p| !p.joins.is_empty()) {
+                    qs.push(q(
+                        format!("/realtime/changes/{i}"),
+                        format!("Realtime `changes` on `{entity}` is not supported: the entity is only TRANSITIVELY tenant-owned (its tenant key lives on an ancestor table), so change events cannot be tenant-scoped from the row image and every tenant's rows would broadcast to every authenticated principal. The changes entity must be the tenant itself or a DIRECT child — flatten the relationship (give `{entity}` its own `belongs_to` the tenant) or drop it from `changes`. See `jerrycan explain JC0547`."),
+                    ));
+                }
+            }
+        }
         // Broadcast + presence topics: snake_case, unique within their list,
         // tenant scope needs tenancy, and any non-none scope needs auth.
         let mut check_topics = |topics: &[RealtimeTopic], kind: &str| {
@@ -1327,6 +1346,44 @@ mod tests {
                 .iter()
                 .any(|q| q.id == "/realtime/changes" && q.question.contains("auth"))
         );
+    }
+
+    /// JC0547 (#102's realtime facet): a `changes` entity that reaches the
+    /// tenant only transitively (a grandchild) has no tenant key in its row
+    /// image, so its channel would get `tenant_column: None` — which the
+    /// runtime treats as world-visible, silently broadcasting every tenant's
+    /// rows to every authenticated principal. The design must be REFUSED up
+    /// front; the tenant entity itself and direct children stay legal.
+    #[test]
+    fn transitive_changes_entity_is_refused_with_jc0547() {
+        let mut d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        // Contact → Lead → Workspace: a grandchild of the tenant.
+        d.modules[1].entities.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "Contact",
+                "belongs_to": [{ "entity": "Lead" }],
+                "fields": [{ "name": "email", "type": "string" }]
+            }))
+            .unwrap(),
+        );
+        d.realtime.as_mut().unwrap().changes.push("Contact".into());
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/realtime/changes/1" && q.question.contains("JC0547")),
+            "{:?}",
+            validate(&d)
+        );
+
+        // A DIRECT child (Lead) and the tenant entity itself (Workspace) are
+        // both scopable from the row image — no JC0547, no other question.
+        let mut ok: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        ok.realtime
+            .as_mut()
+            .unwrap()
+            .changes
+            .push("Workspace".into());
+        assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
     }
 
     #[test]
