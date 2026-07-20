@@ -763,3 +763,46 @@ fn onboard_json_is_one_document_with_next_step() {
     assert!(v["markdown"].as_str().unwrap().contains("Entry path"));
     assert!(v["next_step"].as_str().is_some());
 }
+
+#[test]
+fn onboard_emit_skill_claude_code_writes_under_home() {
+    let home = tempfile::tempdir().unwrap();
+    let out = jerrycan()
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "onboard",
+            "--emit-skill",
+            "--agent",
+            "claude-code",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["written"].as_array().unwrap().len(), 1);
+    assert!(
+        home.path()
+            .join(".claude/skills/jerrycan-backend/SKILL.md")
+            .exists()
+    );
+}
+
+#[test]
+fn onboard_emit_skill_without_agent_is_usage_error() {
+    let out = jerrycan()
+        .args(["onboard", "--emit-skill"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn onboard_emit_skill_unknown_agent_is_usage_error_naming_ids() {
+    let out = jerrycan()
+        .args(["onboard", "--emit-skill", "--agent", "zed"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("claude-code"));
+}

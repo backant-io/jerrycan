@@ -303,12 +303,43 @@ fn run(cli: Cli) -> Result<(), Failure> {
 fn cmd_onboard(
     emit_skill: bool,
     agent: Option<&str>,
-    _dir: Option<PathBuf>,
+    dir: Option<PathBuf>,
     json_mode: bool,
 ) -> Result<(), Failure> {
     if emit_skill {
-        let _ = agent;
-        return Err(Failure::usage("--emit-skill lands in the next commit"));
+        let agent: onboard::Agent = agent
+            .expect("clap `requires` guarantees --agent")
+            .parse()
+            .map_err(Failure::usage)?;
+        let project_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| Failure::environment("HOME is not set"))?;
+        let out = onboard::emit_skill(agent, &project_dir, &home)
+            .map_err(|e| Failure::environment(format!("emit-skill: {e}")))?;
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::json!({
+                    // PathBuf → display strings: independent of serde feature flags.
+                    "written": out.written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                    "unchanged": out.unchanged.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                    "instructions": out.instructions,
+                    "next_step": "run `jerrycan onboard` and follow the runbook",
+                })
+            );
+        } else {
+            for p in &out.written {
+                println!("wrote {}", p.display());
+            }
+            for p in &out.unchanged {
+                println!("unchanged {}", p.display());
+            }
+            if let Some(i) = &out.instructions {
+                println!("{i}");
+            }
+        }
+        return Ok(());
     }
     if json_mode {
         println!(
