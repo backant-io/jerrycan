@@ -8,6 +8,8 @@ use jerrycan::platform::{
 };
 use std::path::{Path, PathBuf};
 
+mod onboard;
+
 #[derive(Parser)]
 #[command(
     name = "jerrycan",
@@ -133,6 +135,18 @@ enum Cmd {
         /// Tables with more rows than this become resumable bulk-COPY seed steps
         #[arg(long, default_value_t = 5000)]
         bulk_threshold: usize,
+    },
+    /// Print the guided build runbook (design → scaffold → implement → check)
+    Onboard {
+        /// Write the skill/rules files for an agent instead of printing
+        #[arg(long, requires = "agent")]
+        emit_skill: bool,
+        /// Target agent: claude-code | cursor | codex | windsurf | generic
+        #[arg(long)]
+        agent: Option<String>,
+        /// Directory for project-level files (default: current directory)
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Serve MCP over stdio
     Mcp,
@@ -277,8 +291,37 @@ fn run(cli: Cli) -> Result<(), Failure> {
             bulk_threshold,
             cli.json,
         ),
+        Cmd::Onboard {
+            emit_skill,
+            agent,
+            dir,
+        } => cmd_onboard(emit_skill, agent.as_deref(), dir, cli.json),
         Cmd::Mcp => jerrycan::platform::mcp::serve_stdio().map_err(Failure::environment),
     }
+}
+
+fn cmd_onboard(
+    emit_skill: bool,
+    agent: Option<&str>,
+    _dir: Option<PathBuf>,
+    json_mode: bool,
+) -> Result<(), Failure> {
+    if emit_skill {
+        let _ = agent;
+        return Err(Failure::usage("--emit-skill lands in the next commit"));
+    }
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "markdown": onboard::runbook(),
+                "next_step": "follow the runbook phases in order, starting with the entry-path question",
+            })
+        );
+    } else {
+        println!("{}", onboard::runbook());
+    }
+    Ok(())
 }
 
 fn cmd_docs(
