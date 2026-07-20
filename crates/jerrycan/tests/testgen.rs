@@ -588,6 +588,172 @@ fn nested_path_scoped_module_gets_isolation_test_with_pinned_tenant() {
     );
 }
 
+/// A GRANDCHILD entity — transitively tenant-owned (`Contact belongs_to Account
+/// belongs_to Org`, mount `/accounts/{account_id}`) — gets a cross-tenant
+/// isolation test (issue #102). Before the transitive fix the generator BAILED on
+/// such entities (direct-`belongs_to` finder returned `""`), leaving the exact
+/// deep-graph leak with NO runtime coverage. WHY (Rule 9): user 1 creates a
+/// Contact under Account 1 (owned by Org 1); user 2 (an Org 2 member, NOT Org 1)
+/// must 404 on GET and DELETE — GREEN only when the handler scopes through the
+/// JOIN chain (`get_for_memberships`/`remove_for_memberships`), RED on the
+/// unscoped accessor that would leak the foreign row. The intermediate Account is
+/// seeded in tenant 1 so the nested create resolves, and the mount's parent fk is
+/// pinned to the seeded id.
+const ORG_ACCOUNT_CONTACT_NESTED: &str = r#"{
+    "name": "crm-api", "contract_version": 1,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+    "modules": [
+        { "name": "orgs",
+          "entities": [{ "name": "Org", "fields": [
+              { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+          "endpoints": [
+              { "operation_id": "create_org", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Org" }, "success": { "status": 201, "entity": "Org" } } ] },
+        { "name": "accounts",
+          "entities": [{ "name": "Account", "belongs_to": [{ "entity": "Org" }],
+              "fields": [{ "name": "id", "type": "integer" }] }],
+          "endpoints": [
+              { "operation_id": "create_account", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Account" }, "success": { "status": 201, "entity": "Account" } } ] },
+        { "name": "contacts", "mount": "/accounts/{account_id}",
+          "entities": [{ "name": "Contact", "belongs_to": [{ "entity": "Account" }],
+              "fields": [{ "name": "id", "type": "integer" }, { "name": "title", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "create_contact", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Contact" }, "success": { "status": 201, "entity": "Contact" } },
+              { "operation_id": "get_contact", "method": "GET", "path": "/{id}", "auth_required": true,
+                "success": { "status": 200, "entity": "Contact" } },
+              { "operation_id": "delete_contact", "method": "DELETE", "path": "/{id}", "auth_required": true,
+                "success": { "status": 204 } } ] }
+    ]
+}"#;
+
+#[test]
+fn grandchild_gets_a_transitive_isolation_test() {
+    let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_NESTED).unwrap();
+    let contacts = d.modules.iter().find(|m| m.name == "contacts").unwrap();
+    let out = testgen::acceptance_rs(&d, contacts);
+    // The isolation test IS emitted for the transitively-owned grandchild.
+    assert!(
+        out.contains("async fn tenant_a_cannot_read_tenant_b_contacts()"),
+        "grandchild isolation test emitted: {out}"
+    );
+    // The intermediate parent (Account) is seeded in tenant 1 (org_id = 1) so the
+    // nested create resolves through the JOIN chain.
+    assert!(
+        out.contains("INSERT INTO \\\"accounts\\\" (id, org_id) VALUES (1, 1)"),
+        "seeds the intermediate Account in tenant 1: {out}"
+    );
+    // The probe URLs thread the seeded parent id into the nested mount — no
+    // unsubstituted `{account_id}` token survives.
+    let iso = out
+        .split("async fn tenant_a_cannot_read_tenant_b_contacts()")
+        .nth(1)
+        .expect("isolation fn present");
+    assert!(
+        iso.contains("\"/accounts/1/\"") && iso.contains("/accounts/1/{id}"),
+        "probe URLs pin the parent fk to the seeded id 1: {iso}"
+    );
+    assert!(
+        !iso.contains("{account_id}"),
+        "no unsubstituted parent mount param in the isolation test: {iso}"
+    );
+    // user 2 (Org 2 member, NOT Org 1) is denied read AND delete.
+    assert!(
+        iso.contains("cross-tenant get must 404"),
+        "get leg 404s for user 2: {iso}"
+    );
+    assert!(
+        iso.contains("cross-tenant delete must 404"),
+        "delete leg 404s for user 2: {iso}"
+    );
+    // A nested route's list is itself tenant-path-guarded — user 2 can't reach
+    // tenant 1's collection — so the list leg is skipped.
+    assert!(
+        !out.contains("user 2 lists their own"),
+        "nested grandchild route emits no list leg: {out}"
+    );
+    // The scaffolding a grandchild module needs is present (transitive
+    // `module_needs_tenant`): tenant 1 (Org) + user 1 membership are seeded, and
+    // the second tenant (Org 2) + user 2 membership for the isolation probe.
+    assert!(
+        out.contains("INSERT INTO \\\"orgs\\\" (id")
+            && out.contains(
+                "INSERT INTO \\\"org_members\\\" (user_id, org_id, role) VALUES (1, 1, 'owner')"
+            ),
+        "tenant 1 Org + user 1 membership seeded for the grandchild module: {out}"
+    );
+    assert!(
+        out.contains("fn seed_second_tenant(") && out.contains("test_cookie_for("),
+        "grandchild isolation needs a second tenant + per-user cookie helper: {out}"
+    );
+}
+
+/// AUGMENT (issue #102 eval): a MULTI-PARENT entity — `Comment belongs_to
+/// [Ticket, User]`, where `Ticket` reaches the tenant (`Ticket belongs_to Org`)
+/// and `User` is the auth identity — must be classified TENANT-owned (scoped
+/// through the Ticket chain), NOT per-user. The presence of the identity fk
+/// `user_id` must NOT downgrade it to a per-user backstop when a genuine tenant
+/// path exists. WHY: a per-user-only test would let a tenant member read ANOTHER
+/// tenant's comment (the identity check passes if they authored it, but the
+/// tenant boundary is what matters). So the tenant isolation test fires and the
+/// per-user one does not.
+const TICKET_COMMENT_MULTIPARENT: &str = r#"{
+    "name": "helpdesk-api", "contract_version": 1,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+    "modules": [
+        { "name": "orgs",
+          "entities": [{ "name": "Org", "fields": [
+              { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+          "endpoints": [
+              { "operation_id": "create_org", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Org" }, "success": { "status": 201, "entity": "Org" } } ] },
+        { "name": "tickets",
+          "entities": [{ "name": "Ticket", "belongs_to": [{ "entity": "Org" }],
+              "fields": [{ "name": "id", "type": "integer" }] }],
+          "endpoints": [
+              { "operation_id": "create_ticket", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Ticket" }, "success": { "status": 201, "entity": "Ticket" } } ] },
+        { "name": "comments",
+          "entities": [{ "name": "Comment",
+              "belongs_to": [{ "entity": "Ticket" }, { "entity": "User" }],
+              "fields": [{ "name": "id", "type": "integer" }, { "name": "body", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "create_comment", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Comment" }, "success": { "status": 201, "entity": "Comment" } },
+              { "operation_id": "get_comment", "method": "GET", "path": "/{id}", "auth_required": true,
+                "success": { "status": 200, "entity": "Comment" } } ] }
+    ]
+}"#;
+
+#[test]
+fn multi_parent_entity_reaching_tenant_is_tenant_owned_not_per_user() {
+    let d: Design = serde_json::from_str(TICKET_COMMENT_MULTIPARENT).unwrap();
+    let comments = d.modules.iter().find(|m| m.name == "comments").unwrap();
+    let out = testgen::acceptance_rs(&d, comments);
+    // Classified TENANT-owned (via the Ticket chain) → the cross-tenant isolation
+    // test is emitted.
+    assert!(
+        out.contains("async fn tenant_a_cannot_read_tenant_b_comments()"),
+        "multi-parent entity reaching the tenant gets the tenant isolation test: {out}"
+    );
+    // NOT classified per-user, despite carrying `user_id` — no #79 test.
+    assert!(
+        !out.contains("async fn user_a_cannot_read_user_b_comments()"),
+        "a tenant-owned multi-parent entity must NOT also get a per-user test: {out}"
+    );
+    // The tenant-reaching parent (Ticket) is seeded in tenant 1 so the flat
+    // create's `ticket_id` resolves through the chain.
+    assert!(
+        out.contains("INSERT INTO \\\"tickets\\\" (id, org_id) VALUES (1, 1)"),
+        "seeds the intermediate Ticket in tenant 1: {out}"
+    );
+}
+
 /// A credential/signature-gated endpoint's SUCCESS test would be UN-GREENABLE: the
 /// generator can't supply the credential, so a minimal-body probe can never reach
 /// the designed success status (a `public` login 401s bad creds; a signed webhook
