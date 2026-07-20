@@ -1097,38 +1097,48 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     // param) is consumed once by the ownership check, so no clone for text pks.
     let update_sets = active_sets(e, false);
     let insert_sets = active_sets(e, true);
+    // The tenant path (issue #102): a direct child has empty joins (keep the typed
+    // sea-orm builder verbatim — byte-identical to pre-#102); a grandchild+ JOINs
+    // up its belongs_to chain to the anchor that carries the tenant fk. The gate
+    // above guarantees `Some` here. Computed before the writes so the membership-
+    // checked write branch can key on `path.joins` too (Task 4).
+    let path = design.tenant_path(entity).expect("gate ensured Some");
+    let join_sql = path.join_sql();
+    let tenant_col = path.tenant_col();
+    let tenant_fk = path.tenant_fk.as_str();
     // Membership-CHECKED writes for a FLAT tenant-owned entity (issue #94, spec §C).
     // A flat route takes the tenant fk from the BODY, so — unlike a path-scoped write,
     // where `Dep<Tenant>` already verified the path tenant — the body fk MUST be
     // verified against the caller's membership set (RLS `WITH CHECK`) before the write.
     // Emitted ONLY for a flat entity; a path-scoped (nested) entity stays byte-identical.
-    let membership_writes = if entity_is_flat_tenant_owned(e, design) {
-        // The tenant fk value is read out of `item` before the insert consumes it: a
-        // text fk must be cloned (it is also moved into the row); an integer fk is Copy.
+    // The membership-checked insert body is path-independent: it depends only on the
+    // entity's own key type (a client-supplied text pk is captured up front and inserted
+    // via `Entity::insert(..).exec`; an integer pk is DB-assigned and read back), so a
+    // direct child and a transitive grandchild share it verbatim.
+    let id_capture = if key == "String" {
+        "        let id = item.id.clone();\n"
+    } else {
+        ""
+    };
+    let create_return_insert = if key == "String" {
+        format!(
+            "        {snake}::Entity::insert({snake}::ActiveModel {{\n{insert_sets}        }})\n        .exec(&txn)\n        .await\n        .map_err(db_error)?;\n        txn.commit().await.map_err(db_error)?;\n        Ok(id)"
+        )
+    } else {
+        format!(
+            "        let row = {snake}::ActiveModel {{\n{insert_sets}        }}\n        .insert(&txn)\n        .await\n        .map_err(db_error)?;\n        txn.commit().await.map_err(db_error)?;\n        Ok(row.id)"
+        )
+    };
+    let membership_writes = if !entity_is_flat_tenant_owned(e, design) {
+        // A path-scoped (nested) entity is scoped by the verified path tenant, so it
+        // never gets these membership-checked writes (JL0006 / issue #78).
+        String::new()
+    } else if path.joins.is_empty() {
+        // DIRECT child (byte-identical to pre-#102): the tenant fk is a real column on
+        // the row, read straight from the body. The fk value is read out before the
+        // insert consumes `item` — a text fk is cloned (also moved into the row), an
+        // integer fk is Copy. The pk is pinned to the CHECKED PATH `id`, never `item.id`.
         let fk_clone = if fk_ty == "String" { ".clone()" } else { "" };
-        // The UPDATE must target the row we authorized — the PATH `id`, NEVER the body
-        // `item.id` (issue #92): a body id could point at a victim row in another
-        // tenant. For a text pk, `id` is moved into `get_for_memberships`, so clone it
-        // there and keep the owned `id` to pin the ActiveModel pk below; an integer pk
-        // is Copy, so `id` survives the call unchanged.
-        let pk_clone = if key == "String" { ".clone()" } else { "" };
-        // `create_for_memberships` differs by pk type exactly as `insert` does: a
-        // client-supplied text pk is known up front (captured, inserted via
-        // `Entity::insert(..).exec`); an integer pk is DB-assigned and read back.
-        let id_capture = if key == "String" {
-            "        let id = item.id.clone();\n"
-        } else {
-            ""
-        };
-        let create_return_insert = if key == "String" {
-            format!(
-                "        {snake}::Entity::insert({snake}::ActiveModel {{\n{insert_sets}        }})\n        .exec(&txn)\n        .await\n        .map_err(db_error)?;\n        txn.commit().await.map_err(db_error)?;\n        Ok(id)"
-            )
-        } else {
-            format!(
-                "        let row = {snake}::ActiveModel {{\n{insert_sets}        }}\n        .insert(&txn)\n        .await\n        .map_err(db_error)?;\n        txn.commit().await.map_err(db_error)?;\n        Ok(row.id)"
-            )
-        };
         format!(
             r#"
     // Membership-CHECKED writes for a FLAT tenant-owned route (issue #94, spec §C):
@@ -1203,16 +1213,113 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
 "#
         )
     } else {
-        String::new()
+        // TRANSITIVE grandchild+ (issue #102): the row carries NO tenant fk. Resolve the
+        // tenant from the body's IMMEDIATE PARENT fk (a real column on the row) and JOIN
+        // up the chain to the anchor that carries the tenant fk. Every identifier comes
+        // from `TenantPath`/`belongs_to`; every value stays a bound `?` param.
+        let parent_fk = &path.joins[0].child_fk;
+        let parent_table = &path.joins[0].parent_table;
+        // JOINs from the immediate parent up to the anchor (empty for a grandchild —
+        // its immediate parent IS the anchor that carries the tenant fk).
+        let parent_joins: String = path
+            .joins
+            .iter()
+            .skip(1)
+            .map(|j| {
+                format!(
+                    " JOIN {p} ON {c}.{fk} = {p}.id",
+                    p = j.parent_table,
+                    c = j.child_table,
+                    fk = j.child_fk,
+                )
+            })
+            .collect();
+        // The parent fk value is read out of `item` before the insert consumes it — a
+        // text fk must be cloned (also moved into the row); an integer fk is Copy. Its
+        // type is the immediate parent entity's key type.
+        let parent_entity = e
+            .belongs_to
+            .iter()
+            .find(|b| Design::fk_column(&b.entity) == path.joins[0].child_fk)
+            .map(|b| b.entity.as_str())
+            .expect("the tenant path's first hop is a belongs_to of the entity");
+        let parent_fk_clone = if design.target_key_rust_type(parent_entity) == "String" {
+            ".clone()"
+        } else {
+            ""
+        };
+        format!(
+            r#"
+    // Membership-CHECKED writes for a FLAT tenant-owned GRANDCHILD (issue #102): the row
+    // carries no tenant fk, so the WITH CHECK resolves the tenant from the body's
+    // immediate parent fk and JOINs up to the anchor — a create under a parent outside
+    // the caller's tenants is 403; an update/delete of a row outside the set is 404;
+    // moving the row to another parent (a cross-tenant move) is 403.
+    pub async fn create_for_memberships(&self, user_id: String, item: {entity}) -> Result<{key}> {{
+        use sea_orm::TransactionTrait;
+{id_capture}        let parent_fk = item.{parent_fk}{parent_fk_clone};
+        let txn = self.db.conn().begin().await.map_err(db_error)?;
+        // WITH CHECK: the body's parent must resolve to a tenant in the caller's set.
+        if txn
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                self.db.sql(
+                    "SELECT 1 FROM {parent_table}{parent_joins} WHERE {parent_table}.id = ? AND {tenant_col} IN (SELECT {tenant_fk} FROM {members} WHERE user_id = ?) LIMIT 1",
+                ),
+                [parent_fk.into(), user_id.into()],
+            ))
+            .await
+            .map_err(db_error)?
+            .is_none()
+        {{
+            return Err(Error::forbidden());
+        }}
+{create_return_insert}
+    }}
+
+    pub async fn update_for_memberships(&self, user_id: String, id: {key}, item: {entity}) -> Result<bool> {{
+        // Load the row scoped to the caller's memberships via the JOIN chain: a row whose
+        // CURRENT tenant is outside the set is invisible → false → 404 (no existence leak).
+        let Some(existing) = self.get_for_memberships(user_id, id{pk_clone}).await? else {{
+            return Ok(false);
+        }};
+        // WITH CHECK: pin the immediate parent fk — a changed parent would move the row
+        // to another parent (and possibly another tenant), so a changed fk → 403.
+        if item.{parent_fk} != existing.{parent_fk} {{
+            return Err(Error::forbidden());
+        }}
+        // Pin the pk to the CHECKED PATH `id`, NOT `item.id` (issue #92): the row
+        // authorized above is `id`, so the UPDATE can only ever write that row.
+        let m = {snake}::ActiveModel {{
+            id: Set(id),
+{update_sets}        }};
+        match m.update(self.db.conn()).await {{
+            Ok(_) => Ok(true),
+            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
+            Err(e) => Err(db_error(e)),
+        }}
+    }}
+
+    pub async fn remove_for_memberships(&self, user_id: String, id: {key}) -> Result<bool> {{
+        // Scope the DELETE to the membership set through the JOIN chain: a row whose
+        // tenant is outside the set matches nothing → 0 rows → false → 404.
+        let r = self
+            .db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "DELETE FROM {table} WHERE id = ? AND id IN (SELECT {table}.id FROM {table}{join_sql} WHERE {tenant_col} IN (SELECT {tenant_fk} FROM {members} WHERE user_id = ?))",
+                ),
+                [id.into(), user_id.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected() > 0)
+    }}
+"#
+        )
     };
-    // The tenant path (issue #102): a direct child has empty joins (keep the typed
-    // sea-orm builder verbatim — byte-identical to pre-#102); a grandchild+ JOINs
-    // up its belongs_to chain to the anchor that carries the tenant fk. The gate
-    // above guarantees `Some` here.
-    let path = design.tenant_path(entity).expect("gate ensured Some");
-    let join_sql = path.join_sql();
-    let tenant_col = path.tenant_col();
-    let tenant_fk = path.tenant_fk.as_str();
     // The four READS branch on the path: a direct child keeps the typed builder; a
     // transitive child emits a raw-SQL JOIN form scoping on the QUALIFIED tenant
     // column. Only identifiers from `TenantPath` reach the SQL; every value stays a
@@ -1338,14 +1445,13 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     }}"#
         )
     };
-    format!(
-        r#"
-    // Tenant-scoped accessors — handlers must use these for tenant-owned data (JL0006).
-{all_for_method}
-
-{get_for_method}
-
-    pub async fn remove_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<bool> {{
+    // The two PATH-SCOPED writes branch on the path exactly like the reads (issue #102):
+    // a direct child keeps the typed sea-orm builder verbatim (byte-identical to
+    // pre-#102); a grandchild+ scopes on the QUALIFIED tenant column reached via the JOIN
+    // chain, using the PATH tenant id (`{fk_col}` param) instead of a membership subquery.
+    let remove_for_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn remove_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<bool> {{
         let r = {snake}::Entity::delete_many()
             .filter({snake}::Column::Id.eq(id))
             .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
@@ -1353,9 +1459,32 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
             .await
             .map_err(db_error)?;
         Ok(r.rows_affected > 0)
-    }}
-
-    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn remove_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<bool> {{
+        // Scope the DELETE to the path tenant through the JOIN chain (issue #102): a row
+        // whose tenant is not the path tenant matches nothing → 0 rows → false → 404.
+        let r = self
+            .db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "DELETE FROM {table} WHERE id = ? AND id IN (SELECT {table}.id FROM {table}{join_sql} WHERE {tenant_col} = ?)",
+                ),
+                [id.into(), {fk_col}.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected() > 0)
+    }}"#
+        )
+    };
+    let update_for_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
         // Scope the write to the tenant: only proceed if the row is already
         // theirs (a foreign or unknown id is a no-op, returning false → 404).
         if {snake}::Entity::find_by_id(id{pk_clone})
@@ -1378,7 +1507,39 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
             Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
             Err(e) => Err(db_error(e)),
         }}
-    }}
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
+        // Scope the write to the path tenant via the transitive JOIN check (issue #102):
+        // load through get_for — a row outside this tenant is a no-op → false → 404.
+        if self.get_for({fk_col}, id{pk_clone}).await?.is_none() {{
+            return Ok(false);
+        }}
+        // Pin the pk to the CHECKED PATH `id`, NOT `item.id` (issue #92): the row
+        // authorized above is `id`, so the UPDATE can only ever write that row.
+        let m = {snake}::ActiveModel {{
+            id: Set(id),
+{update_sets}        }};
+        match m.update(self.db.conn()).await {{
+            Ok(_) => Ok(true),
+            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
+            Err(e) => Err(db_error(e)),
+        }}
+    }}"#
+        )
+    };
+    format!(
+        r#"
+    // Tenant-scoped accessors — handlers must use these for tenant-owned data (JL0006).
+{all_for_method}
+
+{get_for_method}
+
+{remove_for_method}
+
+{update_for_method}
 
     // Membership-set accessors (issues #78/#79) — a FLAT tenant-owned handler
     // (no tenant fk in its path) scopes to the CALLER'S memberships, so a user in
@@ -1706,6 +1867,16 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
         .entities
         .iter()
         .any(|e| !scoped_methods(e, design).is_empty());
+    // …but only a DIRECT tenant-owned entity's accessors use the TYPED `.filter(..)`
+    // builder — a TRANSITIVE (grandchild+) entity scopes entirely through raw JOIN SQL
+    // (issue #102), so it needs `ConnectionTrait` (raw SQL) but NOT `ColumnTrait`/
+    // `QueryFilter`. Keying the filter imports on `has_scoped` would leave them unused
+    // for a transitive-only module, tripping `-D warnings` on generated code.
+    let has_direct_scoped = m.entities.iter().any(|e| {
+        design
+            .tenant_path(&e.name)
+            .is_some_and(|p| p.joins.is_empty())
+    });
     // The TENANT entity's OWN repo (Task 3) also drives raw SQL — `create_with_membership`
     // and `all_for_member` call `get_database_backend()`/`execute()` — so it needs
     // `ConnectionTrait` even without the `.filter(..)` accessors a tenant-OWNED entity has.
@@ -1725,7 +1896,7 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
     // fixed alphabetical order the three pre-existing tiers used — so a
     // tenant-owned, pure-tenant, or plain module stays byte-identical, and a per-user
     // module gets `ColumnTrait`/`QueryFilter` WITHOUT the unused `ConnectionTrait`.
-    let needs_filter = has_scoped || has_owner_scoped; // ColumnTrait + QueryFilter
+    let needs_filter = has_direct_scoped || has_owner_scoped; // ColumnTrait + QueryFilter
     let needs_conn = has_scoped || has_tenant_own; // ConnectionTrait (raw SQL)
     let mut imports = vec!["ActiveModelTrait", "ActiveValue::Set"];
     if needs_filter {
@@ -3208,6 +3379,139 @@ pub(crate) mod tests {
         assert!(
             !src.contains(" JOIN "),
             "direct child must never emit a JOIN:\n{src}"
+        );
+    }
+
+    /// Task 4 (issue #102): a grandchild's membership-CHECKED create resolves the tenant
+    /// from the BODY's immediate parent fk (a real column) and JOINs up to the anchor —
+    /// it can NOT filter a non-existent direct `org_id` column. The WITH CHECK proves the
+    /// parent belongs to a tenant in the caller's membership set (403 otherwise).
+    #[test]
+    fn grandchild_create_verifies_parent_resolves_to_member_tenant() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        assert!(
+            src.contains("SELECT 1 FROM accounts WHERE accounts.id = ? AND accounts.org_id IN (SELECT org_id FROM org_members WHERE user_id = ?)"),
+            "grandchild WITH CHECK resolves the tenant via the parent fk, not a direct column:\n{src}"
+        );
+        assert!(
+            src.contains("let parent_fk = item.account_id"),
+            "the body's immediate parent fk is read out for the CHECK:\n{src}"
+        );
+    }
+
+    /// Task 4 (issue #102): a grandchild's membership-CHECKED update pins the IMMEDIATE
+    /// PARENT fk (the safe generalization of the direct "pin the tenant fk" rule) — a
+    /// changed parent → 403, which blocks moving the row across the tenant boundary.
+    #[test]
+    fn grandchild_update_pins_parent_fk() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        assert!(
+            src.contains("if item.account_id != existing.account_id"),
+            "grandchild update pins the immediate parent fk:\n{src}"
+        );
+    }
+
+    /// Task 4 (issue #102): a grandchild's membership-CHECKED delete scopes through the
+    /// JOIN chain — a self-referential subquery joins up to the anchor and keeps the row
+    /// only if its tenant is in the caller's set (0 rows → false → 404 outside the set).
+    #[test]
+    fn grandchild_remove_deletes_via_membership_subquery() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        assert!(
+            src.contains("DELETE FROM contacts WHERE id = ? AND id IN (SELECT contacts.id FROM contacts JOIN accounts ON contacts.account_id = accounts.id WHERE accounts.org_id IN (SELECT org_id FROM org_members WHERE user_id = ?))"),
+            "grandchild delete scopes through the JOIN chain to the membership set:\n{src}"
+        );
+    }
+
+    /// Task 4 (issue #102): the PATH-SCOPED writes (`remove_for`/`update_for`) of a
+    /// grandchild scope on the QUALIFIED tenant column reached via the JOIN chain, using
+    /// the PATH tenant id — they can NOT filter a non-existent direct `org_id` column, so
+    /// a transitive repo now COMPILES. `update_for` loads through the transitive `get_for`.
+    #[test]
+    fn grandchild_path_scoped_writes_join_to_tenant() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        assert!(
+            src.contains("DELETE FROM contacts WHERE id = ? AND id IN (SELECT contacts.id FROM contacts JOIN accounts ON contacts.account_id = accounts.id WHERE accounts.org_id = ?)"),
+            "path-scoped remove_for scopes on the qualified tenant col via the JOIN:\n{src}"
+        );
+        assert!(
+            src.contains("if self.get_for(org_id, id).await?.is_none()"),
+            "path-scoped update_for loads through the transitive get_for:\n{src}"
+        );
+        // The grandchild must NEVER reference a direct tenant-fk column that doesn't exist.
+        assert!(
+            !src.contains("contact::Column::OrgId") && !src.contains("Column::OrgId"),
+            "a grandchild has no direct org_id column — must not reference it:\n{src}"
+        );
+    }
+
+    /// Byte-identity backstop (issue #102): a DIRECT flat child (Customer belongs_to the
+    /// tenant Club) MUST keep every WRITE body identical to pre-#102 — the membership
+    /// writes read the tenant fk straight from the body, and `remove_for`/`update_for`
+    /// keep the TYPED sea-orm builder. No JOIN, no raw-SQL subquery in any write.
+    #[test]
+    fn direct_flat_child_writes_are_byte_identical() {
+        let d: Design = serde_json::from_str(CLUBS_TENANCY).unwrap();
+        let src = scoped_methods(d.find_entity("Customer").unwrap(), &d);
+        // Membership-checked create/update/delete read the direct tenant fk from the body.
+        assert!(
+            src.contains("let tenant_fk = item.club_id")
+                && src.contains(
+                    "SELECT 1 FROM club_members WHERE user_id = ? AND club_id = ? LIMIT 1"
+                ),
+            "direct create checks the body's own tenant fk:\n{src}"
+        );
+        assert!(
+            src.contains("if item.club_id != existing.club_id"),
+            "direct update pins the tenant fk:\n{src}"
+        );
+        assert!(
+            src.contains("DELETE FROM customers WHERE id = ? AND club_id IN (SELECT club_id FROM club_members WHERE user_id = ?)"),
+            "direct delete filters the direct tenant fk:\n{src}"
+        );
+        // Path-scoped writes keep the typed builder; no JOIN anywhere in a direct child.
+        assert!(
+            src.contains(".filter(customer::Column::ClubId.eq(club_id))"),
+            "direct remove_for/update_for keep the typed builder:\n{src}"
+        );
+        assert!(
+            !src.contains(" JOIN "),
+            "a direct child must never emit a JOIN in any write:\n{src}"
+        );
+    }
+
+    /// Task 4 (issue #102): a TRANSITIVE (grandchild) module scopes purely through raw
+    /// JOIN SQL — it never emits a typed `.filter(Column::..eq())`, so its repo must NOT
+    /// import `ColumnTrait`/`QueryFilter` (they would be unused → `-D warnings` on
+    /// generated code), while still importing `ConnectionTrait` for the raw SQL. A DIRECT
+    /// tenant-owned module keeps the typed builder, so its imports are unchanged.
+    #[test]
+    fn transitive_repo_drops_the_unused_typed_filter_imports() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let contacts = repo_rs(&d.modules[2], mode, &d).unwrap();
+        assert!(
+            !contacts.contains("ColumnTrait") && !contacts.contains("QueryFilter"),
+            "a transitive repo must not import the unused typed-filter traits:\n{contacts}"
+        );
+        assert!(
+            contacts.contains("ConnectionTrait"),
+            "a transitive repo still needs ConnectionTrait for the raw JOIN SQL:\n{contacts}"
+        );
+        // Byte-identity backstop: a DIRECT tenant-owned module keeps the typed builder,
+        // so its import line still carries ColumnTrait + QueryFilter.
+        let cd: Design = serde_json::from_str(CLUBS_TENANCY).unwrap();
+        let customers = repo_rs(&cd.modules[2], mode, &cd).unwrap();
+        assert!(
+            customers.contains("ColumnTrait") && customers.contains("QueryFilter"),
+            "a direct tenant-owned repo keeps the typed-filter imports:\n{customers}"
         );
     }
 
