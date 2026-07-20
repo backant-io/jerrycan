@@ -84,7 +84,15 @@ fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
         // fk columns the memory struct doesn't have.
         let schema =
             if design.wants_db() && design.endpoint_uses_request_dto(m, ep, design.wants_auth()) {
-                entity_ref(&format!("{}Request", rb.entity))
+                // A defaulted-entity UPDATE advertises `{Entity}UpdateRequest` (keeps
+                // the `default` fields — settable on update); every other DTO
+                // endpoint advertises `{Entity}Request` (issue #85 D1).
+                let name = if ep.method.is_update() && design.entity_has_default(&rb.entity) {
+                    format!("{}UpdateRequest", rb.entity)
+                } else {
+                    format!("{}Request", rb.entity)
+                };
+                entity_ref(&name)
             } else {
                 entity_ref(&rb.entity)
             };
@@ -148,7 +156,29 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
                         .is_some_and(|rb| rb.entity == e.name)
             });
         if needs_request_schema {
-            schemas.insert(format!("{}Request", e.name), request_schema(design, e));
+            schemas.insert(
+                format!("{}Request", e.name),
+                request_schema(design, e, false),
+            );
+        }
+        // A defaulted entity with an UPDATE endpoint also advertises
+        // `{Entity}UpdateRequest` — the update wire shape KEEPS the `default` fields
+        // so a client can change them after create (issue #85 D1).
+        let needs_update_schema = design.wants_db()
+            && e.fields.iter().any(|f| f.default.is_some())
+            && m.endpoints.iter().any(|ep| {
+                ep.method.is_update()
+                    && design.endpoint_uses_request_dto(m, ep, design.wants_auth())
+                    && ep
+                        .request_body
+                        .as_ref()
+                        .is_some_and(|rb| rb.entity == e.name)
+            });
+        if needs_update_schema {
+            schemas.insert(
+                format!("{}UpdateRequest", e.name),
+                request_schema(design, e, true),
+            );
         }
     }
     for sub in &m.subroutes {
@@ -162,7 +192,7 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
 /// component (declared fields only), the request shape must spell out the
 /// REMAINING fk columns too — they ARE required client input, and a generated
 /// client needs their types.
-fn request_schema(design: &Design, e: &Entity) -> Value {
+fn request_schema(design: &Design, e: &Entity, for_update: bool) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
     let omit_identity = design.wants_auth();
@@ -181,8 +211,13 @@ fn request_schema(design: &Design, e: &Entity) -> Value {
             required.push(Value::String(col));
         }
     }
-    // A `default` field (#53a) is server-owned — not part of the wire input shape.
-    for f in e.fields.iter().filter(|f| f.default.is_none()) {
+    // A `default` field (#53a) is server-owned on CREATE (dropped); on UPDATE it is
+    // client-settable (kept), so `for_update` includes it (issue #85 D1).
+    for f in e
+        .fields
+        .iter()
+        .filter(|f| for_update || f.default.is_none())
+    {
         properties.insert(f.name.clone(), field_schema(f.field_type));
         if f.required {
             required.push(Value::String(f.name.clone()));

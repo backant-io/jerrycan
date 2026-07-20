@@ -66,6 +66,7 @@ fn fixture_json(
     entity: &str,
     omit_identity_fk: bool,
     bad_enum: Option<&str>,
+    keep_defaults: bool,
 ) -> String {
     let Some(e) = m.entities.iter().find(|e| e.name == entity) else {
         return "{}".to_string();
@@ -89,19 +90,25 @@ fn fixture_json(
                 fk_fixture_value(design, &b.entity)
             )
         });
-    // A `default` field (issue #53a) is server-owned: the probe omits it so the
-    // minimal client body proves the server applies the default (not a 422).
-    let cols = e.fields.iter().filter(|f| f.default.is_none()).map(|f| {
-        // The reject probe (issue #47) corrupts ONE enum field to an out-of-range
-        // sentinel; every other field keeps its valid fixture value so the ONLY
-        // reason for a 422 is that enum.
-        let value = if bad_enum == Some(f.name.as_str()) {
-            format!("\"{ENUM_REJECT_SENTINEL}\"")
-        } else {
-            fixture_value(f)
-        };
-        format!("\"{}\": {}", f.name, value)
-    });
+    // A `default` field (issue #53a) is server-owned on CREATE: the probe omits it
+    // so the minimal client body proves the server applies the default (not a 422).
+    // On UPDATE the field is client-settable (issue #85 D1), so an update probe KEEPS
+    // it — the body must match `{Entity}UpdateRequest`, which requires it.
+    let cols = e
+        .fields
+        .iter()
+        .filter(|f| keep_defaults || f.default.is_none())
+        .map(|f| {
+            // The reject probe (issue #47) corrupts ONE enum field to an out-of-range
+            // sentinel; every other field keeps its valid fixture value so the ONLY
+            // reason for a 422 is that enum.
+            let value = if bad_enum == Some(f.name.as_str()) {
+                format!("\"{ENUM_REJECT_SENTINEL}\"")
+            } else {
+                fixture_value(f)
+            };
+            format!("\"{}\": {}", f.name, value)
+        });
     let fields = fks.chain(cols).collect::<Vec<_>>().join(", ");
     format!("{{{fields}}}")
 }
@@ -178,6 +185,7 @@ fn seed_line(
             .entity,
         omits_identity_fk(design, unit, creator),
         None,
+        false, // seed via the creator (POST) — a create body omits defaults
     );
     if auth && creator.is_guarded() {
         let hk = design.test_auth_header();
@@ -356,6 +364,9 @@ fn request_expr(
                     &rb.entity,
                     omits_identity_fk(design, unit, ep),
                     bad_enum,
+                    // An UPDATE (PUT/PATCH) probe keeps `default` fields so the body
+                    // matches `{Entity}UpdateRequest` (issue #85 D1); a create omits them.
+                    ep.method.is_update(),
                 )
             })
             .unwrap_or_else(|| "{}".to_string())
@@ -407,11 +418,48 @@ fn request_expr(
     }
 }
 
+/// The accumulated mount `base` with every mount-INHERITED path param substituted
+/// by the seeded parent id `1` (issue #81). A subroute-mounted module carries its
+/// ancestor's param in the MOUNT prefix (`/workspaces/{workspace_id}/channels`),
+/// not in `ep.path`; left literal, the router 400/404s the whole group and a
+/// correct app's tests are red by construction. Every `{param}` in `base` is a
+/// mount-inherited ancestor fk (or parent pk) whose row app()'s tenant chain seeds
+/// at id 1 (`tenant_seed`/`seed_tenant1_chain` — the same rows the isolation test's
+/// `cbase` pins), so substituting each to `1` makes the probe URL concrete AND
+/// resolvable. The endpoint's OWN `/{id}` param lives in `ep.path` (appended AFTER
+/// `base`, so never touched here) and is substituted separately by the seeded row
+/// id. A FLAT mount carries no `{param}`, so this is the identity — every
+/// non-nested design stays byte-identical.
+fn concrete_mount_base(base: &str) -> String {
+    let mut out = String::with_capacity(base.len());
+    let mut rest = base;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        match rest[open..].find('}') {
+            Some(rel_close) => {
+                out.push('1');
+                rest = &rest[open + rel_close + 1..];
+            }
+            // Unbalanced brace (never valid in a mount): emit the remainder verbatim.
+            None => {
+                out.push_str(&rest[open..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOut) {
     let auth = out.auth;
+    // Resolve the FULL path per endpoint against a mount base whose inherited params
+    // are pinned to the seeded parent id 1 (issue #81). The RAW `base` still threads
+    // through the subroute recursion below so the accumulation stays intact.
+    let cbase = concrete_mount_base(base);
 
     for ep in &unit.endpoints {
-        let full_path = format!("{}{}", base.trim_end_matches('/'), ep.path);
+        let full_path = format!("{}{}", cbase.trim_end_matches('/'), ep.path);
         let fn_base = &ep.operation_id;
         let status = ep.success.status;
         let guarded = auth && ep.is_guarded();
@@ -480,8 +528,10 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             // Issue #51: seed the row THIS `/{id}` endpoint addresses via ITS OWN
             // entity's creator (`POST /tasks` for `/tasks/{id}`), walking belongs_to
             // parents first — not the module-root creator, which would seed the
-            // wrong entity and make the probe 404 on a CORRECT handler.
-            if let Some((seed, seed_id)) = seed_for_id_probe(design, unit, base, ep, auth) {
+            // wrong entity and make the probe 404 on a CORRECT handler. Seeds/probes
+            // resolve against the mount-substituted `cbase` (issue #81) so a nested
+            // module's seed POST + `/{id}` probe both hit the concrete parent URL.
+            if let Some((seed, seed_id)) = seed_for_id_probe(design, unit, &cbase, ep, auth) {
                 let seeded_path = full_path.replacen(&regex_free_param(&ep.path), &seed_id, 1);
                 let request = request_expr(design, unit, ep, &seeded_path, guarded, None);
                 out.code.push_str(&format!(
@@ -704,12 +754,38 @@ fn module_provides_tenant_dep(design: &Design, module: &ModuleDesign) -> bool {
 /// is the simplest correct default. Deterministic: document order, skipping
 /// entity-less modules (which have no migration file).
 fn collect_workspace_migration_items(design: &Design, current: &ModuleDesign, out: &mut String) {
+    // The current module reaches its own files by `..` (from its own tests dir);
+    // every other module by the cross-crate `../../{module}` path.
+    migration_items(
+        design,
+        |name| {
+            if name == current.name {
+                "..".to_string()
+            } else {
+                format!("../../{name}")
+            }
+        },
+        out,
+    );
+}
+
+/// Emit a `jerrycan::db::Migration { … include_str!(…) }` item for every route
+/// module (and subroute) create-tables migration in the design, into `out` (design
+/// order; entity-less modules skipped — they have no migration file). This is the
+/// FULL workspace schema `App::build` applies (mounting.rs aggregates the same set
+/// into `migrations::MIGRATIONS`). `prefix_for(module_name)` yields the
+/// `include_str!` path prefix to that module's `migrations/` dir — it differs by
+/// caller because their harness files sit at different depths: the route TestApp
+/// (testgen) is at `crates/routes/<m>/tests/` (own module `..`, others `../../<m>`),
+/// while the jobs harness (jobsgen) is at `crates/jobs/tests/` (every module
+/// `../../routes/<m>`). Shared so both harnesses migrate the same tables (issue #84).
+pub(crate) fn migration_items(
+    design: &Design,
+    prefix_for: impl Fn(&str) -> String,
+    out: &mut String,
+) {
     for m in &design.modules {
-        let prefix = if m.name == current.name {
-            "..".to_string()
-        } else {
-            format!("../../{}", m.name)
-        };
+        let prefix = prefix_for(&m.name);
         let m_snake = m.name.replace('-', "_");
         if !m.entities.is_empty() {
             out.push_str(&format!(
@@ -1015,6 +1091,7 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
         &entity.name,
         omits_identity_fk(design, module, create),
         None,
+        false, // isolation seeds a row via create — a create body omits defaults
     );
     let create_path = format!("{cbase}/");
 
@@ -1151,6 +1228,7 @@ fn per_user_isolation_test(design: &Design, module: &ModuleDesign) -> String {
         &entity.name,
         omits_identity_fk(design, module, create),
         None,
+        false, // isolation seeds a row via create — a create body omits defaults
     );
     let create_path = format!("{base}/");
     // Only GUARDED reads carry the owner scope — an unguarded read has no session to
@@ -1258,6 +1336,7 @@ fn tenant_collection_isolation_test(design: &Design, module: &ModuleDesign) -> S
         &entity.name,
         omits_identity_fk(design, module, create),
         None,
+        false, // isolation seeds a row via create — a create body omits defaults
     );
     let hk = design.test_auth_header();
     format!(
@@ -1278,6 +1357,14 @@ fn seed_sql_value(f: &Field) -> String {
         return format!("'{first}'");
     }
     match f.field_type {
+        // A `unique` String/Integer/Float shares its literal with the create-probe
+        // body (`fixture_value`), so a create probe on a pre-seeded tenant row 409s
+        // (#85). Seed a DISTINCT value for those. datetime/uuid seeds ('test-value')
+        // already differ from their probe fixtures (a real timestamp / v4 uuid), so
+        // they stay unchanged; boolean/json are never realistic unique keys.
+        FieldType::String if f.unique => "'seed-test-value'".to_string(),
+        FieldType::Integer if f.unique => "1000".to_string(),
+        FieldType::Float if f.unique => "1000.0".to_string(),
         FieldType::String | FieldType::Datetime | FieldType::Uuid => "'test-value'".to_string(),
         FieldType::Integer => "1".to_string(),
         FieldType::Float => "1.0".to_string(),
@@ -1330,11 +1417,17 @@ fn extension_wiring(design: &Design) -> (String, String) {
         extends.push_str(".extend(jerrycan::jobs::Jobs::postgres(db.clone()))");
     }
     if design.wants_realtime() {
-        // Resolves `Dep<RealtimeHandle>` for realtime handlers (no JC1001). The
-        // base extension is enough for the harness — stub probes never publish, so
-        // the design's channels (wired in the realtime crate at serve time) aren't
-        // needed here.
-        extends.push_str(".extend(jerrycan::realtime::Realtime::new(db.clone()))");
+        // Resolves `Dep<RealtimeHandle>` for realtime handlers (no JC1001) AND
+        // declares the app's broadcast/presence topics on the extension — the SAME
+        // topics the realtime crate wires (realtimegen::wiring_rs). Without them a
+        // handler that publishes to a topic hits JC0404 (undeclared topic) on a bare
+        // `Realtime::new`, so the probe is un-greenable (issue #84). Changes channels
+        // are omitted: they need Postgres (never exercised by a sqlite TestApp) and
+        // are not `RealtimeHandle::publish` targets.
+        extends.push_str(&format!(
+            ".extend(jerrycan::realtime::Realtime::new(db.clone()){})",
+            super::realtimegen::topic_wiring_inline(design)
+        ));
     }
     if extends.is_empty() {
         return (String::new(), String::new());

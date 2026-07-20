@@ -550,8 +550,8 @@ fn nested_path_scoped_module_gets_isolation_test_with_pinned_tenant() {
     );
     // In the ISOLATION test the mount's tenant fk is pinned to tenant 1 (not the
     // literal `{club_id}`): user 1 creates club 1's book, user 2 (a member of club 2
-    // only) reads it and 404s. (The per-endpoint success tests still carry the raw
-    // `{club_id}` mount — a separate mount-substitution gap, out of scope here.)
+    // only) reads it and 404s. (The per-endpoint success tests now pin the mount the
+    // same way — issue #81, covered by `subroute_mount_param_is_substituted_in_per_endpoint_urls`.)
     let iso = out
         .split("async fn tenant_a_cannot_read_tenant_b_books()")
         .nth(1)
@@ -987,8 +987,10 @@ fn post_only_id_action_404_probe_uses_post_not_get() {
 /// with DISTINCT values for that column, or the second-tenant seed the isolation
 /// test depends on crashes every test at setup with a UNIQUE-constraint violation.
 /// WHY (Rule 9): tenant 1 and tenant 2 previously shared `'test-value'` for every
-/// string column; a `unique` column then collides. Tenant 1 must stay byte-identical
-/// (`'test-value'`) and tenant 2 must differ (`'test-value-2'`).
+/// string column; a `unique` column then collides. Tenant 1 seeds a value distinct
+/// from BOTH tenant 2 (`'test-value-2'`) AND the create-probe body (`'test-value'`,
+/// `fixture_value`) — the latter is the #85 D3 fix: without it a create probe on the
+/// tenant entity 409s on the pre-seeded row.
 #[test]
 fn two_tenant_seed_uses_distinct_values_for_a_unique_field() {
     let design: Design = serde_json::from_value(serde_json::json!({
@@ -1038,10 +1040,11 @@ fn two_tenant_seed_uses_distinct_values_for_a_unique_field() {
         .expect("projects module");
     let generated = testgen::acceptance_rs(&design, projects);
 
-    // Tenant 1's seed keeps the byte-identical placeholder for the unique slug.
+    // Tenant 1's seed uses a value DISTINCT from the create-probe body (#85 D3), so
+    // it collides with neither tenant 2 nor a create probe on the tenant entity.
     assert!(
-        generated.contains("VALUES (1, 'test-value')"),
-        "tenant 1 seeds the unchanged placeholder slug: {generated}"
+        generated.contains("VALUES (1, 'seed-test-value')"),
+        "tenant 1 seeds a unique slug distinct from the probe fixture: {generated}"
     );
     // Tenant 2's seed (in seed_second_tenant) must NOT reuse the SAME slug literal —
     // it carries a distinct value so the UNIQUE constraint holds.
@@ -1606,7 +1609,10 @@ fn testapp_wires_declared_realtime_and_jobs_extensions() {
         "contract_version": 1,
         "dependencies": ["db", "auth"],
         "auth": { "model": "jwt", "roles": ["admin"] },
-        "realtime": { "broadcast": [{ "name": "feed", "scope": "auth" }] },
+        "realtime": {
+            "broadcast": [{ "name": "feed", "scope": "auth" }],
+            "presence": [{ "name": "cursors", "scope": "auth" }]
+        },
         "jobs": [{ "name": "sweep", "schedule": "0 * * * *", "queue": "default" }],
         "modules": [{
             "name": "posts",
@@ -1621,8 +1627,20 @@ fn testapp_wires_declared_realtime_and_jobs_extensions() {
     .unwrap();
     let generated = testgen::acceptance_rs(&design, &design.modules[0]);
     assert!(
-        generated.contains(".extend(jerrycan::realtime::Realtime::new(db.clone()))"),
+        generated.contains(".extend(jerrycan::realtime::Realtime::new(db.clone())"),
         "realtime design's TestApp must wire the realtime extension (else JC1001): {generated}"
+    );
+    // Issue #84: the realtime extension must also DECLARE the app's topics, so a
+    // handler that publishes to one resolves instead of failing JC0404 (undeclared
+    // topic) on a bare `Realtime::new`. WHY (Rule 9): a probe that 404s on a MISSING
+    // topic tests the harness, not the contract.
+    assert!(
+        generated.contains(".broadcast(\"feed\", jerrycan::realtime::TopicScope::Auth)"),
+        "realtime TestApp must declare the app's broadcast topics (issue #84): {generated}"
+    );
+    assert!(
+        generated.contains(".presence(\"cursors\", jerrycan::realtime::TopicScope::Auth)"),
+        "realtime TestApp must declare the app's presence topics (issue #84): {generated}"
     );
     assert!(
         generated.contains(".extend(jerrycan::jobs::Jobs::postgres(db.clone()))"),
@@ -1762,4 +1780,178 @@ fn skipped_creator_suppresses_sibling_id_probes() {
         "only the 404 missing-id probe is a counted RED-on-stubs test: {generated}"
     );
     std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// A subroute-mounted, tenant-owned module: `channels` mounts at
+/// `/workspaces/{workspace_id}/channels` (the tenant fk rides in the MOUNT prefix,
+/// not `ep.path`), and each Channel `belongs_to` the tenant Workspace.
+const WORKSPACE_CHANNELS_NESTED: &str = r#"{
+    "name": "chat-api", "contract_version": 1,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+    "modules": [
+        { "name": "workspaces",
+          "entities": [{ "name": "Workspace", "fields": [
+              { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+          "endpoints": [
+              { "operation_id": "create_workspace", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Workspace" }, "success": { "status": 201, "entity": "Workspace" } },
+              { "operation_id": "list_workspaces", "method": "GET", "path": "/", "auth_required": true,
+                "success": { "status": 200, "entity": "Workspace", "list": true } } ] },
+        { "name": "channels", "mount": "/workspaces/{workspace_id}/channels",
+          "entities": [{ "name": "Channel", "belongs_to": [{ "entity": "Workspace" }],
+              "fields": [{ "name": "id", "type": "integer" }, { "name": "name", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "create_channel", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Channel" }, "success": { "status": 201, "entity": "Channel" } },
+              { "operation_id": "get_channel", "method": "GET", "path": "/{id}", "auth_required": true,
+                "success": { "status": 200, "entity": "Channel" },
+                "errors": [{ "status": 404, "when": "unknown id" }] } ] }
+    ]
+}"#;
+
+/// Issue #81: a subroute-mounted module's per-endpoint acceptance URLs must
+/// substitute the mount-inherited path param with the seeded parent id (1), not
+/// leave the literal `{workspace_id}` token. WHY (Rule 9): `channels` inherits
+/// `{workspace_id}` in its MOUNT (not `ep.path`); left literal, the router
+/// 400/404s the whole test group, so a correct app's tests are red BY CONSTRUCTION
+/// and the builder re-scaffolds (the round-5 eval's biggest token sink). The mount
+/// param is the tenant fk, seeded at id 1 by app()'s tenant chain, so pinning it to
+/// `1` makes every probe URL concrete AND resolvable.
+#[test]
+fn subroute_mount_param_is_substituted_in_per_endpoint_urls() {
+    let d: Design = serde_json::from_str(WORKSPACE_CHANNELS_NESTED).unwrap();
+    let channels = d.modules.iter().find(|m| m.name == "channels").unwrap();
+    let out = testgen::acceptance_rs(&d, channels);
+
+    // No REQUEST url (`t.<verb>(...)`) may carry the literal mount param. The router
+    // registration line (`.mount("/workspaces/{workspace_id}/channels", ...)`) keeps
+    // the param PATTERN by design, so it is excluded from this check.
+    for line in out
+        .lines()
+        .filter(|l| l.contains("    t.") || l.contains("= t."))
+    {
+        assert!(
+            !line.contains("{workspace_id}"),
+            "a request URL carries the literal mount param:\n{line}\n---\n{out}"
+        );
+    }
+    // The create success test posts to the concrete, seeded-parent collection URL.
+    let create = test_body(&out, "create_channel_returns_201");
+    assert!(
+        create.contains("t.post_json_with(\"/workspaces/1/channels/\""),
+        "create URL pins the mount param to the seeded id 1:\n{create}"
+    );
+    // The by-id GET success test seeds via the concrete collection URL, then probes
+    // the seeded row under the concrete mount (own `{id}` -> seeded id 1 as well).
+    let get = test_body(&out, "get_channel_returns_200");
+    assert!(
+        get.contains("post_json_with(\"/workspaces/1/channels/\"")
+            && get.contains("/workspaces/1/channels/1"),
+        "get URL seeds + probes under the concrete mount:\n{get}"
+    );
+    // The missing-id 404 probe substitutes the mount param and probes a missing id.
+    let missing = test_body(&out, "get_channel_missing_id_is_404");
+    assert!(
+        missing.contains("/workspaces/1/channels/999999"),
+        "404 probe substitutes the mount param:\n{missing}"
+    );
+}
+
+/// A FLAT module (no mount param) with a standalone `/{id}` route.
+const FLAT_CUSTOMERS: &str = r#"{
+    "name": "shop", "contract_version": 1, "dependencies": ["db"],
+    "modules": [{
+        "name": "customers",
+        "entities": [{ "name": "Customer", "fields": [
+            { "name": "id", "type": "integer" }, { "name": "email", "type": "string" } ]}],
+        "endpoints": [
+            { "operation_id": "create_customer", "method": "POST", "path": "/",
+              "request_body": { "entity": "Customer" },
+              "success": { "status": 201, "entity": "Customer" } },
+            { "operation_id": "show_customer", "method": "GET", "path": "/{id}",
+              "success": { "status": 200, "entity": "Customer" },
+              "errors": [{ "status": 404, "when": "unknown id" }] }
+        ]
+    }]
+}"#;
+
+/// Issue #81 (byte-identity guard): a FLAT module (no mount param) must be
+/// UNCHANGED by the mount-substitution fix — its accumulated mount carries no
+/// `{param}` to substitute, so the substitution is the identity. WHY (Rule 9): the
+/// fix is test-generation-only and must touch ONLY nested-mount modules; a
+/// regression that rewrote flat URLs would silently change every non-nested app's
+/// generated tests.
+#[test]
+fn flat_module_urls_are_unchanged_by_mount_substitution() {
+    let d: Design = serde_json::from_str(FLAT_CUSTOMERS).unwrap();
+    let customers = d.modules.iter().find(|m| m.name == "customers").unwrap();
+    let out = testgen::acceptance_rs(&d, customers);
+    // The flat create posts to the plain collection URL (no cookie: no auth)...
+    assert!(
+        out.contains("t.post_json(\"/customers/\""),
+        "flat create URL is the plain collection path: {out}"
+    );
+    // ...the by-id probe addresses the seeded row directly under it, and the 404
+    // probe hits a missing id — both plain, no nested segment.
+    let show = test_body(&out, "show_customer_returns_200");
+    assert!(
+        show.contains("/customers/1"),
+        "flat by-id URL is the plain path:\n{show}"
+    );
+    assert!(
+        out.contains("/customers/999999"),
+        "flat 404 URL is the plain path: {out}"
+    );
+    // No substitution artifact leaks into a flat file (no nested `/customers/<id>/…`).
+    assert!(
+        !out.contains("/customers/1/"),
+        "a flat module must not gain a nested mount segment: {out}"
+    );
+}
+
+/// Issue #85 (D3): a `unique` field on the tenant entity must seed a value
+/// DISTINCT from the create-probe body, or the create probe 409s on the
+/// pre-seeded tenant row. This tenant module owns a child (`Project`), so `app()`
+/// pre-seeds the `Org` tenant row — and `create_org`'s probe body must not reuse
+/// that row's unique `slug`. WHY (Rule 9): the round-4 `index` workaround did NOT
+/// prevent the collision; only a distinct seed value keeps the create probe green.
+#[test]
+fn unique_tenant_field_seed_does_not_collide_with_the_create_probe() {
+    const UNIQUE_TENANT: &str = r#"{
+        "name": "orgs", "contract_version": 0,
+        "auth": { "model": "session" },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner"] },
+        "modules": [{ "name": "orgs",
+            "entities": [
+                { "name": "Org", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "slug", "type": "string", "unique": true } ] },
+                { "name": "Project", "belongs_to": [{ "entity": "Org" }],
+                  "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "title", "type": "string" } ] } ],
+            "endpoints": [
+                { "operation_id": "list_orgs", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Org", "list": true } },
+                { "operation_id": "create_org", "method": "POST", "path": "/", "auth_required": true,
+                  "request_body": { "entity": "Org" },
+                  "success": { "status": 201, "entity": "Org" } } ] }]
+    }"#;
+    let design: Design = serde_json::from_str(UNIQUE_TENANT).unwrap();
+    let module = &design.modules[0];
+    let generated = testgen::acceptance_rs(&design, module);
+    // The create probe carries the ordinary string fixture for the unique slug.
+    assert!(
+        generated.contains("\"slug\": \"test-value\""),
+        "create probe posts the string fixture for slug:\n{generated}"
+    );
+    // The pre-seeded tenant-1 row must NOT reuse that same unique value, else the
+    // create probe 409s on the seeded row.
+    assert!(
+        !generated.contains("VALUES (1, 'test-value')"),
+        "tenant-1 seed must not reuse the probe's unique slug value (would 409):\n{generated}"
+    );
 }

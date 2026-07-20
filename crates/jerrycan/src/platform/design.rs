@@ -432,6 +432,14 @@ impl HttpMethod {
             HttpMethod::DELETE => "DELETE",
         }
     }
+
+    /// True for a REPLACE/MODIFY method (PUT/PATCH) — the "update" shape, as
+    /// opposed to POST (create). Distinguishes the request DTO by write path: a
+    /// `default` field is server-owned on CREATE (dropped) but client-settable on
+    /// UPDATE (kept), so update keeps it in the body (issue #85 D1).
+    pub fn is_update(self) -> bool {
+        matches!(self, HttpMethod::PUT | HttpMethod::PATCH)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1059,6 +1067,16 @@ impl Design {
             .is_some_and(|e| e.fields.iter().any(|f| f.default.is_some()))
     }
 
+    /// True when entity `entity` (anywhere in the tree) declares a `default` field
+    /// (issue #85 D1). Its UPDATE request DTO (`{Entity}UpdateRequest`) KEEPS those
+    /// fields — a `default` is create-only, so an update must be able to set them —
+    /// while the CREATE DTO drops them. Resolves by name so a caller holding only
+    /// the fk/body entity name agrees with the one holding the `Entity`.
+    pub(crate) fn entity_has_default(&self, entity: &str) -> bool {
+        self.find_entity(entity)
+            .is_some_and(|e| e.fields.iter().any(|f| f.default.is_some()))
+    }
+
     /// The nested-route parent-FK rule (issue #53b): the fk columns this entity's
     /// belongs_to derive that ALSO appear as a `{param}` in some endpoint whose
     /// body is this entity (`Checkin belongs_to Habit` + `POST /{habit_id}/checkins`
@@ -1074,24 +1092,41 @@ impl Design {
         e.belongs_to
             .iter()
             .map(|b| Self::fk_column(&b.entity))
-            .filter(|col| self.any_body_endpoint_path_has(entity_name, col))
+            .filter(|col| self.any_body_endpoint_resolved_path_has(entity_name, col))
             .collect()
     }
 
-    /// True when some endpoint whose request body is `entity_name` has a path
-    /// segment `{col}` (the parent fk the path already carries). Walks the whole
-    /// design tree (modules + subroutes).
-    fn any_body_endpoint_path_has(&self, entity_name: &str, col: &str) -> bool {
-        fn walk(m: &ModuleDesign, entity_name: &str, token: &str) -> bool {
+    /// True when some endpoint whose request body is `entity_name` carries `{col}`
+    /// in its RESOLVED path — the accumulated module/subroute MOUNT prefix plus
+    /// `ep.path`, not `ep.path` alone. Mount-aware twin of the old ep.path-only
+    /// check (issue #82): a child mounted at `/clubs/{club_id}` whose create is
+    /// `POST /` still carries `club_id` in the resolved path, so the fk is
+    /// path-redundant and the request DTO drops it (closing the #125 create vector —
+    /// a body `club_id` can no longer relocate the row into another tenant). The
+    /// mount accumulation mirrors `endpoint_tenant_shape` (mount, trailing `/`
+    /// trimmed, + `ep.path`) and testgen's `base`/`sub_base`, so "resolved path"
+    /// means the same thing everywhere. Walks the whole design tree (modules +
+    /// subroutes). Note: a fk already spelled in `ep.path` (`POST /{col}/…`) is
+    /// found by this check too, so those designs stay byte-identical.
+    fn any_body_endpoint_resolved_path_has(&self, entity_name: &str, col: &str) -> bool {
+        fn walk(m: &ModuleDesign, entity_name: &str, token: &str, prefix: &str) -> bool {
+            let mount = m.effective_mount();
+            let mount = mount.strip_suffix('/').unwrap_or(&mount);
+            let base = format!("{prefix}{mount}");
             m.endpoints.iter().any(|ep| {
                 ep.request_body
                     .as_ref()
                     .is_some_and(|rb| rb.entity == entity_name)
-                    && ep.path.contains(token)
-            }) || m.subroutes.iter().any(|s| walk(s, entity_name, token))
+                    && format!("{base}{}", ep.path).contains(token)
+            }) || m
+                .subroutes
+                .iter()
+                .any(|s| walk(s, entity_name, token, &base))
         }
         let token = format!("{{{col}}}");
-        self.modules.iter().any(|m| walk(m, entity_name, &token))
+        self.modules
+            .iter()
+            .any(|m| walk(m, entity_name, &token, ""))
     }
 
     /// True when this endpoint's request-body entity has a path-redundant parent fk
@@ -1167,6 +1202,27 @@ impl Design {
             .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
             .map(|f| f.field_type.rust_type())
             .unwrap_or("i64")
+    }
+
+    /// The Rust key type a PATH PARAM references (issue #85): a param named after a
+    /// belongs_to fk column (`site_id`) points at that entity's pk, so it must type
+    /// from the referent — a string/uuid-pk `Site` → `String`, not a hardcoded
+    /// `i64`. Matches `{snake}_id` back to the entity whose `fk_column` equals the
+    /// param, then resolves its pk type. Returns `i64` when the param matches no
+    /// entity's fk column (a synthetic/opaque param like `code`), so every design
+    /// whose non-id path params reference integer-pk entities stays byte-identical.
+    pub fn path_param_key_type(&self, param: &str) -> &'static str {
+        fn find_name<'a>(m: &'a ModuleDesign, param: &str) -> Option<&'a str> {
+            m.entities
+                .iter()
+                .map(|e| e.name.as_str())
+                .find(|n| Design::fk_column(n) == param)
+                .or_else(|| m.subroutes.iter().find_map(|s| find_name(s, param)))
+        }
+        match self.modules.iter().find_map(|m| find_name(m, param)) {
+            Some(name) => self.target_key_rust_type(name),
+            None => "i64",
+        }
     }
 
     /// Resolve an entity by name across the whole design tree (any module or
@@ -2180,6 +2236,52 @@ pub(crate) mod tests {
         let create_checkin = &m.endpoints[1];
         assert!(d.endpoint_omits_path_fk(m, create_checkin));
         assert!(d.endpoint_uses_request_dto(m, create_checkin, false));
+    }
+
+    #[test]
+    fn entity_path_fk_columns_is_mount_aware() {
+        // Issue #82 (and the #125 create vector): the path-redundancy check resolves
+        // the FULL path (module MOUNT + `ep.path`), not `ep.path` alone. `Book
+        // belongs_to Club` created by `POST /` under a module mounted at
+        // `/clubs/{club_id}` carries `club_id` in the MOUNT — so it is path-redundant
+        // and must be dropped from the request DTO. A mount-BLIND check saw only
+        // `ep.path == "/"` and left `club_id` client-controllable (the #82 friction /
+        // the #125 cross-tenant-create hole).
+        let mount: Design = serde_json::from_str(
+            r#"{ "name": "clubs", "contract_version": 0, "dependencies": ["db"],
+                "modules": [
+                    { "name": "clubs",
+                      "entities": [{ "name": "Club", "fields": [{ "name": "name", "type": "string" }] }],
+                      "endpoints": [] },
+                    { "name": "books", "mount": "/clubs/{club_id}",
+                      "entities": [{ "name": "Book", "belongs_to": [{ "entity": "Club" }],
+                        "fields": [{ "name": "title", "type": "string" }] }],
+                      "endpoints": [
+                        { "operation_id": "create_book", "method": "POST", "path": "/",
+                          "request_body": { "entity": "Book" },
+                          "success": { "status": 201, "entity": "Book" } }] } ] }"#,
+        )
+        .unwrap();
+        assert_eq!(mount.entity_path_fk_columns("Book"), vec!["club_id"]);
+
+        // The fk already in the endpoint's OWN `ep.path` (`POST /{club_id}/books`) was
+        // detected by the old ep.path-only check too, so the mount-aware switch leaves
+        // it UNCHANGED — no regression for designs that spelled the param on the route.
+        let ep_path: Design = serde_json::from_str(
+            r#"{ "name": "lib", "contract_version": 0, "dependencies": ["db"],
+                "modules": [
+                    { "name": "library",
+                      "entities": [
+                        { "name": "Club", "fields": [{ "name": "name", "type": "string" }] },
+                        { "name": "Book", "belongs_to": [{ "entity": "Club" }],
+                          "fields": [{ "name": "title", "type": "string" }] }],
+                      "endpoints": [
+                        { "operation_id": "create_book", "method": "POST", "path": "/{club_id}/books",
+                          "request_body": { "entity": "Book" },
+                          "success": { "status": 201, "entity": "Book" } }] } ] }"#,
+        )
+        .unwrap();
+        assert_eq!(ep_path.entity_path_fk_columns("Book"), vec!["club_id"]);
     }
 
     #[test]

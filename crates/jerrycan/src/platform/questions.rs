@@ -37,6 +37,52 @@ fn is_pascal(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// Identifiers every generated route crate pulls into scope via
+/// `use jerrycan::prelude::*;` (issue #114). This MIRRORS `jerrycan_core::prelude`
+/// (crates/jerrycan-core/src/lib.rs) plus the re-exported `main` macro — the exact
+/// glob the tool-owned `mod.rs`/`repo.rs`/`handlers.rs` write. An entity whose
+/// PascalCase name equals one of these emits `pub struct {Name}` in `model.rs`,
+/// which the sibling files glob-import via `use super::model::*;` ALONGSIDE the
+/// prelude glob: two glob imports bring the same `{Name}` into scope, so every
+/// reference is `E0659 ... is ambiguous` and the scaffolded crate does not compile
+/// (the round-5 eval hit an entity named `Module`). Kept sorted for auditing; the
+/// lowercase method fns / `main` can never collide with a PascalCase entity name
+/// but are listed so the reserved set matches the glob exactly.
+const RESERVED_PRELUDE_IDENTS: &[&str] = &[
+    "App",
+    "Clock",
+    "CorsConfig",
+    "CorsOrigins",
+    "Created",
+    "Dep",
+    "Error",
+    "Extension",
+    "Headers",
+    "IntoResponse",
+    "Json",
+    "Middleware",
+    "MiddlewareFuture",
+    "Module",
+    "Multipart",
+    "Next",
+    "NoContent",
+    "Path",
+    "Query",
+    "RawBody",
+    "Redirect",
+    "RequestCtx",
+    "Result",
+    "StreamBody",
+    "TestApp",
+    "TestPart",
+    "delete",
+    "get",
+    "main",
+    "patch",
+    "post",
+    "put",
+];
+
 /// An enum `values` entry that is safe to interpolate unescaped into generated
 /// Rust (issue #54): `^[A-Za-z0-9_-]+$`. Values reach a `"..."` string literal in
 /// the generated deserialize allow-list, the 422 error text, and the testgen
@@ -549,7 +595,22 @@ pub fn validate(d: &Design) -> Vec<Question> {
     // the path the NOT-NULL column can be set from neither the body nor the path —
     // the route is un-implementable (the stub even references a `_{col}` binding
     // that doesn't exist). Reuses the R5 resolution — no duplicated fk logic.
-    fn check_dual_create_path_fk(d: &Design, m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+    // `prefix` is the accumulated MOUNT of this module's ancestors; combined with the
+    // module's own `effective_mount()` (trailing `/` trimmed) it resolves each
+    // endpoint's full path — the SAME "resolved path" notion `entity_path_fk_columns`
+    // and `endpoint_tenant_shape` use. A fk carried by the MOUNT (`/clubs/{club_id}`,
+    // create at `POST /`) is therefore injectable and must NOT be flagged (issue #82),
+    // even though `ep.path` alone lacks the param.
+    fn check_dual_create_path_fk(
+        d: &Design,
+        m: &ModuleDesign,
+        ptr: &str,
+        prefix: &str,
+        qs: &mut Vec<Question>,
+    ) {
+        let mount = m.effective_mount();
+        let mount = mount.strip_suffix('/').unwrap_or(&mount);
+        let base = format!("{prefix}{mount}");
         for (i, ep) in m.endpoints.iter().enumerate() {
             let Some(rb) = ep.request_body.as_ref() else {
                 continue;
@@ -560,7 +621,8 @@ pub fn validate(d: &Design) -> Vec<Question> {
             ) {
                 continue;
             }
-            let token = |col: &str| ep.path.contains(&format!("{{{col}}}"));
+            let resolved = format!("{base}{}", ep.path);
+            let token = |col: &str| resolved.contains(&format!("{{{col}}}"));
             if let Some(col) = d
                 .entity_path_fk_columns(&rb.entity)
                 .into_iter()
@@ -576,11 +638,11 @@ pub fn validate(d: &Design) -> Vec<Question> {
             }
         }
         for (i, sub) in m.subroutes.iter().enumerate() {
-            check_dual_create_path_fk(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
+            check_dual_create_path_fk(d, sub, &format!("{ptr}/subroutes/{i}"), &base, qs);
         }
     }
     for (i, m) in d.modules.iter().enumerate() {
-        check_dual_create_path_fk(d, m, &format!("/modules/{i}"), &mut qs);
+        check_dual_create_path_fk(d, m, &format!("/modules/{i}"), "", &mut qs);
     }
 
     // Tenancy: the named entity must resolve, and the Tenant guard needs an
@@ -995,6 +1057,23 @@ fn validate_module(
                 format!(
                     "Entity `{}` is a Rust keyword — it becomes a module/type name that no raw identifier can escape; rename it (e.g. a domain-specific name).",
                     e.name
+                ),
+            ));
+        }
+        // JC0546 (#114): an entity named after a `jerrycan::prelude` re-export
+        // (the eval hit `Module`) emits `pub struct {Name}` in `model.rs`, which
+        // the tool-owned `repo.rs`/`handlers.rs` glob-import via `use super::model::*;`
+        // BESIDE `use jerrycan::prelude::*;`. Two glob imports then bring the same
+        // `{Name}` into scope, so every reference is `E0659 ... is ambiguous` and the
+        // scaffolded crate does not compile. Generation is gated on validation, so
+        // rejecting the name here fails loud (like JC0545) instead of scaffolding an
+        // app that won't build.
+        if RESERVED_PRELUDE_IDENTS.contains(&e.name.as_str()) {
+            qs.push(q(
+                format!("{ptr}/entities/{i}/name"),
+                format!(
+                    "Entity `{name}` collides with `{name}`, an identifier re-exported by `jerrycan::prelude`: generated code writes `use jerrycan::prelude::*;` beside `use super::model::*;`, so the entity's `struct {name}` and the prelude's `{name}` are two glob imports of the same name — every reference is `E0659 ... is ambiguous` and the scaffolded crate does not compile. Rename the entity (e.g. `{name}Record` or a domain-specific name) so it no longer shadows a reserved prelude identifier. See `jerrycan explain JC0546`.",
+                    name = e.name
                 ),
             ));
         }
@@ -2400,6 +2479,107 @@ mod tests {
             );
         }
     }
+
+    /// Issue #82 + #125-create: a tenant child mounted at `/clubs/{club_id}` whose
+    /// create is `POST /` carries its parent fk in the MOUNT. Now that
+    /// `entity_path_fk_columns` is mount-aware it reports `club_id` as path-redundant
+    /// — but the RESOLVED path DOES carry `{club_id}`, so the route IS implementable
+    /// (the handler injects the path/tenant value). JC0544 must resolve the mount the
+    /// same way and NOT flag it; otherwise `require_complete` would block the exact
+    /// nested-mount app 0.5.2 blesses. (A mount-BLIND JC0544 would fire here because
+    /// `ep.path == "/"` lacks `{club_id}` even though the mount supplies it.)
+    #[test]
+    fn nested_mount_create_carries_fk_in_the_mount_and_is_not_flagged() {
+        let d: Design = serde_json::from_str(NESTED_MOUNT_CREATE).unwrap();
+        assert!(
+            !validate(&d).iter().any(|q| q.question.contains("JC0544")),
+            "a mount-nested create carries its fk in the RESOLVED path, so it must not \
+             trip JC0544: {:?}",
+            validate(&d)
+        );
+    }
+
+    // ---- #114 (JC0546): entity name collides with a prelude re-export ---------
+
+    /// An entity named `Module` (a `jerrycan::prelude` re-export) makes the
+    /// generated crate emit `pub struct Module` beside `use jerrycan::prelude::*;`
+    /// and `use super::model::*;` — two glob imports of `Module`, so every
+    /// reference is `E0659 ... is ambiguous` and the scaffold does not compile.
+    /// `validate` must reject the design up front with JC0546 (fail-loud like
+    /// JC0545), naming the entity, the reserved identifier, and the rename fix —
+    /// so `jerrycan new` never scaffolds a crate that won't build.
+    #[test]
+    fn entity_named_after_a_prelude_reexport_is_rejected_with_jc0546() {
+        // MINIMAL's PascalCase entity `Todo` (name + every reference) → `Module`.
+        let d = design(&MINIMAL.replace("Todo", "Module"));
+        let qs = validate(&d);
+        let flagged: Vec<&Question> = qs
+            .iter()
+            .filter(|q| q.question.contains("JC0546"))
+            .collect();
+        assert_eq!(
+            flagged.len(),
+            1,
+            "the single `Module` entity is flagged exactly once: {qs:?}"
+        );
+        let f = flagged[0];
+        assert!(
+            f.id.ends_with("/name"),
+            "the question points at the entity's /name: {}",
+            f.id
+        );
+        assert!(
+            f.question.contains("Module")
+                && f.question.to_lowercase().contains("prelude")
+                && f.question.to_lowercase().contains("rename"),
+            "names the entity, the reserved prelude identifier, and the rename fix: {}",
+            f.question
+        );
+    }
+
+    /// The default `Todo` name shadows nothing, and the shipped conformance
+    /// designs use ordinary entity names — none may trip JC0546 (the negative
+    /// control: the guard fires only on a real reserved-name collision).
+    #[test]
+    fn ordinary_entity_names_do_not_trip_jc0546() {
+        assert!(
+            !validate(&design(MINIMAL))
+                .iter()
+                .any(|q| q.question.contains("JC0546")),
+            "an ordinary entity name is not a prelude collision"
+        );
+        for src in [CONFORMANCE_REFERENCE, CONFORMANCE_TODO] {
+            let d: Design = serde_json::from_str(src).unwrap();
+            assert!(
+                !validate(&d).iter().any(|q| q.question.contains("JC0546")),
+                "conformance design must not trip JC0546"
+            );
+        }
+    }
+
+    /// A tenant child created at `POST /` under a module mounted at `/clubs/{club_id}`
+    /// — the fk `club_id` is supplied by the MOUNT, not `ep.path`.
+    const NESTED_MOUNT_CREATE: &str = r#"{ "name": "clubs-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "clubs",
+              "entities": [{ "name": "Club", "fields": [
+                  { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_club", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Club" },
+                    "success": { "status": 201, "entity": "Club" } } ] },
+            { "name": "books", "mount": "/clubs/{club_id}",
+              "entities": [{ "name": "Book",
+                  "belongs_to": [{ "entity": "Club" }],
+                  "fields": [{ "name": "id", "type": "integer" }, { "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "create_book", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Book" },
+                    "success": { "status": 201, "entity": "Book" } } ] }
+        ] }"#;
 
     /// The #60 repro: one entity created both nested and standalone.
     const DUAL_CREATE: &str = r#"{

@@ -237,6 +237,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs database",
     },
     CodeInfo {
+        code: "JC0546",
+        title: "entity name collides with a prelude re-export",
+        cause: "an entity is named the same as an identifier re-exported by `jerrycan::prelude` (e.g. `Module`, `Error`, `Json`) — generated modules write `use jerrycan::prelude::*;` next to `use super::model::*;`, so the entity's generated `struct` and the prelude item are two glob imports of the same name, and every reference is E0659 `... is ambiguous`; the scaffolded crate does not compile",
+        fix: "rename the entity so its name is not a reserved prelude identifier (e.g. `{Name}Record` or a domain-specific name)",
+        doc: "jerrycan docs validation",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
