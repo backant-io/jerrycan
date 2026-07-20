@@ -204,11 +204,21 @@ pub fn expected_main(design: &Design) -> String {
     // Module declarations. `errors` (the AGENT-owned error-body mapper, issue
     // #13) is present in EVERY mode — framework errors happen with or without a
     // db. db mode adds the AGENT-owned `boot` module (issue #12) and the
-    // tool-owned `migrations` module.
-    let mut mods = String::from("mod errors;\n");
+    // tool-owned `migrations` module. Emitted in ALPHABETICAL order (issue #120):
+    // rustfmt's default `reorder_modules` sorts `mod` declarations, so an
+    // unsorted scaffold would fail `cargo fmt --check` out of the box and trip
+    // JL0003 (generated-file drift) on a file the agent never touched. Sorting
+    // here keeps `cargo fmt` a no-op on a fresh scaffold.
+    let mut mod_names = vec!["errors"];
     if design.wants_db() {
-        mods.push_str("mod boot;\nmod migrations;\n");
+        mod_names.push("boot");
+        mod_names.push("migrations");
     }
+    mod_names.sort_unstable();
+    let mut mods = mod_names
+        .iter()
+        .map(|name| format!("mod {name};\n"))
+        .collect::<String>();
     mods.push('\n');
     let module_decls = mods;
     // The boot hook borrows `db` after all migrations and before it is moved into
@@ -654,6 +664,32 @@ mod tests {
         assert!(
             app_mig < boot && boot < app_new,
             "boot runs after migrations, before App::new: {main}"
+        );
+    }
+
+    /// #120: a fresh scaffold must be `cargo fmt --check` clean out of the box.
+    /// rustfmt's default `reorder_modules` sorts `mod` declarations
+    /// alphabetically, so main.rs must emit them already sorted — otherwise
+    /// `cargo fmt` reorders an untouched generated file and trips JL0003
+    /// (generated-file drift on a file the agent never edited).
+    #[test]
+    fn expected_main_declares_modules_in_sorted_order() {
+        // db mode declares three modules (errors + boot + migrations); memory
+        // mode declares only `errors` (a single line is trivially sorted).
+        let main = expected_main(&jobs_design());
+        let mods: Vec<&str> = main
+            .lines()
+            .filter_map(|l| l.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')))
+            .collect();
+        assert!(
+            mods.contains(&"boot") && mods.contains(&"errors") && mods.contains(&"migrations"),
+            "db mode declares errors/boot/migrations: {mods:?}"
+        );
+        let mut sorted = mods.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            mods, sorted,
+            "mod declarations must be alphabetical so `cargo fmt` is a no-op (issue #120): {mods:?}"
         );
     }
 

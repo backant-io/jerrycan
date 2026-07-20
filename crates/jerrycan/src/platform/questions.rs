@@ -37,6 +37,52 @@ fn is_pascal(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// Identifiers every generated route crate pulls into scope via
+/// `use jerrycan::prelude::*;` (issue #114). This MIRRORS `jerrycan_core::prelude`
+/// (crates/jerrycan-core/src/lib.rs) plus the re-exported `main` macro — the exact
+/// glob the tool-owned `mod.rs`/`repo.rs`/`handlers.rs` write. An entity whose
+/// PascalCase name equals one of these emits `pub struct {Name}` in `model.rs`,
+/// which the sibling files glob-import via `use super::model::*;` ALONGSIDE the
+/// prelude glob: two glob imports bring the same `{Name}` into scope, so every
+/// reference is `E0659 ... is ambiguous` and the scaffolded crate does not compile
+/// (the round-5 eval hit an entity named `Module`). Kept sorted for auditing; the
+/// lowercase method fns / `main` can never collide with a PascalCase entity name
+/// but are listed so the reserved set matches the glob exactly.
+const RESERVED_PRELUDE_IDENTS: &[&str] = &[
+    "App",
+    "Clock",
+    "CorsConfig",
+    "CorsOrigins",
+    "Created",
+    "Dep",
+    "Error",
+    "Extension",
+    "Headers",
+    "IntoResponse",
+    "Json",
+    "Middleware",
+    "MiddlewareFuture",
+    "Module",
+    "Multipart",
+    "Next",
+    "NoContent",
+    "Path",
+    "Query",
+    "RawBody",
+    "Redirect",
+    "RequestCtx",
+    "Result",
+    "StreamBody",
+    "TestApp",
+    "TestPart",
+    "delete",
+    "get",
+    "main",
+    "patch",
+    "post",
+    "put",
+];
+
 /// An enum `values` entry that is safe to interpolate unescaped into generated
 /// Rust (issue #54): `^[A-Za-z0-9_-]+$`. Values reach a `"..."` string literal in
 /// the generated deserialize allow-list, the 422 error text, and the testgen
@@ -1011,6 +1057,23 @@ fn validate_module(
                 format!(
                     "Entity `{}` is a Rust keyword — it becomes a module/type name that no raw identifier can escape; rename it (e.g. a domain-specific name).",
                     e.name
+                ),
+            ));
+        }
+        // JC0546 (#114): an entity named after a `jerrycan::prelude` re-export
+        // (the eval hit `Module`) emits `pub struct {Name}` in `model.rs`, which
+        // the tool-owned `repo.rs`/`handlers.rs` glob-import via `use super::model::*;`
+        // BESIDE `use jerrycan::prelude::*;`. Two glob imports then bring the same
+        // `{Name}` into scope, so every reference is `E0659 ... is ambiguous` and the
+        // scaffolded crate does not compile. Generation is gated on validation, so
+        // rejecting the name here fails loud (like JC0545) instead of scaffolding an
+        // app that won't build.
+        if RESERVED_PRELUDE_IDENTS.contains(&e.name.as_str()) {
+            qs.push(q(
+                format!("{ptr}/entities/{i}/name"),
+                format!(
+                    "Entity `{name}` collides with `{name}`, an identifier re-exported by `jerrycan::prelude`: generated code writes `use jerrycan::prelude::*;` beside `use super::model::*;`, so the entity's `struct {name}` and the prelude's `{name}` are two glob imports of the same name — every reference is `E0659 ... is ambiguous` and the scaffolded crate does not compile. Rename the entity (e.g. `{name}Record` or a domain-specific name) so it no longer shadows a reserved prelude identifier. See `jerrycan explain JC0546`.",
+                    name = e.name
                 ),
             ));
         }
@@ -2434,6 +2497,64 @@ mod tests {
              trip JC0544: {:?}",
             validate(&d)
         );
+    }
+
+    // ---- #114 (JC0546): entity name collides with a prelude re-export ---------
+
+    /// An entity named `Module` (a `jerrycan::prelude` re-export) makes the
+    /// generated crate emit `pub struct Module` beside `use jerrycan::prelude::*;`
+    /// and `use super::model::*;` — two glob imports of `Module`, so every
+    /// reference is `E0659 ... is ambiguous` and the scaffold does not compile.
+    /// `validate` must reject the design up front with JC0546 (fail-loud like
+    /// JC0545), naming the entity, the reserved identifier, and the rename fix —
+    /// so `jerrycan new` never scaffolds a crate that won't build.
+    #[test]
+    fn entity_named_after_a_prelude_reexport_is_rejected_with_jc0546() {
+        // MINIMAL's PascalCase entity `Todo` (name + every reference) → `Module`.
+        let d = design(&MINIMAL.replace("Todo", "Module"));
+        let qs = validate(&d);
+        let flagged: Vec<&Question> = qs
+            .iter()
+            .filter(|q| q.question.contains("JC0546"))
+            .collect();
+        assert_eq!(
+            flagged.len(),
+            1,
+            "the single `Module` entity is flagged exactly once: {qs:?}"
+        );
+        let f = flagged[0];
+        assert!(
+            f.id.ends_with("/name"),
+            "the question points at the entity's /name: {}",
+            f.id
+        );
+        assert!(
+            f.question.contains("Module")
+                && f.question.to_lowercase().contains("prelude")
+                && f.question.to_lowercase().contains("rename"),
+            "names the entity, the reserved prelude identifier, and the rename fix: {}",
+            f.question
+        );
+    }
+
+    /// The default `Todo` name shadows nothing, and the shipped conformance
+    /// designs use ordinary entity names — none may trip JC0546 (the negative
+    /// control: the guard fires only on a real reserved-name collision).
+    #[test]
+    fn ordinary_entity_names_do_not_trip_jc0546() {
+        assert!(
+            !validate(&design(MINIMAL))
+                .iter()
+                .any(|q| q.question.contains("JC0546")),
+            "an ordinary entity name is not a prelude collision"
+        );
+        for src in [CONFORMANCE_REFERENCE, CONFORMANCE_TODO] {
+            let d: Design = serde_json::from_str(src).unwrap();
+            assert!(
+                !validate(&d).iter().any(|q| q.question.contains("JC0546")),
+                "conformance design must not trip JC0546"
+            );
+        }
     }
 
     /// A tenant child created at `POST /` under a module mounted at `/clubs/{club_id}`
