@@ -1205,25 +1205,145 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     } else {
         String::new()
     };
-    format!(
-        r#"
-    // Tenant-scoped accessors — handlers must use these for tenant-owned data (JL0006).
-    pub async fn all_for(&self, {fk_col}: {fk_ty}) -> Result<Vec<{entity}>> {{
+    // The tenant path (issue #102): a direct child has empty joins (keep the typed
+    // sea-orm builder verbatim — byte-identical to pre-#102); a grandchild+ JOINs
+    // up its belongs_to chain to the anchor that carries the tenant fk. The gate
+    // above guarantees `Some` here.
+    let path = design.tenant_path(entity).expect("gate ensured Some");
+    let join_sql = path.join_sql();
+    let tenant_col = path.tenant_col();
+    let tenant_fk = path.tenant_fk.as_str();
+    // The four READS branch on the path: a direct child keeps the typed builder; a
+    // transitive child emits a raw-SQL JOIN form scoping on the QUALIFIED tenant
+    // column. Only identifiers from `TenantPath` reach the SQL; every value stays a
+    // bound `?` param, wrapped in `self.db.sql(..)` exactly like the raw methods.
+    let all_for_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn all_for(&self, {fk_col}: {fk_ty}) -> Result<Vec<{entity}>> {{
         {snake}::Entity::find()
             .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
             .order_by_asc({snake}::Column::Id)
             .all(self.db.conn())
             .await
             .map_err(db_error)
-    }}
-
-    pub async fn get_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<Option<{entity}>> {{
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn all_for(&self, {fk_col}: {fk_ty}) -> Result<Vec<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT {table}.* FROM {table}{join_sql} WHERE {tenant_col} = ? ORDER BY {table}.id",
+                ),
+                [{fk_col}.into()],
+            ))
+            .all(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    };
+    let get_for_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn get_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<Option<{entity}>> {{
         {snake}::Entity::find_by_id(id)
             .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
             .one(self.db.conn())
             .await
             .map_err(db_error)
-    }}
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn get_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<Option<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT {table}.* FROM {table}{join_sql} WHERE {table}.id = ? AND {tenant_col} = ?",
+                ),
+                [id.into(), {fk_col}.into()],
+            ))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    };
+    let all_for_memberships_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn all_for_memberships(&self, user_id: String) -> Result<Vec<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT * FROM {table} WHERE {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?) ORDER BY id",
+                ),
+                [user_id.into()],
+            ))
+            .all(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn all_for_memberships(&self, user_id: String) -> Result<Vec<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT {table}.* FROM {table}{join_sql} WHERE {tenant_col} IN (SELECT {tenant_fk} FROM {members} WHERE user_id = ?) ORDER BY {table}.id",
+                ),
+                [user_id.into()],
+            ))
+            .all(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    };
+    let get_for_memberships_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn get_for_memberships(&self, user_id: String, id: {key}) -> Result<Option<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT * FROM {table} WHERE id = ? AND {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?)",
+                ),
+                [id.into(), user_id.into()],
+            ))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn get_for_memberships(&self, user_id: String, id: {key}) -> Result<Option<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT {table}.* FROM {table}{join_sql} WHERE {table}.id = ? AND {tenant_col} IN (SELECT {tenant_fk} FROM {members} WHERE user_id = ?)",
+                ),
+                [id.into(), user_id.into()],
+            ))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    };
+    format!(
+        r#"
+    // Tenant-scoped accessors — handlers must use these for tenant-owned data (JL0006).
+{all_for_method}
+
+{get_for_method}
 
     pub async fn remove_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<bool> {{
         let r = {snake}::Entity::delete_many()
@@ -1265,33 +1385,9 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     // many tenants sees every tenant's rows they belong to and nothing outside the
     // set (the Supabase RLS shape, restored). `user_id` is the stringified session
     // user id (the membership table's `user_id` is TEXT). Raw SQL, entity-typed.
-    pub async fn all_for_memberships(&self, user_id: String) -> Result<Vec<{entity}>> {{
-        {snake}::Entity::find()
-            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
-                self.db.conn().get_database_backend(),
-                self.db.sql(
-                    "SELECT * FROM {table} WHERE {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?) ORDER BY id",
-                ),
-                [user_id.into()],
-            ))
-            .all(self.db.conn())
-            .await
-            .map_err(db_error)
-    }}
+{all_for_memberships_method}
 
-    pub async fn get_for_memberships(&self, user_id: String, id: {key}) -> Result<Option<{entity}>> {{
-        {snake}::Entity::find()
-            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
-                self.db.conn().get_database_backend(),
-                self.db.sql(
-                    "SELECT * FROM {table} WHERE id = ? AND {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?)",
-                ),
-                [id.into(), user_id.into()],
-            ))
-            .one(self.db.conn())
-            .await
-            .map_err(db_error)
-    }}
+{get_for_memberships_method}
 {membership_writes}"#
     )
 }
@@ -3074,6 +3170,44 @@ pub(crate) mod tests {
         assert!(
             !scoped_methods(contact, &d).is_empty(),
             "grandchild Contact must get scoped methods (was empty pre-#102)"
+        );
+    }
+
+    /// Task 3 (issue #102): the grandchild's tenant-scoped READS join UP the
+    /// belongs_to chain to the tenant fk instead of filtering a non-existent
+    /// direct column. `all_for_memberships` scopes the outer predicate to the
+    /// caller's memberships on the QUALIFIED tenant column, reached via the JOIN.
+    #[test]
+    fn grandchild_all_for_memberships_joins_to_tenant() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        assert!(
+            src.contains("JOIN accounts ON contacts.account_id = accounts.id"),
+            "grandchild read must JOIN up to the tenant anchor:\n{src}"
+        );
+        assert!(
+            src.contains(
+                "WHERE accounts.org_id IN (SELECT org_id FROM org_members WHERE user_id = ?)"
+            ),
+            "membership-set read must scope the QUALIFIED tenant col to the caller's set:\n{src}"
+        );
+    }
+
+    /// Byte-identity backstop (issue #102): a DIRECT child (Book belongs_to the
+    /// tenant Club) MUST keep the TYPED sea-orm builder verbatim — no JOIN, no
+    /// raw-SQL read. The safety net proving the transitive rewrite never touches
+    /// direct children (their emitted read bodies are identical to pre-#102).
+    #[test]
+    fn direct_child_reads_are_byte_identical() {
+        let d: Design = serde_json::from_str(CLUBS_TENANCY).unwrap();
+        let src = scoped_methods(d.find_entity("Book").unwrap(), &d);
+        assert!(
+            src.contains(".filter(book::Column::ClubId.eq(club_id))"),
+            "direct child keeps the typed builder verbatim:\n{src}"
+        );
+        assert!(
+            !src.contains(" JOIN "),
+            "direct child must never emit a JOIN:\n{src}"
         );
     }
 

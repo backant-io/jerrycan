@@ -263,6 +263,30 @@ pub(crate) struct TenantPath {
     pub entity_table: String,
 }
 
+impl TenantPath {
+    /// The JOIN clause walking from the entity's own table up to `anchor_table`,
+    /// e.g. ` JOIN accounts ON contacts.account_id = accounts.id`. Empty for a
+    /// direct child (no joins), so a direct child's SQL stays unchanged.
+    pub(crate) fn join_sql(&self) -> String {
+        self.joins
+            .iter()
+            .map(|j| {
+                format!(
+                    " JOIN {p} ON {c}.{fk} = {p}.id",
+                    p = j.parent_table,
+                    c = j.child_table,
+                    fk = j.child_fk,
+                )
+            })
+            .collect()
+    }
+
+    /// The qualified tenant fk column, e.g. `accounts.org_id`.
+    pub(crate) fn tenant_col(&self) -> String {
+        format!("{}.{}", self.anchor_table, self.tenant_fk)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobDesign {
