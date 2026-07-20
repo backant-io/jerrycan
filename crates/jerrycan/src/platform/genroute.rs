@@ -1510,12 +1510,24 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     }}"#
         )
     } else {
+        // The immediate parent fk (e.g. `account_id`): on a PATH-SCOPED grandchild the path
+        // carries the tenant fk, NOT the parent fk, so the parent fk is not path-redundant —
+        // it stays client-controllable and MUST be pinned, exactly like the membership
+        // branch, or a member could relocate the row to another parent (issue #102).
+        let parent_fk = &path.joins[0].child_fk;
         format!(
             r#"    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
         // Scope the write to the path tenant via the transitive JOIN check (issue #102):
         // load through get_for — a row outside this tenant is a no-op → false → 404.
-        if self.get_for({fk_col}, id{pk_clone}).await?.is_none() {{
+        let Some(existing) = self.get_for({fk_col}, id{pk_clone}).await? else {{
             return Ok(false);
+        }};
+        // WITH CHECK: pin the immediate parent fk — a changed parent would move the row to
+        // another parent (and possibly another tenant), so a changed fk → 403. On a
+        // path-scoped grandchild the parent fk is NOT path-redundant, so unlike the direct
+        // child it must be pinned here (issue #102 cross-tenant write).
+        if item.{parent_fk} != existing.{parent_fk} {{
+            return Err(Error::forbidden());
         }}
         // Pin the pk to the CHECKED PATH `id`, NOT `item.id` (issue #92): the row
         // authorized above is `id`, so the UPDATE can only ever write that row.
@@ -3328,6 +3340,23 @@ pub(crate) mod tests {
                   "success": { "status": 200, "entity": "Contact", "list": true } }] }
         ] }"#;
 
+    /// Slice out a single generated method body — from its `pub async fn {name}(` to the
+    /// next method (or the end of the emitted block) — so a bound-value assertion is scoped
+    /// to THAT method. An identical `[id.into(), user_id.into()]` in a sibling method would
+    /// otherwise mask a swapped bound order in the method under test (Rule 9). The trailing
+    /// `(` in the signature disambiguates `remove_for` from `remove_for_memberships`.
+    fn method_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let sig = format!("pub async fn {name}(");
+        let start = src
+            .find(&sig)
+            .unwrap_or_else(|| panic!("method `{name}` not found in:\n{src}"));
+        let rest = &src[start..];
+        match rest[sig.len()..].find("\n    pub async fn ") {
+            Some(i) => &rest[..sig.len() + i],
+            None => rest,
+        }
+    }
+
     /// Recognition is transitive (#102): a GRANDCHILD entity (Contact belongs_to
     /// Account belongs_to the tenant Org) is now tenant-owned, so `scoped_methods`
     /// emits its tenant-scoped accessors instead of nothing. Pre-#102 the direct-only
@@ -3398,6 +3427,15 @@ pub(crate) mod tests {
             src.contains("let parent_fk = item.account_id"),
             "the body's immediate parent fk is read out for the CHECK:\n{src}"
         );
+        // Rule 9: pin the bound-value ORDER, not just the SQL text — a swapped
+        // `[user_id.into(), parent_fk.into()]` would bind the parent id where the SQL
+        // expects user_id (and vice-versa), a silent cross-tenant hole the SQL-only
+        // assert above cannot catch. `parent_fk.into()` is unique to this method.
+        assert!(
+            method_body(&src, "create_for_memberships")
+                .contains("[parent_fk.into(), user_id.into()]"),
+            "create binds [parent_fk, user_id] in that exact order:\n{src}"
+        );
     }
 
     /// Task 4 (issue #102): a grandchild's membership-CHECKED update pins the IMMEDIATE
@@ -3424,6 +3462,13 @@ pub(crate) mod tests {
             src.contains("DELETE FROM contacts WHERE id = ? AND id IN (SELECT contacts.id FROM contacts JOIN accounts ON contacts.account_id = accounts.id WHERE accounts.org_id IN (SELECT org_id FROM org_members WHERE user_id = ?))"),
             "grandchild delete scopes through the JOIN chain to the membership set:\n{src}"
         );
+        // Rule 9: pin the bound-value ORDER within THIS method — `get_for_memberships`
+        // binds the same `[id.into(), user_id.into()]`, so scope the assert to the
+        // `remove_for_memberships` body or a swap here would pass on the sibling's copy.
+        assert!(
+            method_body(&src, "remove_for_memberships").contains("[id.into(), user_id.into()]"),
+            "remove_for_memberships binds [id, user_id] in that exact order:\n{src}"
+        );
     }
 
     /// Task 4 (issue #102): the PATH-SCOPED writes (`remove_for`/`update_for`) of a
@@ -3438,14 +3483,49 @@ pub(crate) mod tests {
             src.contains("DELETE FROM contacts WHERE id = ? AND id IN (SELECT contacts.id FROM contacts JOIN accounts ON contacts.account_id = accounts.id WHERE accounts.org_id = ?)"),
             "path-scoped remove_for scopes on the qualified tenant col via the JOIN:\n{src}"
         );
+        // Rule 9: pin the bound-value ORDER within the path-scoped `remove_for` — the
+        // transitive `get_for` binds the same `[id.into(), org_id.into()]`, so scope the
+        // assert to the `remove_for` body or a swap here would pass on the sibling's copy.
         assert!(
-            src.contains("if self.get_for(org_id, id).await?.is_none()"),
-            "path-scoped update_for loads through the transitive get_for:\n{src}"
+            method_body(&src, "remove_for").contains("[id.into(), org_id.into()]"),
+            "path-scoped remove_for binds [id, org_id] in that exact order:\n{src}"
+        );
+        assert!(
+            src.contains("let Some(existing) = self.get_for(org_id, id).await? else"),
+            "path-scoped update_for loads the existing row through the transitive get_for:\n{src}"
         );
         // The grandchild must NEVER reference a direct tenant-fk column that doesn't exist.
         assert!(
             !src.contains("contact::Column::OrgId") && !src.contains("Column::OrgId"),
             "a grandchild has no direct org_id column — must not reference it:\n{src}"
+        );
+    }
+
+    /// FIX 1 / issue #102 (cross-tenant WRITE): the PATH-SCOPED transitive `update_for`
+    /// of a grandchild mounted UNDER THE TENANT (`/orgs/{org_id}/contacts/{id}`) must pin
+    /// the immediate parent fk. The path carries `org_id`, not `account_id`, so
+    /// `account_id` stays client-controllable and `active_sets` emits `account_id:
+    /// Set(item.account_id)` unpinned — without this guard a member of org A could
+    /// `PUT /orgs/{A}/contacts/{id}` with body `account_id = <an account in org B>` to
+    /// relocate the row into org B. Under-tenant → PathScoped → NO membership writes are
+    /// emitted, so the guard string can ONLY come from the path-scoped `update_for`: this
+    /// test fails outright if the pin is dropped (it would otherwise hide behind the
+    /// membership branch's identical guard on a flat design).
+    #[test]
+    fn path_scoped_transitive_update_for_pins_parent_fk() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_UNDER_TENANT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        // Sanity: path-scoped → the membership-checked writes (which ALSO pin the parent
+        // fk) are not emitted, so the guard asserted below is unambiguously the one under
+        // test — the path-scoped `update_for`.
+        assert!(
+            !src.contains("create_for_memberships"),
+            "an under-tenant grandchild is PathScoped → no membership writes:\n{src}"
+        );
+        assert!(
+            method_body(&src, "update_for").contains("if item.account_id != existing.account_id"),
+            "path-scoped transitive update_for must pin the immediate parent fk to block a \
+             cross-tenant relocation (issue #102):\n{src}"
         );
     }
 
