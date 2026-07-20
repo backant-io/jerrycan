@@ -118,6 +118,38 @@ pub fn resolver_rs(design: &Design) -> String {
     )
 }
 
+/// The design's broadcast + presence topics as an INLINE builder-method chain
+/// (`.broadcast("x", jerrycan::realtime::TopicScope::Auth).presence("y", …)`), for
+/// callers that splice topic declarations onto a `Realtime::new(db)` on a single
+/// line — namely the route TestApp harness (testgen), whose realtime handlers may
+/// publish to these topics and would otherwise hit JC0404 (undeclared topic) on a
+/// bare `Realtime::new` (issue #84). The `.broadcast`/`.presence` calls and their
+/// scopes match `wiring_rs` exactly. Changes channels are omitted: they are
+/// Postgres-only (never exercised by a sqlite TestApp) and are not
+/// `RealtimeHandle::publish` targets. Empty when the design declares no realtime
+/// block or no broadcast/presence topics.
+pub fn topic_wiring_inline(design: &Design) -> String {
+    let Some(rt) = design.realtime.as_ref() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for t in &rt.broadcast {
+        out.push_str(&format!(
+            ".broadcast(\"{}\", jerrycan::realtime::TopicScope::{})",
+            t.name,
+            topic_scope(t.scope)
+        ));
+    }
+    for t in &rt.presence {
+        out.push_str(&format!(
+            ".presence(\"{}\", jerrycan::realtime::TopicScope::{})",
+            t.name,
+            topic_scope(t.scope)
+        ));
+    }
+    out
+}
+
 /// The tool-owned `src/lib.rs`: `realtime(db)` chaining builder calls in design
 /// order (changes, then broadcast, then presence) — byte-identical across runs.
 pub fn wiring_rs(design: &Design) -> String {
@@ -311,6 +343,34 @@ mod tests {
         assert!(
             a.contains(r#".presence("editors", jerrycan::realtime::TopicScope::Tenant)"#),
             "{a}"
+        );
+    }
+
+    /// Issue #84: `topic_wiring_inline` emits the design's broadcast + presence
+    /// topics as a single-line builder chain (for the TestApp's `Realtime::new`),
+    /// with the SAME names/scopes as `wiring_rs` and NO changes channels/resolver.
+    #[test]
+    fn topic_wiring_inline_lists_broadcast_and_presence_topics() {
+        let d = rt_design();
+        let inline = topic_wiring_inline(&d);
+        assert_eq!(
+            inline,
+            r#".broadcast("deal_room", jerrycan::realtime::TopicScope::Tenant).presence("editors", jerrycan::realtime::TopicScope::Tenant)"#,
+            "inline chain declares broadcast then presence, no newlines: {inline}"
+        );
+        // Changes channels are not publish targets and need Postgres — omitted.
+        assert!(
+            !inline.contains(".changes("),
+            "no changes channels: {inline}"
+        );
+        assert!(!inline.contains('\n'), "single-line chain: {inline}");
+        // A design with no realtime block wires nothing.
+        let mut plain = d.clone();
+        plain.realtime = None;
+        assert_eq!(
+            topic_wiring_inline(&plain),
+            "",
+            "no realtime block ⇒ no topic wiring"
         );
     }
 

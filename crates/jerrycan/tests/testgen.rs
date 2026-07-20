@@ -1606,7 +1606,10 @@ fn testapp_wires_declared_realtime_and_jobs_extensions() {
         "contract_version": 1,
         "dependencies": ["db", "auth"],
         "auth": { "model": "jwt", "roles": ["admin"] },
-        "realtime": { "broadcast": [{ "name": "feed", "scope": "auth" }] },
+        "realtime": {
+            "broadcast": [{ "name": "feed", "scope": "auth" }],
+            "presence": [{ "name": "cursors", "scope": "auth" }]
+        },
         "jobs": [{ "name": "sweep", "schedule": "0 * * * *", "queue": "default" }],
         "modules": [{
             "name": "posts",
@@ -1621,8 +1624,20 @@ fn testapp_wires_declared_realtime_and_jobs_extensions() {
     .unwrap();
     let generated = testgen::acceptance_rs(&design, &design.modules[0]);
     assert!(
-        generated.contains(".extend(jerrycan::realtime::Realtime::new(db.clone()))"),
+        generated.contains(".extend(jerrycan::realtime::Realtime::new(db.clone())"),
         "realtime design's TestApp must wire the realtime extension (else JC1001): {generated}"
+    );
+    // Issue #84: the realtime extension must also DECLARE the app's topics, so a
+    // handler that publishes to one resolves instead of failing JC0404 (undeclared
+    // topic) on a bare `Realtime::new`. WHY (Rule 9): a probe that 404s on a MISSING
+    // topic tests the harness, not the contract.
+    assert!(
+        generated.contains(".broadcast(\"feed\", jerrycan::realtime::TopicScope::Auth)"),
+        "realtime TestApp must declare the app's broadcast topics (issue #84): {generated}"
+    );
+    assert!(
+        generated.contains(".presence(\"cursors\", jerrycan::realtime::TopicScope::Auth)"),
+        "realtime TestApp must declare the app's presence topics (issue #84): {generated}"
     );
     assert!(
         generated.contains(".extend(jerrycan::jobs::Jobs::postgres(db.clone()))"),

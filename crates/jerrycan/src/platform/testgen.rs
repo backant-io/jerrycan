@@ -743,12 +743,38 @@ fn module_provides_tenant_dep(design: &Design, module: &ModuleDesign) -> bool {
 /// is the simplest correct default. Deterministic: document order, skipping
 /// entity-less modules (which have no migration file).
 fn collect_workspace_migration_items(design: &Design, current: &ModuleDesign, out: &mut String) {
+    // The current module reaches its own files by `..` (from its own tests dir);
+    // every other module by the cross-crate `../../{module}` path.
+    migration_items(
+        design,
+        |name| {
+            if name == current.name {
+                "..".to_string()
+            } else {
+                format!("../../{name}")
+            }
+        },
+        out,
+    );
+}
+
+/// Emit a `jerrycan::db::Migration { … include_str!(…) }` item for every route
+/// module (and subroute) create-tables migration in the design, into `out` (design
+/// order; entity-less modules skipped — they have no migration file). This is the
+/// FULL workspace schema `App::build` applies (mounting.rs aggregates the same set
+/// into `migrations::MIGRATIONS`). `prefix_for(module_name)` yields the
+/// `include_str!` path prefix to that module's `migrations/` dir — it differs by
+/// caller because their harness files sit at different depths: the route TestApp
+/// (testgen) is at `crates/routes/<m>/tests/` (own module `..`, others `../../<m>`),
+/// while the jobs harness (jobsgen) is at `crates/jobs/tests/` (every module
+/// `../../routes/<m>`). Shared so both harnesses migrate the same tables (issue #84).
+pub(crate) fn migration_items(
+    design: &Design,
+    prefix_for: impl Fn(&str) -> String,
+    out: &mut String,
+) {
     for m in &design.modules {
-        let prefix = if m.name == current.name {
-            "..".to_string()
-        } else {
-            format!("../../{}", m.name)
-        };
+        let prefix = prefix_for(&m.name);
         let m_snake = m.name.replace('-', "_");
         if !m.entities.is_empty() {
             out.push_str(&format!(
@@ -1369,11 +1395,17 @@ fn extension_wiring(design: &Design) -> (String, String) {
         extends.push_str(".extend(jerrycan::jobs::Jobs::postgres(db.clone()))");
     }
     if design.wants_realtime() {
-        // Resolves `Dep<RealtimeHandle>` for realtime handlers (no JC1001). The
-        // base extension is enough for the harness — stub probes never publish, so
-        // the design's channels (wired in the realtime crate at serve time) aren't
-        // needed here.
-        extends.push_str(".extend(jerrycan::realtime::Realtime::new(db.clone()))");
+        // Resolves `Dep<RealtimeHandle>` for realtime handlers (no JC1001) AND
+        // declares the app's broadcast/presence topics on the extension — the SAME
+        // topics the realtime crate wires (realtimegen::wiring_rs). Without them a
+        // handler that publishes to a topic hits JC0404 (undeclared topic) on a bare
+        // `Realtime::new`, so the probe is un-greenable (issue #84). Changes channels
+        // are omitted: they need Postgres (never exercised by a sqlite TestApp) and
+        // are not `RealtimeHandle::publish` targets.
+        extends.push_str(&format!(
+            ".extend(jerrycan::realtime::Realtime::new(db.clone()){})",
+            super::realtimegen::topic_wiring_inline(design)
+        ));
     }
     if extends.is_empty() {
         return (String::new(), String::new());
