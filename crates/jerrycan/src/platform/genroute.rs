@@ -1023,6 +1023,34 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
     out
 }
 
+/// Like `active_sets`, but the column named `pin_col` is written from `pin_expr`
+/// (a path-verified value) instead of `item.{col}`. Used to pin the tenant fk to
+/// the PATH param in path-scoped writes so the body cannot relocate the row (#125).
+fn active_sets_pinning(e: &Entity, with_id: bool, pin_col: &str, pin_expr: &str) -> String {
+    let indent = "            ";
+    let mut out = String::new();
+    for name in model_field_names(e) {
+        if name == "id" {
+            if !with_id {
+                continue;
+            }
+            if declared_id(e).is_some() {
+                out.push_str(&format!("{indent}id: Set(item.id),\n"));
+            } else {
+                out.push_str(&format!("{indent}id: sea_orm::ActiveValue::NotSet,\n"));
+            }
+        } else {
+            let ident = rust_ident(&name);
+            if name == pin_col {
+                out.push_str(&format!("{indent}{ident}: Set({pin_expr}),\n"));
+            } else {
+                out.push_str(&format!("{indent}{ident}: Set(item.{ident}),\n"));
+            }
+        }
+    }
+    out
+}
+
 /// True when a tenant-owned entity's routes are FLAT (MembershipSet) — none of its
 /// endpoints carry the tenant fk in the path (the Supabase-migrated shape, and any
 /// authored flat design). Such an entity takes the tenant fk from the request BODY on
@@ -1482,6 +1510,15 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     }}"#
         )
     };
+    // The DIRECT path-scoped `update_for` pins the tenant fk to the PATH param
+    // (`{fk_col}`), never `item.{fk_col}`, so the request body cannot relocate the row
+    // into another tenant (issue #125). The row is already authorized against the path
+    // tenant, so writing the same fk back is a no-op on a legitimate request and a
+    // make-impossible relocation on a hostile one — regardless of #82 keeping the fk in
+    // the DTO. Only this direct branch needs it; the transitive branch carries no tenant
+    // fk column on the row (it pins the immediate parent fk instead), and the membership
+    // branches verify the body fk against the caller's set.
+    let update_sets_pinned = active_sets_pinning(e, false, &fk_col, &fk_col);
     let update_for_method = if path.joins.is_empty() {
         format!(
             r#"    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
@@ -1501,7 +1538,7 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
         // body id pointing at another tenant's row must not be reachable here.
         let m = {snake}::ActiveModel {{
             id: Set(id),
-{update_sets}        }};
+{update_sets_pinned}        }};
         match m.update(self.db.conn()).await {{
             Ok(_) => Ok(true),
             Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
@@ -3408,6 +3445,31 @@ pub(crate) mod tests {
         assert!(
             !src.contains(" JOIN "),
             "direct child must never emit a JOIN:\n{src}"
+        );
+    }
+
+    /// Cross-tenant WRITE relocation (issue #125): on a direct path-scoped route
+    /// (`/clubs/{club_id}/books/{id}`) the row is authorized against the PATH tenant,
+    /// but the ActiveModel must also WRITE the tenant fk from the PATH param — never
+    /// from `item.club_id` (the request body). Combined with #82 (the fk is retained
+    /// in the DTO on mount-based nesting), a body `club_id` would let a member of club
+    /// A relocate their row into club B. Pinning the fk to the path param makes that
+    /// relocation impossible regardless of #82.
+    #[test]
+    fn direct_path_scoped_update_for_pins_tenant_fk_to_path_not_body() {
+        let d: Design = serde_json::from_str(CLUBS_TENANCY).unwrap();
+        // Book is the direct path-scoped child (belongs_to the tenant Club, mounted at
+        // `/clubs/{club_id}`) — the same entity the read byte-identity test uses.
+        let src = scoped_methods(d.find_entity("Book").unwrap(), &d);
+        // the path-scoped update_for's ActiveModel must Set the tenant fk from the `club_id`
+        // PATH PARAM, never from `item.club_id` (issue #125 cross-tenant relocation).
+        assert!(
+            src.contains("club_id: Set(club_id)"),
+            "path-scoped update_for must pin the tenant fk to the path param; body:\n{src}"
+        );
+        assert!(
+            !src.contains("club_id: Set(item.club_id)"),
+            "path-scoped update_for must NOT write the tenant fk from the request body (#125)"
         );
     }
 
