@@ -1,0 +1,62 @@
+name: Release
+
+# Prebuilt `jerrycan` binaries on every version tag (onboarding spec §4.1:
+# taiki-e matrix). crates.io publishing stays scripts/publish.sh with its
+# fail-fast eval gate — this workflow only attaches binaries + sha256 checksums
+# to the GitHub release, for install.sh and cargo-binstall. Tag AFTER the
+# crates.io publish succeeds, so a binary release can never lead the registry.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+# create-gh-release / upload-rust-binary write release assets; nothing else.
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the workspace version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$tag" != "$ver" ]; then
+            echo "tag v$tag != workspace version $ver" >&2
+            exit 1
+          fi
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Same pin discipline as ci.yml: keep in sync with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.97
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: jerrycan
+          target: ${{ matrix.target }}
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

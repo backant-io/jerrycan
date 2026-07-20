@@ -84,3 +84,10 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+
+# `cargo binstall jerrycan` resolves the prebuilt binary from the GitHub
+# release produced by .github/workflows/release.yml (asset naming is
+# taiki-e/upload-rust-binary-action's default: <bin>-<target>.tar.gz).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
