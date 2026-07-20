@@ -615,19 +615,18 @@ pub fn validate(d: &Design) -> Vec<Question> {
         // repo entity belongs_to the tenancy root, marking it public would expose
         // one tenant's rows to anyone. Flag the contradiction.
         fn check_public_on_tenant_owned(
+            d: &Design,
             m: &ModuleDesign,
             ptr: &str,
-            tenant: &str,
             qs: &mut Vec<Question>,
         ) {
             for (i, ep) in m.endpoints.iter().enumerate() {
+                // Tenant-owned directly OR transitively (#102): `tenant_path` resolves
+                // a grandchild through its parent chain, so a public endpoint on a
+                // deeply-owned entity is flagged too — matching the transitive
+                // ownership the guard/lint recognize.
                 if ep.public
-                    && endpoint_repo_entity(m, ep).is_some_and(|name| {
-                        m.entities
-                            .iter()
-                            .find(|e| e.name == name)
-                            .is_some_and(|e| e.belongs_to.iter().any(|b| b.entity == tenant))
-                    })
+                    && endpoint_repo_entity(m, ep).is_some_and(|name| d.tenant_path(name).is_some())
                 {
                     qs.push(q(
                         format!("{ptr}/endpoints/{i}"),
@@ -636,11 +635,11 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 }
             }
             for (i, sub) in m.subroutes.iter().enumerate() {
-                check_public_on_tenant_owned(sub, &format!("{ptr}/subroutes/{i}"), tenant, qs);
+                check_public_on_tenant_owned(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
             }
         }
         for (i, m) in d.modules.iter().enumerate() {
-            check_public_on_tenant_owned(m, &format!("/modules/{i}"), &tenancy.entity, &mut qs);
+            check_public_on_tenant_owned(d, m, &format!("/modules/{i}"), &mut qs);
         }
 
         // JC0545 (#102): an entity that reaches the tenant through TWO or more

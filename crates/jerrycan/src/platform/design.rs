@@ -520,7 +520,81 @@ pub(crate) enum TenantShape {
     None,
 }
 
+/// One handler file the JL0006 scan must read, resolved to its REAL on-disk path
+/// (issue #103). A top-level module lives at `crates/routes/{name}/src/handlers.rs`;
+/// a subroute nests under its parent as `.../src/subroutes/{seg}/handlers.rs` (the
+/// same layout the scaffold writes, `-`→`_` per segment). The old lint assumed the
+/// flat path `crates/routes/{module}/src/handlers.rs` even for a nested/transitive
+/// module, so a grandchild handler resolved to a nonexistent file and was silently
+/// skipped — the hole that let the #102 transitive leak ship unseen. Carries the
+/// ownership wording so the scan emits the right leak class (tenant vs per-user)
+/// and the `is_flat` flag that decides whether a bare `repo.insert` is a leak (#94).
+pub struct HandlerRef {
+    /// Path relative to the app root, e.g. `crates/routes/accounts/src/subroutes/contacts/handlers.rs`.
+    pub rel_path: String,
+    /// True when the owning module is a FLAT (membership-set) tenant module, where a
+    /// bare `repo.insert` reads the tenant fk from the BODY and so is a write leak (#94).
+    pub is_flat: bool,
+    /// "a tenant-owned" / "an identity-owned" — the ownership class in the message.
+    pub owned_desc: &'static str,
+    /// "another tenant's rows" / "another user's rows" — what an unscoped call leaks.
+    pub leak_desc: &'static str,
+    /// The registered fix text (the scoped accessors to call instead).
+    pub suggestion: String,
+}
+
+/// The JL0006 fix text for a TENANT-owned handler (both route shapes, issue #94):
+/// a FLAT handler cannot call the path-scoped `*_for` accessors (there is no
+/// tenant-id arg), so the membership-set methods are named too.
+pub(crate) const TENANT_SCOPED_SUGGESTION: &str = "call a scoped accessor instead — path-scoped routes: all_for/get_for/remove_for with the tenant id; flat (membership-set) routes: all_for_memberships/get_for_memberships/update_for_memberships/remove_for_memberships (and create_for_memberships) with the session user's id (_user.0.id)";
+
 impl Design {
+    /// The tenant-owned handler files the JL0006 scan must read, one per module or
+    /// subroute that owns ≥1 tenant-owned entity (directly OR transitively, #102),
+    /// each at its REAL nested on-disk path (issue #103 — see [`HandlerRef`]). Empty
+    /// when there is no tenancy. `is_flat` is OR-ed over the module's owned entities.
+    pub fn tenant_owned_handlers(&self) -> Vec<HandlerRef> {
+        let mut out = Vec::new();
+        if self.tenancy.is_none() {
+            return out;
+        }
+        for m in &self.modules {
+            self.collect_owned_handlers(&format!("crates/routes/{}/src", m.name), m, &mut out);
+        }
+        out
+    }
+
+    /// Walk one module and its subroutes, emitting a [`HandlerRef`] for each node
+    /// that owns a tenant-owned entity. `src_rel` is the node's on-disk src dir,
+    /// extended by `/subroutes/{seg}` per nesting level exactly as the scaffold
+    /// (and the JL0002/JL0007 walks) nest — so the path always points at a real file.
+    fn collect_owned_handlers(&self, src_rel: &str, m: &ModuleDesign, out: &mut Vec<HandlerRef>) {
+        let owned: Vec<&Entity> = m
+            .entities
+            .iter()
+            .filter(|e| self.tenant_path(&e.name).is_some())
+            .collect();
+        if !owned.is_empty() {
+            let is_flat = owned
+                .iter()
+                .any(|e| super::genroute::entity_is_flat_tenant_owned(e, self));
+            out.push(HandlerRef {
+                rel_path: format!("{src_rel}/handlers.rs"),
+                is_flat,
+                owned_desc: "a tenant-owned",
+                leak_desc: "another tenant's rows",
+                suggestion: TENANT_SCOPED_SUGGESTION.to_string(),
+            });
+        }
+        for sub in &m.subroutes {
+            self.collect_owned_handlers(
+                &format!("{src_rel}/subroutes/{}", sub.name.replace('-', "_")),
+                sub,
+                out,
+            );
+        }
+    }
+
     /// The normalized app-level mount prefix: the `base_path` override, or `""`
     /// when absent / `/` / empty (a no-op). Prepended to every module and bucket
     /// mount at app assembly; health/metrics are unaffected. Validation

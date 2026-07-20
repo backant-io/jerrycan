@@ -37,3 +37,4 @@ the cause + fix for any of them.
 | JL0004 | Mutating route unguarded in an auth design |
 | JL0006 | Cross-tenant data access — a tenant-owned handler used an unscoped repo method (use `all_for`/`get_for`/`remove_for`) |
 | JL0007 | Request-boundary escape — agent-owned module code calls process/fs/net directly (use framework I/O; opt out per line with `// jerrycan:allow JL0007`) |
+| JL0008 | A tenant-owned handler could not be scanned for scoping (missing, unreadable, or not valid Rust) — fix the file so `jerrycan check` can verify tenant scoping |

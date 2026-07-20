@@ -5,11 +5,12 @@
 //! JL0004 an auth design leaves a mutating route unguarded
 //! JL0006 a tenant-owned handler calls an UNSCOPED repo method (cross-tenant read)
 //! JL0007 agent-owned module code reaches outside the request boundary (process/fs/net)
+//! JL0008 a tenant-owned handler could not be read/parsed, so its scoping is unverified
 
 use super::checkpipe::Diagnostic;
-use super::design::{Design, HttpMethod, ModuleDesign};
+use super::design::{Design, HandlerRef, HttpMethod, ModuleDesign};
 use super::mounting;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 fn d(
@@ -117,128 +118,186 @@ fn lint_boundary_escapes(root: &Path, design: &Design, out: &mut Vec<Diagnostic>
 }
 
 /// JL0006: a handler in an OWNER-SCOPED module calls an UNSCOPED repo method
-/// (`repo.all()`, `repo.get(`, `repo.remove(`, `repo.update(`, and — on a FLAT
-/// tenant module only — `repo.insert(`). Those read/write/delete across ALL owners,
-/// leaking rows:
-///   - a TENANT-owned module (an entity belongs_to the tenancy entity) → another
-///     tenant's rows;
+/// (`repo.all()`, `repo.get(…)`, `repo.remove(…)`, `repo.update(…)`, and — on a
+/// FLAT tenant module only — `repo.insert(…)`). Those read/write/delete across ALL
+/// owners, leaking rows:
+///   - a TENANT-owned module — an entity that resolves to a tenant path directly OR
+///     transitively (#102: a grandchild through a parent chain) → another tenant's
+///     rows;
 ///   - a per-user IDENTITY-owned module (#79 — an entity belongs_to the auth
 ///     identity, not tenant-scoped) → another user's rows. For these the unscoped
 ///     methods are additionally NOT generated (genroute make-impossible), so this
 ///     lint is belt-and-suspenders: it gives a precise, actionable fix instead of a
 ///     raw `no method all` compile error.
 ///
-/// `repo.insert(` is flagged ONLY on a FLAT (membership-set) tenant module (#94):
+/// Detection is AST-based (`syn::parse_file` + a `Visit` walk), not a substring
+/// scan (issue #103): the substring scan missed a call split across lines
+/// (`repo\n  .all()`) and could be fooled by a rename/alias, and — worse — it built
+/// a FLAT path (`crates/routes/{module}/src/handlers.rs`) for every module, so a
+/// NESTED or transitively-owned handler resolved to a nonexistent file and was
+/// silently skipped (the hole that let the #102 leak ship). The path now comes from
+/// [`Design::tenant_owned_handlers`], which nests `subroutes/{seg}` exactly as the
+/// scaffold writes them. A mention of `repo.all()` in a COMMENT is not a call, so
+/// the AST never flags it; the `*_for`/`*_for_memberships` scoped accessors are
+/// excluded for free (they are different method idents).
+///
+/// `repo.insert(…)` is flagged ONLY on a FLAT (membership-set) tenant module (#94):
 /// there the create reads the tenant fk from the request BODY, so a bare insert
 /// trusts it (the create leak); the fix is `create_for_memberships`. A path-scoped
 /// create pins the fk to the verified tenant, and a per-user create gets the
 /// server-injected identity fk — both safe — so insert is not flagged there.
 ///
-/// The scoped accessors (`all_for`/`get_for`/`remove_for`) are excluded by the `(`
-/// anchor (e.g. `repo.get_for(` has `_` not `(` after `get`). A line ending in
-/// `// jerrycan:allow JL0006` is an explicit, line-scoped opt-out (e.g. a create
-/// that pins the fk to a membership-verified value) — same hatch JL0007 offers.
+/// A line ending in `// jerrycan:allow JL0006` (the call's own source line) is an
+/// explicit, line-scoped opt-out (e.g. a create that pins the fk to a
+/// membership-verified value) — same hatch JL0007 offers.
 ///
 /// We scan ONLY the agent-owned handlers.rs (where the call happens), never
 /// repo.rs: the generated repo's own scoped methods call `Entity::...` directly,
 /// not `self.all()`, so repo.rs never legitimately matches — and scanning it
 /// would flag the unscoped methods the scoped ones are meant to replace.
+///
+/// FAIL LOUD: a tenant-owned handler that is missing, unreadable, or does NOT parse
+/// becomes a [`JL0008`](scan_unscoped) diagnostic — never a silent skip, which is
+/// exactly how #103 hid a leak. Per-user identity handlers are not part of that
+/// hole and are skipped quietly when absent (memory-mode designs have no files).
 fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diagnostic>) {
-    // Tenant-owned modules leak ACROSS TENANTS; a per-user identity-owned module
-    // (#79) leaks ACROSS USERS. An entity is one or the other, so scan the tenant
-    // set first and skip any module it already covered. A tenant module is FLAT when
-    // it owns a membership-set entity — only there is a bare `repo.insert` a create
-    // leak (#94: the flat create reads the tenant fk from the BODY). A path-scoped
-    // create pins the fk to the verified tenant, so its insert is not flagged.
-    let mut tenant_modules: BTreeMap<&str, bool> = BTreeMap::new();
-    for (module, entity) in design.tenant_owned() {
-        let is_flat = design
-            .modules
-            .iter()
-            .find(|m| m.name == module)
-            .and_then(|m| m.entities.iter().find(|e| e.name == entity))
-            .is_some_and(|e| super::genroute::entity_is_flat_tenant_owned(e, design));
-        let flat = tenant_modules.entry(module).or_insert(false);
-        *flat = *flat || is_flat;
+    // Tenant-owned handlers (transitive #102, nested-path-aware #103) scan LOUD.
+    let tenant = design.tenant_owned_handlers();
+    let covered: BTreeSet<&str> = tenant.iter().map(|h| h.rel_path.as_str()).collect();
+    for h in &tenant {
+        scan_unscoped(root, h, true, out);
     }
-    for (&module, &is_flat) in &tenant_modules {
-        scan_unscoped(
-            root,
-            module,
-            "a tenant-owned",
-            "another tenant's rows",
-            // One message, both route shapes (issue #94): a FLAT handler cannot call
-            // the path-scoped `*_for` accessors (there is no tenant-id arg), so the
-            // membership-set methods are named too.
-            "call a scoped accessor instead — path-scoped routes: all_for/get_for/remove_for with the tenant id; flat (membership-set) routes: all_for_memberships/get_for_memberships/update_for_memberships/remove_for_memberships (and create_for_memberships) with the session user's id (_user.0.id)",
-            is_flat,
-            out,
-        );
-    }
+    // Per-user IDENTITY-owned modules (#79) leak ACROSS USERS. Top-level only, flat
+    // path, NOT fail-loud (not part of the #103 tenant hole). Skip any module a
+    // tenant handler already covers at the same path.
     for module in identity_owned_modules(design) {
-        if tenant_modules.contains_key(module) {
+        let rel = format!("crates/routes/{module}/src/handlers.rs");
+        if covered.contains(rel.as_str()) {
             continue;
         }
-        scan_unscoped(
-            root,
-            module,
-            "an identity-owned",
-            "another user's rows",
-            "call the owner-scoped accessor (all_for/get_for/remove_for) with the session user's id (_user.0.id)",
-            false,
-            out,
-        );
+        let h = HandlerRef {
+            rel_path: rel,
+            is_flat: false,
+            owned_desc: "an identity-owned",
+            leak_desc: "another user's rows",
+            suggestion: "call the owner-scoped accessor (all_for/get_for/remove_for) with the session user's id (_user.0.id)".to_string(),
+        };
+        scan_unscoped(root, &h, false, out);
     }
 }
 
-/// Scan one top-level module's `handlers.rs` for the unscoped repo patterns,
-/// pushing a JL0006 per hit with the caller-supplied ownership wording.
-fn scan_unscoped(
-    root: &Path,
-    module: &str,
-    owned_desc: &str,
-    leak_desc: &str,
-    suggestion: &str,
-    flag_insert: bool,
-    out: &mut Vec<Diagnostic>,
-) {
-    // `repo.all()` takes no args; the others anchor on `(` so `*_for(` is excluded.
-    // `repo.insert(` is a CREATE leak only on a FLAT tenant module (#94: the flat
-    // create takes the tenant fk from the BODY, so a bare insert trusts it) — a
-    // path-scoped create pins the fk to the verified tenant and a per-user create
-    // gets the server-injected identity fk, both safe — so it is flagged only when
-    // `flag_insert`.
-    const BASE: [&str; 4] = ["repo.all()", "repo.get(", "repo.remove(", "repo.update("];
-    const ALLOW: &str = "// jerrycan:allow JL0006";
-    let rel = format!("crates/routes/{module}/src/handlers.rs");
-    let Ok(content) = std::fs::read_to_string(root.join(&rel)) else {
-        return;
-    };
-    for (i, line) in content.lines().enumerate() {
-        let hit = BASE
-            .iter()
-            .copied()
-            .find(|&p| line.contains(p))
-            .or_else(|| (flag_insert && line.contains("repo.insert(")).then_some("repo.insert("));
-        let Some(hit) = hit else {
-            continue;
-        };
-        // A line-scoped, explicit opt-out — e.g. a create that pins the tenant fk to a
-        // membership-verified value before inserting is safe despite the bare call.
-        // Mirrors JL0007's allow-hatch.
-        if line.trim_end().ends_with(ALLOW) {
-            continue;
+/// Read one handler file and flag every unscoped repo call in it. `fail_loud`
+/// (tenant-owned handlers) turns a missing, unreadable, or unparseable file into a
+/// LOUD JL0008 instead of a silent skip (issue #103) — a handler whose scoping
+/// cannot be checked is exactly where an unscoped cross-tenant call would hide.
+fn scan_unscoped(root: &Path, h: &HandlerRef, fail_loud: bool, out: &mut Vec<Diagnostic>) {
+    let content = match std::fs::read_to_string(root.join(&h.rel_path)) {
+        Ok(c) => c,
+        Err(_) => {
+            if fail_loud {
+                out.push(jl0008(&h.rel_path));
+            }
+            return;
         }
+    };
+    let ast = match syn::parse_file(&content) {
+        Ok(f) => f,
+        Err(_) => {
+            if fail_loud {
+                out.push(jl0008(&h.rel_path));
+            }
+            return;
+        }
+    };
+    let src: Vec<&str> = content.lines().collect();
+    let mut v = UnscopedVisitor {
+        hits: Vec::new(),
+        flag_insert: h.is_flat,
+        src: &src,
+    };
+    syn::visit::Visit::visit_file(&mut v, &ast);
+    for (line, call) in v.hits {
         out.push(d(
             "JL0006",
-            Some(rel.clone()),
-            Some(i as u64 + 1),
+            Some(h.rel_path.clone()),
+            Some(line as u64),
             format!(
-                "handler in module `{module}` calls the unscoped `{hit}` on {owned_desc} repo — it can read, write, or delete {leak_desc}"
+                "handler calls the unscoped `repo.{call}` on {} repo — it can read, write, or delete {}",
+                h.owned_desc, h.leak_desc
             ),
-            suggestion,
+            &h.suggestion,
             "jerrycan docs database",
         ));
+    }
+}
+
+/// JL0008: a tenant-owned handler could not be read/parsed, so its scoping is
+/// UNVERIFIED. Loud on purpose — the #103 regression was a silent skip in exactly
+/// this spot.
+fn jl0008(rel: &str) -> Diagnostic {
+    d(
+        "JL0008",
+        Some(rel.to_string()),
+        None,
+        format!(
+            "tenant-owned handler `{rel}` could not be scanned for scoping — it is missing, unreadable, or not valid Rust, so an unscoped cross-tenant call could pass unseen"
+        ),
+        "ensure the handler file exists and compiles (run `cargo check`); a scaffold is generated parseable — if you hand-edited it, fix the syntax so `jerrycan check` can verify tenant scoping",
+        "jerrycan docs database",
+    )
+}
+
+/// True when `expr` is (syntactically) the `repo` binding — a bare `repo` path,
+/// possibly wrapped in parens/refs/groups. A genuinely aliased binding falls
+/// through to no-hit (acceptable: the steering trains `repo.` usage).
+fn receiver_is_repo(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Path(p) => p.path.is_ident("repo"),
+        syn::Expr::Paren(p) => receiver_is_repo(&p.expr),
+        syn::Expr::Group(g) => receiver_is_repo(&g.expr),
+        syn::Expr::Reference(r) => receiver_is_repo(&r.expr),
+        _ => false,
+    }
+}
+
+/// Walks a parsed handler file for `repo.<unscoped>(…)` calls. Exact method-name
+/// matching excludes every `*_for`/`*_for_memberships` scoped accessor for free
+/// (they are different idents). `insert` is flagged only on a FLAT tenant module
+/// (#94). Each hit records the call's real source line (via `span-locations`), and
+/// a `// jerrycan:allow JL0006` on that line is an explicit, line-scoped opt-out.
+struct UnscopedVisitor<'a> {
+    hits: Vec<(usize, &'static str)>,
+    flag_insert: bool,
+    src: &'a [&'a str],
+}
+
+impl<'ast> syn::visit::Visit<'ast> for UnscopedVisitor<'_> {
+    fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+        let name = c.method.to_string();
+        // `all` takes no args (the scoped accessors carry the owner id); the others
+        // match on the exact ident, so `all_for`/`get_for`/… never match.
+        let display = match name.as_str() {
+            "all" if c.args.is_empty() => Some("all()"),
+            "get" => Some("get(...)"),
+            "remove" => Some("remove(...)"),
+            "update" => Some("update(...)"),
+            "insert" if self.flag_insert => Some("insert(...)"),
+            _ => None,
+        };
+        if let Some(display) = display
+            && receiver_is_repo(&c.receiver)
+        {
+            let line = c.method.span().start().line;
+            let allowed = self
+                .src
+                .get(line.saturating_sub(1))
+                .is_some_and(|l| l.trim_end().ends_with("// jerrycan:allow JL0006"));
+            if !allowed {
+                self.hits.push((line, display));
+            }
+        }
+        // Recurse so a chain (`repo.foo().all()`) and nested calls are all visited.
+        syn::visit::visit_expr_method_call(self, c);
     }
 }
 
@@ -642,6 +701,139 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
         assert!(
             jl0006_only(root, &per_user_design()).is_empty(),
             "a per-user create insert is server-scoped — not a JL0006 leak"
+        );
+    }
+
+    // ---- JL0006 AST rewrite + nested paths + JL0008 (issue #103) ---------
+
+    /// Org (tenant) → Account (belongs_to Org) as the top-level `accounts` module,
+    /// with Contact (belongs_to Account) as a SUBROUTE of accounts. Contact is thus
+    /// transitively tenant-owned (#102) and its handler nests on disk at
+    /// `crates/routes/accounts/src/subroutes/contacts/handlers.rs` — the path the old
+    /// flat-path scan never built (it looked at `crates/routes/contacts/src/…`, a
+    /// nonexistent file) and so silently skipped (the #103 hole).
+    fn nested_grandchild_design() -> Design {
+        serde_json::from_value(serde_json::json!({
+            "name": "org-api",
+            "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "orgs",
+                  "entities": [{ "name": "Org", "fields": [{ "name": "id", "type": "integer" }] }],
+                  "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                      "success": { "status": 200, "entity": "Org", "list": true } }] },
+                { "name": "accounts",
+                  "entities": [{ "name": "Account",
+                      "belongs_to": [{ "entity": "Org" }],
+                      "fields": [{ "name": "id", "type": "integer" }] }],
+                  "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/",
+                      "success": { "status": 200, "entity": "Account", "list": true } }],
+                  "subroutes": [
+                    { "name": "contacts",
+                      "entities": [{ "name": "Contact",
+                          "belongs_to": [{ "entity": "Account" }],
+                          "fields": [{ "name": "id", "type": "integer" }] }],
+                      "endpoints": [{ "operation_id": "show_contact", "method": "GET", "path": "/{id}",
+                          "success": { "status": 200, "entity": "Contact" } }] }
+                  ] }
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// JL0006 reaches a bare unscoped `repo.get(id)` in a NESTED (grandchild)
+    /// handler at its REAL on-disk path. WHY (Rule 9, #103): the old scan built a
+    /// FLAT `crates/routes/{module}/src/handlers.rs` for every module, so a nested
+    /// or transitively-owned handler resolved to a missing file and was skipped in
+    /// silence — the exact gap that let the #102 transitive leak ship undetected.
+    #[test]
+    fn jl0006_fires_on_unscoped_call_in_nested_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = "crates/routes/accounts/src/subroutes/contacts/handlers.rs";
+        let handlers = root.join(rel);
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn show_contact(repo: Dep<ContactRepo>) -> Result<()> {\n    let _ = repo.get(id).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        // The parent `accounts` handler is present and scoped, so its own scan is
+        // clean (and no JL0008 for a missing file muddies the result).
+        std::fs::write(
+            root.join("crates/routes/accounts/src/handlers.rs"),
+            "async fn list_accounts(repo: Dep<AccountRepo>) -> Result<()> {\n    let _ = repo.all_for(_tenant.id()).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+
+        let diags = run(root, &nested_grandchild_design());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == "JL0006" && d.file.as_deref() == Some(rel) && d.line == Some(2)),
+            "JL0006 must reach the NESTED grandchild handler (was silently skipped, #103): {diags:?}"
+        );
+    }
+
+    /// Run the full lint pass over a V1_FULL `leads` (FLAT tenant-owned) handler
+    /// whose body is `body` wrapped in a handler fn. Reuses the tenant fixture so
+    /// the tenant-owned scan (and its fail-loud JL0008) is exercised.
+    fn lints_for_leads_body(body: &str) -> Vec<Diagnostic> {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/leads/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            format!(
+                "async fn h(repo: Dep<LeadRepo>) -> Result<()> {{\n    {body}\n    Ok(())\n}}\n"
+            ),
+        )
+        .unwrap();
+        run(root, &tenant_design())
+    }
+
+    /// A mention of `repo.all()` in a COMMENT is not a call — the AST walk never
+    /// flags it, and the real call on the next line (`all_for_memberships`, a scoped
+    /// accessor) is clean. WHY (Rule 9): the old substring scan would have flagged
+    /// the comment; AST detection is what closes that false-positive class.
+    #[test]
+    fn jl0006_ast_ignores_repo_all_in_a_comment() {
+        let diags = lints_for_leads_body(
+            "// repo.all() is the unscoped call we must avoid\n    let _x = repo.all_for_memberships(u).await?;",
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == "JL0006"),
+            "a mention in a comment is not a call: {diags:?}"
+        );
+    }
+
+    /// A call split across lines (`repo\n .all()`) is caught — the substring scan
+    /// missed it because `repo.all()` never appeared contiguously on one line. WHY
+    /// (Rule 9, #103): multi-line chains are idiomatic Rust, so a scan that only
+    /// matched one-line spellings left a real evasion path open.
+    #[test]
+    fn jl0006_ast_catches_multiline_chain() {
+        let diags = lints_for_leads_body("let _x = repo\n        .all()\n        .await?;");
+        assert!(
+            diags.iter().any(|d| d.code == "JL0006"),
+            "multi-line chain must be caught (substring scan missed it): {diags:?}"
+        );
+    }
+
+    /// A tenant-owned handler that does NOT parse becomes a LOUD JL0008 — never a
+    /// silent skip. WHY (Rule 9/12, #103): a handler whose scoping cannot be checked
+    /// is exactly where an unscoped cross-tenant call would hide; failing loud makes
+    /// `jerrycan check` surface it instead of passing over it.
+    #[test]
+    fn jl0008_when_tenant_owned_handler_unparseable() {
+        let diags = lints_for_leads_body("fn broken( {{{ this does not parse");
+        assert!(
+            diags.iter().any(|d| d.code == "JL0008"
+                && d.file.as_deref() == Some("crates/routes/leads/src/handlers.rs")),
+            "unparseable tenant-owned handler → loud JL0008, never a silent skip: {diags:?}"
         );
     }
 

@@ -18,7 +18,7 @@ readme = "README.md"
 default = ["cli"]
 # The CLI always carries db (for `jerrycan db migrate`) + tokio (to run the
 # async migrator); generated apps still choose their own features freely.
-cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tokio", "dep:sea-query", "dep:sqlparser", "dep:sha2", "db"]
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tokio", "dep:sea-query", "dep:sqlparser", "dep:sha2", "dep:syn", "dep:proc-macro2", "db"]
 db = ["dep:jerrycan-db"]
 validate = ["dep:jerrycan-validate"]
 auth = ["dep:jerrycan-auth"]
@@ -69,6 +69,12 @@ clap = { version = "4", features = ["derive"], optional = true }
 sea-query = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+# CLI-only: the JL0006 lint parses each tenant-owned handlers.rs into an AST and
+# walks it for unscoped repo calls (issue #103 — a substring scan missed multi-line
+# chains and never reached nested handlers). `span-locations` gives each call its
+# real source line for the diagnostic and the `// jerrycan:allow JL0006` hatch.
+syn = { version = "2", features = ["full", "visit"], optional = true }
+proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }

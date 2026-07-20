@@ -1397,11 +1397,13 @@ dependencies = [
  "jerrycan-realtime",
  "jerrycan-storage",
  "jerrycan-validate",
+ "proc-macro2",
  "sea-query",
  "serde",
  "serde_json",
  "sha2",
  "sqlparser",
+ "syn",
  "tempfile",
  "tokio",
 ]

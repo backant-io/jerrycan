@@ -188,6 +188,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs errors",
     },
     CodeInfo {
+        code: "JL0008",
+        title: "tenant-owned handler could not be scanned for scoping",
+        cause: "JL0006 must read and parse each tenant-owned module's handlers.rs to verify it uses the scoped accessors, but this file is missing, unreadable, or not valid Rust — so scoping could not be checked and an unscoped cross-tenant call could pass unseen",
+        fix: "ensure the handler file exists and compiles (run `cargo check`); a scaffold is generated parseable — if you hand-edited it, fix the syntax so `jerrycan check` can verify tenant scoping",
+        doc: "jerrycan docs database",
+    },
+    CodeInfo {
         code: "JC0540",
         title: "tenant entity is the auth identity",
         cause: "the design's tenancy.entity names the auth identity entity — its derived foreign key column is `user_id`, the same column the generated membership table already uses for the authenticated user, so a user cannot be their own tenant org and the auth_0001 migration would fail with `duplicate column name: user_id`",
