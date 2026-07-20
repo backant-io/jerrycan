@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.5.1 — 2026-07-20
+
+Security patch. v0.5.0 made tenancy correct-by-construction for **direct** tenant
+children only; multi-hop tenant graphs (`Contact → Account → Org`, `Message →
+Channel → Workspace` — the common CRM/chat shape) silently escaped every defense.
+0.5.1 makes tenant ownership **transitive**: an entity is tenant-owned iff a
+`belongs_to` chain reaches the tenant, at any depth. The framework's Rust API is
+additive only; apps with no transitive tenant graph generate **byte-identical**
+output.
+
+### Security & scoping
+- **Transitive tenant ownership (closes #102).** A new resolver walks the
+  `belongs_to` chain to the tenant; guard, scoped repo methods, lint, and
+  isolation test all key off it. Grandchild+ reads/writes **JOIN up the chain**
+  and apply the same membership filter, so a member of Org A can no longer read
+  or write Org B's contacts/deals. Previously `jerrycan check` was green while the
+  data leaked.
+- **Path-scoped writes pin the tenant fk to the route (closes #125, update half).**
+  A path-scoped `update_for` now writes the tenant/parent fk from the **path**,
+  never the request body, so a body fk cannot relocate a row into another tenant.
+  Transitive writes verify the resolved tenant ∈ the caller's memberships (403).
+- **Ambiguous ownership is a hard error (`JC0545`).** An entity that reaches the
+  tenant through more than one `belongs_to` path (a diamond) fails design
+  validation before any code is generated — jerrycan will not guess which chain
+  defines ownership. This is the one behavior change beyond the fix: a design that
+  previously generated (and silently leaked on the ambiguous path) now fails
+  `check` and must collapse to a single path.
+
+### Tooling
+- **JL0006 is now AST-based (closes #103).** The unscoped-repo-call lint parses
+  handlers with `syn` instead of a substring scan, and resolves the **real nested
+  handler paths** — previously it silently skipped subroute/grandchild handlers,
+  which is how the #102 leak shipped past `check`. It also catches unscoped calls
+  inside macro bodies (e.g. `json!`).
+- **`JL0008` — fail-loud lint.** A tenant-owned handler that is missing,
+  unreadable, or unparseable now produces a loud diagnostic instead of a silent
+  skip, so the guardrail can never again fail closed-but-quiet.
+- Cross-tenant **isolation tests are generated for grandchild** entities (seed the
+  intermediate chain, assert a non-member gets 404).
+
+### Deferred (tracked, not in 0.5.1)
+- Transitive tenancy in **realtime** (`changes`/broadcast), **storage** buckets,
+  and the **Supabase migrator** is still direct-only → 0.6.0 (#104/#113, #108/#109,
+  #106). These are not the generated REST surface.
+- **Path-scoped CREATE** parent-fk verification (a nested-under-tenant create can
+  take an unverified parent fk from the body when the mount carries the fk) →
+  0.5.2 with the mount-aware body-trim fix (#125 create vector, #82).
+- JL0006 false-*positive* on a tenancy entity's own detail route (#124).
+
+Framework Rust API additive only (`cargo semver-checks` clean; new `pub` item
+`Design::tenant_owned_handlers`). Direct-child / per-user / non-tenant apps are
+byte-identical to 0.5.0.
+
 ## 0.5.0 — 2026-07-19
 
 The ownership-safety release. Tenancy and per-user scoping are now

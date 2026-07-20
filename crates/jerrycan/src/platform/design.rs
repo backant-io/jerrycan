@@ -235,6 +235,58 @@ pub struct Tenancy {
     pub member_roles: Vec<String>,
 }
 
+/// One JOIN in a transitive tenant-ownership chain: the child table is joined to
+/// its parent on `child_table.child_fk = parent_table.id`. `child_fk` is the
+/// child's foreign key to that parent (`Design::fk_column(parent)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JoinLink {
+    pub child_table: String,
+    pub child_fk: String,
+    pub parent_table: String,
+}
+
+/// The unique `belongs_to` chain that scopes an entity to the tenant (issue #102:
+/// transitive tenant ownership). Built by [`Design::tenant_path`]. `joins` walk
+/// from the entity's own table up to `anchor_table` — the table that *directly*
+/// `belongs_to` the tenant and so carries `tenant_fk`. An empty `joins` means the
+/// entity IS the anchor (a direct child), so this subsumes the old direct
+/// predicate. Gains SQL helpers in a later task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TenantPath {
+    /// JOINs from the entity's own table up to `anchor_table`. Empty ⇒ direct child.
+    pub joins: Vec<JoinLink>,
+    /// Table carrying the tenant fk (== `entity_table` for a direct child).
+    pub anchor_table: String,
+    /// The tenant fk column on `anchor_table`, e.g. `org_id`.
+    pub tenant_fk: String,
+    /// The entity's own table (the SELECT/DELETE target).
+    pub entity_table: String,
+}
+
+impl TenantPath {
+    /// The JOIN clause walking from the entity's own table up to `anchor_table`,
+    /// e.g. ` JOIN accounts ON contacts.account_id = accounts.id`. Empty for a
+    /// direct child (no joins), so a direct child's SQL stays unchanged.
+    pub(crate) fn join_sql(&self) -> String {
+        self.joins
+            .iter()
+            .map(|j| {
+                format!(
+                    " JOIN {p} ON {c}.{fk} = {p}.id",
+                    p = j.parent_table,
+                    c = j.child_table,
+                    fk = j.child_fk,
+                )
+            })
+            .collect()
+    }
+
+    /// The qualified tenant fk column, e.g. `accounts.org_id`.
+    pub(crate) fn tenant_col(&self) -> String {
+        format!("{}.{}", self.anchor_table, self.tenant_fk)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobDesign {
@@ -468,7 +520,81 @@ pub(crate) enum TenantShape {
     None,
 }
 
+/// One handler file the JL0006 scan must read, resolved to its REAL on-disk path
+/// (issue #103). A top-level module lives at `crates/routes/{name}/src/handlers.rs`;
+/// a subroute nests under its parent as `.../src/subroutes/{seg}/handlers.rs` (the
+/// same layout the scaffold writes, `-`→`_` per segment). The old lint assumed the
+/// flat path `crates/routes/{module}/src/handlers.rs` even for a nested/transitive
+/// module, so a grandchild handler resolved to a nonexistent file and was silently
+/// skipped — the hole that let the #102 transitive leak ship unseen. Carries the
+/// ownership wording so the scan emits the right leak class (tenant vs per-user)
+/// and the `is_flat` flag that decides whether a bare `repo.insert` is a leak (#94).
+pub struct HandlerRef {
+    /// Path relative to the app root, e.g. `crates/routes/accounts/src/subroutes/contacts/handlers.rs`.
+    pub rel_path: String,
+    /// True when the owning module is a FLAT (membership-set) tenant module, where a
+    /// bare `repo.insert` reads the tenant fk from the BODY and so is a write leak (#94).
+    pub is_flat: bool,
+    /// "a tenant-owned" / "an identity-owned" — the ownership class in the message.
+    pub owned_desc: &'static str,
+    /// "another tenant's rows" / "another user's rows" — what an unscoped call leaks.
+    pub leak_desc: &'static str,
+    /// The registered fix text (the scoped accessors to call instead).
+    pub suggestion: String,
+}
+
+/// The JL0006 fix text for a TENANT-owned handler (both route shapes, issue #94):
+/// a FLAT handler cannot call the path-scoped `*_for` accessors (there is no
+/// tenant-id arg), so the membership-set methods are named too.
+pub(crate) const TENANT_SCOPED_SUGGESTION: &str = "call a scoped accessor instead — path-scoped routes: all_for/get_for/remove_for with the tenant id; flat (membership-set) routes: all_for_memberships/get_for_memberships/update_for_memberships/remove_for_memberships (and create_for_memberships) with the session user's id (_user.0.id)";
+
 impl Design {
+    /// The tenant-owned handler files the JL0006 scan must read, one per module or
+    /// subroute that owns ≥1 tenant-owned entity (directly OR transitively, #102),
+    /// each at its REAL nested on-disk path (issue #103 — see [`HandlerRef`]). Empty
+    /// when there is no tenancy. `is_flat` is OR-ed over the module's owned entities.
+    pub fn tenant_owned_handlers(&self) -> Vec<HandlerRef> {
+        let mut out = Vec::new();
+        if self.tenancy.is_none() {
+            return out;
+        }
+        for m in &self.modules {
+            self.collect_owned_handlers(&format!("crates/routes/{}/src", m.name), m, &mut out);
+        }
+        out
+    }
+
+    /// Walk one module and its subroutes, emitting a [`HandlerRef`] for each node
+    /// that owns a tenant-owned entity. `src_rel` is the node's on-disk src dir,
+    /// extended by `/subroutes/{seg}` per nesting level exactly as the scaffold
+    /// (and the JL0002/JL0007 walks) nest — so the path always points at a real file.
+    fn collect_owned_handlers(&self, src_rel: &str, m: &ModuleDesign, out: &mut Vec<HandlerRef>) {
+        let owned: Vec<&Entity> = m
+            .entities
+            .iter()
+            .filter(|e| self.tenant_path(&e.name).is_some())
+            .collect();
+        if !owned.is_empty() {
+            let is_flat = owned
+                .iter()
+                .any(|e| super::genroute::entity_is_flat_tenant_owned(e, self));
+            out.push(HandlerRef {
+                rel_path: format!("{src_rel}/handlers.rs"),
+                is_flat,
+                owned_desc: "a tenant-owned",
+                leak_desc: "another tenant's rows",
+                suggestion: TENANT_SCOPED_SUGGESTION.to_string(),
+            });
+        }
+        for sub in &m.subroutes {
+            self.collect_owned_handlers(
+                &format!("{src_rel}/subroutes/{}", sub.name.replace('-', "_")),
+                sub,
+                out,
+            );
+        }
+    }
+
     /// The normalized app-level mount prefix: the `base_path` override, or `""`
     /// when absent / `/` / empty (a no-op). Prepended to every module and bucket
     /// mount at app assembly; health/metrics are unaffected. Validation
@@ -718,15 +844,97 @@ impl Design {
         }
     }
 
-    /// Entities owned by the tenant: any entity (in any module or subroute)
-    /// with a belongs_to aimed at tenancy.entity. (module_name, entity_name) pairs.
-    pub fn tenant_owned(&self) -> Vec<(&str, &str)> {
-        let Some(tenancy) = self.tenancy.as_ref() else {
+    /// The unique `belongs_to` chain from `entity` to `tenancy.entity`, or `None`
+    /// when the entity is not tenant-owned, the tenant itself, ambiguous (a diamond
+    /// — the validator raises `JC0545`, blocking generation), or there is no
+    /// tenancy. A direct child yields zero joins, so this subsumes the old direct
+    /// predicate. PURE — never emits diagnostics; the validator decides on ambiguity.
+    pub(crate) fn tenant_path(&self, entity: &str) -> Option<TenantPath> {
+        let tenancy = self.tenancy.as_ref()?;
+        if entity == tenancy.entity {
+            return None; // the tenant itself is not tenant-owned
+        }
+        let mut chains = self.tenant_path_chains(
+            entity,
+            &tenancy.entity,
+            &mut std::collections::BTreeSet::new(),
+        );
+        // 0 chains = not owned; ≥2 = ambiguous (JC0545 blocks generation). Only a
+        // single, unambiguous chain scopes the entity — never guess a half-path.
+        if chains.len() != 1 {
+            return None;
+        }
+        let joins = chains.pop().expect("exactly one chain");
+        Some(TenantPath {
+            anchor_table: joins
+                .last()
+                .map(|j| j.parent_table.clone())
+                .unwrap_or_else(|| self.table_name(entity)),
+            tenant_fk: Self::fk_column(&tenancy.entity),
+            entity_table: self.table_name(entity),
+            joins,
+        })
+    }
+
+    /// Every distinct `belongs_to` chain from `entity` down to the entity that
+    /// *directly* `belongs_to` `tenant`. A chain of `vec![]` means `entity` itself
+    /// is that anchor (a direct child). Returns 0 chains (not owned), 1 (unique),
+    /// or ≥2 (ambiguous diamond). PURE — no diagnostics; the caller decides.
+    /// Cycle-safe: `visited` guards against a `belongs_to` loop.
+    fn tenant_path_chains(
+        &self,
+        entity: &str,
+        tenant: &str,
+        visited: &mut std::collections::BTreeSet<String>,
+    ) -> Vec<Vec<JoinLink>> {
+        let Some(e) = self.find_entity(entity) else {
             return Vec::new();
         };
+        if e.belongs_to.iter().any(|b| b.entity == tenant) {
+            return vec![Vec::new()]; // direct anchor
+        }
+        if !visited.insert(entity.to_string()) {
+            return Vec::new(); // cycle guard
+        }
+        let mut found = Vec::new();
+        for b in &e.belongs_to {
+            for rest in self.tenant_path_chains(&b.entity, tenant, visited) {
+                let mut chain = vec![JoinLink {
+                    child_table: self.table_name(entity),
+                    child_fk: Self::fk_column(&b.entity),
+                    parent_table: self.table_name(&b.entity),
+                }];
+                chain.extend(rest);
+                found.push(chain);
+            }
+        }
+        visited.remove(entity);
+        found
+    }
+
+    /// How many distinct `belongs_to` chains reach the tenant (0/1/≥2). The
+    /// validator raises `JC0545` when this is ≥2 (an ambiguous diamond).
+    pub(crate) fn tenant_path_branch_count(&self, entity: &str) -> usize {
+        let Some(t) = self.tenancy.as_ref() else {
+            return 0;
+        };
+        if entity == t.entity {
+            return 0;
+        }
+        self.tenant_path_chains(entity, &t.entity, &mut std::collections::BTreeSet::new())
+            .len()
+    }
+
+    /// Entities owned by the tenant — directly OR transitively (issue #102): every
+    /// entity (in any module or subroute) that resolves to a unique tenant path.
+    /// (module_name, entity_name) pairs, in document order.
+    pub fn tenant_owned(&self) -> Vec<(&str, &str)> {
+        if self.tenancy.is_none() {
+            return Vec::new();
+        }
         let mut owned = Vec::new();
         for module in &self.modules {
-            collect_tenant_owned(module, &tenancy.entity, &mut owned);
+            collect_tenant_owned(self, module, &mut owned);
         }
         owned
     }
@@ -759,10 +967,15 @@ impl Design {
             return TenantShape::None;
         };
         let is_tenant_module = module.entities.iter().any(|e| e.name == tenancy.entity);
+        // Transitive tenant ownership (#102): a module owns a tenant-scoped entity
+        // when any of its entities resolves to a tenant path — a direct child (zero
+        // joins) OR a grandchild reached through a parent chain — not merely a direct
+        // `belongs_to`. The PathScoped-vs-MembershipSet decision below still keys on
+        // the resolved PATH, so a flat grandchild stays MembershipSet.
         let owns_tenant_entity = module
             .entities
             .iter()
-            .any(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity));
+            .any(|e| self.tenant_path(&e.name).is_some());
         if !is_tenant_module && !owns_tenant_entity {
             return TenantShape::None;
         }
@@ -1055,20 +1268,23 @@ pub(crate) fn rust_ident(name: &str) -> String {
     }
 }
 
-/// Walk a module and its subroutes in document order, pairing each entity
-/// that belongs_to `tenant` with the owning module/subroute name.
+/// Walk a module and its subroutes in document order, pairing each entity that
+/// resolves to a tenant path (directly OR transitively — issue #102) with the
+/// owning module/subroute name. Delegates ownership to `Design::tenant_path` so
+/// the direct and transitive cases share one resolver (an ambiguous entity
+/// resolves to `None` and is omitted — the design is rejected by `JC0545`).
 fn collect_tenant_owned<'a>(
+    design: &Design,
     module: &'a ModuleDesign,
-    tenant: &str,
     out: &mut Vec<(&'a str, &'a str)>,
 ) {
     for entity in &module.entities {
-        if entity.belongs_to.iter().any(|b| b.entity == tenant) {
+        if design.tenant_path(&entity.name).is_some() {
             out.push((module.name.as_str(), entity.name.as_str()));
         }
     }
     for subroute in &module.subroutes {
-        collect_tenant_owned(subroute, tenant, out);
+        collect_tenant_owned(design, subroute, out);
     }
 }
 
@@ -1486,6 +1702,208 @@ pub(crate) mod tests {
         .unwrap();
         d.modules[1].subroutes.push(sub);
         assert_eq!(d.tenant_owned(), vec![("leads", "Lead"), ("notes", "Note")]);
+    }
+
+    /// Org (tenant) ; Account belongs_to Org ; Contact belongs_to Account —
+    /// a two-hop tenant-ownership chain (the transitive case #102 re-opened).
+    fn org_account_contact() -> Design {
+        serde_json::from_str(
+            r#"{ "name": "org-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "orgs",
+                      "entities": [{ "name": "Org", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "Org", "list": true } }] },
+                    { "name": "accounts",
+                      "entities": [{ "name": "Account",
+                          "belongs_to": [{ "entity": "Org" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "name", "type": "string" }] }],
+                      "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "Account", "list": true } }] },
+                    { "name": "contacts",
+                      "entities": [{ "name": "Contact",
+                          "belongs_to": [{ "entity": "Account" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "email", "type": "string" }] }],
+                      "endpoints": [{ "operation_id": "list_contacts", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "Contact", "list": true } }] }
+                ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// Contact belongs_to [Account, Region]; Account and Region each belongs_to
+    /// Org (the tenant) — two distinct chains reach the tenant (a diamond).
+    fn diamond_design() -> Design {
+        serde_json::from_str(
+            r#"{ "name": "diamond-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "orgs",
+                      "entities": [{ "name": "Org", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "Org", "list": true } }] },
+                    { "name": "accounts",
+                      "entities": [{ "name": "Account",
+                          "belongs_to": [{ "entity": "Org" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "name", "type": "string" }] }],
+                      "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "Account", "list": true } }] },
+                    { "name": "regions",
+                      "entities": [{ "name": "Region",
+                          "belongs_to": [{ "entity": "Org" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "name", "type": "string" }] }],
+                      "endpoints": [{ "operation_id": "list_regions", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "Region", "list": true } }] },
+                    { "name": "contacts",
+                      "entities": [{ "name": "Contact",
+                          "belongs_to": [{ "entity": "Account" }, { "entity": "Region" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "email", "type": "string" }] }],
+                      "endpoints": [{ "operation_id": "list_contacts", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "Contact", "list": true } }] }
+                ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// A→B, B→A (a belongs_to cycle) with the tenant (Org) off to the side —
+    /// the resolver must terminate on the cycle, not recurse forever.
+    fn cyclic_belongs_to_design() -> Design {
+        serde_json::from_str(
+            r#"{ "name": "cycle-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "orgs",
+                      "entities": [{ "name": "Org", "fields": [
+                          { "name": "id", "type": "integer" } ]}],
+                      "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "Org", "list": true } }] },
+                    { "name": "as",
+                      "entities": [{ "name": "A",
+                          "belongs_to": [{ "entity": "B" }],
+                          "fields": [{ "name": "id", "type": "integer" }] }],
+                      "endpoints": [{ "operation_id": "list_as", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "A", "list": true } }] },
+                    { "name": "bs",
+                      "entities": [{ "name": "B",
+                          "belongs_to": [{ "entity": "A" }],
+                          "fields": [{ "name": "id", "type": "integer" }] }],
+                      "endpoints": [{ "operation_id": "list_bs", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "B", "list": true } }] }
+                ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tenant_path_direct_child_has_no_joins() {
+        let d = org_account_contact();
+        let p = d.tenant_path("Account").expect("Account is tenant-owned");
+        assert!(p.joins.is_empty(), "direct child = zero joins");
+        assert_eq!(p.tenant_fk, "org_id");
+        assert_eq!(p.anchor_table, d.table_name("Account"));
+        assert_eq!(p.entity_table, d.table_name("Account"));
+    }
+
+    #[test]
+    fn tenant_path_grandchild_joins_through_parent() {
+        let d = org_account_contact();
+        let p = d
+            .tenant_path("Contact")
+            .expect("Contact is transitively tenant-owned");
+        assert_eq!(p.joins.len(), 1);
+        assert_eq!(p.joins[0].child_table, d.table_name("Contact"));
+        assert_eq!(p.joins[0].child_fk, "account_id");
+        assert_eq!(p.joins[0].parent_table, d.table_name("Account"));
+        assert_eq!(p.anchor_table, d.table_name("Account"));
+        assert_eq!(p.entity_table, d.table_name("Contact"));
+        assert_eq!(p.tenant_fk, "org_id");
+    }
+
+    #[test]
+    fn tenant_path_none_for_unowned_entity() {
+        let d = org_account_contact();
+        assert!(
+            d.tenant_path("Org").is_none(),
+            "the tenant itself is not tenant-owned"
+        );
+    }
+
+    #[test]
+    fn tenant_path_ambiguous_diamond_raises_jc0545() {
+        // A diamond graph reaches the tenant through TWO chains. `tenant_path`
+        // resolves it to None (unscoped) — so the validator MUST reject the
+        // design with JC0545, or the ambiguity silently re-opens the leak.
+        let d = diamond_design();
+        let diags = crate::platform::questions::validate(&d);
+        assert!(
+            diags.iter().any(|x| x.question.contains("JC0545")),
+            "diamond → JC0545"
+        );
+        assert!(
+            d.tenant_path("Contact").is_none(),
+            "ambiguous resolves to None"
+        );
+        assert_eq!(
+            d.tenant_path_branch_count("Contact"),
+            2,
+            "two distinct chains"
+        );
+    }
+
+    #[test]
+    fn tenant_path_cycle_does_not_hang() {
+        let d = cyclic_belongs_to_design();
+        let _ = d.tenant_path("A"); // must return, not loop
+    }
+
+    #[test]
+    fn grandchild_flat_route_is_membership_set_not_none() {
+        // Recognition is now transitive (#102): a GRANDCHILD flat route — `/contacts`,
+        // mounted flat, carrying NO tenant fk (Contact belongs_to Account belongs_to
+        // the tenant Org) — is tenant-owned and classified `MembershipSet`, the flat
+        // membership-scoped shape. Pre-#102 the direct-only `owns_tenant_entity` gate
+        // saw Contact belongs_to Account (not the tenant) and returned `None`: an
+        // UNSCOPED grandchild — the transitive leak this fix closes.
+        let d = org_account_contact();
+        let contacts = &d.modules[2];
+        assert_eq!(
+            d.endpoint_tenant_shape(contacts, &contacts.endpoints[0]),
+            TenantShape::MembershipSet,
+        );
+    }
+
+    #[test]
+    fn direct_child_shape_unchanged() {
+        // Byte-identity guard: switching `owns_tenant_entity` onto the transitive
+        // `tenant_path` must NOT change a DIRECT child's classification. Account is a
+        // direct child of the tenant Org; its own flat route stays `MembershipSet`
+        // (passes pre- AND post-fix). The direct-child PATH-SCOPED case (a nested
+        // `/clubs/{club_id}/…`) is locked by `tenant_shape_classifies_by_route`.
+        let d = org_account_contact();
+        let accounts = &d.modules[1];
+        assert_eq!(
+            d.endpoint_tenant_shape(accounts, &accounts.endpoints[0]),
+            TenantShape::MembershipSet,
+        );
     }
 
     #[test]

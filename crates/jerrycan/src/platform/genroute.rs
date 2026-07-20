@@ -114,20 +114,24 @@ fn path_params(ep: &Endpoint) -> Vec<String> {
     out
 }
 
-/// True when this endpoint operates on a tenant-owned entity (its repo entity
-/// belongs_to the design's tenancy entity). Such guarded endpoints take the
-/// membership-checked `Dep<shared::Tenant>` instead of a bare `CurrentUser`.
+/// True when this endpoint operates on a tenant-owned entity — its repo entity
+/// resolves to a tenant path, directly OR transitively (issue #102: a grandchild
+/// reached through a parent chain). Gates the scope-hint comment; the guard SHAPE
+/// (`Dep<Tenant>` vs bare `CurrentUser`) is decided separately by
+/// `endpoint_uses_tenant_guard` from the resolved path, so a flat grandchild stays
+/// on the bare session.
 fn endpoint_is_tenant_owned(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> bool {
-    let Some(tenancy) = design.tenancy.as_ref() else {
-        return false;
-    };
     let Some(entity) = endpoint_repo_entity(m, ep) else {
         return false;
     };
+    // Transitive tenant ownership (#102): the entity is tenant-owned when it resolves
+    // to a tenant path — a direct child OR a grandchild through a parent chain — not
+    // merely a direct `belongs_to`. `tenant_path` is `None` when there is no tenancy,
+    // so it subsumes the old tenancy guard.
     m.entities
         .iter()
         .find(|e| e.name == entity)
-        .is_some_and(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity))
+        .is_some_and(|e| design.tenant_path(&e.name).is_some())
 }
 
 /// True when a guarded endpoint takes the membership-checked `Dep<Tenant>` — i.e.
@@ -1019,6 +1023,34 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
     out
 }
 
+/// Like `active_sets`, but the column named `pin_col` is written from `pin_expr`
+/// (a path-verified value) instead of `item.{col}`. Used to pin the tenant fk to
+/// the PATH param in path-scoped writes so the body cannot relocate the row (#125).
+fn active_sets_pinning(e: &Entity, with_id: bool, pin_col: &str, pin_expr: &str) -> String {
+    let indent = "            ";
+    let mut out = String::new();
+    for name in model_field_names(e) {
+        if name == "id" {
+            if !with_id {
+                continue;
+            }
+            if declared_id(e).is_some() {
+                out.push_str(&format!("{indent}id: Set(item.id),\n"));
+            } else {
+                out.push_str(&format!("{indent}id: sea_orm::ActiveValue::NotSet,\n"));
+            }
+        } else {
+            let ident = rust_ident(&name);
+            if name == pin_col {
+                out.push_str(&format!("{indent}{ident}: Set({pin_expr}),\n"));
+            } else {
+                out.push_str(&format!("{indent}{ident}: Set(item.{ident}),\n"));
+            }
+        }
+    }
+    out
+}
+
 /// True when a tenant-owned entity's routes are FLAT (MembershipSet) — none of its
 /// endpoints carry the tenant fk in the path (the Supabase-migrated shape, and any
 /// authored flat design). Such an entity takes the tenant fk from the request BODY on
@@ -1031,10 +1063,9 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
 /// Conservative: ANY path-scoped route on the entity ⇒ not flat (no mixed-shape
 /// design exists today, and a path-scoped write is already covered).
 pub(crate) fn entity_is_flat_tenant_owned(e: &Entity, design: &Design) -> bool {
-    let Some(tenancy) = design.tenancy.as_ref() else {
-        return false;
-    };
-    if !e.belongs_to.iter().any(|b| b.entity == tenancy.entity) {
+    // Tenant-owned directly OR transitively (issue #102). `tenant_path` is `None`
+    // when there is no tenancy, so it subsumes the old tenancy guard.
+    if design.tenant_path(&e.name).is_none() {
         return false;
     }
     let Some(m) = design
@@ -1066,7 +1097,10 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     let Some(tenancy) = design.tenancy.as_ref() else {
         return String::new();
     };
-    if !e.belongs_to.iter().any(|b| b.entity == tenancy.entity) {
+    // Tenant-owned directly OR transitively (issue #102): a grandchild reached
+    // through a parent chain gets the scoped accessors too. The JOIN SQL for a
+    // grandchild's filter is Tasks 3/4; this only recognizes ownership.
+    if design.tenant_path(&e.name).is_none() {
         return String::new();
     }
     let entity = &e.name;
@@ -1091,38 +1125,48 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     // param) is consumed once by the ownership check, so no clone for text pks.
     let update_sets = active_sets(e, false);
     let insert_sets = active_sets(e, true);
+    // The tenant path (issue #102): a direct child has empty joins (keep the typed
+    // sea-orm builder verbatim — byte-identical to pre-#102); a grandchild+ JOINs
+    // up its belongs_to chain to the anchor that carries the tenant fk. The gate
+    // above guarantees `Some` here. Computed before the writes so the membership-
+    // checked write branch can key on `path.joins` too (Task 4).
+    let path = design.tenant_path(entity).expect("gate ensured Some");
+    let join_sql = path.join_sql();
+    let tenant_col = path.tenant_col();
+    let tenant_fk = path.tenant_fk.as_str();
     // Membership-CHECKED writes for a FLAT tenant-owned entity (issue #94, spec §C).
     // A flat route takes the tenant fk from the BODY, so — unlike a path-scoped write,
     // where `Dep<Tenant>` already verified the path tenant — the body fk MUST be
     // verified against the caller's membership set (RLS `WITH CHECK`) before the write.
     // Emitted ONLY for a flat entity; a path-scoped (nested) entity stays byte-identical.
-    let membership_writes = if entity_is_flat_tenant_owned(e, design) {
-        // The tenant fk value is read out of `item` before the insert consumes it: a
-        // text fk must be cloned (it is also moved into the row); an integer fk is Copy.
+    // The membership-checked insert body is path-independent: it depends only on the
+    // entity's own key type (a client-supplied text pk is captured up front and inserted
+    // via `Entity::insert(..).exec`; an integer pk is DB-assigned and read back), so a
+    // direct child and a transitive grandchild share it verbatim.
+    let id_capture = if key == "String" {
+        "        let id = item.id.clone();\n"
+    } else {
+        ""
+    };
+    let create_return_insert = if key == "String" {
+        format!(
+            "        {snake}::Entity::insert({snake}::ActiveModel {{\n{insert_sets}        }})\n        .exec(&txn)\n        .await\n        .map_err(db_error)?;\n        txn.commit().await.map_err(db_error)?;\n        Ok(id)"
+        )
+    } else {
+        format!(
+            "        let row = {snake}::ActiveModel {{\n{insert_sets}        }}\n        .insert(&txn)\n        .await\n        .map_err(db_error)?;\n        txn.commit().await.map_err(db_error)?;\n        Ok(row.id)"
+        )
+    };
+    let membership_writes = if !entity_is_flat_tenant_owned(e, design) {
+        // A path-scoped (nested) entity is scoped by the verified path tenant, so it
+        // never gets these membership-checked writes (JL0006 / issue #78).
+        String::new()
+    } else if path.joins.is_empty() {
+        // DIRECT child (byte-identical to pre-#102): the tenant fk is a real column on
+        // the row, read straight from the body. The fk value is read out before the
+        // insert consumes `item` — a text fk is cloned (also moved into the row), an
+        // integer fk is Copy. The pk is pinned to the CHECKED PATH `id`, never `item.id`.
         let fk_clone = if fk_ty == "String" { ".clone()" } else { "" };
-        // The UPDATE must target the row we authorized — the PATH `id`, NEVER the body
-        // `item.id` (issue #92): a body id could point at a victim row in another
-        // tenant. For a text pk, `id` is moved into `get_for_memberships`, so clone it
-        // there and keep the owned `id` to pin the ActiveModel pk below; an integer pk
-        // is Copy, so `id` survives the call unchanged.
-        let pk_clone = if key == "String" { ".clone()" } else { "" };
-        // `create_for_memberships` differs by pk type exactly as `insert` does: a
-        // client-supplied text pk is known up front (captured, inserted via
-        // `Entity::insert(..).exec`); an integer pk is DB-assigned and read back.
-        let id_capture = if key == "String" {
-            "        let id = item.id.clone();\n"
-        } else {
-            ""
-        };
-        let create_return_insert = if key == "String" {
-            format!(
-                "        {snake}::Entity::insert({snake}::ActiveModel {{\n{insert_sets}        }})\n        .exec(&txn)\n        .await\n        .map_err(db_error)?;\n        txn.commit().await.map_err(db_error)?;\n        Ok(id)"
-            )
-        } else {
-            format!(
-                "        let row = {snake}::ActiveModel {{\n{insert_sets}        }}\n        .insert(&txn)\n        .await\n        .map_err(db_error)?;\n        txn.commit().await.map_err(db_error)?;\n        Ok(row.id)"
-            )
-        };
         format!(
             r#"
     // Membership-CHECKED writes for a FLAT tenant-owned route (issue #94, spec §C):
@@ -1197,29 +1241,245 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
 "#
         )
     } else {
-        String::new()
+        // TRANSITIVE grandchild+ (issue #102): the row carries NO tenant fk. Resolve the
+        // tenant from the body's IMMEDIATE PARENT fk (a real column on the row) and JOIN
+        // up the chain to the anchor that carries the tenant fk. Every identifier comes
+        // from `TenantPath`/`belongs_to`; every value stays a bound `?` param.
+        let parent_fk = &path.joins[0].child_fk;
+        let parent_table = &path.joins[0].parent_table;
+        // JOINs from the immediate parent up to the anchor (empty for a grandchild —
+        // its immediate parent IS the anchor that carries the tenant fk).
+        let parent_joins: String = path
+            .joins
+            .iter()
+            .skip(1)
+            .map(|j| {
+                format!(
+                    " JOIN {p} ON {c}.{fk} = {p}.id",
+                    p = j.parent_table,
+                    c = j.child_table,
+                    fk = j.child_fk,
+                )
+            })
+            .collect();
+        // The parent fk value is read out of `item` before the insert consumes it — a
+        // text fk must be cloned (also moved into the row); an integer fk is Copy. Its
+        // type is the immediate parent entity's key type.
+        let parent_entity = e
+            .belongs_to
+            .iter()
+            .find(|b| Design::fk_column(&b.entity) == path.joins[0].child_fk)
+            .map(|b| b.entity.as_str())
+            .expect("the tenant path's first hop is a belongs_to of the entity");
+        let parent_fk_clone = if design.target_key_rust_type(parent_entity) == "String" {
+            ".clone()"
+        } else {
+            ""
+        };
+        format!(
+            r#"
+    // Membership-CHECKED writes for a FLAT tenant-owned GRANDCHILD (issue #102): the row
+    // carries no tenant fk, so the WITH CHECK resolves the tenant from the body's
+    // immediate parent fk and JOINs up to the anchor — a create under a parent outside
+    // the caller's tenants is 403; an update/delete of a row outside the set is 404;
+    // moving the row to another parent (a cross-tenant move) is 403.
+    pub async fn create_for_memberships(&self, user_id: String, item: {entity}) -> Result<{key}> {{
+        use sea_orm::TransactionTrait;
+{id_capture}        let parent_fk = item.{parent_fk}{parent_fk_clone};
+        let txn = self.db.conn().begin().await.map_err(db_error)?;
+        // WITH CHECK: the body's parent must resolve to a tenant in the caller's set.
+        if txn
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                self.db.sql(
+                    "SELECT 1 FROM {parent_table}{parent_joins} WHERE {parent_table}.id = ? AND {tenant_col} IN (SELECT {tenant_fk} FROM {members} WHERE user_id = ?) LIMIT 1",
+                ),
+                [parent_fk.into(), user_id.into()],
+            ))
+            .await
+            .map_err(db_error)?
+            .is_none()
+        {{
+            return Err(Error::forbidden());
+        }}
+{create_return_insert}
+    }}
+
+    pub async fn update_for_memberships(&self, user_id: String, id: {key}, item: {entity}) -> Result<bool> {{
+        // Load the row scoped to the caller's memberships via the JOIN chain: a row whose
+        // CURRENT tenant is outside the set is invisible → false → 404 (no existence leak).
+        let Some(existing) = self.get_for_memberships(user_id, id{pk_clone}).await? else {{
+            return Ok(false);
+        }};
+        // WITH CHECK: pin the immediate parent fk — a changed parent would move the row
+        // to another parent (and possibly another tenant), so a changed fk → 403.
+        if item.{parent_fk} != existing.{parent_fk} {{
+            return Err(Error::forbidden());
+        }}
+        // Pin the pk to the CHECKED PATH `id`, NOT `item.id` (issue #92): the row
+        // authorized above is `id`, so the UPDATE can only ever write that row.
+        let m = {snake}::ActiveModel {{
+            id: Set(id),
+{update_sets}        }};
+        match m.update(self.db.conn()).await {{
+            Ok(_) => Ok(true),
+            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
+            Err(e) => Err(db_error(e)),
+        }}
+    }}
+
+    pub async fn remove_for_memberships(&self, user_id: String, id: {key}) -> Result<bool> {{
+        // Scope the DELETE to the membership set through the JOIN chain: a row whose
+        // tenant is outside the set matches nothing → 0 rows → false → 404.
+        let r = self
+            .db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "DELETE FROM {table} WHERE id = ? AND id IN (SELECT {table}.id FROM {table}{join_sql} WHERE {tenant_col} IN (SELECT {tenant_fk} FROM {members} WHERE user_id = ?))",
+                ),
+                [id.into(), user_id.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected() > 0)
+    }}
+"#
+        )
     };
-    format!(
-        r#"
-    // Tenant-scoped accessors — handlers must use these for tenant-owned data (JL0006).
-    pub async fn all_for(&self, {fk_col}: {fk_ty}) -> Result<Vec<{entity}>> {{
+    // The four READS branch on the path: a direct child keeps the typed builder; a
+    // transitive child emits a raw-SQL JOIN form scoping on the QUALIFIED tenant
+    // column. Only identifiers from `TenantPath` reach the SQL; every value stays a
+    // bound `?` param, wrapped in `self.db.sql(..)` exactly like the raw methods.
+    let all_for_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn all_for(&self, {fk_col}: {fk_ty}) -> Result<Vec<{entity}>> {{
         {snake}::Entity::find()
             .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
             .order_by_asc({snake}::Column::Id)
             .all(self.db.conn())
             .await
             .map_err(db_error)
-    }}
-
-    pub async fn get_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<Option<{entity}>> {{
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn all_for(&self, {fk_col}: {fk_ty}) -> Result<Vec<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT {table}.* FROM {table}{join_sql} WHERE {tenant_col} = ? ORDER BY {table}.id",
+                ),
+                [{fk_col}.into()],
+            ))
+            .all(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    };
+    let get_for_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn get_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<Option<{entity}>> {{
         {snake}::Entity::find_by_id(id)
             .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
             .one(self.db.conn())
             .await
             .map_err(db_error)
-    }}
-
-    pub async fn remove_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<bool> {{
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn get_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<Option<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT {table}.* FROM {table}{join_sql} WHERE {table}.id = ? AND {tenant_col} = ?",
+                ),
+                [id.into(), {fk_col}.into()],
+            ))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    };
+    let all_for_memberships_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn all_for_memberships(&self, user_id: String) -> Result<Vec<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT * FROM {table} WHERE {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?) ORDER BY id",
+                ),
+                [user_id.into()],
+            ))
+            .all(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn all_for_memberships(&self, user_id: String) -> Result<Vec<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT {table}.* FROM {table}{join_sql} WHERE {tenant_col} IN (SELECT {tenant_fk} FROM {members} WHERE user_id = ?) ORDER BY {table}.id",
+                ),
+                [user_id.into()],
+            ))
+            .all(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    };
+    let get_for_memberships_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn get_for_memberships(&self, user_id: String, id: {key}) -> Result<Option<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT * FROM {table} WHERE id = ? AND {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?)",
+                ),
+                [id.into(), user_id.into()],
+            ))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn get_for_memberships(&self, user_id: String, id: {key}) -> Result<Option<{entity}>> {{
+        {snake}::Entity::find()
+            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT {table}.* FROM {table}{join_sql} WHERE {table}.id = ? AND {tenant_col} IN (SELECT {tenant_fk} FROM {members} WHERE user_id = ?)",
+                ),
+                [id.into(), user_id.into()],
+            ))
+            .one(self.db.conn())
+            .await
+            .map_err(db_error)
+    }}"#
+        )
+    };
+    // The two PATH-SCOPED writes branch on the path exactly like the reads (issue #102):
+    // a direct child keeps the typed sea-orm builder verbatim (byte-identical to
+    // pre-#102); a grandchild+ scopes on the QUALIFIED tenant column reached via the JOIN
+    // chain, using the PATH tenant id (`{fk_col}` param) instead of a membership subquery.
+    let remove_for_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn remove_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<bool> {{
         let r = {snake}::Entity::delete_many()
             .filter({snake}::Column::Id.eq(id))
             .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
@@ -1227,13 +1487,51 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
             .await
             .map_err(db_error)?;
         Ok(r.rows_affected > 0)
-    }}
-
-    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    pub async fn remove_for(&self, {fk_col}: {fk_ty}, id: {key}) -> Result<bool> {{
+        // Scope the DELETE to the path tenant through the JOIN chain (issue #102): a row
+        // whose tenant is not the path tenant matches nothing → 0 rows → false → 404.
+        let r = self
+            .db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "DELETE FROM {table} WHERE id = ? AND id IN (SELECT {table}.id FROM {table}{join_sql} WHERE {tenant_col} = ?)",
+                ),
+                [id.into(), {fk_col}.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected() > 0)
+    }}"#
+        )
+    };
+    // The DIRECT path-scoped `update_for` pins the tenant fk to the PATH param
+    // (`{fk_col}`), never `item.{fk_col}`, so the request body cannot relocate the row
+    // into another tenant (issue #125). The row is already authorized against the path
+    // tenant, so writing the same fk back is a no-op on a legitimate request and a
+    // make-impossible relocation on a hostile one — regardless of #82 keeping the fk in
+    // the DTO. Only this direct branch needs it; the transitive branch carries no tenant
+    // fk column on the row (it pins the immediate parent fk instead), and the membership
+    // branches verify the body fk against the caller's set.
+    let update_sets_pinned = active_sets_pinning(e, false, &fk_col, &fk_col);
+    // The direct branch consumes `{fk_col}` twice: once in the ownership-check filter
+    // (`.eq({fk_col})` moves a text tenant pk) and again in the pinned `Set({fk_col})`
+    // below. Clone it into the filter for a text pk so the owned value survives for the
+    // pin (issue #125 use-after-move — E0382); an integer pk is `Copy` (empty suffix, so
+    // integer-pk output stays byte-identical).
+    let pin_fk_clone = if fk_ty == "String" { ".clone()" } else { "" };
+    let update_for_method = if path.joins.is_empty() {
+        format!(
+            r#"    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
         // Scope the write to the tenant: only proceed if the row is already
         // theirs (a foreign or unknown id is a no-op, returning false → 404).
         if {snake}::Entity::find_by_id(id{pk_clone})
-            .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
+            .filter({snake}::Column::{fk_pascal}.eq({fk_col}{pin_fk_clone}))
             .one(self.db.conn())
             .await
             .map_err(db_error)?
@@ -1246,46 +1544,66 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
         // body id pointing at another tenant's row must not be reachable here.
         let m = {snake}::ActiveModel {{
             id: Set(id),
+{update_sets_pinned}        }};
+        match m.update(self.db.conn()).await {{
+            Ok(_) => Ok(true),
+            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
+            Err(e) => Err(db_error(e)),
+        }}
+    }}"#
+        )
+    } else {
+        // The immediate parent fk (e.g. `account_id`): on a PATH-SCOPED grandchild the path
+        // carries the tenant fk, NOT the parent fk, so the parent fk is not path-redundant —
+        // it stays client-controllable and MUST be pinned, exactly like the membership
+        // branch, or a member could relocate the row to another parent (issue #102).
+        let parent_fk = &path.joins[0].child_fk;
+        format!(
+            r#"    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
+        // Scope the write to the path tenant via the transitive JOIN check (issue #102):
+        // load through get_for — a row outside this tenant is a no-op → false → 404.
+        let Some(existing) = self.get_for({fk_col}, id{pk_clone}).await? else {{
+            return Ok(false);
+        }};
+        // WITH CHECK: pin the immediate parent fk — a changed parent would move the row to
+        // another parent (and possibly another tenant), so a changed fk → 403. On a
+        // path-scoped grandchild the parent fk is NOT path-redundant, so unlike the direct
+        // child it must be pinned here (issue #102 cross-tenant write).
+        if item.{parent_fk} != existing.{parent_fk} {{
+            return Err(Error::forbidden());
+        }}
+        // Pin the pk to the CHECKED PATH `id`, NOT `item.id` (issue #92): the row
+        // authorized above is `id`, so the UPDATE can only ever write that row.
+        let m = {snake}::ActiveModel {{
+            id: Set(id),
 {update_sets}        }};
         match m.update(self.db.conn()).await {{
             Ok(_) => Ok(true),
             Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),
             Err(e) => Err(db_error(e)),
         }}
-    }}
+    }}"#
+        )
+    };
+    format!(
+        r#"
+    // Tenant-scoped accessors — handlers must use these for tenant-owned data (JL0006).
+{all_for_method}
+
+{get_for_method}
+
+{remove_for_method}
+
+{update_for_method}
 
     // Membership-set accessors (issues #78/#79) — a FLAT tenant-owned handler
     // (no tenant fk in its path) scopes to the CALLER'S memberships, so a user in
     // many tenants sees every tenant's rows they belong to and nothing outside the
     // set (the Supabase RLS shape, restored). `user_id` is the stringified session
     // user id (the membership table's `user_id` is TEXT). Raw SQL, entity-typed.
-    pub async fn all_for_memberships(&self, user_id: String) -> Result<Vec<{entity}>> {{
-        {snake}::Entity::find()
-            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
-                self.db.conn().get_database_backend(),
-                self.db.sql(
-                    "SELECT * FROM {table} WHERE {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?) ORDER BY id",
-                ),
-                [user_id.into()],
-            ))
-            .all(self.db.conn())
-            .await
-            .map_err(db_error)
-    }}
+{all_for_memberships_method}
 
-    pub async fn get_for_memberships(&self, user_id: String, id: {key}) -> Result<Option<{entity}>> {{
-        {snake}::Entity::find()
-            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
-                self.db.conn().get_database_backend(),
-                self.db.sql(
-                    "SELECT * FROM {table} WHERE id = ? AND {fk_col} IN (SELECT {fk_col} FROM {members} WHERE user_id = ?)",
-                ),
-                [id.into(), user_id.into()],
-            ))
-            .one(self.db.conn())
-            .await
-            .map_err(db_error)
-    }}
+{get_for_memberships_method}
 {membership_writes}"#
     )
 }
@@ -1411,12 +1729,10 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
 /// linted. db-mode only (this is `sql_repo`'s concern; the memory-mode struct has
 /// no fk columns to scope by, so memory output stays byte-identical).
 fn entity_is_per_user_owned(e: &Entity, mode: GenMode, design: &Design) -> bool {
-    mode.auth
-        && Design::has_identity_fk(e)
-        && !design
-            .tenancy
-            .as_ref()
-            .is_some_and(|t| e.belongs_to.iter().any(|b| b.entity == t.entity))
+    // A tenant-owned entity — directly OR transitively (issue #102) — is scoped by
+    // the TENANT (via `scoped_methods`), never per-user, so exclude any entity with a
+    // tenant path. `tenant_path` is `None` when there is no tenancy.
+    mode.auth && Design::has_identity_fk(e) && design.tenant_path(&e.name).is_none()
 }
 
 /// Owner-scoped accessors for a per-user identity-owned entity (issue #79) — keyed
@@ -1606,6 +1922,16 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
         .entities
         .iter()
         .any(|e| !scoped_methods(e, design).is_empty());
+    // …but only a DIRECT tenant-owned entity's accessors use the TYPED `.filter(..)`
+    // builder — a TRANSITIVE (grandchild+) entity scopes entirely through raw JOIN SQL
+    // (issue #102), so it needs `ConnectionTrait` (raw SQL) but NOT `ColumnTrait`/
+    // `QueryFilter`. Keying the filter imports on `has_scoped` would leave them unused
+    // for a transitive-only module, tripping `-D warnings` on generated code.
+    let has_direct_scoped = m.entities.iter().any(|e| {
+        design
+            .tenant_path(&e.name)
+            .is_some_and(|p| p.joins.is_empty())
+    });
     // The TENANT entity's OWN repo (Task 3) also drives raw SQL — `create_with_membership`
     // and `all_for_member` call `get_database_backend()`/`execute()` — so it needs
     // `ConnectionTrait` even without the `.filter(..)` accessors a tenant-OWNED entity has.
@@ -1625,7 +1951,7 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
     // fixed alphabetical order the three pre-existing tiers used — so a
     // tenant-owned, pure-tenant, or plain module stays byte-identical, and a per-user
     // module gets `ColumnTrait`/`QueryFilter` WITHOUT the unused `ConnectionTrait`.
-    let needs_filter = has_scoped || has_owner_scoped; // ColumnTrait + QueryFilter
+    let needs_filter = has_direct_scoped || has_owner_scoped; // ColumnTrait + QueryFilter
     let needs_conn = has_scoped || has_tenant_own; // ConnectionTrait (raw SQL)
     let mut imports = vec!["ActiveModelTrait", "ActiveValue::Set"];
     if needs_filter {
@@ -2967,6 +3293,453 @@ pub(crate) mod tests {
         );
     }
 
+    /// Org (tenant) ; Account belongs_to Org ; Contact belongs_to Account — the
+    /// TRANSITIVE (grandchild) tenant-ownership chain (#102). Contacts flat at
+    /// `/contacts`, so the resolved path carries no tenant fk.
+    const ORG_ACCOUNT_CONTACT: &str = r#"{ "name": "org-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "orgs",
+              "entities": [{ "name": "Org", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Org", "list": true } }] },
+            { "name": "accounts",
+              "entities": [{ "name": "Account",
+                  "belongs_to": [{ "entity": "Org" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "name", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Account", "list": true } }] },
+            { "name": "contacts",
+              "entities": [{ "name": "Contact",
+                  "belongs_to": [{ "entity": "Account" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "email", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_contacts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Contact", "list": true } }] }
+        ] }"#;
+
+    /// Same chain, but Contacts are mounted under their PARENT at
+    /// `/accounts/{account_id}` — the resolved path carries `account_id`, NOT the
+    /// tenant fk `org_id`. This is a FLAT (MembershipSet) grandchild route.
+    const ORG_ACCOUNT_CONTACT_UNDER_PARENT: &str = r#"{ "name": "org-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "orgs",
+              "entities": [{ "name": "Org", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Org", "list": true } }] },
+            { "name": "accounts",
+              "entities": [{ "name": "Account",
+                  "belongs_to": [{ "entity": "Org" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "name", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Account", "list": true } }] },
+            { "name": "contacts", "mount": "/accounts/{account_id}",
+              "entities": [{ "name": "Contact",
+                  "belongs_to": [{ "entity": "Account" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "email", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_contacts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Contact", "list": true } }] }
+        ] }"#;
+
+    /// Same chain, but Contacts are mounted directly under the TENANT at
+    /// `/orgs/{org_id}` — the resolved path carries the tenant fk, so this
+    /// grandchild route is PATH-SCOPED.
+    const ORG_ACCOUNT_CONTACT_UNDER_TENANT: &str = r#"{ "name": "org-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "orgs",
+              "entities": [{ "name": "Org", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Org", "list": true } }] },
+            { "name": "accounts",
+              "entities": [{ "name": "Account",
+                  "belongs_to": [{ "entity": "Org" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "name", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Account", "list": true } }] },
+            { "name": "contacts", "mount": "/orgs/{org_id}",
+              "entities": [{ "name": "Contact",
+                  "belongs_to": [{ "entity": "Account" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "email", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_contacts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Contact", "list": true } }] }
+        ] }"#;
+
+    /// Slice out a single generated method body — from its `pub async fn {name}(` to the
+    /// next method (or the end of the emitted block) — so a bound-value assertion is scoped
+    /// to THAT method. An identical `[id.into(), user_id.into()]` in a sibling method would
+    /// otherwise mask a swapped bound order in the method under test (Rule 9). The trailing
+    /// `(` in the signature disambiguates `remove_for` from `remove_for_memberships`.
+    fn method_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let sig = format!("pub async fn {name}(");
+        let start = src
+            .find(&sig)
+            .unwrap_or_else(|| panic!("method `{name}` not found in:\n{src}"));
+        let rest = &src[start..];
+        match rest[sig.len()..].find("\n    pub async fn ") {
+            Some(i) => &rest[..sig.len() + i],
+            None => rest,
+        }
+    }
+
+    /// Recognition is transitive (#102): a GRANDCHILD entity (Contact belongs_to
+    /// Account belongs_to the tenant Org) is now tenant-owned, so `scoped_methods`
+    /// emits its tenant-scoped accessors instead of nothing. Pre-#102 the direct-only
+    /// gate saw Contact belongs_to Account (not Org) and returned an empty string —
+    /// the grandchild's repo had NO tenant scoping (the transitive leak). This locks
+    /// RECOGNITION only; the JOIN SQL for the grandchild is Tasks 3/4.
+    #[test]
+    fn grandchild_entity_gets_scoped_methods() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let contact = d.find_entity("Contact").unwrap();
+        assert!(
+            !scoped_methods(contact, &d).is_empty(),
+            "grandchild Contact must get scoped methods (was empty pre-#102)"
+        );
+    }
+
+    /// Task 3 (issue #102): the grandchild's tenant-scoped READS join UP the
+    /// belongs_to chain to the tenant fk instead of filtering a non-existent
+    /// direct column. `all_for_memberships` scopes the outer predicate to the
+    /// caller's memberships on the QUALIFIED tenant column, reached via the JOIN.
+    #[test]
+    fn grandchild_all_for_memberships_joins_to_tenant() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        assert!(
+            src.contains("JOIN accounts ON contacts.account_id = accounts.id"),
+            "grandchild read must JOIN up to the tenant anchor:\n{src}"
+        );
+        assert!(
+            src.contains(
+                "WHERE accounts.org_id IN (SELECT org_id FROM org_members WHERE user_id = ?)"
+            ),
+            "membership-set read must scope the QUALIFIED tenant col to the caller's set:\n{src}"
+        );
+    }
+
+    /// Byte-identity backstop (issue #102): a DIRECT child (Book belongs_to the
+    /// tenant Club) MUST keep the TYPED sea-orm builder verbatim — no JOIN, no
+    /// raw-SQL read. The safety net proving the transitive rewrite never touches
+    /// direct children (their emitted read bodies are identical to pre-#102).
+    #[test]
+    fn direct_child_reads_are_byte_identical() {
+        let d: Design = serde_json::from_str(CLUBS_TENANCY).unwrap();
+        let src = scoped_methods(d.find_entity("Book").unwrap(), &d);
+        assert!(
+            src.contains(".filter(book::Column::ClubId.eq(club_id))"),
+            "direct child keeps the typed builder verbatim:\n{src}"
+        );
+        assert!(
+            !src.contains(" JOIN "),
+            "direct child must never emit a JOIN:\n{src}"
+        );
+    }
+
+    /// Cross-tenant WRITE relocation (issue #125): on a direct path-scoped route
+    /// (`/clubs/{club_id}/books/{id}`) the row is authorized against the PATH tenant,
+    /// but the ActiveModel must also WRITE the tenant fk from the PATH param — never
+    /// from `item.club_id` (the request body). Combined with #82 (the fk is retained
+    /// in the DTO on mount-based nesting), a body `club_id` would let a member of club
+    /// A relocate their row into club B. Pinning the fk to the path param makes that
+    /// relocation impossible regardless of #82.
+    #[test]
+    fn direct_path_scoped_update_for_pins_tenant_fk_to_path_not_body() {
+        let d: Design = serde_json::from_str(CLUBS_TENANCY).unwrap();
+        // Book is the direct path-scoped child (belongs_to the tenant Club, mounted at
+        // `/clubs/{club_id}`) — the same entity the read byte-identity test uses.
+        let src = scoped_methods(d.find_entity("Book").unwrap(), &d);
+        // the path-scoped update_for's ActiveModel must Set the tenant fk from the `club_id`
+        // PATH PARAM, never from `item.club_id` (issue #125 cross-tenant relocation).
+        assert!(
+            src.contains("club_id: Set(club_id)"),
+            "path-scoped update_for must pin the tenant fk to the path param; body:\n{src}"
+        );
+        assert!(
+            !src.contains("club_id: Set(item.club_id)"),
+            "path-scoped update_for must NOT write the tenant fk from the request body (#125)"
+        );
+    }
+
+    /// Text-pk tenant use-after-move (issue #125 follow-up): when the tenant's own
+    /// pk is a TEXT type (uuid/string/datetime), the tenant fk param (`team_id:
+    /// String`) is consumed TWICE in the direct path-scoped `update_for` — once by
+    /// the ownership-check filter (`.eq(team_id)` MOVES a `String`) and again by the
+    /// pinned `team_id: Set(team_id)` in the ActiveModel (issue #125 fk pin). Without
+    /// a clone that is a use-after-move (E0382) and the generated crate won't compile.
+    /// The filter must clone the fk for a text pk so the owned value survives for the
+    /// pin. An integer tenant pk is `Copy`, so its output stays byte-identical (the
+    /// Club/Book fixtures, whose tenant pk is an integer, prove that half).
+    #[test]
+    fn direct_path_scoped_update_for_clones_text_tenant_fk_for_the_pin() {
+        let d: Design = serde_json::from_str(TEAM_DOC_TEXT_PK).unwrap();
+        // Doc is the direct path-scoped child of the TEXT-pk tenant Team (mounted at
+        // `/teams/{team_id}`), so its tenant fk param `team_id` is a `String`.
+        let src = scoped_methods(d.find_entity("Doc").unwrap(), &d);
+        // The ownership-check filter must CLONE the String fk so the owned `team_id`
+        // survives for the pinned `Set(team_id)` below — else the generated code moves
+        // `team_id` twice (E0382) and won't compile.
+        assert!(
+            src.contains(".filter(doc::Column::TeamId.eq(team_id.clone()))"),
+            "text-pk tenant fk must be cloned into the ownership filter (issue #125 use-after-move):\n{src}"
+        );
+        // The pin still Sets the fk from the PATH param (never `item.team_id`).
+        assert!(
+            src.contains("team_id: Set(team_id)"),
+            "update_for must still pin the tenant fk to the path param:\n{src}"
+        );
+    }
+
+    /// Task 4 (issue #102): a grandchild's membership-CHECKED create resolves the tenant
+    /// from the BODY's immediate parent fk (a real column) and JOINs up to the anchor —
+    /// it can NOT filter a non-existent direct `org_id` column. The WITH CHECK proves the
+    /// parent belongs to a tenant in the caller's membership set (403 otherwise).
+    #[test]
+    fn grandchild_create_verifies_parent_resolves_to_member_tenant() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        assert!(
+            src.contains("SELECT 1 FROM accounts WHERE accounts.id = ? AND accounts.org_id IN (SELECT org_id FROM org_members WHERE user_id = ?)"),
+            "grandchild WITH CHECK resolves the tenant via the parent fk, not a direct column:\n{src}"
+        );
+        assert!(
+            src.contains("let parent_fk = item.account_id"),
+            "the body's immediate parent fk is read out for the CHECK:\n{src}"
+        );
+        // Rule 9: pin the bound-value ORDER, not just the SQL text — a swapped
+        // `[user_id.into(), parent_fk.into()]` would bind the parent id where the SQL
+        // expects user_id (and vice-versa), a silent cross-tenant hole the SQL-only
+        // assert above cannot catch. `parent_fk.into()` is unique to this method.
+        assert!(
+            method_body(&src, "create_for_memberships")
+                .contains("[parent_fk.into(), user_id.into()]"),
+            "create binds [parent_fk, user_id] in that exact order:\n{src}"
+        );
+    }
+
+    /// Task 4 (issue #102): a grandchild's membership-CHECKED update pins the IMMEDIATE
+    /// PARENT fk (the safe generalization of the direct "pin the tenant fk" rule) — a
+    /// changed parent → 403, which blocks moving the row across the tenant boundary.
+    #[test]
+    fn grandchild_update_pins_parent_fk() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        assert!(
+            src.contains("if item.account_id != existing.account_id"),
+            "grandchild update pins the immediate parent fk:\n{src}"
+        );
+    }
+
+    /// Task 4 (issue #102): a grandchild's membership-CHECKED delete scopes through the
+    /// JOIN chain — a self-referential subquery joins up to the anchor and keeps the row
+    /// only if its tenant is in the caller's set (0 rows → false → 404 outside the set).
+    #[test]
+    fn grandchild_remove_deletes_via_membership_subquery() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        assert!(
+            src.contains("DELETE FROM contacts WHERE id = ? AND id IN (SELECT contacts.id FROM contacts JOIN accounts ON contacts.account_id = accounts.id WHERE accounts.org_id IN (SELECT org_id FROM org_members WHERE user_id = ?))"),
+            "grandchild delete scopes through the JOIN chain to the membership set:\n{src}"
+        );
+        // Rule 9: pin the bound-value ORDER within THIS method — `get_for_memberships`
+        // binds the same `[id.into(), user_id.into()]`, so scope the assert to the
+        // `remove_for_memberships` body or a swap here would pass on the sibling's copy.
+        assert!(
+            method_body(&src, "remove_for_memberships").contains("[id.into(), user_id.into()]"),
+            "remove_for_memberships binds [id, user_id] in that exact order:\n{src}"
+        );
+    }
+
+    /// Task 4 (issue #102): the PATH-SCOPED writes (`remove_for`/`update_for`) of a
+    /// grandchild scope on the QUALIFIED tenant column reached via the JOIN chain, using
+    /// the PATH tenant id — they can NOT filter a non-existent direct `org_id` column, so
+    /// a transitive repo now COMPILES. `update_for` loads through the transitive `get_for`.
+    #[test]
+    fn grandchild_path_scoped_writes_join_to_tenant() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        assert!(
+            src.contains("DELETE FROM contacts WHERE id = ? AND id IN (SELECT contacts.id FROM contacts JOIN accounts ON contacts.account_id = accounts.id WHERE accounts.org_id = ?)"),
+            "path-scoped remove_for scopes on the qualified tenant col via the JOIN:\n{src}"
+        );
+        // Rule 9: pin the bound-value ORDER within the path-scoped `remove_for` — the
+        // transitive `get_for` binds the same `[id.into(), org_id.into()]`, so scope the
+        // assert to the `remove_for` body or a swap here would pass on the sibling's copy.
+        assert!(
+            method_body(&src, "remove_for").contains("[id.into(), org_id.into()]"),
+            "path-scoped remove_for binds [id, org_id] in that exact order:\n{src}"
+        );
+        assert!(
+            src.contains("let Some(existing) = self.get_for(org_id, id).await? else"),
+            "path-scoped update_for loads the existing row through the transitive get_for:\n{src}"
+        );
+        // The grandchild must NEVER reference a direct tenant-fk column that doesn't exist.
+        assert!(
+            !src.contains("contact::Column::OrgId") && !src.contains("Column::OrgId"),
+            "a grandchild has no direct org_id column — must not reference it:\n{src}"
+        );
+    }
+
+    /// FIX 1 / issue #102 (cross-tenant WRITE): the PATH-SCOPED transitive `update_for`
+    /// of a grandchild mounted UNDER THE TENANT (`/orgs/{org_id}/contacts/{id}`) must pin
+    /// the immediate parent fk. The path carries `org_id`, not `account_id`, so
+    /// `account_id` stays client-controllable and `active_sets` emits `account_id:
+    /// Set(item.account_id)` unpinned — without this guard a member of org A could
+    /// `PUT /orgs/{A}/contacts/{id}` with body `account_id = <an account in org B>` to
+    /// relocate the row into org B. Under-tenant → PathScoped → NO membership writes are
+    /// emitted, so the guard string can ONLY come from the path-scoped `update_for`: this
+    /// test fails outright if the pin is dropped (it would otherwise hide behind the
+    /// membership branch's identical guard on a flat design).
+    #[test]
+    fn path_scoped_transitive_update_for_pins_parent_fk() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_UNDER_TENANT).unwrap();
+        let src = scoped_methods(d.find_entity("Contact").unwrap(), &d);
+        // Sanity: path-scoped → the membership-checked writes (which ALSO pin the parent
+        // fk) are not emitted, so the guard asserted below is unambiguously the one under
+        // test — the path-scoped `update_for`.
+        assert!(
+            !src.contains("create_for_memberships"),
+            "an under-tenant grandchild is PathScoped → no membership writes:\n{src}"
+        );
+        assert!(
+            method_body(&src, "update_for").contains("if item.account_id != existing.account_id"),
+            "path-scoped transitive update_for must pin the immediate parent fk to block a \
+             cross-tenant relocation (issue #102):\n{src}"
+        );
+    }
+
+    /// Byte-identity backstop (issue #102): a DIRECT flat child (Customer belongs_to the
+    /// tenant Club) MUST keep every WRITE body identical to pre-#102 — the membership
+    /// writes read the tenant fk straight from the body, and `remove_for`/`update_for`
+    /// keep the TYPED sea-orm builder. No JOIN, no raw-SQL subquery in any write.
+    #[test]
+    fn direct_flat_child_writes_are_byte_identical() {
+        let d: Design = serde_json::from_str(CLUBS_TENANCY).unwrap();
+        let src = scoped_methods(d.find_entity("Customer").unwrap(), &d);
+        // Membership-checked create/update/delete read the direct tenant fk from the body.
+        assert!(
+            src.contains("let tenant_fk = item.club_id")
+                && src.contains(
+                    "SELECT 1 FROM club_members WHERE user_id = ? AND club_id = ? LIMIT 1"
+                ),
+            "direct create checks the body's own tenant fk:\n{src}"
+        );
+        assert!(
+            src.contains("if item.club_id != existing.club_id"),
+            "direct update pins the tenant fk:\n{src}"
+        );
+        assert!(
+            src.contains("DELETE FROM customers WHERE id = ? AND club_id IN (SELECT club_id FROM club_members WHERE user_id = ?)"),
+            "direct delete filters the direct tenant fk:\n{src}"
+        );
+        // Path-scoped writes keep the typed builder; no JOIN anywhere in a direct child.
+        assert!(
+            src.contains(".filter(customer::Column::ClubId.eq(club_id))"),
+            "direct remove_for/update_for keep the typed builder:\n{src}"
+        );
+        assert!(
+            !src.contains(" JOIN "),
+            "a direct child must never emit a JOIN in any write:\n{src}"
+        );
+    }
+
+    /// Task 4 (issue #102): a TRANSITIVE (grandchild) module scopes purely through raw
+    /// JOIN SQL — it never emits a typed `.filter(Column::..eq())`, so its repo must NOT
+    /// import `ColumnTrait`/`QueryFilter` (they would be unused → `-D warnings` on
+    /// generated code), while still importing `ConnectionTrait` for the raw SQL. A DIRECT
+    /// tenant-owned module keeps the typed builder, so its imports are unchanged.
+    #[test]
+    fn transitive_repo_drops_the_unused_typed_filter_imports() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let contacts = repo_rs(&d.modules[2], mode, &d).unwrap();
+        assert!(
+            !contacts.contains("ColumnTrait") && !contacts.contains("QueryFilter"),
+            "a transitive repo must not import the unused typed-filter traits:\n{contacts}"
+        );
+        assert!(
+            contacts.contains("ConnectionTrait"),
+            "a transitive repo still needs ConnectionTrait for the raw JOIN SQL:\n{contacts}"
+        );
+        // Byte-identity backstop: a DIRECT tenant-owned module keeps the typed builder,
+        // so its import line still carries ColumnTrait + QueryFilter.
+        let cd: Design = serde_json::from_str(CLUBS_TENANCY).unwrap();
+        let customers = repo_rs(&cd.modules[2], mode, &cd).unwrap();
+        assert!(
+            customers.contains("ColumnTrait") && customers.contains("QueryFilter"),
+            "a direct tenant-owned repo keeps the typed-filter imports:\n{customers}"
+        );
+    }
+
+    /// LOAD-BEARING INVARIANT (#78 × #102): recognition going transitive must NOT
+    /// change the GUARD SHAPE — the guard shape follows the resolved PATH, never mere
+    /// ownership. A grandchild whose path carries its PARENT'S fk
+    /// (`/accounts/{account_id}/contacts`) but NOT the tenant fk is `MembershipSet`,
+    /// and its handler takes the bare session (`_user: CurrentUser`), NEVER the
+    /// membership-checked `Dep<Tenant>` (a flat handler must not trust an arbitrary
+    /// path membership). Only a grandchild whose path carries the TENANT fk
+    /// (`/orgs/{org_id}/contacts`) is `PathScoped` and gets `Dep<Tenant>`.
+    #[test]
+    fn grandchild_guard_shape_follows_path_not_ownership() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+
+        // (a) Nested under its PARENT (account_id, not the tenant fk) → MembershipSet,
+        //     bare session, NEVER Dep<Tenant>.
+        let flat: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_UNDER_PARENT).unwrap();
+        let contacts = &flat.modules[2];
+        assert_eq!(
+            flat.endpoint_tenant_shape(contacts, &contacts.endpoints[0]),
+            TenantShape::MembershipSet,
+            "grandchild under its parent carries account_id, not the tenant fk"
+        );
+        let handlers = handlers_rs(contacts, mode, &flat);
+        assert!(
+            handlers.contains("_user: CurrentUser") && !handlers.contains("Dep<Tenant>"),
+            "flat grandchild handler must take the bare session, NEVER Dep<Tenant>:\n{handlers}"
+        );
+
+        // (b) Mounted directly under the TENANT (org_id in the path) → PathScoped,
+        //     Dep<Tenant>.
+        let scoped: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_UNDER_TENANT).unwrap();
+        let sc = &scoped.modules[2];
+        assert!(
+            matches!(
+                scoped.endpoint_tenant_shape(sc, &sc.endpoints[0]),
+                TenantShape::PathScoped { .. }
+            ),
+            "grandchild under the tenant carries the tenant fk → PathScoped"
+        );
+        let scoped_handlers = handlers_rs(sc, mode, &scoped);
+        assert!(
+            scoped_handlers.contains("_tenant: Dep<Tenant>"),
+            "path-scoped grandchild handler takes Dep<Tenant>:\n{scoped_handlers}"
+        );
+    }
+
     /// A path-nested + flat tenancy design (BookClubs shape): nested books under
     /// `/clubs/{club_id}`, flat customers, and the clubs collection root.
     const CLUBS_TENANCY: &str = r#"{ "name": "clubs-api", "contract_version": 1,
@@ -3012,6 +3785,39 @@ pub(crate) mod tests {
                     "success": { "status": 200, "entity": "Customer" } },
                   { "operation_id": "delete_customer", "method": "DELETE", "path": "/{id}", "auth_required": true,
                     "success": { "status": 204 } } ] }
+        ] }"#;
+
+    /// Like CLUBS_TENANCY but the tenant `Team` has a TEXT (uuid) primary key, so its
+    /// fk column type is `String` — the shape that trips the #125 use-after-move.
+    /// `Doc` is a direct path-scoped child mounted under the tenant at
+    /// `/teams/{team_id}`, so its `update_for` both filters on and pins the `team_id`
+    /// fk. Kept minimal (GET-only child, mirroring Book) — `scoped_methods` emits
+    /// `update_for` for any path-scoped tenant-owned entity regardless of endpoints.
+    const TEAM_DOC_TEXT_PK: &str = r#"{ "name": "team-docs-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Team", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "teams",
+              "entities": [{ "name": "Team", "fields": [
+                  { "name": "id", "type": "uuid" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_team", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Team" },
+                    "success": { "status": 201, "entity": "Team" } },
+                  { "operation_id": "get_team", "method": "GET", "path": "/{team_id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Team" } } ] },
+            { "name": "docs", "mount": "/teams/{team_id}",
+              "entities": [{ "name": "Doc",
+                  "belongs_to": [{ "entity": "Team" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "list_docs", "method": "GET", "path": "/", "auth_required": true,
+                    "success": { "status": 200, "entity": "Doc", "list": true } },
+                  { "operation_id": "get_doc", "method": "GET", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Doc" } } ] }
         ] }"#;
 
     /// The guard PARAM and the read scope-hint comment follow `endpoint_tenant_shape`

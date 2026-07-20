@@ -646,16 +646,22 @@ fn tenant_module(design: &Design) -> Option<&ModuleDesign> {
 /// so its guarded handlers take `Dep<Tenant>` and the test app must register the
 /// `tenant` factory + seed a membership row.
 fn module_needs_tenant(design: &Design, module: &ModuleDesign) -> bool {
-    let Some(tenancy) = design.tenancy.as_ref() else {
+    if design.tenancy.is_none() {
         return false;
-    };
-    fn walk(m: &ModuleDesign, tenant: &str) -> bool {
+    }
+    // Ownership is TRANSITIVE (issue #102): a grandchild (`Contact belongs_to
+    // Account belongs_to Org`) is tenant-owned too, so its module also needs the
+    // tenant/membership seed + second-tenant scaffolding its isolation test acts
+    // on. `tenant_path(..).is_some()` subsumes the old direct-`belongs_to` check
+    // (a direct child resolves to an empty-`joins` path), so direct designs stay
+    // byte-identical; only grandchild modules gain the scaffolding.
+    fn walk(design: &Design, m: &ModuleDesign) -> bool {
         m.entities
             .iter()
-            .any(|e| e.belongs_to.iter().any(|b| b.entity == tenant))
-            || m.subroutes.iter().any(|s| walk(s, tenant))
+            .any(|e| design.tenant_path(&e.name).is_some())
+            || m.subroutes.iter().any(|s| walk(design, s))
     }
-    walk(module, &tenancy.entity)
+    walk(design, module)
 }
 
 /// True when this module's test app must REGISTER the `tenant` DI factory so a
@@ -768,9 +774,81 @@ fn tenant_seed(design: &Design, module: &ModuleDesign) -> String {
     // in the SQL; since the whole statement is a Rust string literal, those quotes
     // are escaped (`\\\"`) so the generated source stays valid.
     let (cols, vals) = tenant_row_cols_vals(entity, "1", 1);
-    format!(
+    let mut seed = format!(
         "    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant row\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (1, 1, '{role}')\")\n        .await\n        .expect(\"seed membership\");\n"
-    )
+    );
+    // Seed the TRANSITIVE parent chain in tenant 1 (issue #102): a grandchild's
+    // create resolves its parent fk through the JOIN chain, so each intermediate
+    // parent (from the anchor down to the immediate parent) must exist and be
+    // linked to tenant 1. Empty for a direct child (no joins) — byte-identical.
+    if let Some(path) = module
+        .entities
+        .iter()
+        .find_map(|e| design.tenant_path(&e.name))
+    {
+        seed.push_str(&seed_tenant1_chain(design, &path));
+    }
+    seed
+}
+
+/// Seed the transitive parent chain in tenant 1 (issue #102) so a grandchild's
+/// create resolves its parent fk through the JOIN chain. Emits one INSERT per
+/// intermediate parent, ANCHOR FIRST (parents before children): the anchor (the
+/// table that directly `belongs_to` the tenant) carries the tenant fk = 1; each
+/// lower parent carries its own parent fk = 1 (the id of the row just seeded).
+/// Every table is seeded at the fixed id 1. Required (NOT NULL) non-id fields are
+/// seeded with a type-shaped literal so a parent with e.g. a required `name` still
+/// inserts; nullable fields are omitted. Empty for a direct child (no joins).
+fn seed_tenant1_chain(design: &Design, path: &TenantPath) -> String {
+    let n = path.joins.len();
+    let mut out = String::new();
+    for i in (0..n).rev() {
+        let table = &path.joins[i].parent_table;
+        // The fk linking this parent upward: the anchor (top join) carries the
+        // tenant fk; a lower parent carries its fk to ITS parent — the next join's
+        // child fk — whose row we also seed at id 1.
+        let link_fk = if i == n - 1 {
+            path.tenant_fk.as_str()
+        } else {
+            path.joins[i + 1].child_fk.as_str()
+        };
+        let mut cols = vec!["id".to_string(), link_fk.to_string()];
+        let mut vals = vec!["1".to_string(), "1".to_string()];
+        // A parent may declare its own required columns (NOT NULL, no DB default);
+        // seed them too so the INSERT satisfies the schema. Nullable columns are
+        // left NULL. `id` is the fixed 1 above; the upward fk is `link_fk`.
+        if let Some(e) = entity_by_table(design, table) {
+            for f in e.fields.iter().filter(|f| f.name != "id" && f.required) {
+                cols.push(format!("\\\"{}\\\"", f.name));
+                vals.push(seed_sql_value(f));
+            }
+        }
+        out.push_str(&format!(
+            "    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant 1 {table} row\");\n",
+            cols = cols.join(", "),
+            vals = vals.join(", "),
+        ));
+    }
+    out
+}
+
+/// The entity whose table is `table` — the reverse of `Design::table_name`. Table
+/// names are unique per entity, so this resolves the parent `Entity` a
+/// `TenantPath` join references (the join stores only table names), needed to seed
+/// that parent's required columns.
+fn entity_by_table<'a>(design: &'a Design, table: &str) -> Option<&'a Entity> {
+    fn collect<'a>(m: &'a ModuleDesign, out: &mut Vec<&'a Entity>) {
+        out.extend(m.entities.iter());
+        for s in &m.subroutes {
+            collect(s, out);
+        }
+    }
+    let mut all = Vec::new();
+    for m in &design.modules {
+        collect(m, &mut all);
+    }
+    all.into_iter()
+        .find(|e| design.table_name(&e.name) == table)
 }
 
 /// The membership role to seed for the second tenant's user: the role a
@@ -883,12 +961,17 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
     let Some(tenancy) = design.tenancy.as_ref() else {
         return String::new();
     };
-    // The tenant-owned entity declared directly on this module (subroute-nested
-    // tenant entities are out of scope — their isolation is the agent's to test).
-    let Some(entity) = module
+    // The tenant-owned entity on this module — directly OR TRANSITIVELY (issue
+    // #102). `tenant_path` resolves the unique `belongs_to` chain that reaches the
+    // tenant: a DIRECT child yields an empty-`joins` path (byte-identical to the
+    // old direct-`belongs_to` finder); a GRANDCHILD (`Contact belongs_to Account
+    // belongs_to Org`) yields the JOIN chain we seed (`seed_tenant1_chain`) and
+    // pin into the mount below. (Subroute-nested tenant entities remain out of
+    // scope — only top-level module entities, as before.)
+    let Some((entity, path)) = module
         .entities
         .iter()
-        .find(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity))
+        .find_map(|e| design.tenant_path(&e.name).map(|p| (e, p)))
     else {
         return String::new();
     };
@@ -906,13 +989,25 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
     };
     let base = module.effective_mount();
     let base = base.trim_end_matches('/');
-    // A NESTED mount carries the tenant fk (`/clubs/{club_id}/…`): pin it to tenant
-    // 1 so the probe URLs are concrete, and remember we're nested so the list leg
-    // (user 2 can't reach tenant 1's collection at all) is skipped. For a FLAT
-    // mount the token is absent, so `cbase == base` and every URL is byte-identical.
+    // A NESTED mount carries an ancestor fk token: pin every one to the seeded id 1
+    // so the probe URLs are concrete, and remember we're nested so the list leg
+    // (user 2 can't reach tenant 1's collection at all) is skipped. A DIRECT child
+    // carries the TENANT fk (`/clubs/{club_id}/…`); a GRANDCHILD carries a PARENT
+    // fk instead (`/accounts/{account_id}/…` — issue #102), pinned to the
+    // intermediate parent seeded in tenant 1. The `joins` loop is empty for a
+    // direct child, so `cbase`/`is_nested` stay byte-identical to before. For a
+    // FLAT mount no token is present, so `cbase == base` and every URL is unchanged.
     let fk_token = format!("{{{}}}", Design::fk_column(&tenancy.entity));
-    let is_nested = base.contains(&fk_token);
-    let cbase = base.replace(&fk_token, "1");
+    let parent_tokens: Vec<String> = path
+        .joins
+        .iter()
+        .map(|j| format!("{{{}}}", j.child_fk))
+        .collect();
+    let is_nested = base.contains(&fk_token) || parent_tokens.iter().any(|t| base.contains(t));
+    let mut cbase = base.replace(&fk_token, "1");
+    for tok in &parent_tokens {
+        cbase = cbase.replace(tok, "1");
+    }
     let plural = module.name.replace('-', "_");
     let body = fixture_json(
         design,
@@ -936,8 +1031,10 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
         .endpoints
         .iter()
         .find(|ep| ep.method == HttpMethod::DELETE && param_count(ep) == 1);
-    // The list leg only applies to a FLAT (MembershipSet) route: a nested route's
-    // list is itself tenant-path-guarded, so user 2 can't reach tenant 1's list.
+    // The list leg only applies to a FLAT (MembershipSet) route. A nested route's
+    // list is scoped by construction — membership on the parent chain filters the
+    // rows, not a path guard (a grandchild's parent fk is never pinned in the path)
+    // — so there is no cross-tenant list leg to negative-test here.
     let list = module
         .endpoints
         .iter()
@@ -1003,11 +1100,14 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
 /// (the two must agree: genroute suppresses the unscoped methods for exactly the
 /// entities testgen writes an owner-isolation test for).
 fn entity_is_per_user_owned(design: &Design, e: &Entity) -> bool {
-    Design::has_identity_fk(e)
-        && !design
-            .tenancy
-            .as_ref()
-            .is_some_and(|t| e.belongs_to.iter().any(|b| b.entity == t.entity))
+    // TENANT ownership wins and is TRANSITIVE (issue #102): a multi-parent entity
+    // that ALSO carries `user_id` (e.g. `Comment belongs_to [Ticket, User]`, where
+    // Ticket reaches the tenant) is tenant-owned via that chain, NOT per-user — so
+    // it gets the cross-TENANT isolation test, not the #79 per-user one. Keyed on
+    // `tenant_path(..).is_none()` so it agrees with genroute's transitive
+    // `entity_is_per_user_owned` (the two MUST stay in sync). A direct tenant child
+    // resolves to `Some` too, so existing designs are byte-identical.
+    Design::has_identity_fk(e) && design.tenant_path(&e.name).is_none()
 }
 
 /// The per-user (#79) isolation test: user 1 creates a row (the server injects
