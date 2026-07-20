@@ -550,8 +550,8 @@ fn nested_path_scoped_module_gets_isolation_test_with_pinned_tenant() {
     );
     // In the ISOLATION test the mount's tenant fk is pinned to tenant 1 (not the
     // literal `{club_id}`): user 1 creates club 1's book, user 2 (a member of club 2
-    // only) reads it and 404s. (The per-endpoint success tests still carry the raw
-    // `{club_id}` mount — a separate mount-substitution gap, out of scope here.)
+    // only) reads it and 404s. (The per-endpoint success tests now pin the mount the
+    // same way — issue #81, covered by `subroute_mount_param_is_substituted_in_per_endpoint_urls`.)
     let iso = out
         .split("async fn tenant_a_cannot_read_tenant_b_books()")
         .nth(1)
@@ -1762,4 +1762,133 @@ fn skipped_creator_suppresses_sibling_id_probes() {
         "only the 404 missing-id probe is a counted RED-on-stubs test: {generated}"
     );
     std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// A subroute-mounted, tenant-owned module: `channels` mounts at
+/// `/workspaces/{workspace_id}/channels` (the tenant fk rides in the MOUNT prefix,
+/// not `ep.path`), and each Channel `belongs_to` the tenant Workspace.
+const WORKSPACE_CHANNELS_NESTED: &str = r#"{
+    "name": "chat-api", "contract_version": 1,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+    "modules": [
+        { "name": "workspaces",
+          "entities": [{ "name": "Workspace", "fields": [
+              { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+          "endpoints": [
+              { "operation_id": "create_workspace", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Workspace" }, "success": { "status": 201, "entity": "Workspace" } },
+              { "operation_id": "list_workspaces", "method": "GET", "path": "/", "auth_required": true,
+                "success": { "status": 200, "entity": "Workspace", "list": true } } ] },
+        { "name": "channels", "mount": "/workspaces/{workspace_id}/channels",
+          "entities": [{ "name": "Channel", "belongs_to": [{ "entity": "Workspace" }],
+              "fields": [{ "name": "id", "type": "integer" }, { "name": "name", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "create_channel", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Channel" }, "success": { "status": 201, "entity": "Channel" } },
+              { "operation_id": "get_channel", "method": "GET", "path": "/{id}", "auth_required": true,
+                "success": { "status": 200, "entity": "Channel" },
+                "errors": [{ "status": 404, "when": "unknown id" }] } ] }
+    ]
+}"#;
+
+/// Issue #81: a subroute-mounted module's per-endpoint acceptance URLs must
+/// substitute the mount-inherited path param with the seeded parent id (1), not
+/// leave the literal `{workspace_id}` token. WHY (Rule 9): `channels` inherits
+/// `{workspace_id}` in its MOUNT (not `ep.path`); left literal, the router
+/// 400/404s the whole test group, so a correct app's tests are red BY CONSTRUCTION
+/// and the builder re-scaffolds (the round-5 eval's biggest token sink). The mount
+/// param is the tenant fk, seeded at id 1 by app()'s tenant chain, so pinning it to
+/// `1` makes every probe URL concrete AND resolvable.
+#[test]
+fn subroute_mount_param_is_substituted_in_per_endpoint_urls() {
+    let d: Design = serde_json::from_str(WORKSPACE_CHANNELS_NESTED).unwrap();
+    let channels = d.modules.iter().find(|m| m.name == "channels").unwrap();
+    let out = testgen::acceptance_rs(&d, channels);
+
+    // No REQUEST url (`t.<verb>(...)`) may carry the literal mount param. The router
+    // registration line (`.mount("/workspaces/{workspace_id}/channels", ...)`) keeps
+    // the param PATTERN by design, so it is excluded from this check.
+    for line in out
+        .lines()
+        .filter(|l| l.contains("    t.") || l.contains("= t."))
+    {
+        assert!(
+            !line.contains("{workspace_id}"),
+            "a request URL carries the literal mount param:\n{line}\n---\n{out}"
+        );
+    }
+    // The create success test posts to the concrete, seeded-parent collection URL.
+    let create = test_body(&out, "create_channel_returns_201");
+    assert!(
+        create.contains("t.post_json_with(\"/workspaces/1/channels/\""),
+        "create URL pins the mount param to the seeded id 1:\n{create}"
+    );
+    // The by-id GET success test seeds via the concrete collection URL, then probes
+    // the seeded row under the concrete mount (own `{id}` -> seeded id 1 as well).
+    let get = test_body(&out, "get_channel_returns_200");
+    assert!(
+        get.contains("post_json_with(\"/workspaces/1/channels/\"")
+            && get.contains("/workspaces/1/channels/1"),
+        "get URL seeds + probes under the concrete mount:\n{get}"
+    );
+    // The missing-id 404 probe substitutes the mount param and probes a missing id.
+    let missing = test_body(&out, "get_channel_missing_id_is_404");
+    assert!(
+        missing.contains("/workspaces/1/channels/999999"),
+        "404 probe substitutes the mount param:\n{missing}"
+    );
+}
+
+/// A FLAT module (no mount param) with a standalone `/{id}` route.
+const FLAT_CUSTOMERS: &str = r#"{
+    "name": "shop", "contract_version": 1, "dependencies": ["db"],
+    "modules": [{
+        "name": "customers",
+        "entities": [{ "name": "Customer", "fields": [
+            { "name": "id", "type": "integer" }, { "name": "email", "type": "string" } ]}],
+        "endpoints": [
+            { "operation_id": "create_customer", "method": "POST", "path": "/",
+              "request_body": { "entity": "Customer" },
+              "success": { "status": 201, "entity": "Customer" } },
+            { "operation_id": "show_customer", "method": "GET", "path": "/{id}",
+              "success": { "status": 200, "entity": "Customer" },
+              "errors": [{ "status": 404, "when": "unknown id" }] }
+        ]
+    }]
+}"#;
+
+/// Issue #81 (byte-identity guard): a FLAT module (no mount param) must be
+/// UNCHANGED by the mount-substitution fix — its accumulated mount carries no
+/// `{param}` to substitute, so the substitution is the identity. WHY (Rule 9): the
+/// fix is test-generation-only and must touch ONLY nested-mount modules; a
+/// regression that rewrote flat URLs would silently change every non-nested app's
+/// generated tests.
+#[test]
+fn flat_module_urls_are_unchanged_by_mount_substitution() {
+    let d: Design = serde_json::from_str(FLAT_CUSTOMERS).unwrap();
+    let customers = d.modules.iter().find(|m| m.name == "customers").unwrap();
+    let out = testgen::acceptance_rs(&d, customers);
+    // The flat create posts to the plain collection URL (no cookie: no auth)...
+    assert!(
+        out.contains("t.post_json(\"/customers/\""),
+        "flat create URL is the plain collection path: {out}"
+    );
+    // ...the by-id probe addresses the seeded row directly under it, and the 404
+    // probe hits a missing id — both plain, no nested segment.
+    let show = test_body(&out, "show_customer_returns_200");
+    assert!(
+        show.contains("/customers/1"),
+        "flat by-id URL is the plain path:\n{show}"
+    );
+    assert!(
+        out.contains("/customers/999999"),
+        "flat 404 URL is the plain path: {out}"
+    );
+    // No substitution artifact leaks into a flat file (no nested `/customers/<id>/…`).
+    assert!(
+        !out.contains("/customers/1/"),
+        "a flat module must not gain a nested mount segment: {out}"
+    );
 }

@@ -407,11 +407,48 @@ fn request_expr(
     }
 }
 
+/// The accumulated mount `base` with every mount-INHERITED path param substituted
+/// by the seeded parent id `1` (issue #81). A subroute-mounted module carries its
+/// ancestor's param in the MOUNT prefix (`/workspaces/{workspace_id}/channels`),
+/// not in `ep.path`; left literal, the router 400/404s the whole group and a
+/// correct app's tests are red by construction. Every `{param}` in `base` is a
+/// mount-inherited ancestor fk (or parent pk) whose row app()'s tenant chain seeds
+/// at id 1 (`tenant_seed`/`seed_tenant1_chain` — the same rows the isolation test's
+/// `cbase` pins), so substituting each to `1` makes the probe URL concrete AND
+/// resolvable. The endpoint's OWN `/{id}` param lives in `ep.path` (appended AFTER
+/// `base`, so never touched here) and is substituted separately by the seeded row
+/// id. A FLAT mount carries no `{param}`, so this is the identity — every
+/// non-nested design stays byte-identical.
+fn concrete_mount_base(base: &str) -> String {
+    let mut out = String::with_capacity(base.len());
+    let mut rest = base;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        match rest[open..].find('}') {
+            Some(rel_close) => {
+                out.push('1');
+                rest = &rest[open + rel_close + 1..];
+            }
+            // Unbalanced brace (never valid in a mount): emit the remainder verbatim.
+            None => {
+                out.push_str(&rest[open..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOut) {
     let auth = out.auth;
+    // Resolve the FULL path per endpoint against a mount base whose inherited params
+    // are pinned to the seeded parent id 1 (issue #81). The RAW `base` still threads
+    // through the subroute recursion below so the accumulation stays intact.
+    let cbase = concrete_mount_base(base);
 
     for ep in &unit.endpoints {
-        let full_path = format!("{}{}", base.trim_end_matches('/'), ep.path);
+        let full_path = format!("{}{}", cbase.trim_end_matches('/'), ep.path);
         let fn_base = &ep.operation_id;
         let status = ep.success.status;
         let guarded = auth && ep.is_guarded();
@@ -480,8 +517,10 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             // Issue #51: seed the row THIS `/{id}` endpoint addresses via ITS OWN
             // entity's creator (`POST /tasks` for `/tasks/{id}`), walking belongs_to
             // parents first — not the module-root creator, which would seed the
-            // wrong entity and make the probe 404 on a CORRECT handler.
-            if let Some((seed, seed_id)) = seed_for_id_probe(design, unit, base, ep, auth) {
+            // wrong entity and make the probe 404 on a CORRECT handler. Seeds/probes
+            // resolve against the mount-substituted `cbase` (issue #81) so a nested
+            // module's seed POST + `/{id}` probe both hit the concrete parent URL.
+            if let Some((seed, seed_id)) = seed_for_id_probe(design, unit, &cbase, ep, auth) {
                 let seeded_path = full_path.replacen(&regex_free_param(&ep.path), &seed_id, 1);
                 let request = request_expr(design, unit, ep, &seeded_path, guarded, None);
                 out.code.push_str(&format!(
