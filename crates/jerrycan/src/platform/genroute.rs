@@ -3508,6 +3508,83 @@ pub(crate) mod tests {
         );
     }
 
+    /// A nested-mount tenant child created at `POST /` (BookClubs shape, but with a
+    /// create endpoint). The tenant fk `club_id` lives in the module MOUNT
+    /// (`/clubs/{club_id}`), not `ep.path` (`/`). Issue #82 + the #125 CREATE vector:
+    /// once the path-redundancy check is MOUNT-aware, `club_id` is recognized as
+    /// path-owned, so the generated `BookRequest` DROPS it (a client can no longer
+    /// POST a foreign `club_id` into another tenant — the server injects the
+    /// path/tenant value) and the create handler carries the #53b inject-from-path
+    /// steering. A mount-BLIND check kept `club_id` in the body (the #82 friction).
+    const CLUBS_TENANCY_CREATE: &str = r#"{ "name": "clubs-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "clubs",
+              "entities": [{ "name": "Club", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_club", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Club" },
+                    "success": { "status": 201, "entity": "Club" } } ] },
+            { "name": "books", "mount": "/clubs/{club_id}",
+              "entities": [{ "name": "Book",
+                  "belongs_to": [{ "entity": "Club" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "create_book", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Book" },
+                    "success": { "status": 201, "entity": "Book" } } ] }
+        ] }"#;
+
+    #[test]
+    fn nested_mount_create_drops_tenant_fk_from_dto_and_steers_injection() {
+        let d: Design = serde_json::from_str(CLUBS_TENANCY_CREATE).unwrap();
+        let book = d.find_entity("Book").unwrap();
+        // The DTO omits the MOUNT-carried tenant fk (#82 / #125-create): a client body
+        // can't carry a foreign `club_id` because the field no longer exists on the wire.
+        let dto = request_dto_rs(book, &d);
+        // The struct FIELD is gone (the doc comment still names it as a documented
+        // omission — that is the intended output, so match the field declaration).
+        assert!(
+            !dto.contains("pub club_id:"),
+            "BookRequest must drop the mount-carried tenant fk `club_id` (#82/#125-create):\n{dto}"
+        );
+        assert!(
+            dto.contains("pub title:"),
+            "non-fk declared fields stay on the DTO:\n{dto}"
+        );
+        // The create handler takes the trimmed DTO and carries the inject-from-path
+        // steering (#53b), so the agent injects the path/tenant value, never a body fk.
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let books = handlers_rs(&d.modules[1], mode, &d);
+        assert!(
+            books.contains("Json(_body): Json<BookRequest>"),
+            "create_book takes the trimmed DTO, not Json<Book>:\n{books}"
+        );
+        // #125-create closure: the DTO can no longer carry a foreign `club_id`, and the
+        // create handler holds the membership-verified `Dep<Tenant>` as the ONLY tenant
+        // source — the server injects the path tenant, never a client-supplied fk.
+        assert!(
+            books.contains(
+                "pub(crate) async fn create_book(_repo: Dep<BookRepo>, _tenant: Dep<Tenant>, Json(_body): Json<BookRequest>)"
+            ),
+            "path-scoped create carries Dep<Tenant> (the injection source) + the trimmed DTO:\n{books}"
+        );
+        assert!(
+            books.contains(
+                "// path-owned fk: `BookRequest` has NO `club_id` — inject the `_club_id` path"
+            ),
+            "create handler carries the #53b inject-from-path steering:\n{books}"
+        );
+    }
+
     /// Task 4 (issue #102): a grandchild's membership-CHECKED create resolves the tenant
     /// from the BODY's immediate parent fk (a real column) and JOINs up to the anchor —
     /// it can NOT filter a non-existent direct `org_id` column. The WITH CHECK proves the

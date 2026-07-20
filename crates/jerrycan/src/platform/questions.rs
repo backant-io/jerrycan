@@ -549,7 +549,22 @@ pub fn validate(d: &Design) -> Vec<Question> {
     // the path the NOT-NULL column can be set from neither the body nor the path —
     // the route is un-implementable (the stub even references a `_{col}` binding
     // that doesn't exist). Reuses the R5 resolution — no duplicated fk logic.
-    fn check_dual_create_path_fk(d: &Design, m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+    // `prefix` is the accumulated MOUNT of this module's ancestors; combined with the
+    // module's own `effective_mount()` (trailing `/` trimmed) it resolves each
+    // endpoint's full path — the SAME "resolved path" notion `entity_path_fk_columns`
+    // and `endpoint_tenant_shape` use. A fk carried by the MOUNT (`/clubs/{club_id}`,
+    // create at `POST /`) is therefore injectable and must NOT be flagged (issue #82),
+    // even though `ep.path` alone lacks the param.
+    fn check_dual_create_path_fk(
+        d: &Design,
+        m: &ModuleDesign,
+        ptr: &str,
+        prefix: &str,
+        qs: &mut Vec<Question>,
+    ) {
+        let mount = m.effective_mount();
+        let mount = mount.strip_suffix('/').unwrap_or(&mount);
+        let base = format!("{prefix}{mount}");
         for (i, ep) in m.endpoints.iter().enumerate() {
             let Some(rb) = ep.request_body.as_ref() else {
                 continue;
@@ -560,7 +575,8 @@ pub fn validate(d: &Design) -> Vec<Question> {
             ) {
                 continue;
             }
-            let token = |col: &str| ep.path.contains(&format!("{{{col}}}"));
+            let resolved = format!("{base}{}", ep.path);
+            let token = |col: &str| resolved.contains(&format!("{{{col}}}"));
             if let Some(col) = d
                 .entity_path_fk_columns(&rb.entity)
                 .into_iter()
@@ -576,11 +592,11 @@ pub fn validate(d: &Design) -> Vec<Question> {
             }
         }
         for (i, sub) in m.subroutes.iter().enumerate() {
-            check_dual_create_path_fk(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
+            check_dual_create_path_fk(d, sub, &format!("{ptr}/subroutes/{i}"), &base, qs);
         }
     }
     for (i, m) in d.modules.iter().enumerate() {
-        check_dual_create_path_fk(d, m, &format!("/modules/{i}"), &mut qs);
+        check_dual_create_path_fk(d, m, &format!("/modules/{i}"), "", &mut qs);
     }
 
     // Tenancy: the named entity must resolve, and the Tenant guard needs an
@@ -2400,6 +2416,49 @@ mod tests {
             );
         }
     }
+
+    /// Issue #82 + #125-create: a tenant child mounted at `/clubs/{club_id}` whose
+    /// create is `POST /` carries its parent fk in the MOUNT. Now that
+    /// `entity_path_fk_columns` is mount-aware it reports `club_id` as path-redundant
+    /// — but the RESOLVED path DOES carry `{club_id}`, so the route IS implementable
+    /// (the handler injects the path/tenant value). JC0544 must resolve the mount the
+    /// same way and NOT flag it; otherwise `require_complete` would block the exact
+    /// nested-mount app 0.5.2 blesses. (A mount-BLIND JC0544 would fire here because
+    /// `ep.path == "/"` lacks `{club_id}` even though the mount supplies it.)
+    #[test]
+    fn nested_mount_create_carries_fk_in_the_mount_and_is_not_flagged() {
+        let d: Design = serde_json::from_str(NESTED_MOUNT_CREATE).unwrap();
+        assert!(
+            !validate(&d).iter().any(|q| q.question.contains("JC0544")),
+            "a mount-nested create carries its fk in the RESOLVED path, so it must not \
+             trip JC0544: {:?}",
+            validate(&d)
+        );
+    }
+
+    /// A tenant child created at `POST /` under a module mounted at `/clubs/{club_id}`
+    /// — the fk `club_id` is supplied by the MOUNT, not `ep.path`.
+    const NESTED_MOUNT_CREATE: &str = r#"{ "name": "clubs-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "clubs",
+              "entities": [{ "name": "Club", "fields": [
+                  { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_club", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Club" },
+                    "success": { "status": 201, "entity": "Club" } } ] },
+            { "name": "books", "mount": "/clubs/{club_id}",
+              "entities": [{ "name": "Book",
+                  "belongs_to": [{ "entity": "Club" }],
+                  "fields": [{ "name": "id", "type": "integer" }, { "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "create_book", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Book" },
+                    "success": { "status": 201, "entity": "Book" } } ] }
+        ] }"#;
 
     /// The #60 repro: one entity created both nested and standalone.
     const DUAL_CREATE: &str = r#"{
