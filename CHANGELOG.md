@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.5.3 — 2026-07-20
+
+Security patch — closes a **critical realtime broadcast leak**. A `changes`
+channel on the **tenancy entity itself** (`changes: ["Workspace"]` where
+`Workspace` is the tenant) derived `tenant_column: None`, so `change_visible`'s
+`(None, _) => true` broadcast **every row to every authenticated principal**,
+member or not — a cross-tenant data leak with `check` green. Found by the
+round-5 eval (collab app).
+
+### Security
+- **#113 — closed.** When the `changes` entity is the tenancy entity, its own
+  primary key is now its tenant key (`tenant_column: Some("id")`), so a member of
+  tenant T receives only tenant-T's own row and non-members receive nothing. The
+  runtime CDC path was already correct once the column is populated — codegen-only
+  fix, zero runtime change.
+- **`JC0547` — realtime `changes` on a transitively tenant-owned entity (a
+  grandchild) is now refused at design time** instead of silently leaking (its
+  tenant key lives on an ancestor table that CDC can't read from the row image).
+  The changes entity must be the tenant itself or a direct child. Full transitive
+  realtime is a 0.6.0 capability.
+
+### Deferred (tracked)
+- #117 (anonymous clients can't reach `scope:"none"` realtime topics) →
+  0.6.0, alongside the #104 many-membership realtime rework (same resolver path).
+- A generated live-WS cross-tenant negative-control test (the current realtime
+  acceptance tests are `#[ignore]`d stubs) — needs an in-memory WS test client.
+
+Realtime apps whose `changes` entity is a **direct child** of the tenant are
+byte-identical to 0.5.2. Framework Rust API additive only (`cargo semver-checks`
+clean).
+
 ## 0.5.2 — 2026-07-20
 
 Greenability patch. The round-5 eval's biggest cost was builders re-scaffolding
