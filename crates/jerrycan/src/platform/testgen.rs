@@ -66,6 +66,7 @@ fn fixture_json(
     entity: &str,
     omit_identity_fk: bool,
     bad_enum: Option<&str>,
+    keep_defaults: bool,
 ) -> String {
     let Some(e) = m.entities.iter().find(|e| e.name == entity) else {
         return "{}".to_string();
@@ -89,19 +90,25 @@ fn fixture_json(
                 fk_fixture_value(design, &b.entity)
             )
         });
-    // A `default` field (issue #53a) is server-owned: the probe omits it so the
-    // minimal client body proves the server applies the default (not a 422).
-    let cols = e.fields.iter().filter(|f| f.default.is_none()).map(|f| {
-        // The reject probe (issue #47) corrupts ONE enum field to an out-of-range
-        // sentinel; every other field keeps its valid fixture value so the ONLY
-        // reason for a 422 is that enum.
-        let value = if bad_enum == Some(f.name.as_str()) {
-            format!("\"{ENUM_REJECT_SENTINEL}\"")
-        } else {
-            fixture_value(f)
-        };
-        format!("\"{}\": {}", f.name, value)
-    });
+    // A `default` field (issue #53a) is server-owned on CREATE: the probe omits it
+    // so the minimal client body proves the server applies the default (not a 422).
+    // On UPDATE the field is client-settable (issue #85 D1), so an update probe KEEPS
+    // it — the body must match `{Entity}UpdateRequest`, which requires it.
+    let cols = e
+        .fields
+        .iter()
+        .filter(|f| keep_defaults || f.default.is_none())
+        .map(|f| {
+            // The reject probe (issue #47) corrupts ONE enum field to an out-of-range
+            // sentinel; every other field keeps its valid fixture value so the ONLY
+            // reason for a 422 is that enum.
+            let value = if bad_enum == Some(f.name.as_str()) {
+                format!("\"{ENUM_REJECT_SENTINEL}\"")
+            } else {
+                fixture_value(f)
+            };
+            format!("\"{}\": {}", f.name, value)
+        });
     let fields = fks.chain(cols).collect::<Vec<_>>().join(", ");
     format!("{{{fields}}}")
 }
@@ -178,6 +185,7 @@ fn seed_line(
             .entity,
         omits_identity_fk(design, unit, creator),
         None,
+        false, // seed via the creator (POST) — a create body omits defaults
     );
     if auth && creator.is_guarded() {
         let hk = design.test_auth_header();
@@ -356,6 +364,9 @@ fn request_expr(
                     &rb.entity,
                     omits_identity_fk(design, unit, ep),
                     bad_enum,
+                    // An UPDATE (PUT/PATCH) probe keeps `default` fields so the body
+                    // matches `{Entity}UpdateRequest` (issue #85 D1); a create omits them.
+                    ep.method.is_update(),
                 )
             })
             .unwrap_or_else(|| "{}".to_string())
@@ -1080,6 +1091,7 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
         &entity.name,
         omits_identity_fk(design, module, create),
         None,
+        false, // isolation seeds a row via create — a create body omits defaults
     );
     let create_path = format!("{cbase}/");
 
@@ -1216,6 +1228,7 @@ fn per_user_isolation_test(design: &Design, module: &ModuleDesign) -> String {
         &entity.name,
         omits_identity_fk(design, module, create),
         None,
+        false, // isolation seeds a row via create — a create body omits defaults
     );
     let create_path = format!("{base}/");
     // Only GUARDED reads carry the owner scope — an unguarded read has no session to
@@ -1323,6 +1336,7 @@ fn tenant_collection_isolation_test(design: &Design, module: &ModuleDesign) -> S
         &entity.name,
         omits_identity_fk(design, module, create),
         None,
+        false, // isolation seeds a row via create — a create body omits defaults
     );
     let hk = design.test_auth_header();
     format!(
@@ -1343,6 +1357,14 @@ fn seed_sql_value(f: &Field) -> String {
         return format!("'{first}'");
     }
     match f.field_type {
+        // A `unique` String/Integer/Float shares its literal with the create-probe
+        // body (`fixture_value`), so a create probe on a pre-seeded tenant row 409s
+        // (#85). Seed a DISTINCT value for those. datetime/uuid seeds ('test-value')
+        // already differ from their probe fixtures (a real timestamp / v4 uuid), so
+        // they stay unchanged; boolean/json are never realistic unique keys.
+        FieldType::String if f.unique => "'seed-test-value'".to_string(),
+        FieldType::Integer if f.unique => "1000".to_string(),
+        FieldType::Float if f.unique => "1000.0".to_string(),
         FieldType::String | FieldType::Datetime | FieldType::Uuid => "'test-value'".to_string(),
         FieldType::Integer => "1".to_string(),
         FieldType::Float => "1.0".to_string(),

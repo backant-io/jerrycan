@@ -432,6 +432,14 @@ impl HttpMethod {
             HttpMethod::DELETE => "DELETE",
         }
     }
+
+    /// True for a REPLACE/MODIFY method (PUT/PATCH) — the "update" shape, as
+    /// opposed to POST (create). Distinguishes the request DTO by write path: a
+    /// `default` field is server-owned on CREATE (dropped) but client-settable on
+    /// UPDATE (kept), so update keeps it in the body (issue #85 D1).
+    pub fn is_update(self) -> bool {
+        matches!(self, HttpMethod::PUT | HttpMethod::PATCH)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1059,6 +1067,16 @@ impl Design {
             .is_some_and(|e| e.fields.iter().any(|f| f.default.is_some()))
     }
 
+    /// True when entity `entity` (anywhere in the tree) declares a `default` field
+    /// (issue #85 D1). Its UPDATE request DTO (`{Entity}UpdateRequest`) KEEPS those
+    /// fields — a `default` is create-only, so an update must be able to set them —
+    /// while the CREATE DTO drops them. Resolves by name so a caller holding only
+    /// the fk/body entity name agrees with the one holding the `Entity`.
+    pub(crate) fn entity_has_default(&self, entity: &str) -> bool {
+        self.find_entity(entity)
+            .is_some_and(|e| e.fields.iter().any(|f| f.default.is_some()))
+    }
+
     /// The nested-route parent-FK rule (issue #53b): the fk columns this entity's
     /// belongs_to derive that ALSO appear as a `{param}` in some endpoint whose
     /// body is this entity (`Checkin belongs_to Habit` + `POST /{habit_id}/checkins`
@@ -1184,6 +1202,27 @@ impl Design {
             .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
             .map(|f| f.field_type.rust_type())
             .unwrap_or("i64")
+    }
+
+    /// The Rust key type a PATH PARAM references (issue #85): a param named after a
+    /// belongs_to fk column (`site_id`) points at that entity's pk, so it must type
+    /// from the referent — a string/uuid-pk `Site` → `String`, not a hardcoded
+    /// `i64`. Matches `{snake}_id` back to the entity whose `fk_column` equals the
+    /// param, then resolves its pk type. Returns `i64` when the param matches no
+    /// entity's fk column (a synthetic/opaque param like `code`), so every design
+    /// whose non-id path params reference integer-pk entities stays byte-identical.
+    pub fn path_param_key_type(&self, param: &str) -> &'static str {
+        fn find_name<'a>(m: &'a ModuleDesign, param: &str) -> Option<&'a str> {
+            m.entities
+                .iter()
+                .map(|e| e.name.as_str())
+                .find(|n| Design::fk_column(n) == param)
+                .or_else(|| m.subroutes.iter().find_map(|s| find_name(s, param)))
+        }
+        match self.modules.iter().find_map(|m| find_name(m, param)) {
+            Some(name) => self.target_key_rust_type(name),
+            None => "i64",
+        }
     }
 
     /// Resolve an entity by name across the whole design tree (any module or

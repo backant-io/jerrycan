@@ -987,8 +987,10 @@ fn post_only_id_action_404_probe_uses_post_not_get() {
 /// with DISTINCT values for that column, or the second-tenant seed the isolation
 /// test depends on crashes every test at setup with a UNIQUE-constraint violation.
 /// WHY (Rule 9): tenant 1 and tenant 2 previously shared `'test-value'` for every
-/// string column; a `unique` column then collides. Tenant 1 must stay byte-identical
-/// (`'test-value'`) and tenant 2 must differ (`'test-value-2'`).
+/// string column; a `unique` column then collides. Tenant 1 seeds a value distinct
+/// from BOTH tenant 2 (`'test-value-2'`) AND the create-probe body (`'test-value'`,
+/// `fixture_value`) — the latter is the #85 D3 fix: without it a create probe on the
+/// tenant entity 409s on the pre-seeded row.
 #[test]
 fn two_tenant_seed_uses_distinct_values_for_a_unique_field() {
     let design: Design = serde_json::from_value(serde_json::json!({
@@ -1038,10 +1040,11 @@ fn two_tenant_seed_uses_distinct_values_for_a_unique_field() {
         .expect("projects module");
     let generated = testgen::acceptance_rs(&design, projects);
 
-    // Tenant 1's seed keeps the byte-identical placeholder for the unique slug.
+    // Tenant 1's seed uses a value DISTINCT from the create-probe body (#85 D3), so
+    // it collides with neither tenant 2 nor a create probe on the tenant entity.
     assert!(
-        generated.contains("VALUES (1, 'test-value')"),
-        "tenant 1 seeds the unchanged placeholder slug: {generated}"
+        generated.contains("VALUES (1, 'seed-test-value')"),
+        "tenant 1 seeds a unique slug distinct from the probe fixture: {generated}"
     );
     // Tenant 2's seed (in seed_second_tenant) must NOT reuse the SAME slug literal —
     // it carries a distinct value so the UNIQUE constraint holds.
@@ -1905,5 +1908,50 @@ fn flat_module_urls_are_unchanged_by_mount_substitution() {
     assert!(
         !out.contains("/customers/1/"),
         "a flat module must not gain a nested mount segment: {out}"
+    );
+}
+
+/// Issue #85 (D3): a `unique` field on the tenant entity must seed a value
+/// DISTINCT from the create-probe body, or the create probe 409s on the
+/// pre-seeded tenant row. This tenant module owns a child (`Project`), so `app()`
+/// pre-seeds the `Org` tenant row — and `create_org`'s probe body must not reuse
+/// that row's unique `slug`. WHY (Rule 9): the round-4 `index` workaround did NOT
+/// prevent the collision; only a distinct seed value keeps the create probe green.
+#[test]
+fn unique_tenant_field_seed_does_not_collide_with_the_create_probe() {
+    const UNIQUE_TENANT: &str = r#"{
+        "name": "orgs", "contract_version": 0,
+        "auth": { "model": "session" },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner"] },
+        "modules": [{ "name": "orgs",
+            "entities": [
+                { "name": "Org", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "slug", "type": "string", "unique": true } ] },
+                { "name": "Project", "belongs_to": [{ "entity": "Org" }],
+                  "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "title", "type": "string" } ] } ],
+            "endpoints": [
+                { "operation_id": "list_orgs", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Org", "list": true } },
+                { "operation_id": "create_org", "method": "POST", "path": "/", "auth_required": true,
+                  "request_body": { "entity": "Org" },
+                  "success": { "status": 201, "entity": "Org" } } ] }]
+    }"#;
+    let design: Design = serde_json::from_str(UNIQUE_TENANT).unwrap();
+    let module = &design.modules[0];
+    let generated = testgen::acceptance_rs(&design, module);
+    // The create probe carries the ordinary string fixture for the unique slug.
+    assert!(
+        generated.contains("\"slug\": \"test-value\""),
+        "create probe posts the string fixture for slug:\n{generated}"
+    );
+    // The pre-seeded tenant-1 row must NOT reuse that same unique value, else the
+    // create probe 409s on the seeded row.
+    assert!(
+        !generated.contains("VALUES (1, 'test-value')"),
+        "tenant-1 seed must not reuse the probe's unique slug value (would 409):\n{generated}"
     );
 }

@@ -185,6 +185,31 @@ fn endpoint_takes_request_dto(
     mode.db && design.endpoint_uses_request_dto(m, ep, mode.auth)
 }
 
+/// The request-DTO struct name this endpoint's body deserializes into, or `None`
+/// when it takes the plain `Json<{Entity}>`. An UPDATE (PUT/PATCH) of a defaulted
+/// entity takes `{Entity}UpdateRequest` (keeps the `default` fields so they stay
+/// settable — issue #85 D1); every other DTO endpoint takes `{Entity}Request`.
+/// The single source of truth so `handler_params` and `server_owned_fk_comment`
+/// agree on the name.
+fn request_dto_name(
+    m: &ModuleDesign,
+    ep: &Endpoint,
+    mode: GenMode,
+    design: &Design,
+) -> Option<String> {
+    if !endpoint_takes_request_dto(m, ep, mode, design) {
+        return None;
+    }
+    let entity = &ep.request_body.as_ref()?.entity;
+    Some(
+        if ep.method.is_update() && design.entity_has_default(entity) {
+            format!("{entity}UpdateRequest")
+        } else {
+            format!("{entity}Request")
+        },
+    )
+}
+
 /// True when this endpoint gets the server-side realtime publish wiring (issue
 /// #50): a MUTATING endpoint (POST/PUT/PATCH/DELETE — the "created a row, now
 /// push it" shape) in a design that declares a server-publishable broadcast
@@ -230,7 +255,17 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
         .map(key_rust_type)
         .unwrap_or("i64");
     let key_param = entity_key_param(m, ep, design);
-    let param_type = |p: &str| if p == key_param.as_str() { key } else { "i64" };
+    // The endpoint's own key param takes the entity key type; every OTHER path
+    // param types from the entity it REFERENCES (issue #85) — a `{site_id}` for a
+    // string-pk `Site` is `String`, not a hardcoded `i64` (falls back to `i64` for
+    // an opaque param that names no entity's fk column).
+    let param_type = |p: &str| {
+        if p == key_param.as_str() {
+            key
+        } else {
+            design.path_param_key_type(p)
+        }
+    };
     match params_in_path.len() {
         0 => {}
         1 => params.push(format!(
@@ -249,12 +284,12 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
         }
     }
     if let Some(ref rb) = ep.request_body {
-        // Server-owned FK (issue #34): the guarded body drops `user_id`, so the
-        // param type is the `{Entity}Request` DTO, not the entity itself.
-        if endpoint_takes_request_dto(m, ep, mode, design) {
-            params.push(format!("Json(_body): Json<{}Request>", rb.entity));
-        } else {
-            params.push(format!("Json(_body): Json<{}>", rb.entity));
+        // A body that drops a server-owned field (issues #34/#53) takes the trimmed
+        // DTO — `{Entity}Request`, or `{Entity}UpdateRequest` for a defaulted-entity
+        // update (issue #85 D1) — not the entity itself.
+        match request_dto_name(m, ep, mode, design) {
+            Some(name) => params.push(format!("Json(_body): Json<{name}>")),
+            None => params.push(format!("Json(_body): Json<{}>", rb.entity)),
         }
     }
     params.join(", ")
@@ -520,6 +555,11 @@ fn server_owned_fk_comment(
     let Some(e) = m.entities.iter().find(|e| &e.name == entity) else {
         return String::new();
     };
+    // The DTO this endpoint's body deserializes into — `{Entity}Request` on create,
+    // `{Entity}UpdateRequest` on a defaulted-entity update (issue #85 D1). Every
+    // comment names the ACTUAL type the handler receives.
+    let dto = request_dto_name(m, ep, mode, design).expect("endpoint_takes_request_dto ⇒ a DTO");
+    let is_update = ep.method.is_update();
     let mut out = String::new();
     // Identity fk (#34): guarded + auth → the wire body omits `user_id`. The rule is
     // method-agnostic, but the STUB GUIDANCE is not (issue #42): a CREATE (POST)
@@ -533,16 +573,16 @@ fn server_owned_fk_comment(
         let tenant_owned = endpoint_uses_tenant_guard(m, ep, design);
         out.push_str(&match (is_create, tenant_owned) {
             (true, true) => format!(
-                "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Add a `user: CurrentUser` param and use `user.0.id` (the\n    // stringified user pk; parse it for an integer fk) when building the {entity}.\n"
+                "    // server-owned fk: `{dto}` has NO `user_id` — the server injects the\n    // session user's id. Add a `user: CurrentUser` param and use `user.0.id` (the\n    // stringified user pk; parse it for an integer fk) when building the {entity}.\n"
             ),
             (true, false) => format!(
-                "    // server-owned fk: `{entity}Request` has NO `user_id` — the server injects the\n    // session user's id. Use `_user.0.id` (the stringified user pk; parse it for an\n    // integer fk) when building the {entity}.\n"
+                "    // server-owned fk: `{dto}` has NO `user_id` — the server injects the\n    // session user's id. Use `_user.0.id` (the stringified user pk; parse it for an\n    // integer fk) when building the {entity}.\n"
             ),
             (false, true) => format!(
-                "    // server-owned fk: `{entity}Request` has NO `user_id` — on UPDATE, PRESERVE the\n    // existing row's owner. Do NOT reassign `user_id`; scope the update through the\n    // membership (`_tenant`) so a non-owner can't take the row.\n"
+                "    // server-owned fk: `{dto}` has NO `user_id` — on UPDATE, PRESERVE the\n    // existing row's owner. Do NOT reassign `user_id`; scope the update through the\n    // membership (`_tenant`) so a non-owner can't take the row.\n"
             ),
             (false, false) => format!(
-                "    // server-owned fk: `{entity}Request` has NO `user_id` — on UPDATE, PRESERVE the\n    // existing row's owner. Do NOT reassign `user_id` to `_user.0.id`; scope the\n    // UPDATE to the owner (e.g. WHERE user_id = _user.0.id) so a non-owner can't take it.\n"
+                "    // server-owned fk: `{dto}` has NO `user_id` — on UPDATE, PRESERVE the\n    // existing row's owner. Do NOT reassign `user_id` to `_user.0.id`; scope the\n    // UPDATE to the owner (e.g. WHERE user_id = _user.0.id) so a non-owner can't take it.\n"
             ),
         });
     }
@@ -550,29 +590,46 @@ fn server_owned_fk_comment(
     // (`_{col}`), so the handler injects it instead of reading it from the body.
     for col in design.entity_path_fk_columns(entity) {
         out.push_str(&format!(
-            "    // path-owned fk: `{entity}Request` has NO `{col}` — inject the `_{col}` path\n    // value (the handler's Path param) when building the {entity}.\n"
+            "    // path-owned fk: `{dto}` has NO `{col}` — inject the `_{col}` path\n    // value (the handler's Path param) when building the {entity}.\n"
         ));
     }
-    // Server-owned defaults (#53a): the DTO omits each default field; the handler
-    // writes the declared value into the NOT-NULL column.
-    let defaults: Vec<String> = e
-        .fields
-        .iter()
-        .filter_map(|f| {
-            f.default.as_ref().map(|v| {
-                format!(
-                    "`{}` = {}",
-                    f.name,
-                    serde_json::to_string(v).unwrap_or_else(|_| "…".into())
-                )
+    // Defaults (#53a): on CREATE the DTO omits each default field and the handler
+    // writes the declared value; on UPDATE the DTO KEEPS them (issue #85 D1), so the
+    // handler must use the body value — resetting to the default would silently undo
+    // an edit to a defaulted lifecycle field.
+    if is_update {
+        let names: Vec<String> = e
+            .fields
+            .iter()
+            .filter(|f| f.default.is_some())
+            .map(|f| format!("`{}`", f.name))
+            .collect();
+        if !names.is_empty() {
+            out.push_str(&format!(
+                "    // settable defaults: `{dto}` KEEPS {} — a `default` applies on CREATE only;\n    // on UPDATE use the request body's value (do NOT reset it to the default).\n",
+                names.join(", ")
+            ));
+        }
+    } else {
+        let defaults: Vec<String> = e
+            .fields
+            .iter()
+            .filter_map(|f| {
+                f.default.as_ref().map(|v| {
+                    format!(
+                        "`{}` = {}",
+                        f.name,
+                        serde_json::to_string(v).unwrap_or_else(|_| "…".into())
+                    )
+                })
             })
-        })
-        .collect();
-    if !defaults.is_empty() {
-        out.push_str(&format!(
-            "    // server-owned defaults: `{entity}Request` omits {} — set each to its\n    // declared default when building the {entity}.\n",
-            defaults.join(", ")
-        ));
+            .collect();
+        if !defaults.is_empty() {
+            out.push_str(&format!(
+                "    // server-owned defaults: `{dto}` omits {} — set each to its\n    // declared default when building the {entity}.\n",
+                defaults.join(", ")
+            ));
+        }
     }
     out
 }
@@ -831,23 +888,45 @@ pub use {snake}::Model as {entity};
                     .is_some_and(|rb| rb.entity == e.name)
         });
         if needs_dto {
-            out.push_str(&request_dto_rs(e, design));
+            out.push_str(&request_dto_rs(e, design, false));
+        }
+        // A defaulted entity with an UPDATE endpoint also gets `{Entity}UpdateRequest`
+        // — the create DTO drops its `default` fields, but update must keep them so
+        // a defaulted lifecycle enum stays settable after create (issue #85 D1).
+        let needs_update_dto = e.fields.iter().any(|f| f.default.is_some())
+            && m.endpoints.iter().any(|ep| {
+                ep.method.is_update()
+                    && design.endpoint_uses_request_dto(m, ep, auth)
+                    && ep
+                        .request_body
+                        .as_ref()
+                        .is_some_and(|rb| rb.entity == e.name)
+            });
+        if needs_update_dto {
+            out.push_str(&request_dto_rs(e, design, true));
         }
     }
     out.push_str(&enum_deserialize_fns(&m.entities));
     Some(out)
 }
 
-/// The `{Entity}Request` DTO (issues #34 + #53): the entity's deserialization
-/// shape MINUS every field the wire contract drops — the server-owned identity
-/// `user_id` fk (#34), any `default` field (#53a), and a path-redundant parent
-/// fk (#53b). The client never sends these; the server supplies each value.
-/// Everything else mirrors the Model: the pk `id` (synthetic → `#[serde(default)]`),
-/// the remaining fk columns (SetNull → `Option` + default), then the declared
-/// fields with the same optionality and keyword renames. Plain serde struct —
-/// only the Model touches SeaORM.
-fn request_dto_rs(e: &Entity, design: &Design) -> String {
+/// The request DTO (issues #34 + #53 + #85): the entity's deserialization shape
+/// MINUS every field the wire contract drops — the server-owned identity `user_id`
+/// fk (#34) and a path-redundant parent fk (#53b) are always dropped. A `default`
+/// field (#53a) is dropped on CREATE (`for_update = false`, `{Entity}Request` — the
+/// server applies the value) but KEPT on UPDATE (`for_update = true`,
+/// `{Entity}UpdateRequest` — a `default` is create-only, so an update must be able
+/// to set it; issue #85 D1). Everything else mirrors the Model: the pk `id`
+/// (synthetic → `#[serde(default)]`), the remaining fk columns (a SetNull fk is an
+/// optional field with a serde default), then the declared fields with the same
+/// optionality and keyword renames. Plain serde struct — only the Model touches SeaORM.
+fn request_dto_rs(e: &Entity, design: &Design, for_update: bool) -> String {
     let entity = &e.name;
+    let struct_name = if for_update {
+        format!("{entity}UpdateRequest")
+    } else {
+        format!("{entity}Request")
+    };
     let key = key_rust_type(e);
     let id_default = if declared_id(e).is_some() {
         ""
@@ -872,11 +951,12 @@ fn request_dto_rs(e: &Entity, design: &Design) -> String {
             fields.push_str(&format!("    pub {col}: {ty},\n"));
         }
     }
-    // A `default` field (#53a) is server-owned: it does not appear on the wire.
+    // A `default` field (#53a) is server-owned on CREATE (dropped); on UPDATE it is
+    // client-settable (kept), so `for_update` includes it (issue #85 D1).
     for f in e
         .fields
         .iter()
-        .filter(|f| f.name != "id" && f.default.is_none())
+        .filter(|f| f.name != "id" && (for_update || f.default.is_none()))
     {
         let base = f.field_type.rust_type();
         fields.push_str(&keyword_field_attrs(&f.name, "    ", false));
@@ -890,17 +970,24 @@ fn request_dto_rs(e: &Entity, design: &Design) -> String {
             fields.push_str(&format!("    pub {ident}: Option<{base}>,\n"));
         }
     }
-    let doc = request_dto_doc(e, &path_fks, omit_identity);
+    let doc = request_dto_doc(e, &path_fks, omit_identity, for_update);
     format!(
-        "{doc}#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\npub struct {entity}Request {{\n{id_default}    pub id: {key},\n{fields}}}\n\n"
+        "{doc}#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\npub struct {struct_name} {{\n{id_default}    pub id: {key},\n{fields}}}\n\n"
     )
 }
 
-/// The doc comment for a `{Entity}Request` DTO — one `///` line per dropped
-/// server-owned field with its reason, so an agent reading the struct sees
-/// exactly which keys the server supplies. Ordered identity fk → path fk →
-/// defaults (the struct-field order the DTO omits them in).
-fn request_dto_doc(e: &Entity, path_fks: &[String], omit_identity: bool) -> String {
+/// The doc comment for a request DTO — one `///` line per dropped server-owned
+/// field with its reason, so an agent reading the struct sees exactly which keys
+/// the server supplies. Ordered identity fk → path fk → defaults (the struct-field
+/// order the DTO omits them in). On UPDATE (`for_update`) the `default` fields are
+/// KEPT (client-settable), so they are not listed as omitted; the doc notes they
+/// are settable here, unlike on create (issue #85 D1).
+fn request_dto_doc(
+    e: &Entity,
+    path_fks: &[String],
+    omit_identity: bool,
+    for_update: bool,
+) -> String {
     let mut reasons = Vec::new();
     for b in &e.belongs_to {
         let col = Design::fk_column(&b.entity);
@@ -909,6 +996,22 @@ fn request_dto_doc(e: &Entity, path_fks: &[String], omit_identity: bool) -> Stri
         } else if path_fks.contains(&col) {
             reasons.push(format!("`{col}` (from the request path)"));
         }
+    }
+    if for_update {
+        // The `default` fields are KEPT here (settable on update). Only identity/
+        // path fks stay server-owned; note them when present.
+        let omitted = if reasons.is_empty() {
+            "\n/// (none — every declared field is client input on update).".to_string()
+        } else {
+            format!(
+                " These SERVER-OWNED fields\n/// are still omitted (the server supplies each):\n///   {}.",
+                reasons.join(", ")
+            )
+        };
+        return format!(
+            "/// Update body for `{}` — like `{}Request` but KEEPS each `default` field, which\n/// is create-only server-owned yet settable on update (do NOT reset it here).{}\n",
+            e.name, e.name, omitted
+        );
     }
     for f in e.fields.iter().filter(|f| f.default.is_some()) {
         let v = f.default.as_ref().expect("filtered to Some");
@@ -3546,7 +3649,7 @@ pub(crate) mod tests {
         let book = d.find_entity("Book").unwrap();
         // The DTO omits the MOUNT-carried tenant fk (#82 / #125-create): a client body
         // can't carry a foreign `club_id` because the field no longer exists on the wire.
-        let dto = request_dto_rs(book, &d);
+        let dto = request_dto_rs(book, &d, false);
         // The struct FIELD is gone (the doc comment still names it as a documented
         // omission — that is the intended output, so match the field declaration).
         assert!(
@@ -5298,6 +5401,116 @@ pub(crate) mod tests {
         assert!(
             src.contains("Result<Option<String>, D::Error>"),
             "optional validator returns Option<String>: {src}"
+        );
+    }
+
+    /// Issue #85 (D1): a `default` field is dropped from the CREATE request DTO
+    /// (the server applies the declared value) but MUST stay in the UPDATE request
+    /// DTO — otherwise a defaulted lifecycle enum (`status`) can NEVER be changed
+    /// after creation. So a defaulted entity used by BOTH a create and an update
+    /// endpoint emits two DTOs: `{Entity}Request` (create, omits the default) and
+    /// `{Entity}UpdateRequest` (update, keeps it), and each handler binds the
+    /// matching body type. WHY (Rule 9): binding the create DTO on update makes the
+    /// field unsettable — the exact greenability bug this fix closes.
+    const DEFAULT_UPDATE: &str = r#"{
+        "name": "news", "contract_version": 0, "dependencies": ["db"],
+        "modules": [{ "name": "subscribers",
+            "entities": [{ "name": "Subscriber", "fields": [
+                { "name": "id", "type": "integer" },
+                { "name": "email", "type": "string" },
+                { "name": "status", "type": "string", "values": ["active", "expired"], "default": "active" } ] }],
+            "endpoints": [
+                { "operation_id": "create_subscriber", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Subscriber" },
+                  "success": { "status": 201, "entity": "Subscriber" } },
+                { "operation_id": "update_subscriber", "method": "PUT", "path": "/{id}",
+                  "request_body": { "entity": "Subscriber" },
+                  "success": { "status": 200, "entity": "Subscriber" } } ] }]
+    }"#;
+
+    #[test]
+    fn default_field_stays_in_the_update_dto_but_not_the_create_dto() {
+        let d: Design = serde_json::from_str(DEFAULT_UPDATE).unwrap();
+        let m = &d.modules[0];
+        let model = model_rs_db(m, &d, false).unwrap();
+
+        // CREATE DTO omits the default (the server applies it).
+        let create_dto = model
+            .split("pub struct SubscriberRequest {")
+            .nth(1)
+            .expect("SubscriberRequest emitted")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            !create_dto.contains("status"),
+            "CREATE DTO must omit the default field: {create_dto}"
+        );
+
+        // UPDATE DTO keeps the default (it must be settable after create).
+        let update_dto = model
+            .split("pub struct SubscriberUpdateRequest {")
+            .nth(1)
+            .expect(
+                "SubscriberUpdateRequest emitted for a defaulted entity with an update endpoint",
+            )
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            update_dto.contains("pub status: String,"),
+            "UPDATE DTO must keep the default field so it can be changed: {update_dto}"
+        );
+
+        // Each handler binds the matching body type.
+        let mode = GenMode {
+            db: true,
+            auth: false,
+        };
+        let h = handlers_rs(m, mode, &d);
+        assert!(
+            h.contains("async fn create_subscriber(_repo: Dep<SubscriberRepo>, Json(_body): Json<SubscriberRequest>)"),
+            "create binds the create DTO (omits the default): {h}"
+        );
+        assert!(
+            h.contains("async fn update_subscriber(_repo: Dep<SubscriberRepo>, Path(_id): Path<i64>, Json(_body): Json<SubscriberUpdateRequest>)"),
+            "update binds the update DTO (keeps the default): {h}"
+        );
+    }
+
+    /// Issue #85 (D2): a non-`{id}` path param must type from the entity it
+    /// references, not a hardcoded `i64`. `/{site_id}/pages` references `Site`,
+    /// whose pk is a `String`, so the generated handler binds `Path<String>`. WHY
+    /// (Rule 9): a hardcoded `i64` makes the router 400/deserialize-fail every
+    /// string-pk reference — the whole nested group is un-greenable.
+    const STRING_PK_PATH_PARAM: &str = r#"{
+        "name": "cms", "contract_version": 0, "dependencies": ["db"],
+        "modules": [{ "name": "pages",
+            "entities": [
+                { "name": "Site", "fields": [
+                    { "name": "id", "type": "string" },
+                    { "name": "name", "type": "string" } ] },
+                { "name": "Page", "belongs_to": [{ "entity": "Site" }],
+                  "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "title", "type": "string" } ] } ],
+            "endpoints": [
+                { "operation_id": "list_pages", "method": "GET", "path": "/{site_id}/pages",
+                  "success": { "status": 200, "entity": "Page", "list": true } } ] }]
+    }"#;
+
+    #[test]
+    fn non_id_path_param_types_from_its_referenced_entity_pk() {
+        let d: Design = serde_json::from_str(STRING_PK_PATH_PARAM).unwrap();
+        let m = &d.modules[0];
+        let mode = GenMode {
+            db: true,
+            auth: false,
+        };
+        let h = handlers_rs(m, mode, &d);
+        assert!(
+            h.contains("async fn list_pages(_repo: Dep<PageRepo>, Path(_site_id): Path<String>)"),
+            "a non-id path param referencing a string-pk entity must be Path<String>, not Path<i64>: {h}"
         );
     }
 }
