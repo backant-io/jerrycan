@@ -1519,13 +1519,19 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     // fk column on the row (it pins the immediate parent fk instead), and the membership
     // branches verify the body fk against the caller's set.
     let update_sets_pinned = active_sets_pinning(e, false, &fk_col, &fk_col);
+    // The direct branch consumes `{fk_col}` twice: once in the ownership-check filter
+    // (`.eq({fk_col})` moves a text tenant pk) and again in the pinned `Set({fk_col})`
+    // below. Clone it into the filter for a text pk so the owned value survives for the
+    // pin (issue #125 use-after-move — E0382); an integer pk is `Copy` (empty suffix, so
+    // integer-pk output stays byte-identical).
+    let pin_fk_clone = if fk_ty == "String" { ".clone()" } else { "" };
     let update_for_method = if path.joins.is_empty() {
         format!(
             r#"    pub async fn update_for(&self, {fk_col}: {fk_ty}, id: {key}, item: {entity}) -> Result<bool> {{
         // Scope the write to the tenant: only proceed if the row is already
         // theirs (a foreign or unknown id is a no-op, returning false → 404).
         if {snake}::Entity::find_by_id(id{pk_clone})
-            .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
+            .filter({snake}::Column::{fk_pascal}.eq({fk_col}{pin_fk_clone}))
             .one(self.db.conn())
             .await
             .map_err(db_error)?
@@ -3473,6 +3479,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// Text-pk tenant use-after-move (issue #125 follow-up): when the tenant's own
+    /// pk is a TEXT type (uuid/string/datetime), the tenant fk param (`team_id:
+    /// String`) is consumed TWICE in the direct path-scoped `update_for` — once by
+    /// the ownership-check filter (`.eq(team_id)` MOVES a `String`) and again by the
+    /// pinned `team_id: Set(team_id)` in the ActiveModel (issue #125 fk pin). Without
+    /// a clone that is a use-after-move (E0382) and the generated crate won't compile.
+    /// The filter must clone the fk for a text pk so the owned value survives for the
+    /// pin. An integer tenant pk is `Copy`, so its output stays byte-identical (the
+    /// Club/Book fixtures, whose tenant pk is an integer, prove that half).
+    #[test]
+    fn direct_path_scoped_update_for_clones_text_tenant_fk_for_the_pin() {
+        let d: Design = serde_json::from_str(TEAM_DOC_TEXT_PK).unwrap();
+        // Doc is the direct path-scoped child of the TEXT-pk tenant Team (mounted at
+        // `/teams/{team_id}`), so its tenant fk param `team_id` is a `String`.
+        let src = scoped_methods(d.find_entity("Doc").unwrap(), &d);
+        // The ownership-check filter must CLONE the String fk so the owned `team_id`
+        // survives for the pinned `Set(team_id)` below — else the generated code moves
+        // `team_id` twice (E0382) and won't compile.
+        assert!(
+            src.contains(".filter(doc::Column::TeamId.eq(team_id.clone()))"),
+            "text-pk tenant fk must be cloned into the ownership filter (issue #125 use-after-move):\n{src}"
+        );
+        // The pin still Sets the fk from the PATH param (never `item.team_id`).
+        assert!(
+            src.contains("team_id: Set(team_id)"),
+            "update_for must still pin the tenant fk to the path param:\n{src}"
+        );
+    }
+
     /// Task 4 (issue #102): a grandchild's membership-CHECKED create resolves the tenant
     /// from the BODY's immediate parent fk (a real column) and JOINs up to the anchor —
     /// it can NOT filter a non-existent direct `org_id` column. The WITH CHECK proves the
@@ -3750,6 +3785,39 @@ pub(crate) mod tests {
                     "success": { "status": 200, "entity": "Customer" } },
                   { "operation_id": "delete_customer", "method": "DELETE", "path": "/{id}", "auth_required": true,
                     "success": { "status": 204 } } ] }
+        ] }"#;
+
+    /// Like CLUBS_TENANCY but the tenant `Team` has a TEXT (uuid) primary key, so its
+    /// fk column type is `String` — the shape that trips the #125 use-after-move.
+    /// `Doc` is a direct path-scoped child mounted under the tenant at
+    /// `/teams/{team_id}`, so its `update_for` both filters on and pins the `team_id`
+    /// fk. Kept minimal (GET-only child, mirroring Book) — `scoped_methods` emits
+    /// `update_for` for any path-scoped tenant-owned entity regardless of endpoints.
+    const TEAM_DOC_TEXT_PK: &str = r#"{ "name": "team-docs-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Team", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "teams",
+              "entities": [{ "name": "Team", "fields": [
+                  { "name": "id", "type": "uuid" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_team", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Team" },
+                    "success": { "status": 201, "entity": "Team" } },
+                  { "operation_id": "get_team", "method": "GET", "path": "/{team_id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Team" } } ] },
+            { "name": "docs", "mount": "/teams/{team_id}",
+              "entities": [{ "name": "Doc",
+                  "belongs_to": [{ "entity": "Team" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "list_docs", "method": "GET", "path": "/", "auth_required": true,
+                    "success": { "status": 200, "entity": "Doc", "list": true } },
+                  { "operation_id": "get_doc", "method": "GET", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Doc" } } ] }
         ] }"#;
 
     /// The guard PARAM and the read scope-hint comment follow `endpoint_tenant_shape`
