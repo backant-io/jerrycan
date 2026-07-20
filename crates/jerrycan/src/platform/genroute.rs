@@ -114,20 +114,24 @@ fn path_params(ep: &Endpoint) -> Vec<String> {
     out
 }
 
-/// True when this endpoint operates on a tenant-owned entity (its repo entity
-/// belongs_to the design's tenancy entity). Such guarded endpoints take the
-/// membership-checked `Dep<shared::Tenant>` instead of a bare `CurrentUser`.
+/// True when this endpoint operates on a tenant-owned entity — its repo entity
+/// resolves to a tenant path, directly OR transitively (issue #102: a grandchild
+/// reached through a parent chain). Gates the scope-hint comment; the guard SHAPE
+/// (`Dep<Tenant>` vs bare `CurrentUser`) is decided separately by
+/// `endpoint_uses_tenant_guard` from the resolved path, so a flat grandchild stays
+/// on the bare session.
 fn endpoint_is_tenant_owned(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> bool {
-    let Some(tenancy) = design.tenancy.as_ref() else {
-        return false;
-    };
     let Some(entity) = endpoint_repo_entity(m, ep) else {
         return false;
     };
+    // Transitive tenant ownership (#102): the entity is tenant-owned when it resolves
+    // to a tenant path — a direct child OR a grandchild through a parent chain — not
+    // merely a direct `belongs_to`. `tenant_path` is `None` when there is no tenancy,
+    // so it subsumes the old tenancy guard.
     m.entities
         .iter()
         .find(|e| e.name == entity)
-        .is_some_and(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity))
+        .is_some_and(|e| design.tenant_path(&e.name).is_some())
 }
 
 /// True when a guarded endpoint takes the membership-checked `Dep<Tenant>` — i.e.
@@ -1031,10 +1035,9 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
 /// Conservative: ANY path-scoped route on the entity ⇒ not flat (no mixed-shape
 /// design exists today, and a path-scoped write is already covered).
 pub(crate) fn entity_is_flat_tenant_owned(e: &Entity, design: &Design) -> bool {
-    let Some(tenancy) = design.tenancy.as_ref() else {
-        return false;
-    };
-    if !e.belongs_to.iter().any(|b| b.entity == tenancy.entity) {
+    // Tenant-owned directly OR transitively (issue #102). `tenant_path` is `None`
+    // when there is no tenancy, so it subsumes the old tenancy guard.
+    if design.tenant_path(&e.name).is_none() {
         return false;
     }
     let Some(m) = design
@@ -1066,7 +1069,10 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     let Some(tenancy) = design.tenancy.as_ref() else {
         return String::new();
     };
-    if !e.belongs_to.iter().any(|b| b.entity == tenancy.entity) {
+    // Tenant-owned directly OR transitively (issue #102): a grandchild reached
+    // through a parent chain gets the scoped accessors too. The JOIN SQL for a
+    // grandchild's filter is Tasks 3/4; this only recognizes ownership.
+    if design.tenant_path(&e.name).is_none() {
         return String::new();
     }
     let entity = &e.name;
@@ -1411,12 +1417,10 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
 /// linted. db-mode only (this is `sql_repo`'s concern; the memory-mode struct has
 /// no fk columns to scope by, so memory output stays byte-identical).
 fn entity_is_per_user_owned(e: &Entity, mode: GenMode, design: &Design) -> bool {
-    mode.auth
-        && Design::has_identity_fk(e)
-        && !design
-            .tenancy
-            .as_ref()
-            .is_some_and(|t| e.belongs_to.iter().any(|b| b.entity == t.entity))
+    // A tenant-owned entity — directly OR transitively (issue #102) — is scoped by
+    // the TENANT (via `scoped_methods`), never per-user, so exclude any entity with a
+    // tenant path. `tenant_path` is `None` when there is no tenancy.
+    mode.auth && Design::has_identity_fk(e) && design.tenant_path(&e.name).is_none()
 }
 
 /// Owner-scoped accessors for a per-user identity-owned entity (issue #79) — keyed
@@ -2964,6 +2968,160 @@ pub(crate) mod tests {
                 "WHERE id = ? AND workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = ?)"
             ),
             "{src}"
+        );
+    }
+
+    /// Org (tenant) ; Account belongs_to Org ; Contact belongs_to Account — the
+    /// TRANSITIVE (grandchild) tenant-ownership chain (#102). Contacts flat at
+    /// `/contacts`, so the resolved path carries no tenant fk.
+    const ORG_ACCOUNT_CONTACT: &str = r#"{ "name": "org-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "orgs",
+              "entities": [{ "name": "Org", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Org", "list": true } }] },
+            { "name": "accounts",
+              "entities": [{ "name": "Account",
+                  "belongs_to": [{ "entity": "Org" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "name", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Account", "list": true } }] },
+            { "name": "contacts",
+              "entities": [{ "name": "Contact",
+                  "belongs_to": [{ "entity": "Account" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "email", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_contacts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Contact", "list": true } }] }
+        ] }"#;
+
+    /// Same chain, but Contacts are mounted under their PARENT at
+    /// `/accounts/{account_id}` — the resolved path carries `account_id`, NOT the
+    /// tenant fk `org_id`. This is a FLAT (MembershipSet) grandchild route.
+    const ORG_ACCOUNT_CONTACT_UNDER_PARENT: &str = r#"{ "name": "org-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "orgs",
+              "entities": [{ "name": "Org", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Org", "list": true } }] },
+            { "name": "accounts",
+              "entities": [{ "name": "Account",
+                  "belongs_to": [{ "entity": "Org" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "name", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Account", "list": true } }] },
+            { "name": "contacts", "mount": "/accounts/{account_id}",
+              "entities": [{ "name": "Contact",
+                  "belongs_to": [{ "entity": "Account" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "email", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_contacts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Contact", "list": true } }] }
+        ] }"#;
+
+    /// Same chain, but Contacts are mounted directly under the TENANT at
+    /// `/orgs/{org_id}` — the resolved path carries the tenant fk, so this
+    /// grandchild route is PATH-SCOPED.
+    const ORG_ACCOUNT_CONTACT_UNDER_TENANT: &str = r#"{ "name": "org-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "orgs",
+              "entities": [{ "name": "Org", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Org", "list": true } }] },
+            { "name": "accounts",
+              "entities": [{ "name": "Account",
+                  "belongs_to": [{ "entity": "Org" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "name", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Account", "list": true } }] },
+            { "name": "contacts", "mount": "/orgs/{org_id}",
+              "entities": [{ "name": "Contact",
+                  "belongs_to": [{ "entity": "Account" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "email", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_contacts", "method": "GET", "path": "/", "auth_required": true,
+                  "success": { "status": 200, "entity": "Contact", "list": true } }] }
+        ] }"#;
+
+    /// Recognition is transitive (#102): a GRANDCHILD entity (Contact belongs_to
+    /// Account belongs_to the tenant Org) is now tenant-owned, so `scoped_methods`
+    /// emits its tenant-scoped accessors instead of nothing. Pre-#102 the direct-only
+    /// gate saw Contact belongs_to Account (not Org) and returned an empty string —
+    /// the grandchild's repo had NO tenant scoping (the transitive leak). This locks
+    /// RECOGNITION only; the JOIN SQL for the grandchild is Tasks 3/4.
+    #[test]
+    fn grandchild_entity_gets_scoped_methods() {
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT).unwrap();
+        let contact = d.find_entity("Contact").unwrap();
+        assert!(
+            !scoped_methods(contact, &d).is_empty(),
+            "grandchild Contact must get scoped methods (was empty pre-#102)"
+        );
+    }
+
+    /// LOAD-BEARING INVARIANT (#78 × #102): recognition going transitive must NOT
+    /// change the GUARD SHAPE — the guard shape follows the resolved PATH, never mere
+    /// ownership. A grandchild whose path carries its PARENT'S fk
+    /// (`/accounts/{account_id}/contacts`) but NOT the tenant fk is `MembershipSet`,
+    /// and its handler takes the bare session (`_user: CurrentUser`), NEVER the
+    /// membership-checked `Dep<Tenant>` (a flat handler must not trust an arbitrary
+    /// path membership). Only a grandchild whose path carries the TENANT fk
+    /// (`/orgs/{org_id}/contacts`) is `PathScoped` and gets `Dep<Tenant>`.
+    #[test]
+    fn grandchild_guard_shape_follows_path_not_ownership() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+
+        // (a) Nested under its PARENT (account_id, not the tenant fk) → MembershipSet,
+        //     bare session, NEVER Dep<Tenant>.
+        let flat: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_UNDER_PARENT).unwrap();
+        let contacts = &flat.modules[2];
+        assert_eq!(
+            flat.endpoint_tenant_shape(contacts, &contacts.endpoints[0]),
+            TenantShape::MembershipSet,
+            "grandchild under its parent carries account_id, not the tenant fk"
+        );
+        let handlers = handlers_rs(contacts, mode, &flat);
+        assert!(
+            handlers.contains("_user: CurrentUser") && !handlers.contains("Dep<Tenant>"),
+            "flat grandchild handler must take the bare session, NEVER Dep<Tenant>:\n{handlers}"
+        );
+
+        // (b) Mounted directly under the TENANT (org_id in the path) → PathScoped,
+        //     Dep<Tenant>.
+        let scoped: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_UNDER_TENANT).unwrap();
+        let sc = &scoped.modules[2];
+        assert!(
+            matches!(
+                scoped.endpoint_tenant_shape(sc, &sc.endpoints[0]),
+                TenantShape::PathScoped { .. }
+            ),
+            "grandchild under the tenant carries the tenant fk → PathScoped"
+        );
+        let scoped_handlers = handlers_rs(sc, mode, &scoped);
+        assert!(
+            scoped_handlers.contains("_tenant: Dep<Tenant>"),
+            "path-scoped grandchild handler takes Dep<Tenant>:\n{scoped_handlers}"
         );
     }
 

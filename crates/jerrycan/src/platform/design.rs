@@ -869,10 +869,15 @@ impl Design {
             return TenantShape::None;
         };
         let is_tenant_module = module.entities.iter().any(|e| e.name == tenancy.entity);
+        // Transitive tenant ownership (#102): a module owns a tenant-scoped entity
+        // when any of its entities resolves to a tenant path — a direct child (zero
+        // joins) OR a grandchild reached through a parent chain — not merely a direct
+        // `belongs_to`. The PathScoped-vs-MembershipSet decision below still keys on
+        // the resolved PATH, so a flat grandchild stays MembershipSet.
         let owns_tenant_entity = module
             .entities
             .iter()
-            .any(|e| e.belongs_to.iter().any(|b| b.entity == tenancy.entity));
+            .any(|e| self.tenant_path(&e.name).is_some());
         if !is_tenant_module && !owns_tenant_entity {
             return TenantShape::None;
         }
@@ -1770,6 +1775,37 @@ pub(crate) mod tests {
     fn tenant_path_cycle_does_not_hang() {
         let d = cyclic_belongs_to_design();
         let _ = d.tenant_path("A"); // must return, not loop
+    }
+
+    #[test]
+    fn grandchild_flat_route_is_membership_set_not_none() {
+        // Recognition is now transitive (#102): a GRANDCHILD flat route — `/contacts`,
+        // mounted flat, carrying NO tenant fk (Contact belongs_to Account belongs_to
+        // the tenant Org) — is tenant-owned and classified `MembershipSet`, the flat
+        // membership-scoped shape. Pre-#102 the direct-only `owns_tenant_entity` gate
+        // saw Contact belongs_to Account (not the tenant) and returned `None`: an
+        // UNSCOPED grandchild — the transitive leak this fix closes.
+        let d = org_account_contact();
+        let contacts = &d.modules[2];
+        assert_eq!(
+            d.endpoint_tenant_shape(contacts, &contacts.endpoints[0]),
+            TenantShape::MembershipSet,
+        );
+    }
+
+    #[test]
+    fn direct_child_shape_unchanged() {
+        // Byte-identity guard: switching `owns_tenant_entity` onto the transitive
+        // `tenant_path` must NOT change a DIRECT child's classification. Account is a
+        // direct child of the tenant Org; its own flat route stays `MembershipSet`
+        // (passes pre- AND post-fix). The direct-child PATH-SCOPED case (a nested
+        // `/clubs/{club_id}/…`) is locked by `tenant_shape_classifies_by_route`.
+        let d = org_account_contact();
+        let accounts = &d.modules[1];
+        assert_eq!(
+            d.endpoint_tenant_shape(accounts, &accounts.endpoints[0]),
+            TenantShape::MembershipSet,
+        );
     }
 
     #[test]
