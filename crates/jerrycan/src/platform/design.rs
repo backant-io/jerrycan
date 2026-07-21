@@ -151,6 +151,16 @@ pub struct Entity {
     pub table: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub belongs_to: Vec<BelongsTo>,
+    /// The public-read/owner-write shape (issue #105): on an identity-owned,
+    /// non-tenant entity in an auth design, READS (GET list + detail) are public
+    /// — unguarded and unscoped, a list returns EVERY owner's rows (the feed
+    /// intent) — while WRITES (POST/PUT/PATCH/DELETE) stay owner-scoped and
+    /// guarded exactly as issue #79. Valid ONLY on that per-user shape; JC0549
+    /// rejects it anywhere else (tenant-owned, no identity fk, no auth model) and
+    /// rejects any public/unguarded write on the entity. Serde-default false and
+    /// skipped when false, so every existing design round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub public_read: bool,
     pub fields: Vec<Field>,
 }
 
@@ -1032,6 +1042,25 @@ impl Design {
     /// `user_id` — the server injects the session user's id (issue #34).
     pub(crate) fn has_identity_fk(e: &Entity) -> bool {
         e.belongs_to.iter().any(Self::is_identity_fk)
+    }
+
+    /// The public-read/owner-write classifier (issue #105): entity `entity`
+    /// opted in via `public_read: true` AND is per-user owned. The per-user leg
+    /// MIRRORS genroute's `entity_is_per_user_owned` (`mode.auth` — which
+    /// generation sets from `wants_auth()` — plus an identity fk plus no tenant
+    /// path, direct or transitive), so the classifier, the repo emission, the
+    /// testgen shape, and the lint config agree on WHICH entities get public
+    /// reads with owner-gated writes. Resolves by NAME across the tree so a
+    /// caller holding only an endpoint's repo-entity name agrees with one
+    /// holding the `Entity`. False for every non-opt-in entity, so existing
+    /// designs are untouched.
+    pub(crate) fn entity_is_public_read(&self, entity: &str) -> bool {
+        self.find_entity(entity).is_some_and(|e| {
+            e.public_read
+                && self.wants_auth()
+                && Self::has_identity_fk(e)
+                && self.tenant_path(entity).is_none()
+        })
     }
 
     /// The server-owned-FK rule (issue #34), design-level: a GUARDED endpoint
@@ -2449,5 +2478,111 @@ pub(crate) mod tests {
             s.contains("A server-owned default value"),
             "published schema must document the `default` field key"
         );
+    }
+
+    #[test]
+    fn public_read_defaults_false_and_round_trips() {
+        // WHY (#105): serde-default false + skip-when-false means an existing
+        // design.json without the key parses unchanged AND serializes WITHOUT
+        // `public_read`, so every non-opt-in design round-trips byte-identically.
+        let e: Entity = serde_json::from_str(
+            r#"{ "name": "Post", "fields": [ { "name": "title", "type": "string" } ] }"#,
+        )
+        .unwrap();
+        assert!(!e.public_read, "absent key defaults to false");
+        let back = serde_json::to_value(&e).unwrap();
+        assert!(
+            back.get("public_read").is_none(),
+            "false is not serialized: {back}"
+        );
+        let on: Entity = serde_json::from_str(
+            r#"{ "name": "Post", "public_read": true,
+                 "fields": [ { "name": "title", "type": "string" } ] }"#,
+        )
+        .unwrap();
+        assert!(on.public_read);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["public_read"],
+            serde_json::json!(true),
+            "an opted-in entity keeps the flag across a round trip"
+        );
+    }
+
+    #[test]
+    fn published_schema_accepts_public_read() {
+        let s = include_str!("../../../../docs/contracts/design-schema.json");
+        assert!(
+            s.contains("\"public_read\""),
+            "published schema must admit the entity public_read key (#105)"
+        );
+    }
+
+    #[test]
+    fn entity_is_public_read_requires_the_per_user_shape() {
+        // WHY (#105): this classifier is the single predicate the generator,
+        // testgen, and lints key public reads on — it must be true ONLY for a
+        // `public_read` entity that is per-user owned (auth design + identity
+        // fk + not tenant-owned), mirroring genroute's
+        // `entity_is_per_user_owned` so validation and emission agree.
+        let src = r#"{
+            "name": "feed", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin"] },
+            "dependencies": ["db", "auth"],
+            "modules": [{
+                "name": "posts",
+                "entities": [
+                    { "name": "Post", "public_read": true,
+                      "belongs_to": [{ "entity": "User" }],
+                      "fields": [{ "name": "title", "type": "string" }] },
+                    { "name": "Draft",
+                      "belongs_to": [{ "entity": "User" }],
+                      "fields": [{ "name": "title", "type": "string" }] },
+                    { "name": "Tag", "public_read": true,
+                      "fields": [{ "name": "label", "type": "string" }] },
+                    { "name": "User", "fields": [{ "name": "email", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "list_posts", "method": "GET", "path": "/",
+                      "success": { "status": 200, "entity": "Post", "list": true } }
+                ]
+            }]
+        }"#;
+        let d: Design = serde_json::from_str(src).unwrap();
+        assert!(
+            d.entity_is_public_read("Post"),
+            "public_read + identity fk + auth + no tenancy → public-read"
+        );
+        assert!(
+            !d.entity_is_public_read("Draft"),
+            "per-user owned but NOT opted in → owner-scoped as before"
+        );
+        assert!(
+            !d.entity_is_public_read("Tag"),
+            "opted in but no identity fk → not public-read"
+        );
+        assert!(!d.entity_is_public_read("Nope"), "unknown entity → false");
+
+        // No active auth model → the per-user shape doesn't exist → false.
+        let mut no_auth = d.clone();
+        no_auth.auth = None;
+        no_auth.dependencies.retain(|dep| dep != "auth");
+        assert!(!no_auth.entity_is_public_read("Post"));
+
+        // Tenant-owned (Post belongs_to the tenancy root) → false: the tenant
+        // guard scopes it, public_read is identity-owned-only.
+        let mut tenant: Design = serde_json::from_str(src).unwrap();
+        tenant.tenancy = Some(
+            serde_json::from_str(r#"{ "entity": "Org", "member_roles": ["owner"] }"#).unwrap(),
+        );
+        tenant.modules[0].entities.push(
+            serde_json::from_str(
+                r#"{ "name": "Org", "fields": [{ "name": "label", "type": "string" }] }"#,
+            )
+            .unwrap(),
+        );
+        tenant.modules[0].entities[0]
+            .belongs_to
+            .push(serde_json::from_str(r#"{ "entity": "Org" }"#).unwrap());
+        assert!(!tenant.entity_is_public_read("Post"));
     }
 }

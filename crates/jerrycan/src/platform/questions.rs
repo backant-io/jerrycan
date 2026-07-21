@@ -874,6 +874,103 @@ pub fn validate(d: &Design) -> Vec<Question> {
         }
     }
 
+    // JC0549 (#105): the public-read/owner-write shape. `public_read` is a
+    // modifier on the per-user ownership shape (#79) — reads public, writes
+    // owner-scoped — so (a) it is valid ONLY on an identity-owned, non-tenant
+    // entity in an auth design, and (b) every WRITE of a public_read entity must
+    // stay owner-gated (a public/unguarded write is the open door: anyone could
+    // create/mutate rows the public then reads). Independently of opt-in, (c)
+    // closes the latent unguarded-per-user-GET bug: in db+auth mode a per-user
+    // entity's repo emits ONLY the owner-scoped accessors and an unguarded
+    // handler receives no session user, so an unguarded GET that has NOT opted
+    // into public_read is unimplementable — refuse it with a clear fork instead
+    // of generating a dead-end stub.
+    fn check_public_read(d: &Design, m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+        for (i, e) in m.entities.iter().enumerate() {
+            if !e.public_read {
+                continue;
+            }
+            if !d.wants_auth() {
+                qs.push(q(
+                    format!("{ptr}/entities/{i}"),
+                    format!(
+                        "Entity `{}` declares public_read but the design has no active auth model — public_read keeps WRITES owner-gated, which needs an authenticated session; set auth.model to `session` or `jwt`, or drop public_read. See `jerrycan explain JC0549`.",
+                        e.name
+                    ),
+                ));
+            }
+            if !Design::has_identity_fk(e) {
+                qs.push(q(
+                    format!("{ptr}/entities/{i}"),
+                    format!(
+                        "Entity `{}` declares public_read but carries no identity fk — public_read is a modifier on the per-user ownership shape (reads public, writes owner-scoped), so the entity needs a `belongs_to` the auth identity entity; add it, or drop public_read. See `jerrycan explain JC0549`.",
+                        e.name
+                    ),
+                ));
+            }
+            // Tenant-owned directly OR transitively (#102) — mirrors the
+            // public-endpoint-on-tenant-owned rejection above: a public read
+            // would bypass the Tenant guard and expose one tenant's rows to
+            // anyone. public_read is identity-owned-only in v1.
+            if d.tenant_path(&e.name).is_some() {
+                qs.push(q(
+                    format!("{ptr}/entities/{i}"),
+                    format!(
+                        "Entity `{}` declares public_read but is tenant-owned — public reads would bypass the Tenant guard and expose one tenant's rows to anyone; public_read is identity-owned-only, so remove public_read or move the entity off tenancy. See `jerrycan explain JC0549`.",
+                        e.name
+                    ),
+                ));
+            }
+        }
+        for (i, ep) in m.endpoints.iter().enumerate() {
+            let Some(name) = endpoint_repo_entity(m, ep) else {
+                continue;
+            };
+            let Some(e) = m.entities.iter().find(|e| e.name == name) else {
+                continue;
+            };
+            if matches!(ep.method, HttpMethod::GET) {
+                // (c) The latent-bug closure. Per-user ownership mirrors
+                // genroute's `entity_is_per_user_owned` (auth + identity fk +
+                // no tenant path); db mode is the extra gate because only
+                // `sql_repo` suppresses the unscoped reads (a memory repo keeps
+                // plain `all`/`get`, so the stub stays implementable there).
+                let per_user_owned = d.wants_auth()
+                    && Design::has_identity_fk(e)
+                    && d.tenant_path(&e.name).is_none();
+                if !ep.is_guarded()
+                    && !ep.public
+                    && d.wants_db()
+                    && per_user_owned
+                    && !d.entity_is_public_read(&e.name)
+                {
+                    qs.push(q(
+                        format!("{ptr}/endpoints/{i}"),
+                        format!(
+                            "Endpoint `{}` is an unguarded read on the owner-scoped entity `{}`, which is unimplementable — the entity's repo emits only the owner-scoped accessors and an unguarded handler receives no session user. Set `public_read: true` on `{}` to make its reads public, or keep the GET authenticated (`auth_required: true`). See `jerrycan explain JC0549`.",
+                            ep.operation_id, e.name, e.name
+                        ),
+                    ));
+                }
+            } else if e.public_read && (ep.public || !ep.is_guarded()) {
+                // (b) A write must stay owner-gated regardless of the flag.
+                qs.push(q(
+                    format!("{ptr}/endpoints/{i}"),
+                    format!(
+                        "Endpoint `{}` ({:?} {}) is a write on the public_read entity `{}` but is public/unguarded — public_read makes READS public while WRITES stay owner-gated; set `auth_required: true` (and drop `public`) on every write of `{}`. See `jerrycan explain JC0549`.",
+                        ep.operation_id, ep.method, ep.path, e.name, e.name
+                    ),
+                ));
+            }
+        }
+        for (i, sub) in m.subroutes.iter().enumerate() {
+            check_public_read(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
+        }
+    }
+    for (i, m) in d.modules.iter().enumerate() {
+        check_public_read(d, m, &format!("/modules/{i}"), &mut qs);
+    }
+
     // Jobs require a database: the engine's default store is Postgres and the
     // generated `jobs(db)` wiring + JOBS_MIGRATIONS run over `jerrycan::db::Db`.
     // A jobs-without-db design can't compile, so reject it here (one error for the
@@ -2343,6 +2440,216 @@ mod tests {
             ]
         }]
     }"#;
+
+    // ---- #105 (JC0549): public-read/owner-write shape --------------------------
+
+    /// A complete, valid public-read/owner-write design (#105): identity-owned
+    /// `Post` opted into `public_read`, unguarded GETs (the public reads), and
+    /// guarded writes. Entity order puts `Post` first so the bodyless DELETE's
+    /// repo-entity fallback resolves to it, mirroring genroute.
+    const PUBLIC_READ_FEED: &str = r#"{
+        "name": "feed", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["admin"] },
+        "dependencies": ["db", "auth"],
+        "modules": [{
+            "name": "posts",
+            "entities": [
+                { "name": "Post", "public_read": true,
+                  "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                  "fields": [{ "name": "title", "type": "string" }] },
+                { "name": "User", "fields": [{ "name": "email", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "list_posts", "method": "GET", "path": "/",
+                  "success": { "status": 200, "entity": "Post", "list": true } },
+                { "operation_id": "get_post", "method": "GET", "path": "/{id}",
+                  "success": { "status": 200, "entity": "Post" } },
+                { "operation_id": "create_post", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "Post" },
+                  "success": { "status": 201, "entity": "Post" } },
+                { "operation_id": "update_post", "method": "PUT", "path": "/{id}",
+                  "auth_required": true,
+                  "request_body": { "entity": "Post" },
+                  "success": { "status": 200, "entity": "Post" } },
+                { "operation_id": "delete_post", "method": "DELETE", "path": "/{id}",
+                  "auth_required": true,
+                  "success": { "status": 204 } }
+            ]
+        }]
+    }"#;
+
+    fn jc0549(qs: &[Question]) -> Vec<&Question> {
+        qs.iter()
+            .filter(|q| q.question.contains("JC0549"))
+            .collect()
+    }
+
+    /// #105 (positive): the blessed shape — public_read on an identity-owned,
+    /// non-tenant entity in an auth design, with unguarded GETs and guarded
+    /// writes — is exactly what the flag exists for, so it must sail through
+    /// validation untouched.
+    #[test]
+    fn public_read_per_user_design_passes_validation() {
+        let d: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        let qs = validate(&d);
+        assert!(
+            qs.is_empty(),
+            "a valid public_read design must pass: {qs:?}"
+        );
+        assert!(
+            design_conflict(&d).is_none(),
+            "no structural conflict either"
+        );
+    }
+
+    /// #105: public_read on a tenant-owned entity would let its public reads
+    /// bypass the Tenant guard (one tenant's rows exposed to anyone) — refused,
+    /// mirroring the public-endpoint-on-tenant-owned rejection.
+    #[test]
+    fn public_read_on_tenant_owned_entity_is_rejected() {
+        let mut d: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        d.tenancy = Some(
+            serde_json::from_str(r#"{ "entity": "Org", "member_roles": ["owner"] }"#).unwrap(),
+        );
+        d.modules[0].entities.push(
+            serde_json::from_str(
+                r#"{ "name": "Org", "fields": [{ "name": "label", "type": "string" }] }"#,
+            )
+            .unwrap(),
+        );
+        d.modules[0].entities[0]
+            .belongs_to
+            .push(serde_json::from_str(r#"{ "entity": "Org" }"#).unwrap());
+        let qs = validate(&d);
+        let hits = jc0549(&qs);
+        assert!(
+            hits.iter()
+                .any(|q| q.question.contains("tenant-owned") && q.question.contains("Post")),
+            "tenant-owned public_read must raise JC0549 naming the entity: {qs:?}"
+        );
+    }
+
+    /// #105: public_read is a modifier on the per-user ownership shape — an
+    /// entity with no identity fk has no owner to scope writes to, so the flag
+    /// is meaningless and refused with the belongs_to fix.
+    #[test]
+    fn public_read_on_non_identity_entity_is_rejected() {
+        let mut d: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        d.modules[0].entities[0].belongs_to.clear();
+        let qs = validate(&d);
+        let hits = jc0549(&qs);
+        assert!(
+            hits.iter()
+                .any(|q| q.question.contains("identity fk") && q.question.contains("Post")),
+            "public_read without an identity fk must raise JC0549: {qs:?}"
+        );
+    }
+
+    /// #105: without an active auth model there is no session to owner-gate the
+    /// writes with — public_read would be public-read/public-write.
+    #[test]
+    fn public_read_without_auth_model_is_rejected() {
+        let mut d: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        d.auth = None;
+        d.dependencies.retain(|dep| dep != "auth");
+        let qs = validate(&d);
+        let hits = jc0549(&qs);
+        assert!(
+            hits.iter()
+                .any(|q| q.question.contains("no active auth model")),
+            "public_read without auth must raise JC0549: {qs:?}"
+        );
+    }
+
+    /// #105: the open door. public_read makes READS public; a write that is
+    /// itself public or unguarded would let anyone mutate the rows everyone
+    /// reads — every write of the entity must stay owner-gated.
+    #[test]
+    fn public_or_unguarded_write_on_public_read_entity_is_rejected() {
+        // (a) an explicit `public: true` write.
+        let mut d: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        let create = d.modules[0]
+            .endpoints
+            .iter_mut()
+            .find(|ep| ep.operation_id == "create_post")
+            .unwrap();
+        create.auth_required = false;
+        create.public = true;
+        let qs = validate(&d);
+        assert!(
+            jc0549(&qs)
+                .iter()
+                .any(|q| q.question.contains("create_post") && q.question.contains("write")),
+            "a public write on a public_read entity must raise JC0549: {qs:?}"
+        );
+        // (b) a merely unguarded write (no auth_required, not public).
+        let mut d2: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        d2.modules[0]
+            .endpoints
+            .iter_mut()
+            .find(|ep| ep.operation_id == "delete_post")
+            .unwrap()
+            .auth_required = false;
+        let qs2 = validate(&d2);
+        assert!(
+            jc0549(&qs2)
+                .iter()
+                .any(|q| q.question.contains("delete_post")),
+            "an unguarded write on a public_read entity must raise JC0549: {qs2:?}"
+        );
+    }
+
+    /// #105 §E (the latent-bug closure, independent of opt-in): an unguarded GET
+    /// on a per-user owner-scoped entity that has NOT opted into public_read
+    /// generates an unimplementable stub today — the repo emits only owner-scoped
+    /// accessors while the handler gets no session user. JC0549 turns the silent
+    /// dead-end into a clear fork: opt into public_read, or guard the GET.
+    #[test]
+    fn unguarded_get_on_owner_scoped_entity_without_public_read_is_rejected() {
+        let mut d: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        d.modules[0].entities[0].public_read = false;
+        let qs = validate(&d);
+        let hits = jc0549(&qs);
+        assert_eq!(
+            hits.len(),
+            2,
+            "both unguarded GETs (list + detail) must be flagged: {qs:?}"
+        );
+        assert!(
+            hits.iter().all(|q| q.question.contains("unimplementable")
+                && q.question.contains("public_read: true")
+                && q.question.contains("auth_required: true")),
+            "the message must present the fork (opt in, or guard the GET): {qs:?}"
+        );
+
+        // Memory mode keeps the unscoped repo reads, so the stub IS
+        // implementable there — no JC0549.
+        let mut mem: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        mem.modules[0].entities[0].public_read = false;
+        mem.dependencies.retain(|dep| dep != "db");
+        assert!(
+            jc0549(&validate(&mem)).is_empty(),
+            "memory mode has no owner-scoped repo suppression"
+        );
+    }
+
+    /// #105 §E (negative): guarding the GETs is the other prong of the fork —
+    /// a fully owner-scoped entity (#79) with authenticated reads stays exactly
+    /// as valid as before.
+    #[test]
+    fn guarded_get_on_owner_scoped_entity_passes_validation() {
+        let mut d: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        d.modules[0].entities[0].public_read = false;
+        for ep in &mut d.modules[0].endpoints {
+            ep.auth_required = true;
+        }
+        let qs = validate(&d);
+        assert!(
+            qs.is_empty(),
+            "the guarded per-user shape must keep passing: {qs:?}"
+        );
+    }
 
     #[test]
     fn jobs_validate_name_uniqueness_and_cron_shape() {
