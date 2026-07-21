@@ -22,6 +22,7 @@ fn embedded_copies_match_canonical_repo_files() {
         "docs/contracts/mcp-tools.json".into(),
         "embedded/contracts/mcp-tools.json".into(),
     ));
+    pairs.push(("docs/SKILL.md".into(), "embedded/SKILL.md".into()));
     pairs.push((
         "conformance/designs/todo-api.design.json".into(),
         "embedded/designs/todo-api.design.json".into(),

@@ -51,6 +51,14 @@ Goal: a precise list of **resources, operations, actors, and cross-cutting needs
 Ask **one question at a time**, prefer multiple-choice. Cover, in roughly this order
 (skip what's already obvious from the request):
 
+- **Entry path — settle this before anything else.** Ask which of these it is:
+  **(a) Build the backend for an existing project/frontend** in this workspace →
+  work the questions below, then Phase 1b derives the contract from the code.
+  **(b) Start from scratch** → the questions below are the whole elicitation.
+  **(c) Migrate from Supabase** → jump to Phase 1c; the migrator replaces
+  Phases 3–4. **(d) Migrate from another backend/framework** → scope wall:
+  only Supabase migration is automated today. Say so plainly, and offer
+  (a)/(b) with the old system as reference material instead.
 - **The product in one sentence.** What is it, who uses it?
 - **Is there an existing frontend or API consumer?** (If yes → Phase 1b. If no →
   greenfield: derive resources from the domain.)
@@ -108,6 +116,31 @@ guessing.
 > If the frontend expects a shape jerrycan can't express as an entity (composite
 > /aggregate/nested payloads), note it now — it becomes a hand-written
 > `Json<Value>` handler (see Phase 2 + the gotchas).
+
+### Phase 1c — Migrating from Supabase (entry path (c) only)
+
+The migrator does Phases 3–4 for you — it authors the design AND scaffolds the
+app deterministically from the Supabase project. Your job is the gaps.
+
+- **Read `jerrycan docs migrate-supabase` now** — the complete reference for
+  the export layout, what translates, and what becomes a gap item.
+- With the user, produce the **offline export** (schema.sql, per-table CSVs,
+  storage/buckets.json, auth users + identities) exactly as that page
+  prescribes. `--live` is opt-in and the user's explicit call — never in CI.
+- Run `jerrycan migrate --from supabase <export-dir>` (`--out`/`--name` if the
+  user wants a specific target). It emits the app, a resumable data seed,
+  `gap-report.json`, and `MIGRATION.md`.
+- **Walk `gap-report.json` with the user item by item.** Each gap is something
+  the migrator refused to guess (unrecognized RLS, plpgsql/Edge bodies, exotic
+  types). Decide per item: hand-write it in a handler (Phase 5), descope, or
+  keep it external.
+- Surface `MIGRATION.md`'s **secret-rotation checklist** before anything runs:
+  no Supabase secret was copied; the user must set fresh values.
+- Rejoin the loop at Phase 4's tail: `jerrycan gen-tests --module <m>` per
+  module, `jerrycan db migrate` + `jerrycan db seed` against the target
+  database, then Phase 5 with the gap list as the implementation queue. Skip
+  Phases 3–4 (design and scaffold already exist); a Supabase migration's auth
+  model is always `jwt`.
 
 ## Phase 2 — Scope check against what jerrycan builds (flag walls EARLY)
 

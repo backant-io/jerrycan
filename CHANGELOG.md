@@ -45,6 +45,11 @@ acceptance tests cover every gate.
   is now unblocked (#132); no live realtime-socket revocation on remove/re-role;
   `require_role` stays single-role exact-match.
 
+### Onboarding & distribution
+- **`jerrycan onboard`** — prints the guided build runbook; `--emit-skill --agent <id>` installs the jerrycan-backend skill for claude-code / cursor / codex / windsurf / generic.
+- Skill: explicit entry-path branching (existing project / from scratch / migrate from Supabase) + a Phase 1c Supabase-migration runbook.
+- Release: tag-triggered **prebuilt binaries** (macOS arm64/x64, Linux x64/arm64 musl) + `cargo binstall jerrycan`.
+
 Framework Rust API additive (`cargo semver-checks` clean); the surface is
 generated-app code.
 

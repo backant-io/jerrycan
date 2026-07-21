@@ -30,6 +30,7 @@ a `--json` mode whose output is the same data the MCP tool returns.
 | `jerrycan test` | `--module <m>` | The app's test suite only (subset of check) | — |
 | `jerrycan package` | `--binary\|--docker\|--k8s\|--systemd` | runs the check gate first, emits deploy/ artifacts + CycloneDX SBOM; never deploys | jerrycan_package |
 | `jerrycan docs <topic>` | `--search <q>` | Render docs page in terminal / search | jerrycan_docs_get / _search |
+| `jerrycan onboard` | `--emit-skill --agent <claude-code\|cursor\|codex\|windsurf\|generic>` `--dir <d>` | Print the guided build runbook (embedded SKILL.md, frontmatter stripped); with `--emit-skill`, write the agent's skill/rules files (claude-code → `~/.claude/skills/jerrycan-backend/`, cursor/codex/windsurf → `AGENTS.md` marker block, generic → print only) | — |
 | `jerrycan add <extension>` | `db`, `validate`, `auth`, or `observe` | Wire an extension: flips the design dependency, regenerates mounting + policy files | — |
 | `jerrycan db migrate` | `--url <db-url>` (or env) | Apply module-owned migrations via the tracking-table runner | — |
 | `jerrycan mcp` | | Serve MCP over stdio (Phase 1) | — |
