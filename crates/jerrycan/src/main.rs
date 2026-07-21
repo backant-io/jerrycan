@@ -949,7 +949,11 @@ fn cmd_migrate(
 fn cmd_list_routes(json_mode: bool) -> Result<(), Failure> {
     let root = app_root()?;
     let design = load_design(&root.join("design.json"))?;
-    let routes = genroute::route_map(&design);
+    let mut routes = genroute::route_map(&design);
+    // The tool-owned member-management routes (#107) are registered at
+    // `App::build` but live outside the design's endpoint table — append them
+    // so the listing shows the full live surface (empty without tenancy).
+    routes.extend(genroute::implicit_member_routes(&design));
     let payload = serde_json::json!({ "routes": routes });
     let mut human = String::new();
     for r in &routes {

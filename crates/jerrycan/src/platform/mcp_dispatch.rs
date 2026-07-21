@@ -324,7 +324,15 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
         "jerrycan_list_routes" => {
             let root = root_from(args);
             match Design::from_path(&root.join("design.json")) {
-                Ok(design) => (false, json!({ "routes": genroute::route_map(&design) })),
+                Ok(design) => {
+                    // Match the CLI lister: the tool-owned member routes (#107)
+                    // are registered at `App::build` but live outside the
+                    // design's endpoint table — append them so the listing
+                    // shows the full live surface (empty without tenancy).
+                    let mut routes = genroute::route_map(&design);
+                    routes.extend(genroute::implicit_member_routes(&design));
+                    (false, json!({ "routes": routes }))
+                }
                 Err(e) => err_payload(e),
             }
         }

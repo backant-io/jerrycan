@@ -838,11 +838,14 @@ fn tenant_seed(design: &Design, module: &ModuleDesign) -> String {
     let table = design.table_name(&tenancy.entity);
     let members = format!("{}_members", Design::to_snake(&tenancy.entity));
     let fk = Design::fk_column(&tenancy.entity);
+    // The seed role is member_roles[0]; JC0548 guarantees a non-empty list at
+    // design time, so the fallback is dead code — `"member"` to match genroute's
+    // (equally dead) seed-role fallback byte-for-byte.
     let role = tenancy
         .member_roles
         .first()
         .map(String::as_str)
-        .unwrap_or("owner");
+        .unwrap_or("member");
 
     // Columns + values for the tenant row: id = 1 (so the fk resolves), then each
     // declared non-id field with a seed-safe fixture (enum fields use a declared

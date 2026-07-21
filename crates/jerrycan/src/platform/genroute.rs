@@ -1746,8 +1746,10 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
     let table = design.table_name(entity);
     let members = format!("{}_members", snake);
     let fk_col = Design::fk_column(&tenancy.entity);
-    // The seed role is the FIRST declared member_role ("creator becomes organizer");
-    // `member` is a safe fallback if a design declares tenancy with no roles.
+    // The seed role is the FIRST declared member_role ("creator becomes organizer").
+    // JC0548 guarantees a non-empty list at design time, so the `member` fallback is
+    // dead code — kept (consistently with testgen/storagegen/openapi) only so an
+    // unvalidated design handed straight to the generator cannot panic.
     let role = tenancy
         .member_roles
         .first()
@@ -1962,9 +1964,9 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
 /// member-management surface (issue #107) — module-scope companions to
 /// `tenant_own_methods`, emitted ONLY beside the tenancy entity's own repo
 /// (empty everywhere else, so all other repo output stays byte-identical).
-/// `MEMBER_ROLES[0]` is the admin role by convention; an empty `member_roles`
-/// falls back to `["member"]`, mirroring the seed-role fallback above (a
-/// planned design-time check will guarantee non-empty, duplicate-free roles).
+/// `MEMBER_ROLES[0]` is the admin role by convention; JC0548 guarantees a
+/// non-empty, duplicate-free list at design time, so the `["member"]` fallback
+/// is dead code mirroring the seed-role fallback above.
 fn tenant_member_row(e: &Entity, design: &Design) -> String {
     let Some(tenancy) = design.tenancy.as_ref() else {
         return String::new();
@@ -2628,8 +2630,8 @@ pub(crate) fn members_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Op
     let entity = &tenancy.entity;
     let fk_col = Design::fk_column(entity);
     // The admin role: FIRST declared member_role, same fallback as the seed role
-    // in `tenant_own_methods` (a planned design-time check will guarantee
-    // non-empty roles; until then the two sites must agree byte-for-byte).
+    // in `tenant_own_methods` (JC0548 guarantees non-empty roles at design time;
+    // the dead fallbacks still must agree byte-for-byte).
     let admin = tenancy
         .member_roles
         .first()
@@ -3200,6 +3202,62 @@ pub fn route_map(design: &Design) -> Vec<RouteEntry> {
     out
 }
 
+/// The implicit member-management routes (issue #107): the tool-owned
+/// `/{fk}/members` + `/{fk}/members/{user_id}` pair `module_body` registers for
+/// the tenant module, as mount-resolved `RouteEntry` rows (handlers named by
+/// their OpenAPI operation ids). Deliberately NOT folded into `route_map`:
+/// testgen and the OpenAPI emitter own their member-surface output separately,
+/// so polluting the design-endpoint table would double-emit there. Design-time
+/// conflict detection (`router_param_conflict`, JC0542) and the route listing DO
+/// consume these, so a design endpoint colliding with the reserved paths fails
+/// `check` instead of aborting `App::build` (JC0500), and `jerrycan routes`
+/// shows the full live surface. Empty without tenancy (or without db/auth) —
+/// the same `emits_member_surface` gate the generator runs.
+pub fn implicit_member_routes(design: &Design) -> Vec<RouteEntry> {
+    let mode = GenMode {
+        db: design.wants_db(),
+        auth: design.wants_auth(),
+    };
+    fn walk(
+        m: &ModuleDesign,
+        prefix: &str,
+        top: &str,
+        mode: GenMode,
+        design: &Design,
+        out: &mut Vec<RouteEntry>,
+    ) {
+        let base = format!("{}{}", prefix, m.effective_mount());
+        if emits_member_surface(m, mode, design) {
+            let tenancy = design.tenancy.as_ref().expect("gated on tenancy");
+            let fk = Design::fk_column(&tenancy.entity);
+            let snake = Design::to_snake(&tenancy.entity);
+            let collection = format!("{}/{{{fk}}}/members", base.trim_end_matches('/'));
+            let item = format!("{collection}/{{user_id}}");
+            for (method, path, handler) in [
+                ("GET", &collection, format!("list_{snake}_members")),
+                ("POST", &collection, format!("add_{snake}_member")),
+                ("PATCH", &item, format!("set_{snake}_member_role")),
+                ("DELETE", &item, format!("remove_{snake}_member")),
+            ] {
+                out.push(RouteEntry {
+                    method: method.to_string(),
+                    path: path.clone(),
+                    module: top.to_string(),
+                    handler,
+                });
+            }
+        }
+        for sub in &m.subroutes {
+            walk(sub, &base, top, mode, design, out);
+        }
+    }
+    let mut out = Vec::new();
+    for m in &design.modules {
+        walk(m, "", &m.name, mode, design, &mut out);
+    }
+    out
+}
+
 pub fn module_by_path<'a>(design: &'a Design, path: &str) -> Option<&'a ModuleDesign> {
     let mut parts = path.split('/');
     let first = parts.next()?;
@@ -3231,6 +3289,65 @@ pub(crate) mod tests {
 
     fn todos() -> ModuleDesign {
         demo().modules.into_iter().next().unwrap()
+    }
+
+    /// #107: `implicit_member_routes` is the conflict walker's + route lister's
+    /// view of the tool-owned `/{fk}/members` surface `module_body` registers —
+    /// mount-resolved rows for the tenant module ONLY, handlers named by their
+    /// OpenAPI operation ids, and NONE without tenancy or without db/auth. It
+    /// must stay OUT of `route_map` (testgen/OpenAPI own their member-surface
+    /// emission), so a design that never emits the surface sees no rows at all.
+    #[test]
+    fn implicit_member_routes_mirror_the_registered_member_surface() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "clubs-api", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+            "modules": [{
+                "name": "clubs",
+                "entities": [{ "name": "Club", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "name", "type": "string" } ]}],
+                "endpoints": [
+                    { "operation_id": "list_clubs", "method": "GET", "path": "/",
+                      "auth_required": true,
+                      "success": { "status": 200, "entity": "Club", "list": true } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let rows = implicit_member_routes(&d);
+        let flat: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("GET", "/clubs/{club_id}/members"),
+                ("POST", "/clubs/{club_id}/members"),
+                ("PATCH", "/clubs/{club_id}/members/{user_id}"),
+                ("DELETE", "/clubs/{club_id}/members/{user_id}"),
+            ],
+            "the four registered member routes, mount-resolved"
+        );
+        assert!(rows.iter().all(|r| r.module == "clubs"));
+        assert_eq!(rows[0].handler, "list_club_members");
+        assert_eq!(rows[3].handler, "remove_club_member");
+        // The member routes never leak into the design-endpoint table.
+        assert!(
+            route_map(&d).iter().all(|r| !r.path.contains("/members")),
+            "route_map stays design-endpoints-only"
+        );
+        // No tenancy (the MINIMAL demo): no surface.
+        assert!(implicit_member_routes(&demo()).is_empty());
+        // Memory mode (no `db` dependency): no members table, no surface.
+        let mut mem = d.clone();
+        mem.dependencies.retain(|dep| dep != "db");
+        assert!(implicit_member_routes(&mem).is_empty());
     }
 
     /// The DDL must declare the fk columns the Model derives from belongs_to (the

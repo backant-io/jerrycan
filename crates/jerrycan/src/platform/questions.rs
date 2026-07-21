@@ -190,6 +190,13 @@ pub fn design_conflict(d: &Design) -> Option<DesignConflict> {
             ),
         });
     }
+    // JC0548 (#107): with tenancy, `member_roles` backs the generated member-
+    // management surface — `member_roles[0]` is the admin role, and every role
+    // is interpolated UNESCAPED into generated Rust string literals — so the
+    // list must be non-empty, duplicate-free, and identifier-shaped.
+    if let Some(conflict) = member_roles_conflict(d) {
+        return Some(conflict);
+    }
     // JC0541 (#44): an entity literally named `{X}Request` collides with the
     // `{X}Request` DTO/OpenAPI component generated for an entity `X` that omits a
     // server-owned field. Two `struct XRequest` would fail to compile in genroute and
@@ -204,6 +211,53 @@ pub fn design_conflict(d: &Design) -> Option<DesignConflict> {
     // failure. Caught here as a fatal conflict — it needs a rename or a restructure.
     if let Some(conflict) = router_param_conflict(d) {
         return Some(conflict);
+    }
+    None
+}
+
+/// The JC0548 check (issue #107): a tenancy design's `member_roles` must be
+/// non-empty (`member_roles[0]` is the admin role — it gates add/re-role/remove
+/// and the last-admin rule, and seeds the creator's membership), duplicate-free
+/// (the list becomes the generated `MEMBER_ROLES` allow-list and the OpenAPI
+/// `role` enum), and identifier-shaped — the same `^[A-Za-z0-9_-]+$` charset
+/// JC0543 enforces for enum values, because role names are interpolated
+/// UNESCAPED into generated Rust string literals (the `MEMBER_ROLES` const, the
+/// membership seed SQL, `require_role("…")` gates), so a quote or backslash
+/// emits a crate that fails to compile far from the design. One message per
+/// failure mode, naming the offending role.
+fn member_roles_conflict(d: &Design) -> Option<DesignConflict> {
+    let tenancy = d.tenancy.as_ref()?;
+    let roles = &tenancy.member_roles;
+    if roles.is_empty() {
+        return Some(DesignConflict {
+            code: "JC0548",
+            message: "tenancy.member_roles is empty — the member-management surface needs at least one declared role: `member_roles[0]` is the admin role (it gates member add/re-role/remove and the last-admin rule), and the tenant creator's membership is seeded with it. Declare the roles a member may hold, admin first (e.g. [\"owner\", \"member\"]). See `jerrycan explain JC0548`.".to_string(),
+            hint: "declare tenancy.member_roles, admin role first (e.g. [\"owner\", \"member\"])"
+                .to_string(),
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    for role in roles {
+        if !is_enum_value(role) {
+            return Some(DesignConflict {
+                code: "JC0548",
+                message: format!(
+                    "tenancy.member_roles entry `{role}` is not an identifier (^[A-Za-z0-9_-]+$) — role names are interpolated unescaped into generated Rust string literals (the MEMBER_ROLES const, the membership seed, `require_role` gates), so a quote or backslash emits a crate that fails to compile; other non-identifier characters are rejected under the same rule. Use identifier-shaped roles (letters, digits, `_`, `-`). See `jerrycan explain JC0548`."
+                ),
+                hint: format!(
+                    "rename role `{role}` to an identifier-shaped name (letters, digits, `_`, `-`)"
+                ),
+            });
+        }
+        if !seen.insert(role.as_str()) {
+            return Some(DesignConflict {
+                code: "JC0548",
+                message: format!(
+                    "tenancy.member_roles lists `{role}` more than once — the list becomes the generated MEMBER_ROLES allow-list and the OpenAPI `role` enum, and `member_roles[0]` is the admin role, so a duplicate makes the declared role set ambiguous. List each role exactly once. See `jerrycan explain JC0548`."
+                ),
+                hint: format!("remove the duplicate `{role}` from tenancy.member_roles"),
+            });
+        }
     }
     None
 }
@@ -223,7 +277,12 @@ pub fn design_conflict(d: &Design) -> Option<DesignConflict> {
 /// param name at a position agrees (`/{id}` + `/{id}/comments` is fine), and only
 /// two DIFFERENT param names at the same node conflict. Analyzed over the
 /// mount-resolved route table (`genroute::route_map`), so subroute-mount params
-/// (which occupy real positions) are included.
+/// (which occupy real positions) are included — PLUS the implicit member routes
+/// (`genroute::implicit_member_routes`, issue #107), which `App::build` registers
+/// for the tenant module but which never enter the design-endpoint table: a
+/// tenant-module endpoint with a custom param name (`GET /{slug}`), or one
+/// occupying a reserved `/{fk}/members` path, would otherwise pass validation and
+/// abort at startup.
 fn router_param_conflict(d: &Design) -> Option<DesignConflict> {
     /// A structure-only twin of `router::Node`: static children keyed by literal,
     /// plus at most ONE param slot carrying its name and the first route to set it.
@@ -232,8 +291,54 @@ fn router_param_conflict(d: &Design) -> Option<DesignConflict> {
         statics: std::collections::HashMap<String, Node>,
         param: Option<(String, String, Box<Node>)>,
     }
+    // The router registers routes from the LOAD-normalized design
+    // (`normalize_tenant_detail_routes` rewrites the tenant's own `{id}` detail
+    // params to `{tenant_fk}` in `Design::from_path` and the MCP merge paths).
+    // Every production caller hands this twin a normalized design already;
+    // re-normalizing a clone keeps it faithful for direct (test/programmatic)
+    // callers too — idempotent, so never wrong — which matters now that the
+    // member routes (named `{tenant_fk}` by construction) join the walk.
+    let normalized;
+    let d = if d.tenancy.is_some() {
+        normalized = {
+            let mut n = d.clone();
+            n.normalize_tenant_detail_routes();
+            n
+        };
+        &normalized
+    } else {
+        d
+    };
+    let design_routes = super::genroute::route_map(d);
+    let member_routes = super::genroute::implicit_member_routes(d);
+    // A design endpoint that OCCUPIES a reserved member path is a second
+    // `.route()` registration of the same path — `App::build` aborts with
+    // JC0500 `duplicate route registration` (methods don't disambiguate: the
+    // member surface registers its own route lines). Param names already agree
+    // here (a mismatch is the trie conflict below), so string equality is exact.
+    if let Some(taken) = member_routes
+        .iter()
+        .find(|mr| design_routes.iter().any(|dr| dr.path == mr.path))
+    {
+        let tenant = &d
+            .tenancy
+            .as_ref()
+            .expect("member routes imply tenancy")
+            .entity;
+        let fk = Design::fk_column(tenant);
+        let path = &taken.path;
+        return Some(DesignConflict {
+            code: "JC0542",
+            message: format!(
+                "route `{path}` collides with the implicit member-management surface generated for the `{tenant}` tenancy (issue #107) — jerrycan reserves `/{{{fk}}}/members` and `/{{{fk}}}/members/{{user_id}}` under the tenant module, and a second registration of the same path aborts `App::build` at startup with JC0500 `duplicate route registration` (after a clean scaffold, mid-test). Move the design endpoint off the reserved path (any static segment other than `members`), or drop it and use the generated member surface. See `jerrycan explain JC0542`."
+            ),
+            hint: format!(
+                "the member-management surface owns `{path}` — move or rename the design endpoint (a static segment other than `members` avoids the reserved pair), or rely on the generated member routes"
+            ),
+        });
+    }
     let mut root = Node::default();
-    for entry in super::genroute::route_map(d) {
+    for entry in design_routes.into_iter().chain(member_routes) {
         let path = entry.path;
         let mut node = &mut root;
         for seg in path.split('/').filter(|s| !s.is_empty()) {
@@ -2006,6 +2111,70 @@ mod tests {
         assert!(design_conflict(&plain).is_none());
     }
 
+    // ---- #107 (JC0548): tenancy member_roles content ---------------------------
+
+    /// JC0548 (#107): `member_roles[0]` is the admin role the generated member
+    /// surface gates on, and every role is interpolated UNESCAPED into generated
+    /// Rust string literals — so with tenancy the list must be non-empty,
+    /// duplicate-free, and identifier-shaped (JC0543's charset). Each failure
+    /// mode gets its own message naming the offender; without the check, an
+    /// empty list silently demotes the admin convention to a fallback role and a
+    /// quoted role emits a crate that fails to compile far from the design.
+    #[test]
+    fn tenancy_member_roles_must_be_nonempty_unique_identifiers() {
+        let base: Design = serde_json::from_str(V1_FULL).unwrap();
+        // Empty: the admin-role convention has nothing to stand on.
+        let mut empty = base.clone();
+        empty.tenancy.as_mut().unwrap().member_roles = vec![];
+        let c = design_conflict(&empty).expect("empty member_roles must be a conflict");
+        assert_eq!(c.code, "JC0548");
+        assert!(
+            c.message.contains("empty") && c.message.contains("admin"),
+            "empty message names the failure and the admin convention: {}",
+            c.message
+        );
+        assert!(!c.hint.is_empty());
+        // Duplicate: names the repeated role.
+        let mut dup = base.clone();
+        dup.tenancy.as_mut().unwrap().member_roles =
+            vec!["owner".into(), "member".into(), "owner".into()];
+        let c = design_conflict(&dup).expect("duplicated member_roles must be a conflict");
+        assert_eq!(c.code, "JC0548");
+        assert!(
+            c.message.contains("`owner`") && c.message.contains("more than once"),
+            "duplicate message names the repeated role: {}",
+            c.message
+        );
+        // Charset: a quote breaks the unescaped interpolation into generated Rust
+        // (the same rule JC0543 enforces for enum values); names the offender.
+        let mut bad = base.clone();
+        bad.tenancy.as_mut().unwrap().member_roles = vec!["owner".into(), "ow\"ner".into()];
+        let c = design_conflict(&bad).expect("non-identifier role must be a conflict");
+        assert_eq!(c.code, "JC0548");
+        assert!(
+            c.message.contains("ow\"ner") && c.message.contains("[A-Za-z0-9_-]"),
+            "charset message names the offending role and the rule: {}",
+            c.message
+        );
+        // Identifier-shaped, duplicate-free lists pass — including the shipped
+        // tenancy conformance design.
+        assert!(design_conflict(&base).is_none(), "valid roles must pass");
+        let mut hyphen = base.clone();
+        hyphen.tenancy.as_mut().unwrap().member_roles =
+            vec!["team-lead".into(), "read_only".into(), "Member2".into()];
+        assert!(
+            design_conflict(&hyphen).is_none(),
+            "`-`/`_`/mixed-case roles are identifier-shaped: {:?}",
+            design_conflict(&hyphen).map(|c| c.message)
+        );
+        let reference: Design = serde_json::from_str(CONFORMANCE_REFERENCE).unwrap();
+        assert!(
+            design_conflict(&reference).is_none(),
+            "conformance member_roles must not trip JC0548: {:?}",
+            design_conflict(&reference).map(|c| c.message)
+        );
+    }
+
     /// Issue #44 (positive): an entity literally named `{X}Request` alongside an
     /// entity `X` whose guarded body omits the identity fk generates two `XRequest`
     /// definitions (Rust struct + OpenAPI component). `design_conflict` rejects it up
@@ -2499,6 +2668,99 @@ mod tests {
                 design_conflict(&d).map(|c| c.message)
             );
         }
+    }
+
+    // ---- #107: the implicit member routes join the JC0542 walk ----------------
+
+    /// A minimal Club-tenancy design (db + auth, so the member surface is
+    /// emitted) whose tenant module has one detail endpoint at `detail_path`.
+    fn club_tenancy(detail_path: &str) -> Design {
+        serde_json::from_str(&format!(
+            r#"{{
+            "name": "clubs-api", "contract_version": 1,
+            "auth": {{ "model": "session", "roles": ["owner", "member"] }},
+            "dependencies": ["db", "auth"],
+            "tenancy": {{ "entity": "Club", "member_roles": ["owner", "member"] }},
+            "modules": [{{
+                "name": "clubs",
+                "entities": [{{ "name": "Club", "fields": [
+                    {{ "name": "id", "type": "integer" }},
+                    {{ "name": "slug", "type": "string" }} ]}}],
+                "endpoints": [
+                    {{ "operation_id": "show_club", "method": "GET", "path": "{detail_path}",
+                      "auth_required": true,
+                      "success": {{ "status": 200, "entity": "Club" }} }}
+                ]
+            }}]
+        }}"#
+        ))
+        .unwrap()
+    }
+
+    /// A tenant module with a CUSTOM-param endpoint — `GET /{slug}` where the
+    /// conventional `/{id}` would have been normalized to `/{club_id}`. The
+    /// tool-owned member routes register `/{club_id}/members…` at `App::build`,
+    /// so `{slug}` vs `{club_id}` at the shared position aborts startup with
+    /// JC0500 — previously AFTER a clean check, breaking the "green check ⇒ it
+    /// runs" promise. The walk must include the member routes and reject the
+    /// design up front with JC0542 naming both routes.
+    #[test]
+    fn tenant_custom_param_collides_with_the_member_routes() {
+        let c = design_conflict(&club_tenancy("/{slug}"))
+            .expect("a custom tenant param must conflict with the member routes");
+        assert_eq!(c.code, "JC0542");
+        assert!(
+            c.message.contains("/clubs/{slug}") && c.message.contains("/clubs/{club_id}/members"),
+            "names the design route AND the member route: {}",
+            c.message
+        );
+        assert!(
+            c.message.contains("{slug}") && c.message.contains("{club_id}"),
+            "names both param names: {}",
+            c.message
+        );
+    }
+
+    /// The conventional shape stays green: a tenant detail route written as
+    /// `/{id}` is load-normalized to `/{club_id}` (`normalize_tenant_detail_routes`),
+    /// which AGREES with the member routes' param — the walk must apply the same
+    /// normalization the router sees, so the design passes exactly when
+    /// `App::build` succeeds (no false positive on every ordinary tenancy app).
+    #[test]
+    fn normalized_tenant_detail_route_agrees_with_the_member_routes() {
+        assert!(
+            design_conflict(&club_tenancy("/{id}")).is_none(),
+            "the normalized `/{{club_id}}` detail route must not conflict: {:?}",
+            design_conflict(&club_tenancy("/{id}")).map(|c| c.message)
+        );
+        // Same param name written explicitly: also fine.
+        assert!(
+            design_conflict(&club_tenancy("/{club_id}")).is_none(),
+            "an explicit `/{{club_id}}` detail route must not conflict"
+        );
+    }
+
+    /// A design endpoint OCCUPYING a reserved member path (`GET /{club_id}/members`)
+    /// is a second `.route()` registration of the same path — `App::build` aborts
+    /// with JC0500 `duplicate route registration` (methods don't disambiguate).
+    /// JC0542 must reject it at design time, naming the reserved surface.
+    #[test]
+    fn design_endpoint_on_a_reserved_member_path_is_a_conflict() {
+        let c = design_conflict(&club_tenancy("/{club_id}/members"))
+            .expect("a design endpoint on the reserved member path must conflict");
+        assert_eq!(c.code, "JC0542");
+        assert!(
+            c.message.contains("/clubs/{club_id}/members")
+                && c.message.contains("member-management"),
+            "names the reserved path and the member surface: {}",
+            c.message
+        );
+        assert!(
+            c.message.contains("duplicate route registration"),
+            "states the startup failure it prevents: {}",
+            c.message
+        );
+        assert!(!c.hint.is_empty());
     }
 
     // ---- #54 (JC0543): enum value content ------------------------------------
