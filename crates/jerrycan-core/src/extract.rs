@@ -366,10 +366,26 @@ impl FromRequest for RawBody {
 /// ANY extraction failure. For genuinely optional inputs — the canonical use
 /// is optional auth (`Option<CurrentUser>` on a route that also accepts a
 /// signed URL). Do NOT use it to paper over malformed required input: the
-/// failure reason is discarded by design.
+/// failure reason is discarded by design — reach for `Result<T, Error>` when
+/// the failure must stay observable.
 impl<T: FromRequest> FromRequest for Option<T> {
     async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
         Ok(T::from_request(ctx).await.ok())
+    }
+}
+
+/// Error-PRESERVING optional extraction: `Ok(v)` when the inner extractor
+/// succeeds, `Err(e)` carrying ITS error when it fails — the extraction itself
+/// never fails the request, so the handler decides. For routes that accept
+/// more than one credential and must keep the guard's real status when the
+/// fallback also misses (#109): a private tenant bucket's download takes
+/// `Result<Dep<Tenant>, Error>` and, past the signed-URL branch, propagates
+/// with `let tenant = tenant?;` — a missing session stays 401 and a
+/// non-member's guard failure stays 403, instead of `Option<T>` collapsing
+/// both into a rebound 401.
+impl<T: FromRequest> FromRequest for Result<T, Error> {
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        Ok(T::from_request(ctx).await)
     }
 }
 
@@ -494,6 +510,42 @@ mod tests {
         // Missing/malformed query → None, not a 400.
         assert_eq!(t.get("/probe").await.text(), "null");
         assert_eq!(t.get("/probe?n=not-a-number").await.text(), "null");
+    }
+
+    #[tokio::test]
+    async fn result_extractor_preserves_the_inner_error() {
+        // WHY (#109): Option<T> discards WHY the inner extractor failed, so a
+        // route that accepts a session OR a signed URL collapses a guard's 403
+        // into a blanket 401. Result<T, Error> keeps the inner error for the
+        // handler to propagate (`let v = v?;`) — extraction itself never fails
+        // the request, so the fallback credential path still runs first.
+        struct Gate;
+        impl FromRequest for Gate {
+            async fn from_request(_ctx: &mut RequestCtx) -> Result<Self> {
+                Err(Error::forbidden())
+            }
+        }
+        async fn probe(gate: Result<Gate, Error>) -> Result<Json<&'static str>> {
+            let _gate = gate?;
+            Ok(Json("open"))
+        }
+        let t = crate::App::new()
+            .route("/probe", crate::get(probe))
+            .into_test();
+        let res = t.get("/probe").await;
+        assert_eq!(
+            res.status().as_u16(),
+            403,
+            "the inner error's status survives; body: {}",
+            res.text()
+        );
+        assert!(res.text().contains("JC0403"), "body: {}", res.text());
+        // The success side passes the value through as Ok(Ok(v)).
+        let mut c = ctx("/x", "");
+        let ok = <Result<Headers, Error> as FromRequest>::from_request(&mut c)
+            .await
+            .expect("outer extraction never fails");
+        assert!(ok.is_ok(), "success is Ok(Ok(_))");
     }
 
     #[tokio::test]
