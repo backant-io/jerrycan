@@ -244,6 +244,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs validation",
     },
     CodeInfo {
+        code: "JC0547",
+        title: "realtime changes on a transitively tenant-owned entity",
+        cause: "a realtime `changes` entity reaches the tenant only through an intermediate parent (a grandchild chain like Contact -> Account -> Org), so its row image carries no tenant key column — change events could not be tenant-scoped and every tenant's rows would broadcast to every authenticated principal",
+        fix: "the changes entity must be the tenant itself or a DIRECT child of it: flatten the relationship (give the entity its own belongs_to the tenant) or drop it from `changes`",
+        doc: "jerrycan docs realtime",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -343,6 +350,25 @@ mod tests {
             dual.fix.contains("path parameter") && dual.fix.contains("split"),
             "JC0544 must name both remedies: {}",
             dual.fix
+        );
+    }
+
+    #[test]
+    fn jc0547_names_the_transitive_changes_leak_and_both_remedies() {
+        // WHY: JC0547 converts the transitive-changes silent cross-tenant
+        // broadcast leak (#102's realtime facet) into a design-time refusal —
+        // `jerrycan explain JC0547` must state the cause (no tenant key in the
+        // row image) and name BOTH remedies (flatten, or drop from `changes`).
+        let info = lookup("JC0547").unwrap();
+        assert!(
+            info.cause.contains("tenant key") && info.cause.contains("broadcast"),
+            "cause must name the missing row-image tenant key and the leak: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("flatten") && info.fix.contains("drop"),
+            "fix must name both remedies: {}",
+            info.fix
         );
     }
 

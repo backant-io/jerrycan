@@ -16,7 +16,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 license = "MIT"
 homepage = "https://jerrycan.cc"
@@ -25,16 +25,16 @@ authors = ["Pavel Hegler"]
 rust-version = "1.97"
 
 [workspace.dependencies]
-jerrycan-core = { path = "crates/jerrycan-core", version = "0.5.2" }
-jerrycan-macros = { path = "crates/jerrycan-macros", version = "0.5.2" }
-jerrycan-db = { path = "crates/jerrycan-db", version = "0.5.2" }
-jerrycan-validate = { path = "crates/jerrycan-validate", version = "0.5.2" }
-jerrycan-auth = { path = "crates/jerrycan-auth", version = "0.5.2" }
-jerrycan-observe = { path = "crates/jerrycan-observe", version = "0.5.2" }
-jerrycan-ratelimit = { path = "crates/jerrycan-ratelimit", version = "0.5.2" }
-jerrycan-jobs = { path = "crates/jerrycan-jobs", version = "0.5.2" }
-jerrycan-storage = { path = "crates/jerrycan-storage", version = "0.5.2" }
-jerrycan-realtime = { path = "crates/jerrycan-realtime", version = "0.5.2" }
+jerrycan-core = { path = "crates/jerrycan-core", version = "0.5.3" }
+jerrycan-macros = { path = "crates/jerrycan-macros", version = "0.5.3" }
+jerrycan-db = { path = "crates/jerrycan-db", version = "0.5.3" }
+jerrycan-validate = { path = "crates/jerrycan-validate", version = "0.5.3" }
+jerrycan-auth = { path = "crates/jerrycan-auth", version = "0.5.3" }
+jerrycan-observe = { path = "crates/jerrycan-observe", version = "0.5.3" }
+jerrycan-ratelimit = { path = "crates/jerrycan-ratelimit", version = "0.5.3" }
+jerrycan-jobs = { path = "crates/jerrycan-jobs", version = "0.5.3" }
+jerrycan-storage = { path = "crates/jerrycan-storage", version = "0.5.3" }
+jerrycan-realtime = { path = "crates/jerrycan-realtime", version = "0.5.3" }
 # Realtime WS transport. No TLS features: server-side it rides hyper's already-
 # accepted socket; the test client connects plain ws:// on loopback. Verified
 # 0.30.0 current on docs.rs (from_raw_socket + inherent send +
