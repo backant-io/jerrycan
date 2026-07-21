@@ -856,6 +856,39 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
         );
     }
 
+    /// The MACRO token scanner keeps its WRITE needles under the public_read
+    /// needle split (`flag_reads=false`): an unscoped `repo.remove(`/`repo.update(`
+    /// wrapped in a macro body — invisible to the AST method-call walk — must
+    /// still be flagged on a public_read module. WHY (Rule 9): the read needles
+    /// are disarmed there, and if the macro scanner's needle list drifted from the
+    /// AST visitor's (they are built independently), a macro-wrapped cross-user
+    /// WRITE would sail through exactly where the lint's guard is thinnest.
+    #[test]
+    fn jl0006_macro_scanner_keeps_write_needles_on_a_public_read_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/workouts/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn delete_workout(repo: Dep<WorkoutRepo>) -> Result<()> {\n    let _ = serde_json::json!({ \"gone\": repo.remove(7).await? });\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &public_read_design());
+        assert_eq!(
+            hits.len(),
+            1,
+            "the macro-wrapped unscoped write must be flagged even with the read \
+             needles disarmed: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the macro line: {hits:?}");
+        assert!(
+            hits[0].message.contains("remove(...)"),
+            "names the write needle: {:?}",
+            hits[0]
+        );
+    }
+
     /// A MIXED module — one `public_read` entity plus one plain per-user entity —
     /// KEEPS the read needles: the lint cannot tell which repo an unscoped
     /// `repo.all()` targets, so it stays conservative (the false positive has the

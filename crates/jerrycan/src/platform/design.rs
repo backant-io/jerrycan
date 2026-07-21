@@ -1071,6 +1071,27 @@ impl Design {
             .is_some_and(|e| e.public_read && self.entity_is_per_user_owned(e))
     }
 
+    /// True when this endpoint is a PUBLIC read on a `public_read` entity (issue
+    /// #105): a GET whose repo entity opted into public_read runs UNGUARDED —
+    /// regardless of its declared `auth_required` — so the read is public by
+    /// construction (the entity flag drives it; the design doesn't hand-set auth
+    /// per GET). Writes always keep their guard, and a role-gated GET
+    /// (`required_roles`) keeps its guard too: an explicit role demand outranks
+    /// the entity-level read-open default (stripping it would silently drop the
+    /// role check the design asked for). THE single guarding-split predicate:
+    /// handler emission (genroute), the OpenAPI `security` stanza (openapi), and
+    /// the generated 401 probe (testgen) all resolve through this ONE method —
+    /// keyed on each site's own `is_guarded()` reading, the trio would drift
+    /// (the OpenAPI doc would advertise a credential on an unguarded handler and
+    /// the acceptance suite would 401-probe a handler that correctly 200s: a
+    /// permanently-red test on a correct app). False for every non-`public_read`
+    /// design, keeping output byte-identical.
+    pub(crate) fn endpoint_is_public_read_get(&self, m: &ModuleDesign, ep: &Endpoint) -> bool {
+        matches!(ep.method, HttpMethod::GET)
+            && ep.required_roles.is_empty()
+            && endpoint_repo_entity(m, ep).is_some_and(|entity| self.entity_is_public_read(entity))
+    }
+
     /// The server-owned-FK rule (issue #34), design-level: a GUARDED endpoint
     /// whose request-body entity carries an identity FK omits that FK from the
     /// wire contract — the generated probe bodies and the OpenAPI request
@@ -1366,6 +1387,55 @@ pub(crate) fn rust_ident(name: &str) -> String {
 /// owning module/subroute name. Delegates ownership to `Design::tenant_path` so
 /// the direct and transitive cases share one resolver (an ambiguous entity
 /// resolves to `None` and is omitted — the design is rejected by `JC0545`).
+/// The bare collection path a parameterized endpoint acts under: its path with the
+/// trailing `/{param}` removed (`/tasks/{id}` → `/tasks`, `/{id}` → `/`). None when
+/// the path carries no `{param}` (nothing to strip).
+fn collection_path(ep: &Endpoint) -> Option<String> {
+    let p = ep.path.as_str();
+    let brace = p.rfind('{')?;
+    let cut = p[..brace].rfind('/').unwrap_or(0);
+    Some(if cut == 0 {
+        "/".to_string()
+    } else {
+        p[..cut].to_string()
+    })
+}
+
+/// The POST creator (with a body) mounted at a bare collection `path` in this
+/// module — the route whose entity owns the rows addressable under `path/{id}`.
+fn creator_at<'a>(m: &'a ModuleDesign, path: &str) -> Option<&'a Endpoint> {
+    m.endpoints
+        .iter()
+        .find(|ep| ep.method == HttpMethod::POST && ep.path == path && ep.request_body.is_some())
+}
+
+/// The entity whose repo/model a route's handler binds. Resolution order: the
+/// request body's entity, then the success entity, then — for a no-body endpoint
+/// like `DELETE /{id}` that names neither (issue #56) — the entity of the
+/// COLLECTION it acts under (its parent path's POST creator), so a multi-entity
+/// module's `/tasks/{id}` stub binds `TaskRepo`, not the module's FIRST entity.
+/// Falls back to the first entity only when path-based resolution finds nothing
+/// (a bare `/import`, or a module with no matching creator) — byte-identical to
+/// the pre-#56 behavior for every single-entity module (the collection creator IS
+/// the sole entity there). Lives here (not genroute) so the ONE resolution serves
+/// both emission and [`Design::endpoint_is_public_read_get`].
+pub(crate) fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a str> {
+    if m.entities.is_empty() {
+        return None;
+    }
+    ep.request_body
+        .as_ref()
+        .map(|rb| rb.entity.as_str())
+        .or(ep.success.entity.as_deref())
+        .or_else(|| {
+            collection_path(ep)
+                .and_then(|coll| creator_at(m, &coll))
+                .and_then(|c| c.request_body.as_ref())
+                .map(|rb| rb.entity.as_str())
+        })
+        .or_else(|| m.entities.first().map(|e| e.name.as_str()))
+}
+
 fn collect_tenant_owned<'a>(
     design: &Design,
     module: &'a ModuleDesign,

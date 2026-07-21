@@ -533,6 +533,153 @@ fn per_user_identity_owned_modules_get_isolation_tests() {
     );
 }
 
+/// The public-read/owner-write feed design (#105): Post is per-user identity-owned
+/// with `public_read: true`; `list_posts` is DECLARED `auth_required` (the entity
+/// flag must override it — the exact shape the blessed fixture uses).
+const FEED: &str = r#"{
+    "name": "feedapp", "contract_version": 1,
+    "auth": { "model": "session", "roles": ["user"] },
+    "dependencies": ["db", "auth"],
+    "modules": [
+        { "name": "users",
+          "entities": [{ "name": "User", "fields": [{ "name": "email", "type": "string" }] }],
+          "endpoints": [] },
+        { "name": "posts",
+          "entities": [{ "name": "Post", "public_read": true,
+              "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+              "fields": [{ "name": "title", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "list_posts", "method": "GET", "path": "/", "auth_required": true,
+                "success": { "status": 200, "entity": "Post", "list": true } },
+              { "operation_id": "get_post", "method": "GET", "path": "/{id}",
+                "success": { "status": 200, "entity": "Post" } },
+              { "operation_id": "create_post", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Post" },
+                "success": { "status": 201, "entity": "Post" } },
+              { "operation_id": "update_post", "method": "PUT", "path": "/{id}", "auth_required": true,
+                "request_body": { "entity": "Post" },
+                "success": { "status": 200, "entity": "Post" } },
+              { "operation_id": "delete_post", "method": "DELETE", "path": "/{id}", "auth_required": true,
+                "success": { "status": 204 } } ] }
+    ]
+}"#;
+
+/// #105 gate-lie fix: genroute emits a `public_read` GET UNGUARDED (no
+/// CurrentUser) even when the design declares it `auth_required` — so testgen
+/// must NOT emit its `_without_auth_is_401` probe. WHY (Rule 9): before the
+/// shared predicate, testgen keyed on the raw `is_guarded()` and asserted a
+/// no-cookie `list_posts` 401s, while the correct generated handler 200s — a
+/// valid design produced a PERMANENTLY-RED acceptance test (green-means-safe
+/// broken in the worst direction). The success probe must also run WITHOUT a
+/// credential (anonymous is the contract). Writes keep their 401 probes.
+#[test]
+fn public_read_gets_lose_the_401_probe_and_probe_anonymously() {
+    let d: Design = serde_json::from_str(FEED).unwrap();
+    let posts = d.modules.iter().find(|m| m.name == "posts").unwrap();
+    let out = testgen::acceptance_rs(&d, posts);
+    assert!(
+        !out.contains("list_posts_without_auth_is_401")
+            && !out.contains("get_post_without_auth_is_401"),
+        "a public_read GET must not get a 401 probe (the handler is unguarded — the test would be red-when-correct): {out}"
+    );
+    let list_probe = out
+        .split("async fn list_posts_returns_200")
+        .nth(1)
+        .expect("list success probe present")
+        .split("async fn")
+        .next()
+        .unwrap();
+    assert!(
+        list_probe.contains("t.get(\"/posts/\")") && !list_probe.contains("test_cookie"),
+        "the public list probes anonymously: {list_probe}"
+    );
+    // Writes stay guarded: probe with a credential AND keep the 401 test.
+    for probe in [
+        "create_post_without_auth_is_401",
+        "update_post_without_auth_is_401",
+        "delete_post_without_auth_is_401",
+    ] {
+        assert!(out.contains(probe), "{probe} must stay: {out}");
+    }
+}
+
+/// The #105 isolation variant: a `public_read` module gets the public-read/
+/// owner-write test — anon list contains ANOTHER user's row, anon detail 200s,
+/// anon create 401s, a non-owner PUT/DELETE 404s with the row SURVIVING, the
+/// owner's PUT succeeds — and does NOT get the #79 cross-user test (whose
+/// read-denial legs would be red on a correct public feed).
+#[test]
+fn public_read_modules_get_the_owner_write_isolation_test() {
+    let d: Design = serde_json::from_str(FEED).unwrap();
+    let posts = d.modules.iter().find(|m| m.name == "posts").unwrap();
+    let out = testgen::acceptance_rs(&d, posts);
+    assert!(
+        out.contains("async fn anon_reads_but_only_the_owner_writes_posts()"),
+        "public_read isolation test emitted: {out}"
+    );
+    assert!(
+        out.contains("SECURITY (#105)"),
+        "carries the #105 security doc-comment: {out}"
+    );
+    assert!(
+        !out.contains("async fn user_a_cannot_read_user_b_posts()"),
+        "the #79 cross-user test must NOT be emitted for a public_read entity: {out}"
+    );
+    let body = out
+        .split("async fn anon_reads_but_only_the_owner_writes_posts()")
+        .nth(1)
+        .unwrap()
+        .split("#[tokio::test]")
+        .next()
+        .unwrap();
+    for leg in [
+        "anonymous list must 200 (public_read)",
+        "must contain ANOTHER user's row",
+        "anonymous detail must 200 (public_read)",
+        "an anonymous create must 401",
+        "a non-owner update must 404",
+        "a non-owner delete must 404",
+        "must SURVIVE a non-owner write attempt",
+        "the OWNER's update must succeed",
+    ] {
+        assert!(body.contains(leg), "leg `{leg}` present: {body}");
+    }
+}
+
+/// The `required_roles.is_empty()` conjunct in the shared predicate is
+/// LOAD-BEARING: a role-gated GET on a `public_read` entity KEEPS its guard, so
+/// it keeps its 401 probe and probes WITH a credential. Deleting the conjunct
+/// (treating every GET on the entity as public) must turn this red — otherwise
+/// an explicit role demand would be silently dropped.
+#[test]
+fn role_gated_get_on_a_public_read_entity_keeps_the_401_probe() {
+    let mut d: Design = serde_json::from_str(FEED).unwrap();
+    let posts_idx = d.modules.iter().position(|m| m.name == "posts").unwrap();
+    d.modules[posts_idx]
+        .endpoints
+        .iter_mut()
+        .find(|ep| ep.operation_id == "list_posts")
+        .unwrap()
+        .required_roles = vec!["user".to_string()];
+    let posts = &d.modules[posts_idx];
+    let out = testgen::acceptance_rs(&d, posts);
+    assert!(
+        out.contains("list_posts_without_auth_is_401"),
+        "a role-gated GET keeps its guard and its 401 probe: {out}"
+    );
+    let list_probe = out
+        .split("async fn list_posts_returns_200")
+        .nth(1)
+        .expect("list success probe present")
+        .split("async fn")
+        .next()
+        .unwrap();
+    assert!(
+        list_probe.contains("test_cookie"),
+        "a role-gated GET probes WITH a credential: {list_probe}"
+    );
+}
+
 /// A path-scoped NESTED tenant module (BookClubs `/clubs/{club_id}/books`) gets a
 /// cross-tenant isolation test with the mount pinned to tenant 1 — the exact #78
 /// nested-creator leak that had NO coverage before. A member of club 2 gets 404 on

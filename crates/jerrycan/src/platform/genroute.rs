@@ -37,54 +37,10 @@ fn key_rust_type(e: &Entity) -> &'static str {
     }
 }
 
-/// The bare collection path a parameterized endpoint acts under: its path with the
-/// trailing `/{param}` removed (`/tasks/{id}` → `/tasks`, `/{id}` → `/`). None when
-/// the path carries no `{param}` (nothing to strip). Mirrors testgen's
-/// `collection_path`, kept local so the two generators stay decoupled.
-fn collection_path(ep: &Endpoint) -> Option<String> {
-    let p = ep.path.as_str();
-    let brace = p.rfind('{')?;
-    let cut = p[..brace].rfind('/').unwrap_or(0);
-    Some(if cut == 0 {
-        "/".to_string()
-    } else {
-        p[..cut].to_string()
-    })
-}
-
-/// The POST creator (with a body) mounted at a bare collection `path` in this
-/// module — the route whose entity owns the rows addressable under `path/{id}`.
-fn creator_at<'a>(m: &'a ModuleDesign, path: &str) -> Option<&'a Endpoint> {
-    m.endpoints
-        .iter()
-        .find(|ep| ep.method == HttpMethod::POST && ep.path == path && ep.request_body.is_some())
-}
-
-/// The entity whose repo/model a route's handler binds. Resolution order: the
-/// request body's entity, then the success entity, then — for a no-body endpoint
-/// like `DELETE /{id}` that names neither (issue #56) — the entity of the
-/// COLLECTION it acts under (its parent path's POST creator), so a multi-entity
-/// module's `/tasks/{id}` stub binds `TaskRepo`, not the module's FIRST entity.
-/// Falls back to the first entity only when path-based resolution finds nothing
-/// (a bare `/import`, or a module with no matching creator) — byte-identical to
-/// the pre-#56 behavior for every single-entity module (the collection creator IS
-/// the sole entity there).
-fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a str> {
-    if m.entities.is_empty() {
-        return None;
-    }
-    ep.request_body
-        .as_ref()
-        .map(|rb| rb.entity.as_str())
-        .or(ep.success.entity.as_deref())
-        .or_else(|| {
-            collection_path(ep)
-                .and_then(|coll| creator_at(m, &coll))
-                .and_then(|c| c.request_body.as_ref())
-                .map(|rb| rb.entity.as_str())
-        })
-        .or_else(|| m.entities.first().map(|e| e.name.as_str()))
-}
+// `collection_path`/`creator_at`/`endpoint_repo_entity` live in design.rs (#105):
+// the repo-entity resolution also feeds `Design::endpoint_is_public_read_get`, so
+// emission and the guarding-split predicate share ONE resolution (reached here
+// through the `use super::design::*` glob above).
 
 fn return_type(ep: &Endpoint) -> String {
     let entity = ep.success.entity.as_deref();
@@ -220,20 +176,10 @@ fn endpoint_emits_realtime_publish(ep: &Endpoint, design: &Design) -> bool {
     !matches!(ep.method, HttpMethod::GET) && design.server_publishable_broadcast().is_some()
 }
 
-/// True when this endpoint is a PUBLIC read on a `public_read` entity (issue
-/// #105): a GET whose repo entity opted into public_read takes NO `CurrentUser`
-/// — regardless of its declared `auth_required` — so the read is public by
-/// construction (the entity flag drives it; the design doesn't hand-set auth
-/// per GET). Writes always keep their guard, and a role-gated GET
-/// (`required_roles`) keeps its guard too: an explicit role demand outranks the
-/// entity-level read-open default (stripping it would silently drop the role
-/// check the design asked for). False for every non-`public_read` design,
-/// keeping output byte-identical.
-fn endpoint_is_public_read_get(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> bool {
-    matches!(ep.method, HttpMethod::GET)
-        && ep.required_roles.is_empty()
-        && endpoint_repo_entity(m, ep).is_some_and(|entity| design.entity_is_public_read(entity))
-}
+// The public-read guarding split (issue #105) is `Design::endpoint_is_public_read_get`
+// — the ONE role-aware predicate shared with openapi.rs (`security` stanza) and
+// testgen.rs (401 probe), so the handler, the advertised contract, and the
+// acceptance suite cannot disagree about whether a GET is guarded.
 
 fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> String {
     let mut params = Vec::new();
@@ -250,7 +196,7 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
     if mode.auth && ep.is_guarded() {
         if endpoint_uses_tenant_guard(m, ep, design) {
             params.push("_tenant: Dep<Tenant>".to_string());
-        } else if !endpoint_is_public_read_get(m, ep, design) {
+        } else if !design.endpoint_is_public_read_get(m, ep) {
             params.push("_user: CurrentUser".to_string());
         }
     }
@@ -490,8 +436,11 @@ fn owner_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &
     // public_read (#105): the read is PUBLIC — steer to the unscoped `all()`/
     // `get(id)` (which the repo now emits) instead of the owner-scoped accessors;
     // there is no `_user` param to scope by (handler_params dropped it). Writes
-    // keep the owner-scoped steering through their own comments/accessors.
-    if design.entity_is_public_read(entity) {
+    // keep the owner-scoped steering through their own comments/accessors. Keyed
+    // on the SAME endpoint-level predicate as handler_params — a role-gated GET
+    // KEEPS its `_user` param, so it must keep the #79 owner-scope steer below
+    // (steering it to the unscoped read would contradict its own signature).
+    if design.endpoint_is_public_read_get(m, ep) {
         let call = if ep.success.list {
             format!("{entity}Repo::all()")
         } else {
@@ -506,6 +455,16 @@ fn owner_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &
     } else {
         format!("{entity}Repo::get_for(_user.0.id, _id)")
     };
+    // A ROLE-GATED GET on a public_read entity keeps its `_user` guard (the role
+    // demand outranks the read-open default), so its steer must match its own
+    // signature — and, unlike the plain #79 case, the unscoped reads DO exist on
+    // this repo (they serve the public GETs), so the "NOT generated" claim would
+    // be a lie here.
+    if design.entity_is_public_read(entity) {
+        return format!(
+            "    // role-gated read on a public_read {entity} (issues #79/#105): the required_roles\n    // keep this GET guarded — check the role (see above), then scope via `{call}`\n    // (parse `_user.0.id`, the stringified session user id, for an integer fk), or\n    // deliberately serve the public collection with the unscoped read.\n"
+        );
+    }
     format!(
         "    // owner scope (issue #79): this {entity} belongs to the session user — scope this\n    // read via `{call}` (parse `_user.0.id`, the stringified session user id, for an\n    // integer fk). The unscoped repo method is NOT generated, so a cross-user read\n    // can't be written.\n"
     )
@@ -538,7 +497,7 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
         let needs_user = m.endpoints.iter().any(|ep| {
             ep.is_guarded()
                 && !endpoint_uses_tenant_guard(m, ep, design)
-                && !endpoint_is_public_read_get(m, ep, design)
+                && !design.endpoint_is_public_read_get(m, ep)
         });
         if needs_tenant {
             uses.push_str("use shared::Tenant;\n");
@@ -4010,6 +3969,58 @@ pub(crate) mod tests {
         assert!(
             drafts_stub.contains("DraftRepo::all_for(_user.0.id)"),
             "the non-public sibling keeps the owner-scope steer: {drafts_stub}"
+        );
+    }
+
+    /// The `required_roles.is_empty()` conjunct in the shared
+    /// `Design::endpoint_is_public_read_get` is LOAD-BEARING: a ROLE-GATED GET on
+    /// a `public_read` entity KEEPS its `CurrentUser` guard (an explicit role
+    /// demand outranks the entity-level read-open default — stripping it would
+    /// silently drop the role check the design asked for), and its stub steer
+    /// matches that signature (the role-gated owner-scope variant, never the
+    /// "no session needed" public steer). Deleting the conjunct must turn this
+    /// red.
+    #[test]
+    fn role_gated_public_read_get_keeps_its_guard_and_owner_steer() {
+        let mut d: Design = serde_json::from_str(PUBLIC_READ).unwrap();
+        d.modules[1]
+            .endpoints
+            .iter_mut()
+            .find(|ep| ep.operation_id == "list_posts")
+            .unwrap()
+            .required_roles = vec!["user".to_string()];
+        let h = handlers_rs(
+            &d.modules[1],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        );
+        assert!(
+            h.contains("pub(crate) async fn list_posts(_repo: Dep<PostRepo>, _user: CurrentUser)"),
+            "a role-gated GET keeps its CurrentUser despite public_read: {h}"
+        );
+        let list_stub = h
+            .split("async fn list_posts")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            list_stub.contains("role-gated read on a public_read Post")
+                && list_stub.contains("PostRepo::all_for(_user.0.id)"),
+            "the steer matches the guarded signature: {list_stub}"
+        );
+        assert!(
+            !list_stub.contains("no session needed"),
+            "the public steer must not contradict the kept guard: {list_stub}"
+        );
+        // The un-roled detail GET on the same entity stays public.
+        assert!(
+            h.contains("pub(crate) async fn get_post(_repo: Dep<PostRepo>, Path(_id): Path<i64>)"),
+            "the un-roled sibling GET stays unguarded: {h}"
         );
     }
 
