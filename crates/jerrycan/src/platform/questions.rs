@@ -874,6 +874,64 @@ pub fn validate(d: &Design) -> Vec<Question> {
         }
     }
 
+    // JC0550 (#88): the tenant entity's OWN detail route must address the tenant
+    // by its pk fk. The load normalization rewrites only the literal `{id}`
+    // (→ `{fk}`), so a route addressed by any OTHER param (`/{slug}`,
+    // `/by-slug/{slug}`, a multi-param custom) survives it — and the membership
+    // guard, which verifies the tenant NAMED BY THE PATH FK, cannot bind it: the
+    // handler would be generated with a bare `CurrentUser` and NO membership
+    // check at all, silently. Renaming the param is NOT a fix — the guard parses
+    // the path value as the tenant PK type, so a slug would be reinterpreted as
+    // a pk — hence a loud refusal (the JC0549 pattern: a latent unimplementable
+    // shape becomes a clear fork). Checked over a normalized clone (the
+    // `router_param_conflict` precedent): production callers hand `validate()` a
+    // load-normalized design already, and re-normalizing is idempotent, so the
+    // conventional `/{id}` passes for direct (test/programmatic) callers too.
+    if let Some(tenancy) = &d.tenancy {
+        let fk = Design::fk_column(&tenancy.entity);
+        let normalized = {
+            let mut n = d.clone();
+            n.normalize_tenant_detail_routes();
+            n
+        };
+        // The trailing path param — the one that addresses the detail row.
+        fn trailing_path_param(path: &str) -> Option<&str> {
+            let rest = &path[path.rfind('{')? + 1..];
+            rest.find('}').map(|end| &rest[..end])
+        }
+        fn check_tenant_detail_param(
+            tenant: &str,
+            fk: &str,
+            m: &ModuleDesign,
+            ptr: &str,
+            qs: &mut Vec<Question>,
+        ) {
+            for (i, ep) in m.endpoints.iter().enumerate() {
+                if endpoint_repo_entity(m, ep) != Some(tenant) {
+                    continue;
+                }
+                let Some(param) = trailing_path_param(&ep.path) else {
+                    continue;
+                };
+                if param != fk {
+                    qs.push(q(
+                        format!("{ptr}/endpoints/{i}"),
+                        format!(
+                            "Endpoint `{}` ({:?} {}) is the tenant `{}`'s own detail route but addresses it by `{{{}}}`, not its pk `{{{}}}` — the membership guard verifies the tenant named by the path fk, so a non-pk param (e.g. a slug) cannot be membership-checked and the route would run with no membership check at all. Use `/{{id}}` (auto-normalized to `/{{{}}}`) or `/{{{}}}` directly; slug-based tenant addressing is not yet supported. See `jerrycan explain JC0550`.",
+                            ep.operation_id, ep.method, ep.path, tenant, param, fk, fk, fk
+                        ),
+                    ));
+                }
+            }
+            for (i, sub) in m.subroutes.iter().enumerate() {
+                check_tenant_detail_param(tenant, fk, sub, &format!("{ptr}/subroutes/{i}"), qs);
+            }
+        }
+        for (i, m) in normalized.modules.iter().enumerate() {
+            check_tenant_detail_param(&tenancy.entity, &fk, m, &format!("/modules/{i}"), &mut qs);
+        }
+    }
+
     // JC0549 (#105): the public-read/owner-write shape. `public_read` is a
     // modifier on the per-user ownership shape (#79) — reads public, writes
     // owner-scoped — so (a) it is valid ONLY on an identity-owned, non-tenant
@@ -3159,6 +3217,15 @@ mod tests {
             "names both param names: {}",
             c.message
         );
+        // #88: the SAME `/{slug}` design is also refused by validate() — it is
+        // the tenant's own detail route addressed by a non-pk param (JC0550).
+        // Both codes are legitimate: JC0542 names the router conflict with the
+        // member routes, JC0550 the unverifiable membership.
+        let qs = validate(&club_tenancy("/{slug}"));
+        assert!(
+            qs.iter().any(|q| q.question.contains("JC0550")),
+            "a db+auth `/{{slug}}` tenant detail route must also trip JC0550: {qs:?}"
+        );
     }
 
     /// The conventional shape stays green: a tenant detail route written as
@@ -3228,6 +3295,92 @@ mod tests {
                 c.message
             );
         }
+    }
+
+    // ---- #88 (JC0550): a non-pk tenant detail param is refused -----------------
+
+    /// #88: a tenant entity's OWN detail route addressed by a non-pk param
+    /// survives normalization (only the literal `{id}` is renamed), the
+    /// membership guard cannot bind an fk, and the handler was generated with
+    /// a bare `CurrentUser` and NO membership check at all — silently. JC0550
+    /// turns that silent hole into a design-time refusal naming the operation,
+    /// the offending param, and the fk. Covers BOTH the first-position
+    /// `/{slug}` (which db+auth JC0542 also catches via the member routes) and
+    /// the non-first-position `/by-slug/{slug}`, which JC0542 cannot see (the
+    /// static segment diverges from `{club_id}` in the trie) — the reachable
+    /// silent hole.
+    #[test]
+    fn tenant_own_non_pk_detail_param_is_refused_with_jc0550() {
+        for path in ["/{slug}", "/by-slug/{slug}"] {
+            let qs = validate(&club_tenancy(path));
+            let hit = qs
+                .iter()
+                .find(|q| q.question.contains("JC0550"))
+                .unwrap_or_else(|| panic!("`{path}` must trip JC0550: {qs:?}"));
+            assert!(
+                hit.question.contains("show_club")
+                    && hit.question.contains("GET")
+                    && hit.question.contains("`Club`")
+                    && hit.question.contains("{slug}")
+                    && hit.question.contains("{club_id}"),
+                "JC0550 must name the operation, method, tenant, param, and fk: {}",
+                hit.question
+            );
+        }
+    }
+
+    /// The pk shapes stay green: the conventional `/{id}` (load-normalized to
+    /// `/{club_id}`) and the explicit `/{club_id}` both address the tenant by
+    /// its pk, so the guard binds the fk by name and JC0550 must not fire —
+    /// every ordinary tenancy app validates exactly as before.
+    #[test]
+    fn tenant_pk_detail_routes_do_not_trip_jc0550() {
+        for path in ["/{id}", "/{club_id}"] {
+            let qs = validate(&club_tenancy(path));
+            assert!(
+                !qs.iter().any(|q| q.question.contains("JC0550")),
+                "`{path}` must not trip JC0550: {qs:?}"
+            );
+        }
+    }
+
+    /// A CHILD entity's `/{slug}` detail route is NOT the tenant's own detail
+    /// route — its handler binds the child's repo, and child scoping is
+    /// JL0006's domain, not the tenant guard's fk binding — so JC0550 must
+    /// stay silent (only the tenant's OWN detail route is refused).
+    #[test]
+    fn child_entity_slug_detail_route_does_not_trip_jc0550() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "clubs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "clubs",
+                      "entities": [{ "name": "Club", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [
+                          { "operation_id": "get_club", "method": "GET", "path": "/{id}",
+                            "auth_required": true,
+                            "success": { "status": 200, "entity": "Club" } } ] },
+                    { "name": "books",
+                      "entities": [{ "name": "Book",
+                          "belongs_to": [{ "entity": "Club" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "slug", "type": "string" }] }],
+                      "endpoints": [
+                          { "operation_id": "get_book", "method": "GET", "path": "/{slug}",
+                            "auth_required": true,
+                            "success": { "status": 200, "entity": "Book" } } ] }
+                ] }"#,
+        )
+        .unwrap();
+        let qs = validate(&d);
+        assert!(
+            !qs.iter().any(|q| q.question.contains("JC0550")),
+            "a child entity's `/{{slug}}` detail route must not trip JC0550: {qs:?}"
+        );
     }
 
     /// #140: two spellings of ONE route — `GET /archive` and `POST /archive/`

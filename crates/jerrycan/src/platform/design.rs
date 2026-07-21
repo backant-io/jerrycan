@@ -849,12 +849,32 @@ impl Design {
     /// `entity` (the tenant module); recurse so a tenant entity declared in a
     /// subroute is still found. Never touches a module that merely OWNS a
     /// tenant-owned child.
+    ///
+    /// Scoped to endpoints whose resolved repo entity IS the tenant entity
+    /// (issue #89): a sibling entity hosted in the same module keeps its own
+    /// `/{id}` detail routes — there `{id}` is the SIBLING's key, and renaming
+    /// it to the tenant fk would mis-scope the sibling's detail route to the
+    /// tenant guard. Resolution is the lenient [`endpoint_repo_entity`]: its
+    /// first-entity fallback preserves the normalization of a bodyless tenant
+    /// detail route (a `DELETE /{id}` with no success entity) in a
+    /// single-entity tenant module. Because that resolver reads OTHER
+    /// endpoints' paths (collection-creator resolution, #56), the targets are
+    /// collected in an immutable pre-pass BEFORE any path is rewritten — never
+    /// resolve mid-rename against half-rewritten collection paths.
     fn normalize_own_detail_routes(m: &mut ModuleDesign, entity: &str, fk_token: &str) {
         if m.entities.iter().any(|e| e.name == entity) {
-            for ep in &mut m.endpoints {
-                if ep.path.contains("{id}") {
-                    ep.path = ep.path.replace("{id}", fk_token);
-                }
+            let targets: Vec<usize> = m
+                .endpoints
+                .iter()
+                .enumerate()
+                .filter(|(_, ep)| {
+                    ep.path.contains("{id}") && endpoint_repo_entity(m, ep) == Some(entity)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            for i in targets {
+                let path = &mut m.endpoints[i].path;
+                *path = path.replace("{id}", fk_token);
             }
         }
         for sub in &mut m.subroutes {
@@ -2218,6 +2238,11 @@ pub(crate) mod tests {
         // collection root (`POST`/`GET "/"`) is unaffected. This is the security
         // fix: without the rename the guard's path branch misses and leaks another
         // tenant's row.
+        //
+        // Issue #89: a SIBLING entity hosted in the SAME (tenant-declaring) module
+        // keeps its own `/trophies/{id}` detail routes — `{id}` there is the
+        // TROPHY's key, and renaming it to `{club_id}` would mis-scope the
+        // sibling's detail route to the tenant guard.
         let mut d: Design = serde_json::from_str(
             r#"{ "name": "clubs-api", "contract_version": 1,
                 "auth": { "model": "session", "roles": ["owner", "member"] },
@@ -2225,9 +2250,15 @@ pub(crate) mod tests {
                 "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
                 "modules": [
                     { "name": "clubs",
-                      "entities": [{ "name": "Club", "fields": [
-                          { "name": "id", "type": "integer" },
-                          { "name": "name", "type": "string" } ]}],
+                      "entities": [
+                          { "name": "Club", "fields": [
+                              { "name": "id", "type": "integer" },
+                              { "name": "name", "type": "string" } ]},
+                          { "name": "Trophy",
+                            "belongs_to": [{ "entity": "Club" }],
+                            "fields": [
+                              { "name": "id", "type": "integer" },
+                              { "name": "title", "type": "string" } ]}],
                       "endpoints": [
                           { "operation_id": "create_club", "method": "POST", "path": "/",
                             "request_body": { "entity": "Club" },
@@ -2235,6 +2266,16 @@ pub(crate) mod tests {
                           { "operation_id": "get_club", "method": "GET", "path": "/{id}",
                             "success": { "status": 200, "entity": "Club" } },
                           { "operation_id": "delete_club", "method": "DELETE", "path": "/{id}",
+                            "success": { "status": 204 } },
+                          { "operation_id": "create_trophy", "method": "POST", "path": "/trophies",
+                            "request_body": { "entity": "Trophy" },
+                            "success": { "status": 201, "entity": "Trophy" } },
+                          { "operation_id": "get_trophy", "method": "GET", "path": "/trophies/{id}",
+                            "success": { "status": 200, "entity": "Trophy" } },
+                          { "operation_id": "update_trophy", "method": "PUT", "path": "/trophies/{id}",
+                            "request_body": { "entity": "Trophy" },
+                            "success": { "status": 200, "entity": "Trophy" } },
+                          { "operation_id": "delete_trophy", "method": "DELETE", "path": "/trophies/{id}",
                             "success": { "status": 204 } } ] },
                     { "name": "books", "mount": "/clubs/{club_id}",
                       "entities": [{ "name": "Book",
@@ -2267,6 +2308,24 @@ pub(crate) mod tests {
         );
         // The collection root is untouched.
         assert_eq!(d.modules[0].endpoints[0].path, "/");
+        // #89: the sibling entity's OWN detail routes in the SAME module keep
+        // `{id}` — it is the trophy's key, not the tenant's. `get_trophy` and
+        // `update_trophy` resolve to Trophy via their explicit entity;
+        // `delete_trophy` (bodyless, no success entity) resolves via its
+        // collection creator `POST /trophies` — which the immutable pre-pass
+        // must consult BEFORE any path is rewritten.
+        assert_eq!(
+            d.modules[0].endpoints[4].path, "/trophies/{id}",
+            "sibling GET detail untouched"
+        );
+        assert_eq!(
+            d.modules[0].endpoints[5].path, "/trophies/{id}",
+            "sibling PUT detail untouched"
+        );
+        assert_eq!(
+            d.modules[0].endpoints[6].path, "/trophies/{id}",
+            "sibling DELETE detail untouched"
+        );
         // The nested child (`books/{id}` — the BOOK) and the flat child
         // (`customers/{id}`) keep `{id}` — normalizing them would misname a
         // non-tenant key.
