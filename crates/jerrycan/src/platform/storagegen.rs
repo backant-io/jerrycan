@@ -7,7 +7,7 @@
 //! jerrycan-storage; the generated handlers only resolve the principal into a
 //! `Scope` and delegate.
 
-use super::design::{AuthModel, BucketDesign, Design, Entity, ModuleDesign, Visibility};
+use super::design::{AuthModel, BucketDesign, Design, ModuleDesign, Visibility};
 use std::fs;
 use std::path::Path;
 
@@ -59,28 +59,18 @@ enum BucketScope {
     UserInTenant,
 }
 
-fn find_entity<'a>(m: &'a ModuleDesign, name: &str) -> Option<&'a Entity> {
-    m.entities
-        .iter()
-        .find(|e| e.name == name)
-        .or_else(|| m.subroutes.iter().find_map(|s| find_entity(s, name)))
-}
-
-fn owner_belongs_to_tenant(design: &Design, owner: &str, tenant: &str) -> bool {
-    design
-        .modules
-        .iter()
-        .find_map(|m| find_entity(m, owner))
-        .is_some_and(|e| e.belongs_to.iter().any(|b| b.entity == tenant))
-}
-
 fn bucket_scope(design: &Design, b: &BucketDesign) -> BucketScope {
     match (&b.owner, design.tenancy.as_ref()) {
         (None, _) => BucketScope::Unowned,
         (Some(o), Some(t)) if *o == t.entity => BucketScope::Tenant,
-        (Some(o), Some(t)) if owner_belongs_to_tenant(design, o, &t.entity) => {
-            BucketScope::UserInTenant
-        }
+        // Transitive too (0.5.4): a grandchild owner reaches the tenant through
+        // its `belongs_to` chain. Storage needs `tenant_path` only as a BOOLEAN
+        // — the Tenant guard resolves the tenant at request time and the
+        // handler stamps `tenant_id` itself, so no JOIN SQL is emitted. A
+        // direct child resolves `Some(zero-join)`, keeping direct-owned buckets
+        // byte-identical. A diamond owner resolves `None` — refused by JC0545
+        // in bucket validation, never silently degraded to `User` here.
+        (Some(o), Some(_)) if design.tenant_path(o).is_some() => BucketScope::UserInTenant,
         (Some(_), _) => BucketScope::User,
     }
 }
@@ -88,14 +78,29 @@ fn bucket_scope(design: &Design, b: &BucketDesign) -> BucketScope {
 /// The per-scope code fragments. Every string is valid Rust in its slot;
 /// guard params end with ", " so they compose before other params (a trailing
 /// comma in a fn signature is legal where a fragment lands last).
+///
+/// The private `download` doc (`download_doc`) is per-scope because the truth
+/// differs (#109): a user bucket's only guard failure IS a missing session
+/// (401), while a tenant bucket's guard also 403s an authenticated non-member
+/// — and that status now survives (`Result<Dep<Tenant>, Error>` + `tenant?`
+/// instead of `Option` rebound to a blanket 401).
 struct ScopeFragments {
     guard_params: &'static str,
     opt_guard_params: &'static str,
     scope_expr: &'static str,
     opt_guard_bind: &'static str,
+    download_doc: &'static str,
     use_user: bool,
     use_tenant: bool,
 }
+
+/// The pre-0.5.4 private-download doc — kept verbatim for user/unowned
+/// buckets, whose only session-path failure really is a 401.
+const DOWNLOAD_DOC_401: &str = "/// GET /{id} — download: a scoped session OR a valid `exp`/`sig` pair (the\n/// app-HMAC signed URL). A missing/failed guard on the session path reads as\n/// 401 (this route's credential can also be the URL itself).";
+
+/// The tenant-scoped private-download doc (#109): the guard's own status
+/// surfaces past the signed-URL branch.
+const DOWNLOAD_DOC_TENANT: &str = "/// GET /{id} — download: a scoped session OR a valid `exp`/`sig` pair (the\n/// app-HMAC signed URL). On the session path the tenant guard's OWN status\n/// surfaces (#109): no session = 401, an authenticated non-member = 403.";
 
 fn fragments(scope: BucketScope) -> ScopeFragments {
     match scope {
@@ -104,6 +109,7 @@ fn fragments(scope: BucketScope) -> ScopeFragments {
             opt_guard_params: "user: Option<CurrentUser>, ",
             scope_expr: "Scope::default()",
             opt_guard_bind: "let _user = user.ok_or_else(Error::unauthorized)?;\n    let scope = Scope::default();",
+            download_doc: DOWNLOAD_DOC_401,
             use_user: true,
             use_tenant: false,
         },
@@ -112,22 +118,25 @@ fn fragments(scope: BucketScope) -> ScopeFragments {
             opt_guard_params: "user: Option<CurrentUser>, ",
             scope_expr: "Scope { owner_id: Some(user.0.id.to_string()), tenant_id: None }",
             opt_guard_bind: "let user = user.ok_or_else(Error::unauthorized)?;\n    let scope = Scope { owner_id: Some(user.0.id.to_string()), tenant_id: None };",
+            download_doc: DOWNLOAD_DOC_401,
             use_user: true,
             use_tenant: false,
         },
         BucketScope::Tenant => ScopeFragments {
             guard_params: "tenant: Dep<Tenant>, ",
-            opt_guard_params: "tenant: Option<Dep<Tenant>>, ",
+            opt_guard_params: "tenant: Result<Dep<Tenant>, Error>, ",
             scope_expr: "Scope { owner_id: Some(tenant.id().to_string()), tenant_id: Some(tenant.id().to_string()) }",
-            opt_guard_bind: "let tenant = tenant.ok_or_else(Error::unauthorized)?;\n    let scope = Scope { owner_id: Some(tenant.id().to_string()), tenant_id: Some(tenant.id().to_string()) };",
+            opt_guard_bind: "let tenant = tenant?;\n    let scope = Scope { owner_id: Some(tenant.id().to_string()), tenant_id: Some(tenant.id().to_string()) };",
+            download_doc: DOWNLOAD_DOC_TENANT,
             use_user: false,
             use_tenant: true,
         },
         BucketScope::UserInTenant => ScopeFragments {
             guard_params: "user: CurrentUser, tenant: Dep<Tenant>, ",
-            opt_guard_params: "user: Option<CurrentUser>, tenant: Option<Dep<Tenant>>, ",
+            opt_guard_params: "user: Option<CurrentUser>, tenant: Result<Dep<Tenant>, Error>, ",
             scope_expr: "Scope { owner_id: Some(user.0.id.to_string()), tenant_id: Some(tenant.id().to_string()) }",
-            opt_guard_bind: "let user = user.ok_or_else(Error::unauthorized)?;\n    let tenant = tenant.ok_or_else(Error::unauthorized)?;\n    let scope = Scope { owner_id: Some(user.0.id.to_string()), tenant_id: Some(tenant.id().to_string()) };",
+            opt_guard_bind: "let user = user.ok_or_else(Error::unauthorized)?;\n    let tenant = tenant?;\n    let scope = Scope { owner_id: Some(user.0.id.to_string()), tenant_id: Some(tenant.id().to_string()) };",
+            download_doc: DOWNLOAD_DOC_TENANT,
             use_user: true,
             use_tenant: true,
         },
@@ -218,9 +227,7 @@ pub(crate) async fn list(storage: Dep<Storage>, db: Dep<Db>, {guard}) -> Result<
     Ok(Json(storage.list_objects(&db, &BUCKET, Some(&scope)).await?))
 }}
 
-/// GET /{{id}} — download: a scoped session OR a valid `exp`/`sig` pair (the
-/// app-HMAC signed URL). A missing/failed guard on the session path reads as
-/// 401 (this route's credential can also be the URL itself).
+{download_doc}
 pub(crate) async fn download(storage: Dep<Storage>, db: Dep<Db>, {opt_guard}Path(id): Path<String>, Query(q): Query<GetQuery>) -> Result<Response> {{
     if let (Some(exp), Some(sig)) = (q.exp, q.sig.as_deref()) {{
         let (meta, bytes) = storage.get_signed(&db, &BUCKET, &id, exp, sig, std::time::SystemTime::now()).await?;
@@ -231,6 +238,7 @@ pub(crate) async fn download(storage: Dep<Storage>, db: Dep<Db>, {opt_guard}Path
     jerrycan::storage::object_response(&meta, bytes, false)
 }}
 "#,
+            download_doc = f.download_doc,
             opt_guard = f.opt_guard_params,
             opt_guard_bind = f.opt_guard_bind,
         )
@@ -470,7 +478,9 @@ fn bucket_tests(design: &Design, b: &BucketDesign, base: &str, out: &mut String)
     // wrong header. Under session/none `hk == "cookie"`, so output is byte-identical.
     let hk = design.test_auth_header();
     let public = matches!(b.visibility, Visibility::Public);
-    let owned = bucket_scope(design, b) != BucketScope::Unowned;
+    let scope = bucket_scope(design, b);
+    let owned = scope != BucketScope::Unowned;
+    let tenant_scoped = matches!(scope, BucketScope::Tenant | BucketScope::UserInTenant);
     let mime = concrete_mime(b);
     let cache = if public {
         "public, max-age=3600"
@@ -499,6 +509,16 @@ fn bucket_tests(design: &Design, b: &BucketDesign, base: &str, out: &mut String)
     if !public {
         out.push_str(&format!(
             "#[tokio::test]\nasync fn {ident}_download_without_auth_is_401() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"{mount}?key=guard.bin\", b\"x\", &[(\"{hk}\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\");\n    let res = t.get(&format!(\"{mount}/{{id}}\")).await;\n    assert_eq!(res.status().as_u16(), 401, \"private read without a session; body: {{}}\", res.text());\n}}\n\n"
+        ));
+    }
+
+    // 3b. #109: a private tenant-scoped download surfaces the guard's REAL
+    // status — user 3 has a valid credential but no membership row (users 1/2
+    // are the only seeded members), so the Tenant guard 403s and that 403 must
+    // reach the wire instead of being rebound to a blanket 401.
+    if !public && tenant_scoped {
+        out.push_str(&format!(
+            "/// SECURITY (#109): an authenticated NON-MEMBER (a valid credential, no\n/// membership row) gets the tenant guard's 403 — not a misleading 401 that\n/// hides the real authz outcome.\n#[tokio::test]\nasync fn {ident}_download_by_non_member_is_403() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"{mount}?key=member.bin\", b\"x\", &[(\"{hk}\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(created.status().as_u16(), 201, \"setup; body: {{}}\", created.text());\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\");\n    let res = t.get_with(&format!(\"{mount}/{{id}}\"), &[(\"{hk}\", &test_cookie_for(3))]).await;\n    assert_eq!(res.status().as_u16(), 403, \"a non-member reads the guard's 403, not 401; body: {{}}\", res.text());\n}}\n\n"
         ));
     }
 
@@ -699,10 +719,19 @@ mod tests {
             m.contains("Scope { owner_id: Some(tenant.id().to_string()), tenant_id: Some(tenant.id().to_string()) }"),
             "{m}"
         );
-        // Private download: optional guard OR a signed URL, both paths present.
-        assert!(m.contains("tenant: Option<Dep<Tenant>>"), "{m}");
+        // Private download: error-PRESERVING guard OR a signed URL, both paths
+        // present (#109): `Result<Dep<Tenant>, Error>` + `tenant?` surfaces the
+        // guard's own 401/403 instead of a rebound blanket 401.
+        assert!(m.contains("tenant: Result<Dep<Tenant>, Error>"), "{m}");
+        assert!(m.contains("let tenant = tenant?;"), "{m}");
+        assert!(!m.contains("Option<Dep<Tenant>>"), "{m}");
+        assert!(!m.contains("ok_or_else(Error::unauthorized)"), "{m}");
         assert!(m.contains("get_signed(&db, &BUCKET, &id, exp, sig,"), "{m}");
-        assert!(m.contains("ok_or_else(Error::unauthorized)?"), "{m}");
+        // The doc comment tells the truth about the statuses.
+        assert!(
+            m.contains("no session = 401, an authenticated non-member = 403"),
+            "{m}"
+        );
         // Private list is scoped.
         assert!(
             m.contains("async fn list(storage: Dep<Storage>, db: Dep<Db>, tenant: Dep<Tenant>,"),
@@ -727,6 +756,67 @@ mod tests {
             m.contains("Scope { owner_id: Some(user.0.id.to_string()), tenant_id: Some(tenant.id().to_string()) }"),
             "{m}"
         );
+    }
+
+    /// SECURITY (0.5.4): a bucket owned by a GRANDCHILD of the tenant
+    /// (User → Team → Org) is tenant-scoped too. The pre-0.5.1 direct
+    /// `belongs_to == tenant` predicate classified it `User`, dropping the
+    /// Tenant guard and the tenant_id stamp — any authenticated user could
+    /// reach a bucket that was meant to be tenant-scoped.
+    #[test]
+    fn grandchild_owned_bucket_is_tenant_scoped() {
+        let mut d = design();
+        // Graft: Team belongs_to Org; User (avatars' owner) belongs_to Team.
+        // Private, so the download path (the #109 surface) is generated too.
+        d.modules[0].entities.push(
+            serde_json::from_str(
+                r#"{ "name": "Team", "belongs_to": [{ "entity": "Org" }],
+                     "fields": [{ "name": "id", "type": "integer" }] }"#,
+            )
+            .unwrap(),
+        );
+        d.modules[0].entities[1].belongs_to =
+            vec![serde_json::from_str(r#"{ "entity": "Team" }"#).unwrap()];
+        d.storage.as_mut().unwrap().buckets[0].visibility = Visibility::Private;
+        let m = bucket_rs(&d, &d.storage.as_ref().unwrap().buckets[0].clone());
+        assert!(m.contains("user: CurrentUser, tenant: Dep<Tenant>,"), "{m}");
+        assert!(
+            m.contains("Scope { owner_id: Some(user.0.id.to_string()), tenant_id: Some(tenant.id().to_string()) }"),
+            "{m}"
+        );
+        // The download guard is the error-preserving pair: the session stays a
+        // plain 401 when absent, the tenant guard's 403 survives (#109).
+        assert!(
+            m.contains("user: Option<CurrentUser>, tenant: Result<Dep<Tenant>, Error>,"),
+            "{m}"
+        );
+        assert!(
+            m.contains(
+                "let user = user.ok_or_else(Error::unauthorized)?;\n    let tenant = tenant?;"
+            ),
+            "{m}"
+        );
+    }
+
+    /// Byte-identity (0.5.4): a PRIVATE plain-user bucket keeps the exact
+    /// pre-0.5.4 download shape — `Option<CurrentUser>` rebound to 401 and the
+    /// original doc text. Only tenant-scoped downloads changed; a user bucket
+    /// has no 403-capable guard, so its output must not move by a byte.
+    #[test]
+    fn private_user_bucket_download_keeps_the_option_guard() {
+        let mut d = design();
+        d.storage.as_mut().unwrap().buckets[0].visibility = Visibility::Private;
+        let m = bucket_rs(&d, &d.storage.as_ref().unwrap().buckets[0].clone());
+        assert!(m.contains("user: Option<CurrentUser>, Path(id)"), "{m}");
+        assert!(
+            m.contains("let user = user.ok_or_else(Error::unauthorized)?;"),
+            "{m}"
+        );
+        assert!(
+            m.contains("A missing/failed guard on the session path reads as\n/// 401"),
+            "{m}"
+        );
+        assert!(!m.contains("Result<Dep<Tenant>"), "{m}");
     }
 
     #[test]
@@ -791,12 +881,19 @@ mod tests {
             "async fn avatars_cross_owner_access_is_denied()",
             "async fn avatars_signed_url_grants_and_rejects()",
             "async fn invoices_download_without_auth_is_401()",
+            "async fn invoices_download_by_non_member_is_403()",
             "async fn invoices_cross_owner_access_is_denied()",
             "async fn invoices_owner_prefix_isolates_keys()",
             "async fn invoices_signed_url_grants_and_rejects()",
         ] {
             assert!(a.contains(needle), "missing {needle} in:\n{a}");
         }
+        // #109 negative control: user 3 has a VALID credential but no
+        // membership row — the guard's 403 must surface, not a blanket 401.
+        // Only tenant-scoped private buckets get it (a user bucket has no
+        // 403-capable guard; avatars is public and user-owned).
+        assert!(a.contains("test_cookie_for(3)"), "{a}");
+        assert!(!a.contains("avatars_download_by_non_member"), "{a}");
         // The negative controls encode the SECURITY contract: cross-owner GET
         // 404s and the row survives a cross-owner DELETE.
         assert!(a.contains("cross-owner delete must 404"), "{a}");

@@ -893,6 +893,25 @@ pub fn validate(d: &Design) -> Vec<Question> {
                     format!("Bucket owner `{owner}` is not a declared entity anywhere in the design — define it or fix the reference."),
                 ));
             }
+            // JC0545, storage facet (0.5.4): a bucket owner that reaches the
+            // tenant through TWO or more `belongs_to` chains (a diamond) makes
+            // `tenant_path` resolve `None`, which would SILENTLY degrade the
+            // bucket from tenant scope to plain per-user scope — no Tenant
+            // guard, no tenant_id stamp. Refuse it at the bucket pointer (the
+            // entity-level diamond check above fires too; this one names the
+            // bucket that degrades). A tenant-itself or no-tenant-path owner
+            // stays User/Unowned as before — only the ≥2-branch case is refused.
+            if let Some(ref owner) = b.owner
+                && d.tenant_path_branch_count(owner) >= 2
+            {
+                qs.push(q(
+                    format!("{bptr}/owner"),
+                    format!(
+                        "Bucket `{}` is owned by `{owner}`, which reaches the tenant through more than one `belongs_to` path (a diamond graph) — jerrycan cannot decide which chain defines tenant ownership, and falling back to per-user scope would silently drop the Tenant guard and leak the bucket across tenants. Collapse `{owner}`'s tenant ownership to a SINGLE `belongs_to` path. See `jerrycan explain JC0545`.",
+                        b.name
+                    ),
+                ));
+            }
             if b.owner_prefix && b.owner.is_none() {
                 qs.push(q(
                     format!("{bptr}/owner_prefix"),
@@ -1543,6 +1562,55 @@ mod tests {
                 .iter()
                 .any(|q| q.id.starts_with("/storage/buckets/0/allowed_mime")),
             "*/*, type/* and type/subtype are all valid"
+        );
+    }
+
+    /// JC0545, storage facet (0.5.4): a bucket owner that reaches the tenant
+    /// through TWO `belongs_to` chains (a diamond) makes `tenant_path` resolve
+    /// `None`, which would SILENTLY degrade the bucket from tenant scope to
+    /// plain per-user scope — no Tenant guard, no tenant_id stamp, a
+    /// cross-tenant leak with `check` green. The bucket itself must be
+    /// refused; a single (even transitive) chain stays legal.
+    #[test]
+    fn diamond_bucket_owner_is_refused_with_jc0545() {
+        let diamond = |d: &mut Design| {
+            // User (avatars' owner) → {Team, Project} → Org: two chains.
+            for parent in [
+                r#"{ "name": "Team", "belongs_to": [{ "entity": "Org" }],
+                     "fields": [{ "name": "id", "type": "integer" }] }"#,
+                r#"{ "name": "Project", "belongs_to": [{ "entity": "Org" }],
+                     "fields": [{ "name": "id", "type": "integer" }] }"#,
+            ] {
+                d.modules[0]
+                    .entities
+                    .push(serde_json::from_str(parent).unwrap());
+            }
+            d.modules[0].entities[1].belongs_to = vec![
+                serde_json::from_str(r#"{ "entity": "Team" }"#).unwrap(),
+                serde_json::from_str(r#"{ "entity": "Project" }"#).unwrap(),
+            ];
+        };
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        diamond(&mut d);
+        assert!(
+            validate(&d)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/owner" && q.question.contains("JC0545")),
+            "diamond bucket owner → JC0545 at the bucket pointer: {:?}",
+            validate(&d)
+        );
+        // A single transitive chain (drop the Project leg) is NOT ambiguous —
+        // the bucket becomes UserInTenant, no refusal.
+        let mut single: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        diamond(&mut single);
+        single.modules[0].entities[1].belongs_to =
+            vec![serde_json::from_str(r#"{ "entity": "Team" }"#).unwrap()];
+        assert!(
+            !validate(&single)
+                .iter()
+                .any(|q| q.id.starts_with("/storage/buckets/0")),
+            "a unique transitive chain is legal: {:?}",
+            validate(&single)
         );
     }
 
