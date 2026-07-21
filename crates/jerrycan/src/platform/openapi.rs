@@ -226,6 +226,158 @@ fn request_schema(design: &Design, e: &Entity, for_update: bool) -> Value {
     json!({ "type": "object", "properties": properties, "required": required })
 }
 
+/// The generated member-management surface (issue #107): the four tool-owned
+/// member routes on the tenant module. Unlike storage buckets these are
+/// first-class tenant routes, so they ARE advertised — a generated client can
+/// invite/remove/re-role members without reading the Rust. Gated exactly like
+/// genroute's emission (tenancy + db + auth), so any design without the surface
+/// keeps a byte-identical document.
+fn member_surface_paths(design: &Design, paths: &mut serde_json::Map<String, Value>) {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return;
+    };
+    if !design.wants_db() || !design.wants_auth() {
+        return;
+    }
+    // The mount-resolved base of the module DECLARING the tenant entity —
+    // recursing so a tenant declared in a subroute is still found (mirrors
+    // genroute's per-module emission site).
+    fn base_of(m: &ModuleDesign, prefix: &str, entity: &str) -> Option<String> {
+        let base = format!("{}{}", prefix, m.effective_mount());
+        if m.entities.iter().any(|e| e.name == entity) {
+            return Some(base);
+        }
+        m.subroutes.iter().find_map(|s| base_of(s, &base, entity))
+    }
+    let Some(base) = design
+        .modules
+        .iter()
+        .find_map(|m| base_of(m, "", &tenancy.entity))
+    else {
+        return;
+    };
+    let entity = &tenancy.entity;
+    let snake = Design::to_snake(entity);
+    let fk = Design::fk_column(entity);
+    // The admin role: member_roles[0], same fallback as genroute's emission.
+    let admin = tenancy
+        .member_roles
+        .first()
+        .map(String::as_str)
+        .unwrap_or("member");
+    // The tenant fk param types as the tenant KEY; `user_id` is an opaque string
+    // (no FK backs it — migrated-uuid support), and `role` is pinned to the
+    // declared member_roles so a generated client can't even send an off-set one.
+    let fk_schema = match design.target_key_rust_type(entity) {
+        "String" => json!({ "type": "string" }),
+        _ => json!({ "type": "integer", "format": "int64" }),
+    };
+    let role_schema = if tenancy.member_roles.is_empty() {
+        json!({ "type": "string" })
+    } else {
+        json!({ "type": "string", "enum": tenancy.member_roles })
+    };
+    let member_schema = json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "integer", "format": "int64" },
+            "user_id": { "type": "string" },
+            "role": role_schema.clone(),
+        },
+        "required": ["id", "user_id", "role"],
+    });
+    // The POST wire/echo shape (the handler echoes what it wrote; the row id is
+    // in the roster).
+    let add_schema = json!({
+        "type": "object",
+        "properties": { "user_id": { "type": "string" }, "role": role_schema.clone() },
+        "required": ["user_id", "role"],
+    });
+    let fk_param = json!({ "name": fk, "in": "path", "required": true, "schema": fk_schema });
+    let user_param = json!({ "name": "user_id", "in": "path", "required": true, "schema": { "type": "string" } });
+    let security = security_scheme_name(design).map(|scheme| json!([{ scheme: [] }]));
+    let not_member = format!("caller is not a member of this {snake} (membership guard)");
+    let not_admin = format!("caller does not hold the admin role `{admin}`");
+    let bad_role = "role is not one of the declared member_roles";
+
+    let mut list = json!({
+        "operationId": format!("list_{snake}_members"),
+        "parameters": [fk_param.clone()],
+        "responses": {
+            "200": {
+                "description": "success",
+                "content": { "application/json": {
+                    "schema": { "type": "array", "items": member_schema } } },
+            },
+            "404": { "description": not_member.clone() },
+        },
+    });
+    let mut add = json!({
+        "operationId": format!("add_{snake}_member"),
+        "parameters": [fk_param.clone()],
+        "requestBody": {
+            "required": true,
+            "content": { "application/json": { "schema": add_schema.clone() } },
+        },
+        "responses": {
+            "201": {
+                "description": "success",
+                "content": { "application/json": { "schema": add_schema } },
+            },
+            "403": { "description": not_admin.clone() },
+            "404": { "description": not_member.clone() },
+            "409": { "description": "user is already a member" },
+            "422": { "description": bad_role },
+        },
+    });
+    let mut set_role = json!({
+        "operationId": format!("set_{snake}_member_role"),
+        "parameters": [fk_param.clone(), user_param.clone()],
+        "requestBody": {
+            "required": true,
+            "content": { "application/json": { "schema": {
+                "type": "object",
+                "properties": { "role": role_schema },
+                "required": ["role"],
+            } } },
+        },
+        "responses": {
+            "204": { "description": "success" },
+            "403": { "description": not_admin },
+            "404": { "description": format!("{not_member}, or no such member") },
+            "409": { "description": format!("cannot demote the last {admin}") },
+            "422": { "description": bad_role },
+        },
+    });
+    let mut remove = json!({
+        "operationId": format!("remove_{snake}_member"),
+        "parameters": [fk_param, user_param],
+        "responses": {
+            "204": { "description": "success" },
+            "403": {
+                "description": format!(
+                    "removing another member requires the admin role `{admin}` (self-removal is open to any member)"
+                ),
+            },
+            "404": { "description": format!("{not_member}, or no such member") },
+            "409": { "description": format!("cannot remove the last {admin}") },
+        },
+    });
+    if let Some(sec) = security {
+        for op in [&mut list, &mut add, &mut set_role, &mut remove] {
+            op["security"] = sec.clone();
+        }
+    }
+    let collection = format!("{}/{{{fk}}}/members", base.trim_end_matches('/'));
+    let item = format!("{collection}/{{user_id}}");
+    let entry = paths.entry(collection).or_insert_with(|| json!({}));
+    entry["get"] = list;
+    entry["post"] = add;
+    let entry = paths.entry(item).or_insert_with(|| json!({}));
+    entry["patch"] = set_role;
+    entry["delete"] = remove;
+}
+
 /// The complete OpenAPI 3.1 document for a design.
 pub fn document(design: &Design) -> Value {
     let mut paths = serde_json::Map::new();
@@ -234,6 +386,9 @@ pub fn document(design: &Design) -> Value {
         walk_paths(design, m, "", &mut paths);
         walk_schemas(design, m, &mut schemas);
     }
+    // The generated member-management routes (issue #107) join the document
+    // AFTER the design's own paths (tool-owned routes, tenancy designs only).
+    member_surface_paths(design, &mut paths);
     let mut components = json!({ "schemas": schemas });
     // securitySchemes only when the design has a real guard credential (issue #29);
     // omitted entirely for `none` so that document stays byte-identical to before.
@@ -555,5 +710,120 @@ mod tests {
             !required.iter().any(|v| v == "done"),
             "optional fields are not required"
         );
+    }
+
+    /// Issue #107 / 0.6.0 Task 2: the generated member-management routes are
+    /// FIRST-CLASS tenant routes, so — unlike storage buckets — they appear in
+    /// the OpenAPI document: a generated client can list/add/re-role/remove
+    /// members without ever reading the generated Rust. The contract encodes the
+    /// authorization design: guarded ops advertise the design's credential, the
+    /// role wire-values are pinned to the declared member_roles (a client can't
+    /// even send an off-set role), and the 403/409/422 responses spell out the
+    /// admin gate, the last-admin lockout, and the role validation.
+    #[test]
+    fn tenancy_document_advertises_the_member_surface() {
+        let design: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let d = document(&design);
+        let list = &d["paths"]["/workspaces/{workspace_id}/members"]["get"];
+        assert_eq!(
+            list["operationId"], "list_workspace_members",
+            "list op: {d}"
+        );
+        // Guarded like every tenant route: the jwt design advertises bearerAuth.
+        assert_eq!(list["security"], json!([{ "bearerAuth": [] }]));
+        // The roster item shape is the T1 row: {id, user_id, role}.
+        let item = &list["responses"]["200"]["content"]["application/json"]["schema"]["items"];
+        assert_eq!(item["required"], json!(["id", "user_id", "role"]));
+        // role is pinned to the DECLARED member_roles.
+        assert_eq!(
+            item["properties"]["role"]["enum"],
+            json!(["owner", "member"])
+        );
+        // The fk param types as the tenant key (integer pk here).
+        assert_eq!(list["parameters"][0]["name"], "workspace_id");
+        assert_eq!(list["parameters"][0]["schema"]["type"], "integer");
+
+        let add = &d["paths"]["/workspaces/{workspace_id}/members"]["post"];
+        assert_eq!(add["operationId"], "add_workspace_member");
+        let body = &add["requestBody"]["content"]["application/json"]["schema"];
+        assert_eq!(body["required"], json!(["user_id", "role"]));
+        assert!(add["responses"]["201"].is_object(), "add is a 201: {add}");
+        for status in ["403", "404", "409", "422"] {
+            assert!(
+                add["responses"][status].is_object(),
+                "add advertises {status}: {add}"
+            );
+        }
+
+        let set = &d["paths"]["/workspaces/{workspace_id}/members/{user_id}"]["patch"];
+        assert_eq!(set["operationId"], "set_workspace_member_role");
+        assert_eq!(set["parameters"][1]["name"], "user_id");
+        assert_eq!(set["parameters"][1]["schema"]["type"], "string");
+        assert!(set["responses"]["204"].is_object());
+        assert_eq!(
+            set["responses"]["409"]["description"], "cannot demote the last owner",
+            "the last-admin lockout is contract-visible: {set}"
+        );
+
+        let remove = &d["paths"]["/workspaces/{workspace_id}/members/{user_id}"]["delete"];
+        assert_eq!(remove["operationId"], "remove_workspace_member");
+        assert!(remove["responses"]["204"].is_object());
+        assert_eq!(
+            remove["responses"]["409"]["description"],
+            "cannot remove the last owner"
+        );
+        // The self-removal exception is part of the advertised contract.
+        assert!(
+            remove["responses"]["403"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("self-removal"),
+            "DELETE documents the self-removal exception: {remove}"
+        );
+    }
+
+    /// NO-DRIFT: a design without the member surface — no tenancy at all, or a
+    /// tenancy design in a mode genroute wouldn't emit for — advertises NO
+    /// member routes, keeping the document byte-identical to pre-#107.
+    #[test]
+    fn non_tenancy_documents_have_no_member_paths() {
+        // (a) the plain todos design.
+        let d = doc();
+        assert!(
+            d["paths"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|k| !k.contains("/members")),
+            "no member paths without tenancy: {d}"
+        );
+        // (b) the SAME tenancy design with tenancy stripped loses exactly the
+        // member paths and nothing else.
+        let design: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let mut stripped = design.clone();
+        stripped.tenancy = None;
+        let with = document(&design);
+        let without = document(&stripped);
+        let with_paths = with["paths"].as_object().unwrap();
+        let without_paths = without["paths"].as_object().unwrap();
+        let extra: Vec<&str> = with_paths
+            .keys()
+            .filter(|k| !without_paths.contains_key(*k))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            extra,
+            vec![
+                "/workspaces/{workspace_id}/members",
+                "/workspaces/{workspace_id}/members/{user_id}"
+            ],
+            "the ONLY path delta is the member surface"
+        );
+        for (k, v) in without_paths {
+            assert_eq!(
+                v, &with_paths[k],
+                "shared path `{k}` must be identical with/without tenancy"
+            );
+        }
     }
 }
