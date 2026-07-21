@@ -1727,6 +1727,12 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
 /// The insert differs by pk type exactly as `insert` does (integer pk assigned by
 /// the DB and read back from the row; client-supplied text pk known up front and
 /// inserted via `Entity::insert(..).exec(..)`).
+///
+/// Issue #107 adds the member-management surface on the same repo — `members_of`
+/// / `add_member` / `set_member_role` / `remove_member` / `count_admins` — real
+/// SQL keyed on the path tenant fk, with role validation (422), the last-admin
+/// guard (409), and duplicate adds surfacing UNIQUE as 409 via `db_error`. The
+/// `{Tenant}Member` row struct + MEMBER_ROLES const live in `tenant_member_row`.
 fn tenant_own_methods(e: &Entity, design: &Design) -> String {
     let Some(tenancy) = design.tenancy.as_ref() else {
         return String::new();
@@ -1797,6 +1803,17 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
              \x20   }}"
         )
     };
+    // Member-management surface (issue #107): every method keys on the PATH
+    // tenant fk. A String (text-pk) fk is MOVED into the last statement's bound
+    // values, so the earlier pre-check reads clone it; an integer fk is `Copy`
+    // (a `.clone()` there would trip `clippy::clone_on_copy` in the app).
+    let fkc = if key == "String" { ".clone()" } else { "" };
+    let roles_msg = if tenancy.member_roles.is_empty() {
+        "member".to_string()
+    } else {
+        tenancy.member_roles.join(", ")
+    };
+    let admin = role;
     format!(
         r#"
     // Membership lifecycle (issue #78) — the tenant entity's own repo. Create via
@@ -1817,6 +1834,170 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
             .await
             .map_err(db_error)
     }}
+
+    // Member management (issue #107) — the tool-owned member surface. Every
+    // method keys on the PATH tenant fk the membership guard already verified.
+    // `role` must be one of the declared MEMBER_ROLES (422 — no DB CHECK backs
+    // the column); the last "{admin}" can never be removed or demoted (409), so a
+    // tenant is never left admin-less; a duplicate add surfaces the
+    // UNIQUE(user_id, {fk_col}) index as 409 via db_error — no second mapping here.
+    pub async fn members_of(&self, fk: {key}) -> Result<Vec<{entity}Member>> {{
+        {entity}Member::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            self.db.conn().get_database_backend(),
+            self.db.sql(
+                "SELECT id, user_id, role FROM {members} WHERE {fk_col} = ? ORDER BY id",
+            ),
+            [fk.into()],
+        ))
+        .all(self.db.conn())
+        .await
+        .map_err(db_error)
+    }}
+
+    pub async fn add_member(&self, fk: {key}, user_id: String, role: String) -> Result<()> {{
+        if !MEMBER_ROLES.contains(&role.as_str()) {{
+            return Err(Error::unprocessable("role must be one of: {roles_msg}"));
+        }}
+        self.db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "INSERT INTO {members} (user_id, {fk_col}, role) VALUES (?, ?, ?)",
+                ),
+                [user_id.into(), fk.into(), role.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(())
+    }}
+
+    pub async fn set_member_role(&self, fk: {key}, user_id: String, role: String) -> Result<bool> {{
+        if !MEMBER_ROLES.contains(&role.as_str()) {{
+            return Err(Error::unprocessable("role must be one of: {roles_msg}"));
+        }}
+        let target = {entity}Member::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            self.db.conn().get_database_backend(),
+            self.db.sql(
+                "SELECT id, user_id, role FROM {members} WHERE user_id = ? AND {fk_col} = ?",
+            ),
+            [user_id.clone().into(), fk{fkc}.into()],
+        ))
+        .one(self.db.conn())
+        .await
+        .map_err(db_error)?;
+        if target.is_some_and(|m| m.role == "{admin}")
+            && role != "{admin}"
+            && self.count_admins(fk{fkc}).await? == 1
+        {{
+            return Err(Error::conflict("cannot demote the last {admin}"));
+        }}
+        let r = self
+            .db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "UPDATE {members} SET role = ? WHERE user_id = ? AND {fk_col} = ?",
+                ),
+                [role.into(), user_id.into(), fk.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected() > 0)
+    }}
+
+    pub async fn remove_member(&self, fk: {key}, user_id: String) -> Result<bool> {{
+        let target = {entity}Member::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            self.db.conn().get_database_backend(),
+            self.db.sql(
+                "SELECT id, user_id, role FROM {members} WHERE user_id = ? AND {fk_col} = ?",
+            ),
+            [user_id.clone().into(), fk{fkc}.into()],
+        ))
+        .one(self.db.conn())
+        .await
+        .map_err(db_error)?;
+        if target.is_some_and(|m| m.role == "{admin}")
+            && self.count_admins(fk{fkc}).await? == 1
+        {{
+            return Err(Error::conflict("cannot remove the last {admin}"));
+        }}
+        let r = self
+            .db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql("DELETE FROM {members} WHERE user_id = ? AND {fk_col} = ?"),
+                [user_id.into(), fk.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected() > 0)
+    }}
+
+    pub async fn count_admins(&self, fk: {key}) -> Result<i64> {{
+        let row = self
+            .db
+            .conn()
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT COUNT(*) AS n FROM {members} WHERE {fk_col} = ? AND role = ?",
+                ),
+                [fk.into(), "{admin}".into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        match row {{
+            Some(r) => r.try_get::<i64>("", "n").map_err(db_error),
+            None => Ok(0),
+        }}
+    }}
+"#
+    )
+}
+
+/// The serializable member-row type + the baked `member_roles` const backing the
+/// member-management surface (issue #107) — module-scope companions to
+/// `tenant_own_methods`, emitted ONLY beside the tenancy entity's own repo
+/// (empty everywhere else, so all other repo output stays byte-identical).
+/// `MEMBER_ROLES[0]` is the admin role by convention; an empty `member_roles`
+/// falls back to `["member"]`, mirroring the seed-role fallback above (a
+/// planned design-time check will guarantee non-empty, duplicate-free roles).
+fn tenant_member_row(e: &Entity, design: &Design) -> String {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return String::new();
+    };
+    if e.name != tenancy.entity {
+        return String::new();
+    }
+    let entity = &e.name;
+    let members = format!("{}_members", Design::to_snake(entity));
+    let quoted = if tenancy.member_roles.is_empty() {
+        "\"member\"".to_string()
+    } else {
+        tenancy
+            .member_roles
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        r#"/// Roles a `{members}` row may hold — design.json `tenancy.member_roles`. The
+/// FIRST entry is the admin role: it gates member management and is protected
+/// by the last-admin rule (jerrycan issue #107).
+const MEMBER_ROLES: &[&str] = &[{quoted}];
+
+/// One `{members}` row — the member-surface list/lookup shape (issue #107).
+#[derive(serde::Serialize, sea_orm::FromQueryResult)]
+pub struct {entity}Member {{
+    pub id: i64,
+    pub user_id: String,
+    pub role: String,
+}}
+
 "#
     )
 }
@@ -1943,6 +2124,9 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
     // entity); mutually exclusive with `scoped` (an entity can't be BOTH the tenant
     // and belong_to the tenant).
     let tenant_own = tenant_own_methods(e, design);
+    // Module-scope companions to `tenant_own`: the `{Tenant}Member` row struct +
+    // MEMBER_ROLES const (issue #107). Empty for every non-tenant entity.
+    let member_row = tenant_member_row(e, design);
     // The insert differs by pk type. An auto-increment integer pk is assigned by
     // the DB, so `ActiveModel::insert` returns the persisted row (with its id).
     // A client-supplied text pk (string/uuid) is already known, and
@@ -1991,7 +2175,7 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
         )
     };
     format!(
-        r#"pub struct {entity}Repo {{
+        r#"{member_row}pub struct {entity}Repo {{
     db: Db,
 }}
 
@@ -2064,6 +2248,11 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
         imports.push("ConnectionTrait");
     }
     imports.push("EntityTrait");
+    if has_tenant_own {
+        // `find_by_statement` (the typed `{Tenant}Member` rows, issue #107) is a
+        // FromQueryResult trait method — only the tenant's own module needs it.
+        imports.push("FromQueryResult");
+    }
     if needs_filter {
         imports.push("QueryFilter");
     }
@@ -4240,6 +4429,259 @@ pub(crate) mod tests {
         assert!(
             src.contains("WHERE m.user_id = ?"),
             "list filters by the caller:\n{src}"
+        );
+    }
+
+    /// Issue #107 / 0.6.0 Task 1: the tenant entity's own repo carries the full
+    /// member-management surface — list/add/re-role/remove plus the
+    /// `count_admins` helper backing the last-admin guard — as REAL SQL keyed on
+    /// the PATH tenant fk the membership guard already verified. Without these,
+    /// every tenancy app hand-writes `INSERT INTO {tenant}_members …` (the #107
+    /// finding), which is exactly the raw-SQL drift a generated surface kills.
+    #[test]
+    fn tenant_entity_repo_gets_member_management_methods() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains("pub async fn members_of(&self, fk: i64) -> Result<Vec<ClubMember>>"),
+            "members_of lists the roster as typed rows:\n{src}"
+        );
+        assert!(
+            src.contains(
+                "SELECT id, user_id, role FROM club_members WHERE club_id = ? ORDER BY id"
+            ),
+            "members_of reads only the path tenant's rows:\n{src}"
+        );
+        assert!(
+            src.contains(
+                "pub async fn add_member(&self, fk: i64, user_id: String, role: String) -> Result<()>"
+            ),
+            "add_member exists:\n{src}"
+        );
+        assert!(
+            src.contains(
+                "pub async fn set_member_role(&self, fk: i64, user_id: String, role: String) -> Result<bool>"
+            ),
+            "set_member_role exists:\n{src}"
+        );
+        assert!(
+            src.contains("UPDATE club_members SET role = ? WHERE user_id = ? AND club_id = ?"),
+            "set_member_role updates scoped to (user, tenant):\n{src}"
+        );
+        assert!(
+            src.contains(
+                "pub async fn remove_member(&self, fk: i64, user_id: String) -> Result<bool>"
+            ),
+            "remove_member exists:\n{src}"
+        );
+        assert!(
+            src.contains("DELETE FROM club_members WHERE user_id = ? AND club_id = ?"),
+            "remove_member deletes scoped to (user, tenant):\n{src}"
+        );
+        assert!(
+            src.contains("pub async fn count_admins(&self, fk: i64) -> Result<i64>"),
+            "count_admins helper exists:\n{src}"
+        );
+        assert!(
+            src.contains("SELECT COUNT(*) AS n FROM club_members WHERE club_id = ? AND role = ?"),
+            "count_admins counts one tenant's admins:\n{src}"
+        );
+    }
+
+    /// The member surface's row type and role rule are BAKED into the generated
+    /// code: a serializable `{Tenant}Member` row (a later handler returns
+    /// `[{id, user_id, role}]` without hand-rolling a DTO), and the design's
+    /// `member_roles` as a const validated on add/re-role → 422 (no DB CHECK
+    /// backs the column). A duplicate add is NOT pre-checked in the repo — the
+    /// UNIQUE(user_id, fk) index fires and jerrycan-db's `db_error` maps it to
+    /// 409, so there is exactly ONE conflict mapping and no drift.
+    #[test]
+    fn member_row_type_roles_const_and_validation_are_baked_in() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains("#[derive(serde::Serialize, sea_orm::FromQueryResult)]")
+                && src.contains("pub struct ClubMember {"),
+            "typed serializable member row:\n{src}"
+        );
+        assert!(
+            src.contains("pub id: i64,")
+                && src.contains("pub user_id: String,")
+                && src.contains("pub role: String,"),
+            "row shape is id + user_id + role:\n{src}"
+        );
+        assert!(
+            src.contains("const MEMBER_ROLES: &[&str] = &[\"owner\", \"member\"];"),
+            "declared member_roles baked as a const:\n{src}"
+        );
+        assert!(
+            src.contains("if !MEMBER_ROLES.contains(&role.as_str())")
+                && src.contains("Error::unprocessable(\"role must be one of: owner, member\")"),
+            "an out-of-set role is refused as 422:\n{src}"
+        );
+        // `find_by_statement` (typed member rows) is a FromQueryResult trait
+        // method, so the trait joins the facade imports for this module.
+        assert!(
+            src.contains(
+                "use jerrycan::db::sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait, EntityTrait, FromQueryResult, QueryOrder};"
+            ),
+            "FromQueryResult joins the trait imports:\n{src}"
+        );
+        // No second conflict path: add_member carries no Error::conflict of its
+        // own — the UNIQUE index + db_error IS the 409.
+        let add_body =
+            &src[src.find("fn add_member").unwrap()..src.find("fn set_member_role").unwrap()];
+        assert!(
+            !add_body.contains("Error::conflict"),
+            "duplicate adds must surface via db_error, not a second mapping:\n{add_body}"
+        );
+    }
+
+    /// Integrity (#107 design §B): the LAST admin can neither be demoted nor
+    /// removed — both paths 409 — otherwise the tenant is permanently locked out
+    /// of member management (nobody left holding member_roles[0], and the write
+    /// gate is admin-only). Re-affirming the admin role on the last admin stays
+    /// legal: the demote guard fires only when the role actually changes.
+    #[test]
+    fn member_writes_enforce_the_last_admin_guard() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains("Error::conflict(\"cannot demote the last owner\")"),
+            "demoting the last admin is refused:\n{src}"
+        );
+        assert!(
+            src.contains("Error::conflict(\"cannot remove the last owner\")"),
+            "removing the last admin is refused:\n{src}"
+        );
+        // Both writes consult the per-tenant admin count.
+        assert_eq!(
+            src.matches("self.count_admins(fk).await? == 1").count(),
+            2,
+            "both writes check the per-tenant admin count:\n{src}"
+        );
+        // The admin role is the FIRST declared member_role, bound in count_admins.
+        assert!(
+            src.contains("[fk.into(), \"owner\".into()]"),
+            "count_admins counts the first declared role:\n{src}"
+        );
+        assert!(
+            src.contains("&& role != \"owner\""),
+            "re-setting the same admin role is not a demotion:\n{src}"
+        );
+    }
+
+    /// NO-DRIFT (byte-identity): the member surface exists ONLY on the tenancy
+    /// entity's own repo. A non-tenant entity in a tenancy design, and every
+    /// entity in a non-tenancy design, emit exactly the pre-#107 repo — no
+    /// member methods, no row struct, no roles const, no FromQueryResult import.
+    #[test]
+    fn member_surface_is_confined_to_the_tenant_repo() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        // (a) tenancy design, NON-tenant module: leads (V1_FULL modules[1]).
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let leads = repo_rs(&d.modules[1], mode, &d).unwrap();
+        for needle in [
+            "members_of",
+            "add_member",
+            "set_member_role",
+            "remove_member",
+            "count_admins",
+            "MEMBER_ROLES",
+            "LeadMember",
+        ] {
+            assert!(
+                !leads.contains(needle),
+                "non-tenant repo must not carry `{needle}`:\n{leads}"
+            );
+        }
+        // (b) the SAME tenant module with tenancy stripped: nothing member-shaped
+        // remains, including the FromQueryResult import — byte-identical output.
+        let mut d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        d.tenancy = None;
+        let clubs = repo_rs(&d.modules[0], mode, &d).unwrap();
+        for needle in [
+            "members_of",
+            "add_member",
+            "set_member_role",
+            "remove_member",
+            "count_admins",
+            "MEMBER_ROLES",
+            "ClubMember",
+            "FromQueryResult",
+        ] {
+            assert!(
+                !clubs.contains(needle),
+                "non-tenancy repo must not carry `{needle}`:\n{clubs}"
+            );
+        }
+    }
+
+    /// A TEXT-pk tenant (uuid/string id — the migrated-Supabase shape): the fk
+    /// param is `String`, so the guard pre-checks clone it and the final bound
+    /// statement still receives the owned value.
+    #[test]
+    fn member_methods_take_a_text_tenant_fk_when_the_tenant_pk_is_text() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "orgs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["admin", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Org", "member_roles": ["admin", "member"] },
+                "modules": [
+                    { "name": "orgs",
+                      "entities": [{ "name": "Org", "fields": [
+                          { "name": "id", "type": "string" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [
+                          { "operation_id": "create_org", "method": "POST", "path": "/", "auth_required": true,
+                            "request_body": { "entity": "Org" },
+                            "success": { "status": 201, "entity": "Org" } } ] }
+                ] }"#,
+        )
+        .unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains("pub async fn members_of(&self, fk: String) -> Result<Vec<OrgMember>>"),
+            "text tenant pk means a String fk param:\n{src}"
+        );
+        assert!(
+            src.contains("self.count_admins(fk.clone()).await? == 1"),
+            "a String fk is cloned into the admin-count pre-check:\n{src}"
         );
     }
 
