@@ -680,6 +680,40 @@ fn role_gated_get_on_a_public_read_entity_keeps_the_401_probe() {
     );
 }
 
+/// The strict-resolution pin (#105 whole-branch review): an ENTITY-LESS
+/// `auth_required` GET (`GET /stats`, custom-JSON success, no body, no
+/// `{param}`) in the `public_read` module KEEPS its `_without_auth_is_401`
+/// probe. WHY (Rule 9): the lenient first-entity fallback classified it as a
+/// public read of `Post` — an entity it never reads — so the
+/// declared-authenticated endpoint shipped anonymous with NO 401 probe: a
+/// silent guard drop under a green gate. The explicit public reads keep losing
+/// their probes (they are genuinely public), and the probe suite stays green
+/// on a correct app.
+#[test]
+fn entityless_authed_get_keeps_the_401_probe_beside_public_read() {
+    let mut v: serde_json::Value = serde_json::from_str(FEED).unwrap();
+    v["modules"][1]["endpoints"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "operation_id": "get_stats", "method": "GET", "path": "/stats",
+            "auth_required": true, "success": { "status": 200 }
+        }));
+    let d: Design = serde_json::from_value(v).unwrap();
+    let posts = d.modules.iter().find(|m| m.name == "posts").unwrap();
+    let out = testgen::acceptance_rs(&d, posts);
+    assert!(
+        out.contains("get_stats_without_auth_is_401"),
+        "an entity-less auth_required GET keeps its 401 probe: {out}"
+    );
+    // The explicit public reads stay probe-free — the fix must not over-guard.
+    assert!(
+        !out.contains("list_posts_without_auth_is_401")
+            && !out.contains("get_post_without_auth_is_401"),
+        "the explicit public_read GETs stay 401-probe-free: {out}"
+    );
+}
+
 /// A path-scoped NESTED tenant module (BookClubs `/clubs/{club_id}/books`) gets a
 /// cross-tenant isolation test with the mount pinned to tenant 1 — the exact #78
 /// nested-creator leak that had NO coverage before. A member of club 2 gets 404 on

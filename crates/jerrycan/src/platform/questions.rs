@@ -923,14 +923,15 @@ pub fn validate(d: &Design) -> Vec<Question> {
             }
         }
         for (i, ep) in m.endpoints.iter().enumerate() {
-            let Some(name) = endpoint_repo_entity(m, ep) else {
-                continue;
-            };
-            let Some(e) = m.entities.iter().find(|e| e.name == name) else {
-                continue;
-            };
             if matches!(ep.method, HttpMethod::GET) {
-                // (c) The latent-bug closure. Per-user ownership IS
+                // (c) The latent-bug closure. Resolved via the STRICT resolver
+                // (`design::endpoint_repo_entity_strict` — explicit signals
+                // only): an ENTITY-LESS GET (custom-JSON success, no body, no
+                // `{param}` collection — the documented hand-written
+                // `Json<serde_json::Value>` shape) reads NO entity's repo, so
+                // the first-entity fallback must not tie it to a per-user
+                // neighbor and falsely refuse an implementable `public: true`
+                // custom GET as unimplementable. Per-user ownership IS
                 // `Design::entity_is_per_user_owned` — the one shared classifier
                 // (#105 §F); db mode is the extra gate because only `sql_repo`
                 // suppresses the unscoped reads (a memory repo keeps plain
@@ -939,6 +940,12 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 // unguarded read (public cannot combine with a guard), and the
                 // stub it generates is exactly as unimplementable — only the
                 // `public_read` entity flag makes an open read coherent here.
+                let Some(name) = endpoint_repo_entity_strict(m, ep) else {
+                    continue;
+                };
+                let Some(e) = m.entities.iter().find(|e| e.name == name) else {
+                    continue;
+                };
                 let per_user_owned = d.entity_is_per_user_owned(e);
                 if !ep.is_guarded()
                     && d.wants_db()
@@ -953,15 +960,26 @@ pub fn validate(d: &Design) -> Vec<Question> {
                         ),
                     ));
                 }
-            } else if e.public_read && (ep.public || !ep.is_guarded()) {
+            } else {
                 // (b) A write must stay owner-gated regardless of the flag.
-                qs.push(q(
-                    format!("{ptr}/endpoints/{i}"),
-                    format!(
-                        "Endpoint `{}` ({:?} {}) is a write on the public_read entity `{}` but is public/unguarded — public_read makes READS public while WRITES stay owner-gated; set `auth_required: true` (and drop `public`) on every write of `{}`. See `jerrycan explain JC0549`.",
-                        ep.operation_id, ep.method, ep.path, e.name, e.name
-                    ),
-                ));
+                // Writes keep the LENIENT resolution (the repo the generated
+                // stub actually binds — first-entity fallback included): the
+                // failure mode here is fail-CLOSED, so over-matching only asks.
+                let Some(name) = endpoint_repo_entity(m, ep) else {
+                    continue;
+                };
+                let Some(e) = m.entities.iter().find(|e| e.name == name) else {
+                    continue;
+                };
+                if e.public_read && (ep.public || !ep.is_guarded()) {
+                    qs.push(q(
+                        format!("{ptr}/endpoints/{i}"),
+                        format!(
+                            "Endpoint `{}` ({:?} {}) is a write on the public_read entity `{}` but is public/unguarded — public_read makes READS public while WRITES stay owner-gated; set `auth_required: true` (and drop `public`) on every write of `{}`. See `jerrycan explain JC0549`.",
+                            ep.operation_id, ep.method, ep.path, e.name, e.name
+                        ),
+                    ));
+                }
             }
         }
         for (i, sub) in m.subroutes.iter().enumerate() {
@@ -2669,6 +2687,49 @@ mod tests {
         assert!(
             qs2.is_empty(),
             "public GETs + the public_read flag is the migrated feed shape: {qs2:?}"
+        );
+    }
+
+    /// The strict-resolution pin (#105 whole-branch review): an ENTITY-LESS
+    /// `public: true` GET (`GET /config`, custom-JSON success, no body, no
+    /// `{param}` — the documented hand-written `Json<serde_json::Value>`
+    /// shape) in a PLAIN per-user module VALIDATES question-free. WHY (Rule
+    /// 9): JC0549(c) resolved the endpoint's repo entity through the lenient
+    /// first-entity fallback, tied `/config` to the owner-scoped `Post` it
+    /// never reads, and FALSELY refused an implementable design base accepted
+    /// — the check must fire only for GETs an explicit signal ties to the
+    /// owner-scoped entity. The unguarded-read refusal on the REAL entity
+    /// reads (explicit `success.entity`/`{id}`) must keep firing.
+    #[test]
+    fn entityless_public_get_in_a_plain_per_user_module_passes_validation() {
+        let mut d: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        d.modules[0].entities[0].public_read = false;
+        // Guard the entity reads (the valid #79 prong) so only /config varies.
+        for ep in &mut d.modules[0].endpoints {
+            ep.auth_required = true;
+        }
+        let config: Endpoint = serde_json::from_str(
+            r#"{ "operation_id": "get_config", "method": "GET", "path": "/config",
+                 "public": true, "success": { "status": 200 } }"#,
+        )
+        .unwrap();
+        d.modules[0].endpoints.push(config);
+        let qs = validate(&d);
+        assert!(
+            qs.is_empty(),
+            "an entity-less public custom-JSON GET reads no entity's repo and must not be refused: {qs:?}"
+        );
+
+        // The refusal still fires when an EXPLICIT signal ties the unguarded
+        // GET to the owner-scoped entity — the strict resolver narrows the
+        // check, it does not disable it.
+        let mut still: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        still.modules[0].entities[0].public_read = false;
+        let qs2 = validate(&still);
+        assert_eq!(
+            jc0549(&qs2).len(),
+            2,
+            "explicit unguarded reads of the owner-scoped entity stay refused: {qs2:?}"
         );
     }
 

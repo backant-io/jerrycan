@@ -1085,11 +1085,19 @@ impl Design {
     /// (the OpenAPI doc would advertise a credential on an unguarded handler and
     /// the acceptance suite would 401-probe a handler that correctly 200s: a
     /// permanently-red test on a correct app). False for every non-`public_read`
-    /// design, keeping output byte-identical.
+    /// design, keeping output byte-identical. Resolves the repo entity via
+    /// [`endpoint_repo_entity_strict`] — explicit signals ONLY: an entity-less
+    /// GET (custom-JSON success, no body, no `{param}` collection) binds no
+    /// entity, so it KEEPS its declared guard. The lenient first-entity
+    /// fallback would be fail-OPEN here: an `auth_required` `GET /stats` beside
+    /// a `public_read` first entity would be reclassified as a public read it
+    /// never performs, and the handler/OpenAPI/401-probe trio would ship it
+    /// anonymous with a green gate.
     pub(crate) fn endpoint_is_public_read_get(&self, m: &ModuleDesign, ep: &Endpoint) -> bool {
         matches!(ep.method, HttpMethod::GET)
             && ep.required_roles.is_empty()
-            && endpoint_repo_entity(m, ep).is_some_and(|entity| self.entity_is_public_read(entity))
+            && endpoint_repo_entity_strict(m, ep)
+                .is_some_and(|entity| self.entity_is_public_read(entity))
     }
 
     /// The server-owned-FK rule (issue #34), design-level: a GUARDED endpoint
@@ -1420,6 +1428,25 @@ fn creator_at<'a>(m: &'a ModuleDesign, path: &str) -> Option<&'a Endpoint> {
 /// the sole entity there). Lives here (not genroute) so the ONE resolution serves
 /// both emission and [`Design::endpoint_is_public_read_get`].
 pub(crate) fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a str> {
+    endpoint_repo_entity_strict(m, ep).or_else(|| m.entities.first().map(|e| e.name.as_str()))
+}
+
+/// [`endpoint_repo_entity`] WITHOUT the first-entity fallback: the entity an
+/// EXPLICIT design signal ties the endpoint to — request body, success entity,
+/// or the collection creator its `{param}` path acts under (#56) — and `None`
+/// for an entity-less endpoint (custom-JSON success, no body, no `{param}`
+/// collection: the documented hand-written `Json<serde_json::Value>` shape).
+/// SECURITY-SENSITIVE consumers must use THIS resolver: the lenient fallback is
+/// a convenience for repo-binding in stubs, but classifying an endpoint's
+/// guarding by it is fail-OPEN — an `auth_required` `GET /stats` that never
+/// reads the module's first entity would inherit that entity's `public_read`
+/// and silently ship anonymous ([`Design::endpoint_is_public_read_get`]), and
+/// JC0549(c) would falsely refuse a `public: true` custom GET in a per-user
+/// module as unimplementable.
+pub(crate) fn endpoint_repo_entity_strict<'a>(
+    m: &'a ModuleDesign,
+    ep: &'a Endpoint,
+) -> Option<&'a str> {
     if m.entities.is_empty() {
         return None;
     }
@@ -1433,7 +1460,6 @@ pub(crate) fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) ->
                 .and_then(|c| c.request_body.as_ref())
                 .map(|rb| rb.entity.as_str())
         })
-        .or_else(|| m.entities.first().map(|e| e.name.as_str()))
 }
 
 fn collect_tenant_owned<'a>(

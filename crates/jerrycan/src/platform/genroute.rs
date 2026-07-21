@@ -459,8 +459,12 @@ fn owner_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &
     // demand outranks the read-open default), so its steer must match its own
     // signature — and, unlike the plain #79 case, the unscoped reads DO exist on
     // this repo (they serve the public GETs), so the "NOT generated" claim would
-    // be a lie here.
-    if design.entity_is_public_read(entity) {
+    // be a lie here. Keyed on the roles EXPLICITLY: the predicate above resolves
+    // strictly, so an ENTITY-LESS guarded GET (custom-JSON success — tied to
+    // this public_read entity only by the lenient repo-binding fallback) also
+    // lands here, and it must keep the plain #79 steer below (byte-identical to
+    // the pre-#105 emission), not a role-gated comment for roles it never asked.
+    if !ep.required_roles.is_empty() && design.entity_is_public_read(entity) {
         return format!(
             "    // role-gated read on a public_read {entity} (issues #79/#105): the required_roles\n    // keep this GET guarded — check the role (see above), then scope via `{call}`\n    // (parse `_user.0.id`, the stringified session user id, for an integer fk), or\n    // deliberately serve the public collection with the unscoped read.\n"
         );
@@ -4049,6 +4053,68 @@ pub(crate) mod tests {
         assert!(
             h.contains("async fn list_posts(_repo: Dep<PostRepo>)"),
             "{h}"
+        );
+    }
+
+    /// The strict-resolution pin (#105 whole-branch review): an ENTITY-LESS
+    /// `auth_required` GET — custom-JSON success, no body, no `{param}` (the
+    /// documented hand-written `Json<serde_json::Value>` shape, e.g.
+    /// `GET /stats`) — KEEPS its `_user: CurrentUser` even when the module's
+    /// FIRST entity is `public_read`. WHY (Rule 9): the lenient first-entity
+    /// fallback tied `/stats` to `Post`, `endpoint_is_public_read_get` went
+    /// true, and the guard the design DECLARED was silently dropped — fail-open,
+    /// invisible to a green gate, and a regression against base (which emitted
+    /// `_user: CurrentUser` for the identical shape). The stub also keeps the
+    /// plain #79 owner-scope steer — byte-identical to the flagless emission —
+    /// not the role-gated public_read variant (it asked for no roles). The REAL
+    /// public reads in the same module stay unguarded: the strict resolver
+    /// still sees their explicit `success.entity`/`{id}` signals.
+    #[test]
+    fn entityless_authed_get_keeps_its_guard_despite_a_public_read_sibling() {
+        let mut d: Design = serde_json::from_str(PUBLIC_READ).unwrap();
+        let stats: Endpoint = serde_json::from_str(
+            r#"{ "operation_id": "get_stats", "method": "GET", "path": "/stats",
+                 "auth_required": true, "success": { "status": 200 } }"#,
+        )
+        .unwrap();
+        d.modules[1].endpoints.push(stats);
+        let h = handlers_rs(
+            &d.modules[1],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        );
+        assert!(
+            h.contains("pub(crate) async fn get_stats(_repo: Dep<PostRepo>, _user: CurrentUser)"),
+            "an entity-less auth_required GET keeps its declared guard: {h}"
+        );
+        let stats_stub = h
+            .split("async fn get_stats")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            stats_stub.contains("owner scope (issue #79)"),
+            "the stub keeps the plain #79 steer (base-identical): {stats_stub}"
+        );
+        assert!(
+            !stats_stub.contains("role-gated") && !stats_stub.contains("no session needed"),
+            "no public_read steer may leak onto the entity-less GET: {stats_stub}"
+        );
+        // The explicit public reads stay public — the fix must not over-guard.
+        assert!(
+            h.contains("pub(crate) async fn list_posts(_repo: Dep<PostRepo>) ->"),
+            "the explicit public_read list GET stays unguarded: {h}"
+        );
+        assert!(
+            h.contains(
+                "pub(crate) async fn get_post(_repo: Dep<PostRepo>, Path(_id): Path<i64>) ->"
+            ),
+            "the explicit public_read detail GET stays unguarded: {h}"
         );
     }
 

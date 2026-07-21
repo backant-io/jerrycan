@@ -559,6 +559,38 @@ mod tests {
         );
     }
 
+    /// The strict-resolution pin (#105 whole-branch review): an ENTITY-LESS
+    /// `auth_required` GET (`GET /stats`, custom-JSON success, no `{param}`)
+    /// beside a `public_read` FIRST entity KEEPS its `security` stanza — the
+    /// first-entity fallback tied it to `Post` and stripped the stanza, so the
+    /// shipped contract advertised an open endpoint for a route the design
+    /// declared authenticated (genroute keeps its `CurrentUser`; the doc must
+    /// keep the credential the handler demands).
+    #[test]
+    fn entityless_authed_get_beside_a_public_read_entity_keeps_security() {
+        let mut design: Design =
+            serde_json::from_str(crate::platform::genroute::tests::PUBLIC_READ).unwrap();
+        let stats: Endpoint = serde_json::from_str(
+            r#"{ "operation_id": "get_stats", "method": "GET", "path": "/stats",
+                 "auth_required": true, "success": { "status": 200 } }"#,
+        )
+        .unwrap();
+        design.modules[1].endpoints.push(stats);
+        let d = document(&design);
+        assert_eq!(
+            d["paths"]["/posts/stats"]["get"]["security"],
+            json!([{ "cookieAuth": [] }]),
+            "an entity-less auth_required GET keeps its advertised credential: {}",
+            d["paths"]["/posts/stats"]["get"]
+        );
+        // The explicit public reads still advertise none.
+        assert!(
+            d["paths"]["/posts/"]["get"].get("security").is_none(),
+            "the explicit public_read list GET still carries no stanza: {}",
+            d["paths"]["/posts/"]["get"]
+        );
+    }
+
     /// A `none`-model design emits NO security schemes and NO per-op security —
     /// its OpenAPI stays byte-identical to before this feature (issue #29).
     #[test]
