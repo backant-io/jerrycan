@@ -201,6 +201,7 @@ fn build_one(
         name,
         table,
         belongs_to,
+        public_read: false,
         fields,
     })
 }

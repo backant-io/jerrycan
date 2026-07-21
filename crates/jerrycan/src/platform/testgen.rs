@@ -462,7 +462,13 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         let full_path = format!("{}{}", cbase.trim_end_matches('/'), ep.path);
         let fn_base = &ep.operation_id;
         let status = ep.success.status;
-        let guarded = auth && ep.is_guarded();
+        // A public_read GET (#105) is emitted UNGUARDED regardless of its declared
+        // `auth_required` (the shared `Design::endpoint_is_public_read_get` — the
+        // same predicate genroute keys the handler on), so it must probe WITHOUT a
+        // credential and must NOT get a 401 test: a no-cookie request to the public
+        // feed correctly 200s, and asserting 401 would generate a permanently-RED
+        // test on a correct app. A role-gated GET keeps its guard and its 401 probe.
+        let guarded = auth && ep.is_guarded() && !design.endpoint_is_public_read_get(unit, ep);
         // Endpoints whose success needs a credential/signature the generator can't
         // supply (login, signed webhook, api-key route): no un-greenable success
         // probe — emit a TODO instead. Detected by heuristic OR declared
@@ -1019,6 +1025,7 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
     let mut out = String::new();
     out.push_str(&tenant_owned_isolation_test(design, module));
     out.push_str(&per_user_isolation_test(design, module));
+    out.push_str(&public_read_isolation_test(design, module));
     out.push_str(&tenant_collection_isolation_test(design, module));
     out
 }
@@ -1176,22 +1183,6 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
     t
 }
 
-/// True when `e` is per-user identity-owned: it carries an identity fk (`user_id`,
-/// belongs_to the auth identity) and is NOT tenant-owned (a tenant-owned entity is
-/// scoped by the tenant instead). Mirrors genroute's `entity_is_per_user_owned`
-/// (the two must agree: genroute suppresses the unscoped methods for exactly the
-/// entities testgen writes an owner-isolation test for).
-fn entity_is_per_user_owned(design: &Design, e: &Entity) -> bool {
-    // TENANT ownership wins and is TRANSITIVE (issue #102): a multi-parent entity
-    // that ALSO carries `user_id` (e.g. `Comment belongs_to [Ticket, User]`, where
-    // Ticket reaches the tenant) is tenant-owned via that chain, NOT per-user — so
-    // it gets the cross-TENANT isolation test, not the #79 per-user one. Keyed on
-    // `tenant_path(..).is_none()` so it agrees with genroute's transitive
-    // `entity_is_per_user_owned` (the two MUST stay in sync). A direct tenant child
-    // resolves to `Some` too, so existing designs are byte-identical.
-    Design::has_identity_fk(e) && design.tenant_path(&e.name).is_none()
-}
-
 /// The per-user (#79) isolation test: user 1 creates a row (the server injects
 /// user 1's id); user 2 must not be able to read, list, or delete it. WHY (Rule 9):
 /// the identity-owned shape JC0540 steers agents toward had NO backstop — an
@@ -1204,10 +1195,17 @@ fn per_user_isolation_test(design: &Design, module: &ModuleDesign) -> String {
     if !(design.wants_db() && design.wants_auth()) {
         return String::new();
     }
+    // Per-user classification is `Design::entity_is_per_user_owned` — the ONE
+    // shared predicate (#105 §F): genroute suppresses the unscoped methods for
+    // exactly the entities this test covers (TENANT ownership wins and is
+    // TRANSITIVE, #102 — such entities get the cross-tenant test instead). A
+    // `public_read` entity is EXCLUDED: its reads legitimately serve every
+    // owner's rows, so this test's cross-user read-denial legs would be RED on a
+    // correct app — it gets `public_read_isolation_test` (#105) instead.
     let Some(entity) = module
         .entities
         .iter()
-        .find(|e| entity_is_per_user_owned(design, e))
+        .find(|e| design.entity_is_per_user_owned(e) && !design.entity_is_public_read(&e.name))
     else {
         return String::new();
     };
@@ -1290,6 +1288,162 @@ fn per_user_isolation_test(design: &Design, module: &ModuleDesign) -> String {
                 "    let survives = t.get_with(&format!(\"{base}/{{id}}\"), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(survives.status().as_u16(), 200, \"user 1's row must survive a cross-user delete; body: {{}}\", survives.text());\n",
             ));
         }
+    }
+    t.push_str("}\n\n");
+    t
+}
+
+/// The public-read/owner-write isolation test (#105) — the `public_read` sibling
+/// of [`per_user_isolation_test`]. WHY (Rule 9): the flag splits the ownership
+/// contract in two, and each half needs a backstop or it silently rots into the
+/// other. The READ half — anyone, even anonymous, sees EVERY owner's rows (the
+/// feed intent) — fails if an agent leaves the read owner-scoped (all_for) or
+/// guarded. The WRITE half — creates need a session, updates/deletes 404 for a
+/// non-owner with the row SURVIVING — fails if "public read" bleeds into "public
+/// write" (an anon POST landing, or a foreign PUT/DELETE touching the row).
+/// Emitted only for a module owning a `public_read` entity (the shared
+/// `Design::entity_is_public_read` classifier) with a guarded creator; every
+/// other design stays byte-identical. db+auth only.
+fn public_read_isolation_test(design: &Design, module: &ModuleDesign) -> String {
+    if !(design.wants_db() && design.wants_auth()) {
+        return String::new();
+    }
+    let Some(entity) = module
+        .entities
+        .iter()
+        .find(|e| design.entity_is_public_read(&e.name))
+    else {
+        return String::new();
+    };
+    // A GUARDED creator at "/" with a body — the server injects the owner id from
+    // the session, so the created row is owned by user 1 (and the anon-POST-401
+    // leg has a guard to prove).
+    let Some(create) = module.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::POST
+            && ep.path == "/"
+            && ep.is_guarded()
+            && ep
+                .request_body
+                .as_ref()
+                .is_some_and(|rb| rb.entity == entity.name)
+    }) else {
+        return String::new();
+    };
+    let base = module.effective_mount();
+    let base = base.trim_end_matches('/');
+    let plural = module.name.replace('-', "_");
+    let body = fixture_json(
+        design,
+        module,
+        &entity.name,
+        omits_identity_fk(design, module, create),
+        None,
+        false, // isolation seeds a row via create — a create body omits defaults
+    );
+    let create_path = format!("{base}/");
+    // The read legs use the endpoints genroute actually UNGUARDS — the shared
+    // `Design::endpoint_is_public_read_get` (a role-gated GET keeps its guard and
+    // is not probed anonymously). The write legs bind this entity's guarded
+    // PUT/DELETE at "/{id}".
+    let this_entity =
+        |ep: &&Endpoint| endpoint_repo_entity(module, ep) == Some(entity.name.as_str());
+    let list = module
+        .endpoints
+        .iter()
+        .find(|ep| {
+            ep.method == HttpMethod::GET
+                && param_count(ep) == 0
+                && this_entity(ep)
+                && design.endpoint_is_public_read_get(module, ep)
+        })
+        .map(|ep| ep.path.clone());
+    let get_one = module.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::GET
+            && param_count(ep) == 1
+            && this_entity(ep)
+            && design.endpoint_is_public_read_get(module, ep)
+    });
+    let put_one = module.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::PUT && param_count(ep) == 1 && this_entity(ep) && ep.is_guarded()
+    });
+    let delete_one = module.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::DELETE
+            && param_count(ep) == 1
+            && this_entity(ep)
+            && ep.is_guarded()
+    });
+
+    let hk = design.test_auth_header();
+    let mut t = String::new();
+    t.push_str(&format!(
+        "/// SECURITY (#105): {entity} is public_read — reads are PUBLIC (anyone, even\n/// anonymous, sees every owner's rows), writes stay OWNER-scoped. User 1 creates a\n/// row; an anonymous reader must see it; an anonymous create must 401; user 2's\n/// update/delete must 404 with the row surviving; user 1's update succeeds.\n#[tokio::test]\nasync fn anon_reads_but_only_the_owner_writes_{plural}() {{\n    let t = app().await;\n",
+        entity = entity.name,
+    ));
+    t.push_str(&format!(
+        "    let created = t.post_json_with(\"{create_path}\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n",
+        status = create.success.status,
+        entity = entity.name,
+    ));
+    if list.is_some() {
+        t.push_str("    let id_value = row[\"id\"].clone();\n");
+    }
+    if get_one.is_some() || put_one.is_some() || delete_one.is_some() {
+        t.push_str(
+            "    let id = row[\"id\"].as_str().map(str::to_string).unwrap_or_else(|| row[\"id\"].to_string());\n",
+        );
+    }
+    // PUBLIC READ: an anonymous list returns 200 AND contains user 1's row — the
+    // whole collection, not the caller's slice (there is no caller).
+    if let Some(list_path) = &list {
+        t.push_str(&format!(
+            "    let listed = t.get(\"{base}{list_path}\").await;\n    assert_eq!(listed.status().as_u16(), 200, \"anonymous list must 200 (public_read); body: {{}}\", listed.text());\n    let rows: serde_json::Value = serde_json::from_str(&listed.text()).expect(\"list json\");\n    let present = rows.as_array().map(|a| a.iter().any(|r| r[\"id\"] == id_value)).unwrap_or(false);\n    assert!(present, \"the anonymous list must contain ANOTHER user's row (public read serves the whole collection); body: {{}}\", listed.text());\n",
+        ));
+    }
+    if get_one.is_some() {
+        t.push_str(&format!(
+            "    let detail = t.get(&format!(\"{base}/{{id}}\")).await;\n    assert_eq!(detail.status().as_u16(), 200, \"anonymous detail must 200 (public_read); body: {{}}\", detail.text());\n",
+        ));
+    }
+    // OWNER WRITE: an anonymous create is rejected by the guard.
+    t.push_str(&format!(
+        "    let anon_create = t.post_json(\"{create_path}\", &serde_json::json!({body})).await;\n    assert_eq!(anon_create.status().as_u16(), 401, \"public_read never opens WRITES — an anonymous create must 401; body: {{}}\", anon_create.text());\n",
+    ));
+    if let Some(put) = put_one {
+        let put_body = fixture_json(
+            design,
+            module,
+            &entity.name,
+            omits_identity_fk(design, module, put),
+            None,
+            true, // an UPDATE body keeps `default` fields ({Entity}UpdateRequest)
+        );
+        t.push_str(&format!(
+            "    let foreign_put = t.put_json_with(&format!(\"{base}/{{id}}\"), &serde_json::json!({put_body}), &[(\"{hk}\", &test_cookie_for(2))]).await;\n    assert_eq!(foreign_put.status().as_u16(), 404, \"a non-owner update must 404 (use update_for, not update); body: {{}}\", foreign_put.text());\n",
+        ));
+    }
+    if delete_one.is_some() {
+        t.push_str(&format!(
+            "    let foreign_del = t.delete_with(&format!(\"{base}/{{id}}\"), &[(\"{hk}\", &test_cookie_for(2))]).await;\n    assert_eq!(foreign_del.status().as_u16(), 404, \"a non-owner delete must 404 (use remove_for, not remove); body: {{}}\", foreign_del.text());\n",
+        ));
+    }
+    if get_one.is_some() && (put_one.is_some() || delete_one.is_some()) {
+        t.push_str(&format!(
+            "    let survives = t.get(&format!(\"{base}/{{id}}\")).await;\n    assert_eq!(survives.status().as_u16(), 200, \"the row must SURVIVE a non-owner write attempt; body: {{}}\", survives.text());\n",
+        ));
+    }
+    if let Some(put) = put_one {
+        let put_body = fixture_json(
+            design,
+            module,
+            &entity.name,
+            omits_identity_fk(design, module, put),
+            None,
+            true,
+        );
+        t.push_str(&format!(
+            "    let owner_put = t.put_json_with(&format!(\"{base}/{{id}}\"), &serde_json::json!({put_body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(owner_put.status().as_u16(), {status}, \"the OWNER's update must succeed; body: {{}}\", owner_put.text());\n",
+            status = put.success.status,
+        ));
     }
     t.push_str("}\n\n");
     t

@@ -45,8 +45,15 @@ fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
 
     // A guarded op requires the design's credential (issue #29): stamp `security`
     // referencing the model's scheme so a generated client sends it. Public /
-    // signature-authenticated ops (and any op in a `none` design) carry none.
+    // signature-authenticated ops (and any op in a `none` design) carry none. A
+    // public_read GET (#105) carries none EITHER — genroute emits its handler
+    // unguarded regardless of the declared `auth_required` (the shared
+    // `Design::endpoint_is_public_read_get`), so advertising a credential here
+    // would be a lie: a generated client would refuse anonymous calls to a feed
+    // that correctly serves them. A role-gated GET keeps its stanza (it keeps
+    // its guard).
     if ep.is_guarded()
+        && !design.endpoint_is_public_read_get(m, ep)
         && let Some(scheme) = security_scheme_name(design)
     {
         op["security"] = json!([{ scheme: [] }]);
@@ -482,6 +489,105 @@ mod tests {
         assert_eq!(
             d["paths"]["/users/"]["get"]["security"],
             json!([{ "cookieAuth": [] }])
+        );
+    }
+
+    /// #105 gate-lie fix: a `public_read` GET runs UNGUARDED — genroute strips
+    /// its `CurrentUser` even when the design declares `auth_required` — so its
+    /// operation must NOT advertise a credential. WHY (Rule 9): before the shared
+    /// `Design::endpoint_is_public_read_get` predicate, this stanza keyed on the
+    /// raw `is_guarded()` and stamped `cookieAuth` on the public feed — a client
+    /// generated from the contract refused anonymous calls a correct handler
+    /// serves (the doc lied about the running code). Writes on the same entity,
+    /// and guarded GETs on a NON-public_read sibling, keep their stanza.
+    #[test]
+    fn public_read_get_advertises_no_security_but_writes_keep_it() {
+        let d = document(
+            &serde_json::from_str::<Design>(crate::platform::genroute::tests::PUBLIC_READ).unwrap(),
+        );
+        // The DECLARED-guarded list GET carries no security — the flag overrides.
+        assert!(
+            d["paths"]["/posts/"]["get"].get("security").is_none(),
+            "a public_read GET must not advertise a credential: {}",
+            d["paths"]["/posts/"]["get"]
+        );
+        assert!(
+            d["paths"]["/posts/{id}"]["get"].get("security").is_none(),
+            "the public detail GET carries none either: {}",
+            d["paths"]["/posts/{id}"]["get"]
+        );
+        // Writes keep the credential the guard actually demands.
+        for (path, method) in [
+            ("/posts/", "post"),
+            ("/posts/{id}", "put"),
+            ("/posts/{id}", "delete"),
+        ] {
+            assert_eq!(
+                d["paths"][path][method]["security"],
+                json!([{ "cookieAuth": [] }]),
+                "write {method} {path} keeps its security stanza"
+            );
+        }
+        // The guarded GET on the non-public sibling entity keeps it too.
+        assert_eq!(
+            d["paths"]["/posts/drafts"]["get"]["security"],
+            json!([{ "cookieAuth": [] }]),
+            "a guarded non-public_read GET keeps its stanza"
+        );
+    }
+
+    /// The `required_roles.is_empty()` conjunct is LOAD-BEARING: a ROLE-GATED GET
+    /// on a `public_read` entity keeps its guard (genroute keeps `CurrentUser`),
+    /// so it must keep its `security` stanza. Deleting the conjunct from the
+    /// shared predicate must turn this red.
+    #[test]
+    fn role_gated_get_on_a_public_read_entity_keeps_security() {
+        let mut design: Design =
+            serde_json::from_str(crate::platform::genroute::tests::PUBLIC_READ).unwrap();
+        design.modules[1]
+            .endpoints
+            .iter_mut()
+            .find(|ep| ep.operation_id == "list_posts")
+            .unwrap()
+            .required_roles = vec!["user".to_string()];
+        let d = document(&design);
+        assert_eq!(
+            d["paths"]["/posts/"]["get"]["security"],
+            json!([{ "cookieAuth": [] }]),
+            "a role-gated GET keeps its guard AND its advertised credential: {}",
+            d["paths"]["/posts/"]["get"]
+        );
+    }
+
+    /// The strict-resolution pin (#105 whole-branch review): an ENTITY-LESS
+    /// `auth_required` GET (`GET /stats`, custom-JSON success, no `{param}`)
+    /// beside a `public_read` FIRST entity KEEPS its `security` stanza — the
+    /// first-entity fallback tied it to `Post` and stripped the stanza, so the
+    /// shipped contract advertised an open endpoint for a route the design
+    /// declared authenticated (genroute keeps its `CurrentUser`; the doc must
+    /// keep the credential the handler demands).
+    #[test]
+    fn entityless_authed_get_beside_a_public_read_entity_keeps_security() {
+        let mut design: Design =
+            serde_json::from_str(crate::platform::genroute::tests::PUBLIC_READ).unwrap();
+        let stats: Endpoint = serde_json::from_str(
+            r#"{ "operation_id": "get_stats", "method": "GET", "path": "/stats",
+                 "auth_required": true, "success": { "status": 200 } }"#,
+        )
+        .unwrap();
+        design.modules[1].endpoints.push(stats);
+        let d = document(&design);
+        assert_eq!(
+            d["paths"]["/posts/stats"]["get"]["security"],
+            json!([{ "cookieAuth": [] }]),
+            "an entity-less auth_required GET keeps its advertised credential: {}",
+            d["paths"]["/posts/stats"]["get"]
+        );
+        // The explicit public reads still advertise none.
+        assert!(
+            d["paths"]["/posts/"]["get"].get("security").is_none(),
+            "the explicit public_read list GET still carries no stanza: {}",
+            d["paths"]["/posts/"]["get"]
         );
     }
 

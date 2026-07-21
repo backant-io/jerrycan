@@ -318,6 +318,11 @@
             }
           }
         },
+        "public_read": {
+          "type": "boolean",
+          "default": false,
+          "description": "The public-read/owner-write shape (issue #105). Valid ONLY on an identity-owned, non-tenant entity in an auth design: READS (GET list + detail) become public — unguarded and unscoped, a list returns every owner's rows — while WRITES (POST/PUT/PATCH/DELETE) stay owner-scoped and auth_required. JC0549 rejects it on a tenant-owned or non-identity entity, in a no-auth design, and on any public/unguarded write of the entity."
+        },
         "fields": {
           "type": "array",
           "minItems": 1,

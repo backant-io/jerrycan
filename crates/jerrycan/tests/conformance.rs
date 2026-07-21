@@ -595,6 +595,239 @@ fn second_entity_id_probes_go_green_on_a_correct_scaffold() {
     );
 }
 
+/// The public-read/owner-write conformance fixture (#105): Post is per-user
+/// identity-owned with `public_read: true`; `list_posts` is DECLARED
+/// `auth_required` (the entity flag must override it — correct-by-construction).
+/// User lives in its OWN module so the identity fk is cross-module (no DB FK —
+/// the isolation test's session users need no seeded rows).
+const FEED_PUBLIC_READ: &str = r#"{
+  "name": "feed-api",
+  "contract_version": 1,
+  "auth": { "model": "session", "roles": ["user"] },
+  "dependencies": ["db", "auth"],
+  "modules": [
+    {
+      "name": "users",
+      "entities": [{ "name": "User", "fields": [{ "name": "email", "type": "string" }] }],
+      "endpoints": [
+        { "operation_id": "register", "method": "POST", "path": "/register",
+          "public": true,
+          "request_body": { "entity": "User" },
+          "success": { "status": 201, "entity": "User" } }
+      ]
+    },
+    {
+      "name": "posts",
+      "entities": [
+        { "name": "Post", "public_read": true,
+          "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+          "fields": [{ "name": "title", "type": "string" }] }
+      ],
+      "endpoints": [
+        { "operation_id": "list_posts", "method": "GET", "path": "/",
+          "auth_required": true,
+          "success": { "status": 200, "entity": "Post", "list": true } },
+        { "operation_id": "get_post", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Post" },
+          "errors": [{ "status": 404, "when": "unknown id" }] },
+        { "operation_id": "create_post", "method": "POST", "path": "/",
+          "auth_required": true,
+          "request_body": { "entity": "Post" },
+          "success": { "status": 201, "entity": "Post" } },
+        { "operation_id": "update_post", "method": "PUT", "path": "/{id}",
+          "auth_required": true,
+          "request_body": { "entity": "Post" },
+          "success": { "status": 200, "entity": "Post" },
+          "errors": [{ "status": 404, "when": "unknown id or not the owner" }] },
+        { "operation_id": "delete_post", "method": "DELETE", "path": "/{id}",
+          "auth_required": true,
+          "success": { "status": 204 },
+          "errors": [{ "status": 404, "when": "unknown id or not the owner" }] }
+      ]
+    }
+  ]
+}"#;
+
+/// The correct public-read/owner-write posts handlers (#105): PUBLIC reads via
+/// the unscoped `all()`/`get()` (no session), owner-scoped writes via the
+/// server-injected session user id + `update_for`/`remove_for`.
+const FEED_POSTS_HANDLERS: &str = r#"//! Correct #105 posts handlers: public reads, owner-scoped writes.
+use super::model::*;
+use super::repo::*;
+use jerrycan::prelude::*;
+use shared::CurrentUser;
+
+pub(crate) async fn list_posts(repo: Dep<PostRepo>) -> Result<Json<Vec<Post>>> {
+    Ok(Json(repo.all().await?))
+}
+
+pub(crate) async fn get_post(repo: Dep<PostRepo>, Path(id): Path<i64>) -> Result<Json<Post>> {
+    repo.get(id).await?.map(Json).ok_or_else(Error::not_found)
+}
+
+pub(crate) async fn create_post(repo: Dep<PostRepo>, user: CurrentUser, Json(body): Json<PostRequest>) -> Result<Created<Post>> {
+    let user_id: i64 = user.0.id.parse().map_err(|_| Error::unauthorized())?;
+    let mut post = Post { id: 0, user_id, title: body.title };
+    post.id = repo.insert(post.clone()).await?;
+    Ok(Created(post))
+}
+
+pub(crate) async fn update_post(repo: Dep<PostRepo>, user: CurrentUser, Path(id): Path<i64>, Json(body): Json<PostRequest>) -> Result<Json<Post>> {
+    let user_id: i64 = user.0.id.parse().map_err(|_| Error::unauthorized())?;
+    let post = Post { id, user_id, title: body.title };
+    if repo.update_for(user_id, id, post.clone()).await? {
+        Ok(Json(post))
+    } else {
+        Err(Error::not_found())
+    }
+}
+
+pub(crate) async fn delete_post(repo: Dep<PostRepo>, user: CurrentUser, Path(id): Path<i64>) -> Result<NoContent> {
+    let user_id: i64 = user.0.id.parse().map_err(|_| Error::unauthorized())?;
+    if repo.remove_for(user_id, id).await? {
+        Ok(NoContent)
+    } else {
+        Err(Error::not_found())
+    }
+}
+"#;
+
+/// The trivial users handler for the feed fixture.
+const FEED_USERS_HANDLERS: &str = r#"//! Correct users handlers for the #105 feed fixture.
+use super::model::*;
+use super::repo::*;
+use jerrycan::prelude::*;
+
+pub(crate) async fn register(repo: Dep<UserRepo>, Json(body): Json<User>) -> Result<Created<User>> {
+    let mut user = body.clone();
+    user.id = repo.insert(body).await?;
+    Ok(Created(user))
+}
+"#;
+
+/// Issue #105 end-to-end: the public-read/owner-write shape proves out on a real
+/// scaffold. Scaffold → gen-tests (the acceptance suite carries the #105
+/// isolation test and NO 401 probe for the public reads) → RED on stubs →
+/// implement the correct handlers → the SAME suite goes GREEN — proving anon
+/// list serves another user's row (200), anon detail 200s, anon create 401s, a
+/// non-owner PUT/DELETE 404s with the row surviving, and the owner's PUT 200s.
+/// Then the full `jerrycan check` gate passes on the implemented app — JL0006
+/// stays silent on the module's unscoped public reads while the write needles
+/// stay armed.
+#[test]
+#[ignore = "heavy: scaffold + gen-tests + red run + implement + green run + check (#105 public_read)"]
+fn public_read_feed_goes_green_on_a_correct_scaffold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, FEED_PUBLIC_READ).unwrap();
+    let app = tmp.path().join("feed-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .args(["new"])
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "the public_read design must scaffold");
+
+    // The generated posts handlers: public GETs take no CurrentUser (despite the
+    // declared auth_required on list_posts), writes keep the guard.
+    let stubs = std::fs::read_to_string(app.join("crates/routes/posts/src/handlers.rs")).unwrap();
+    assert!(
+        stubs.contains("async fn list_posts(_repo: Dep<PostRepo>)"),
+        "the public list stub must take no CurrentUser:\n{stubs}"
+    );
+    assert!(
+        stubs.contains("async fn create_post(_repo: Dep<PostRepo>, _user: CurrentUser,"),
+        "writes keep the guard:\n{stubs}"
+    );
+
+    // gen-tests: the suite carries the #105 isolation test; the public reads get
+    // no 401 probe (the pre-fix gate-lie generated a permanently-red one).
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "gen-tests", "--module", "posts"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "gen-tests posts: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let acceptance =
+        std::fs::read_to_string(app.join("crates/routes/posts/tests/acceptance.rs")).unwrap();
+    assert!(
+        acceptance.contains("async fn anon_reads_but_only_the_owner_writes_posts()"),
+        "the #105 isolation test must be generated:\n{acceptance}"
+    );
+    assert!(
+        !acceptance.contains("list_posts_without_auth_is_401")
+            && !acceptance.contains("get_post_without_auth_is_401"),
+        "no 401 probe for the public reads (red-when-correct otherwise):\n{acceptance}"
+    );
+    assert!(
+        acceptance.contains("create_post_without_auth_is_401"),
+        "writes keep their 401 probes:\n{acceptance}"
+    );
+
+    // RED: stubs (500) fail the generated suite.
+    let red = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace", "--no-fail-fast"])
+        .output()
+        .unwrap();
+    assert!(!red.status.success(), "stub handlers must fail the suite");
+
+    // Implement the correct handlers.
+    install_handler(
+        &app,
+        "crates/routes/posts/src/handlers.rs",
+        FEED_POSTS_HANDLERS,
+    );
+    install_handler(
+        &app,
+        "crates/routes/users/src/handlers.rs",
+        FEED_USERS_HANDLERS,
+    );
+
+    // GREEN: the same probes pass — the four-way #105 contract holds on a real
+    // app: anon read 200 (another user's row), anon write 401, non-owner write
+    // 404 (row survives), owner write 200.
+    let green = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace"])
+        .status()
+        .unwrap();
+    assert!(
+        green.success(),
+        "the correct public-read/owner-write handlers must satisfy the generated suite"
+    );
+
+    // And the full gate holds on the implemented app: JL0006 must stay silent on
+    // the unscoped public reads (`repo.all()`/`repo.get(`) in this public_read
+    // module while the owner-scoped writes pass untouched.
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON doc");
+    assert_eq!(
+        payload["ok"], true,
+        "diagnostics: {}",
+        payload["diagnostics"]
+    );
+}
+
 /// Issue #53 end-to-end: body-omittable server-owned fields. J4's shape (a public
 /// `POST /subscribers` whose `confirmed`/`status` default server-side) AND J2's
 /// shape (a nested `POST /habits/{habit_id}/checkins` whose parent fk comes from

@@ -169,7 +169,7 @@ fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diag
     let tenant = design.tenant_owned_handlers();
     let covered: BTreeSet<&str> = tenant.iter().map(|h| h.rel_path.as_str()).collect();
     for h in &tenant {
-        scan_unscoped(root, h, true, out);
+        scan_unscoped(root, h, true, true, out);
     }
     // Per-user IDENTITY-owned modules (#79) leak ACROSS USERS. Top-level only, flat
     // path, NOT fail-loud (not part of the #103 tenant hole). Skip any module a
@@ -179,14 +179,35 @@ fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diag
         if covered.contains(rel.as_str()) {
             continue;
         }
+        // public_read (#105): when EVERY per-user entity this module owns is
+        // public_read, its unscoped `repo.all()`/`get(` READS are legitimate (the
+        // repo emits them for the public GETs) — restrict the needles to the
+        // writes. A MIXED module (any non-public per-user entity) keeps the read
+        // needles: the scan can't tell which repo an unscoped call targets, so it
+        // stays conservative (the line-scoped allow-hatch covers the false
+        // positive; a missed real read leak would have nothing).
+        let reads_public = design
+            .modules
+            .iter()
+            .find(|m| m.name == module)
+            .is_some_and(|m| {
+                m.entities
+                    .iter()
+                    .filter(|e| design.entity_is_per_user_owned(e))
+                    .all(|e| design.entity_is_public_read(&e.name))
+            });
         let h = HandlerRef {
             rel_path: rel,
             is_flat: false,
             owned_desc: "an identity-owned",
             leak_desc: "another user's rows",
-            suggestion: "call the owner-scoped accessor (all_for/get_for/remove_for) with the session user's id (_user.0.id)".to_string(),
+            suggestion: if reads_public {
+                "route the write through the owner-scoped accessors (update_for/remove_for) with the session user's id (_user.0.id); reads are public on this public_read module".to_string()
+            } else {
+                "call the owner-scoped accessor (all_for/get_for/remove_for) with the session user's id (_user.0.id)".to_string()
+            },
         };
-        scan_unscoped(root, &h, false, out);
+        scan_unscoped(root, &h, false, !reads_public, out);
     }
 }
 
@@ -194,7 +215,16 @@ fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diag
 /// (tenant-owned handlers) turns a missing, unreadable, or unparseable file into a
 /// LOUD JL0008 instead of a silent skip (issue #103) — a handler whose scoping
 /// cannot be checked is exactly where an unscoped cross-tenant call would hide.
-fn scan_unscoped(root: &Path, h: &HandlerRef, fail_loud: bool, out: &mut Vec<Diagnostic>) {
+/// `flag_reads` is false ONLY for a public_read per-user module (#105), where the
+/// unscoped `repo.all()`/`get(` reads are the generated public surface — the
+/// write needles always stay armed.
+fn scan_unscoped(
+    root: &Path,
+    h: &HandlerRef,
+    fail_loud: bool,
+    flag_reads: bool,
+    out: &mut Vec<Diagnostic>,
+) {
     let content = match std::fs::read_to_string(root.join(&h.rel_path)) {
         Ok(c) => c,
         Err(_) => {
@@ -217,6 +247,7 @@ fn scan_unscoped(root: &Path, h: &HandlerRef, fail_loud: bool, out: &mut Vec<Dia
     let mut v = UnscopedVisitor {
         hits: Vec::new(),
         flag_insert: h.is_flat,
+        flag_reads,
         src: &src,
     };
     syn::visit::Visit::visit_file(&mut v, &ast);
@@ -278,6 +309,10 @@ fn receiver_is_repo(expr: &syn::Expr) -> bool {
 struct UnscopedVisitor<'a> {
     hits: Vec<(usize, &'static str)>,
     flag_insert: bool,
+    /// False only on a public_read per-user module (#105): the unscoped
+    /// `all`/`get` reads are the legitimate public surface there, so only the
+    /// write needles stay armed.
+    flag_reads: bool,
     src: &'a [&'a str],
 }
 
@@ -287,8 +322,8 @@ impl<'ast> syn::visit::Visit<'ast> for UnscopedVisitor<'_> {
         // `all` takes no args (the scoped accessors carry the owner id); the others
         // match on the exact ident, so `all_for`/`get_for`/… never match.
         let display = match name.as_str() {
-            "all" if c.args.is_empty() => Some("all()"),
-            "get" => Some("get(...)"),
+            "all" if c.args.is_empty() && self.flag_reads => Some("all()"),
+            "get" if self.flag_reads => Some("get(...)"),
             "remove" => Some("remove(...)"),
             "update" => Some("update(...)"),
             "insert" if self.flag_insert => Some("insert(...)"),
@@ -338,13 +373,16 @@ impl UnscopedVisitor<'_> {
     /// line carries the `// jerrycan:allow JL0006` hatch, same as the non-macro path.
     fn scan_macro(&mut self, mac: &syn::Macro) {
         let tokens: String = mac.tokens.to_string().split_whitespace().collect();
-        // (needle, display) — mirrors the match arms of `visit_expr_method_call`.
-        let mut needles: Vec<(&str, &'static str)> = vec![
-            ("repo.all()", "all()"),
-            ("repo.get(", "get(...)"),
-            ("repo.remove(", "remove(...)"),
-            ("repo.update(", "update(...)"),
-        ];
+        // (needle, display) — mirrors the match arms of `visit_expr_method_call`,
+        // including the flag_reads/flag_insert config (needle order preserved so
+        // multi-hit diagnostics keep their order).
+        let mut needles: Vec<(&str, &'static str)> = Vec::new();
+        if self.flag_reads {
+            needles.push(("repo.all()", "all()"));
+            needles.push(("repo.get(", "get(...)"));
+        }
+        needles.push(("repo.remove(", "remove(...)"));
+        needles.push(("repo.update(", "update(...)"));
         if self.flag_insert {
             needles.push(("repo.insert(", "insert(...)"));
         }
@@ -377,17 +415,16 @@ impl UnscopedVisitor<'_> {
 
 /// Top-level modules that own a per-user IDENTITY-owned entity (#79): an entity
 /// that belongs_to the auth identity (`user_id`) and is NOT tenant-owned. Empty
-/// unless the design wants auth. Mirrors genroute's `entity_is_per_user_owned` so
-/// the lint and the method-suppression agree on which modules are owner-scoped.
+/// unless the design wants auth. Classification is [`Design::entity_is_per_user_owned`]
+/// — the ONE shared per-user predicate (#105 §F) — so the lint and the
+/// method-suppression agree on which modules are owner-scoped.
 fn identity_owned_modules(design: &Design) -> BTreeSet<&str> {
     let mut out = BTreeSet::new();
-    if !design.wants_auth() {
-        return out;
-    }
     for m in &design.modules {
-        let has_per_user = m.entities.iter().any(|e| {
-            e.belongs_to.iter().any(Design::is_identity_fk) && design.tenant_path(&e.name).is_none()
-        });
+        let has_per_user = m
+            .entities
+            .iter()
+            .any(|e| design.entity_is_per_user_owned(e));
         if has_per_user {
             out.insert(m.name.as_str());
         }
@@ -771,6 +808,138 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
         assert!(
             jl0006_only(root, &per_user_design()).is_empty(),
             "a per-user create insert is server-scoped — not a JL0006 leak"
+        );
+    }
+
+    /// The per-user design with `public_read: true` on Workout (#105): reads are
+    /// public (the repo emits the unscoped `all`/`get`), writes stay owner-scoped.
+    fn public_read_design() -> Design {
+        let mut d = per_user_design();
+        d.modules[0].entities[0].public_read = true;
+        d
+    }
+
+    /// Issue #105: on a module whose per-user entities are ALL `public_read`, the
+    /// unscoped `repo.all()`/`repo.get(` READS are legitimate (the repo emits them
+    /// for the public GETs) — JL0006 must NOT flag them, in plain calls or macro
+    /// token streams. The WRITE needles keep firing: `public_read` never exempts
+    /// `repo.update(`/`repo.remove(` (#79's owner-write contract). WHY (Rule 9):
+    /// without the needle split the lint would false-positive every public feed
+    /// handler, training agents to scatter allow-hatches — which would ALSO mute
+    /// real write leaks on those same lines.
+    #[test]
+    fn jl0006_public_read_module_skips_reads_but_flags_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/workouts/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn list_workouts(repo: Dep<WorkoutRepo>) -> Result<()> {\n    let _ = repo.all().await?;\n    let _ = repo.get(7).await?;\n    let _ = serde_json::json!({ \"rows\": repo.all().await? });\n    Ok(())\n}\nasync fn update_workout(repo: Dep<WorkoutRepo>) -> Result<()> {\n    let _ = repo.update(7, item).await?;\n    let _ = repo.remove(7).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &public_read_design());
+        assert_eq!(
+            hits.len(),
+            2,
+            "only the WRITE needles fire on a public_read module: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(8), "the `repo.update(` line: {hits:?}");
+        assert_eq!(hits[1].line, Some(9), "the `repo.remove(` line: {hits:?}");
+        assert!(
+            hits.iter().all(|h| h
+                .suggestion
+                .as_deref()
+                .unwrap()
+                .contains("update_for/remove_for")),
+            "steers writes to the owner-scoped write accessors: {hits:?}"
+        );
+    }
+
+    /// The MACRO token scanner keeps its WRITE needles under the public_read
+    /// needle split (`flag_reads=false`): an unscoped `repo.remove(`/`repo.update(`
+    /// wrapped in a macro body — invisible to the AST method-call walk — must
+    /// still be flagged on a public_read module. WHY (Rule 9): the read needles
+    /// are disarmed there, and if the macro scanner's needle list drifted from the
+    /// AST visitor's (they are built independently), a macro-wrapped cross-user
+    /// WRITE would sail through exactly where the lint's guard is thinnest.
+    #[test]
+    fn jl0006_macro_scanner_keeps_write_needles_on_a_public_read_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/workouts/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn delete_workout(repo: Dep<WorkoutRepo>) -> Result<()> {\n    let _ = serde_json::json!({ \"gone\": repo.remove(7).await? });\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &public_read_design());
+        assert_eq!(
+            hits.len(),
+            1,
+            "the macro-wrapped unscoped write must be flagged even with the read \
+             needles disarmed: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the macro line: {hits:?}");
+        assert!(
+            hits[0].message.contains("remove(...)"),
+            "names the write needle: {:?}",
+            hits[0]
+        );
+    }
+
+    /// A MIXED module — one `public_read` entity plus one plain per-user entity —
+    /// KEEPS the read needles: the lint cannot tell which repo an unscoped
+    /// `repo.all()` targets, so it stays conservative (the false positive has the
+    /// line-scoped allow-hatch; a missed real read leak would have nothing).
+    #[test]
+    fn jl0006_mixed_module_keeps_the_read_needles() {
+        let mut design = public_read_design();
+        design.modules[0].entities.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "Meal",
+                "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                "fields": [{ "name": "calories", "type": "integer" }]
+            }))
+            .unwrap(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/workouts/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn list_meals(repo: Dep<MealRepo>) -> Result<()> {\n    let _ = repo.all().await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &design);
+        assert_eq!(
+            hits.len(),
+            1,
+            "a mixed module keeps flagging unscoped reads: {hits:?}"
+        );
+    }
+
+    /// The `public_read` flag NEVER exempts a write: an unguarded POST in a
+    /// public_read design still trips JL0004 — the #105 contract is public READ,
+    /// owner WRITE, so reads-public must never bleed into writes-public.
+    #[test]
+    fn jl0004_still_fires_on_an_unguarded_write_in_a_public_read_design() {
+        let mut design = public_read_design();
+        design.modules[0].endpoints.push(
+            serde_json::from_value(serde_json::json!({
+                "operation_id": "create_workout", "method": "POST", "path": "/",
+                "request_body": { "entity": "Workout" },
+                "success": { "status": 201, "entity": "Workout" }
+            }))
+            .unwrap(),
+        );
+        let hits = jl0004_only(&design);
+        assert_eq!(
+            hits.len(),
+            1,
+            "public_read never exempts an unguarded write: {hits:?}"
         );
     }
 

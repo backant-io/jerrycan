@@ -56,6 +56,29 @@ id) — the unscoped `all()`/`get()`/`update()`/`remove()` are **not generated**
 a handler cannot accidentally read or mutate another user's rows, and a generated
 isolation test proves user B cannot reach user A's rows.
 
+### Public reads on per-user data (`public_read`)
+The third ownership shape — **public-read / owner-write** — is the feed/blog/
+listing model: anyone (even anonymous) reads every owner's rows, but only the
+owner writes. Set `"public_read": true` on the per-user entity (valid ONLY on an
+identity-owned, non-tenant entity in an auth design; anything else is `JC0549`):
+
+- **Reads open up:** the GET handlers take no `CurrentUser` (even if declared
+  `auth_required`), the repo gets its unscoped `all()`/`get()` back, the OpenAPI
+  operations drop their `security` stanza, and no 401 tests are generated for the
+  reads. A public list serves the **whole collection**, deliberately.
+- **Writes stay exactly as owner-scoped:** guarded, server-injected `user_id` on
+  create, `update_for`/`remove_for` (a non-owner's update/delete → 404, hiding
+  existence); the unscoped `update()`/`remove()` stay un-generated, and a write
+  endpoint marked `public`/unguarded is rejected. A GET with `required_roles`
+  keeps its guard — an explicit role demand outranks the flag.
+- The generated isolation test proves the full contract: an anonymous list
+  returns another user's row (200), an anonymous create 401s, a non-owner
+  update/delete 404s with the row surviving, and the owner's update succeeds.
+
+Without the flag, an unguarded (or `public`) GET on a per-user entity is refused
+as unimplementable (`JC0549`) — the owner-scoped repo has no unscoped read to
+call. Tenant-owned entities cannot opt in: their reads stay membership-gated.
+
 The tenant entity must never BE the auth identity entity: a user cannot be their
 own tenant org, and the validator rejects such a design before scaffolding with
 `JC0540` (`jerrycan explain JC0540`). `tenancy.entity` names a separate org/team

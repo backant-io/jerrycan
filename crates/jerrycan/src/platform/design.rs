@@ -151,6 +151,16 @@ pub struct Entity {
     pub table: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub belongs_to: Vec<BelongsTo>,
+    /// The public-read/owner-write shape (issue #105): on an identity-owned,
+    /// non-tenant entity in an auth design, READS (GET list + detail) are public
+    /// — unguarded and unscoped, a list returns EVERY owner's rows (the feed
+    /// intent) — while WRITES (POST/PUT/PATCH/DELETE) stay owner-scoped and
+    /// guarded exactly as issue #79. Valid ONLY on that per-user shape; JC0549
+    /// rejects it anywhere else (tenant-owned, no identity fk, no auth model) and
+    /// rejects any public/unguarded write on the entity. Serde-default false and
+    /// skipped when false, so every existing design round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub public_read: bool,
     pub fields: Vec<Field>,
 }
 
@@ -1034,6 +1044,62 @@ impl Design {
         e.belongs_to.iter().any(Self::is_identity_fk)
     }
 
+    /// True when `e` is OWNER-scoped by the AUTHENTICATED USER (issue #79): an
+    /// auth design, an identity fk (`user_id` — a belongs_to aimed at the auth
+    /// identity entity, the same COLUMN-name resolution JC0540/#34 use), and NOT
+    /// tenant-owned — directly OR transitively (issue #102): an entity with a
+    /// tenant path is scoped by the TENANT (via `scoped_methods`), never
+    /// per-user. THE single per-user classifier (#105 §F): repo emission
+    /// (genroute), the JC0549 validation (questions), the isolation-test shape
+    /// (testgen), the JL0006 module scan (lints), and [`Self::entity_is_public_read`]
+    /// all resolve through this ONE method, so the mirror sites cannot drift
+    /// apart — mirror drift is exactly how the #102-class holes shipped.
+    pub(crate) fn entity_is_per_user_owned(&self, e: &Entity) -> bool {
+        self.wants_auth() && Self::has_identity_fk(e) && self.tenant_path(&e.name).is_none()
+    }
+
+    /// The public-read/owner-write classifier (issue #105): entity `entity`
+    /// opted in via `public_read: true` AND is per-user owned. The per-user leg
+    /// IS [`Self::entity_is_per_user_owned`] — the one shared classifier — so
+    /// this flag, the repo emission, the testgen shape, and the lint config
+    /// agree on WHICH entities get public reads with owner-gated writes.
+    /// Resolves by NAME across the tree so a caller holding only an endpoint's
+    /// repo-entity name agrees with one holding the `Entity`. False for every
+    /// non-opt-in entity, so existing designs are untouched.
+    pub(crate) fn entity_is_public_read(&self, entity: &str) -> bool {
+        self.find_entity(entity)
+            .is_some_and(|e| e.public_read && self.entity_is_per_user_owned(e))
+    }
+
+    /// True when this endpoint is a PUBLIC read on a `public_read` entity (issue
+    /// #105): a GET whose repo entity opted into public_read runs UNGUARDED —
+    /// regardless of its declared `auth_required` — so the read is public by
+    /// construction (the entity flag drives it; the design doesn't hand-set auth
+    /// per GET). Writes always keep their guard, and a role-gated GET
+    /// (`required_roles`) keeps its guard too: an explicit role demand outranks
+    /// the entity-level read-open default (stripping it would silently drop the
+    /// role check the design asked for). THE single guarding-split predicate:
+    /// handler emission (genroute), the OpenAPI `security` stanza (openapi), and
+    /// the generated 401 probe (testgen) all resolve through this ONE method —
+    /// keyed on each site's own `is_guarded()` reading, the trio would drift
+    /// (the OpenAPI doc would advertise a credential on an unguarded handler and
+    /// the acceptance suite would 401-probe a handler that correctly 200s: a
+    /// permanently-red test on a correct app). False for every non-`public_read`
+    /// design, keeping output byte-identical. Resolves the repo entity via
+    /// [`endpoint_repo_entity_strict`] — explicit signals ONLY: an entity-less
+    /// GET (custom-JSON success, no body, no `{param}` collection) binds no
+    /// entity, so it KEEPS its declared guard. The lenient first-entity
+    /// fallback would be fail-OPEN here: an `auth_required` `GET /stats` beside
+    /// a `public_read` first entity would be reclassified as a public read it
+    /// never performs, and the handler/OpenAPI/401-probe trio would ship it
+    /// anonymous with a green gate.
+    pub(crate) fn endpoint_is_public_read_get(&self, m: &ModuleDesign, ep: &Endpoint) -> bool {
+        matches!(ep.method, HttpMethod::GET)
+            && ep.required_roles.is_empty()
+            && endpoint_repo_entity_strict(m, ep)
+                .is_some_and(|entity| self.entity_is_public_read(entity))
+    }
+
     /// The server-owned-FK rule (issue #34), design-level: a GUARDED endpoint
     /// whose request-body entity carries an identity FK omits that FK from the
     /// wire contract — the generated probe bodies and the OpenAPI request
@@ -1329,6 +1395,73 @@ pub(crate) fn rust_ident(name: &str) -> String {
 /// owning module/subroute name. Delegates ownership to `Design::tenant_path` so
 /// the direct and transitive cases share one resolver (an ambiguous entity
 /// resolves to `None` and is omitted — the design is rejected by `JC0545`).
+/// The bare collection path a parameterized endpoint acts under: its path with the
+/// trailing `/{param}` removed (`/tasks/{id}` → `/tasks`, `/{id}` → `/`). None when
+/// the path carries no `{param}` (nothing to strip).
+fn collection_path(ep: &Endpoint) -> Option<String> {
+    let p = ep.path.as_str();
+    let brace = p.rfind('{')?;
+    let cut = p[..brace].rfind('/').unwrap_or(0);
+    Some(if cut == 0 {
+        "/".to_string()
+    } else {
+        p[..cut].to_string()
+    })
+}
+
+/// The POST creator (with a body) mounted at a bare collection `path` in this
+/// module — the route whose entity owns the rows addressable under `path/{id}`.
+fn creator_at<'a>(m: &'a ModuleDesign, path: &str) -> Option<&'a Endpoint> {
+    m.endpoints
+        .iter()
+        .find(|ep| ep.method == HttpMethod::POST && ep.path == path && ep.request_body.is_some())
+}
+
+/// The entity whose repo/model a route's handler binds. Resolution order: the
+/// request body's entity, then the success entity, then — for a no-body endpoint
+/// like `DELETE /{id}` that names neither (issue #56) — the entity of the
+/// COLLECTION it acts under (its parent path's POST creator), so a multi-entity
+/// module's `/tasks/{id}` stub binds `TaskRepo`, not the module's FIRST entity.
+/// Falls back to the first entity only when path-based resolution finds nothing
+/// (a bare `/import`, or a module with no matching creator) — byte-identical to
+/// the pre-#56 behavior for every single-entity module (the collection creator IS
+/// the sole entity there). Lives here (not genroute) so the ONE resolution serves
+/// both emission and [`Design::endpoint_is_public_read_get`].
+pub(crate) fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a str> {
+    endpoint_repo_entity_strict(m, ep).or_else(|| m.entities.first().map(|e| e.name.as_str()))
+}
+
+/// [`endpoint_repo_entity`] WITHOUT the first-entity fallback: the entity an
+/// EXPLICIT design signal ties the endpoint to — request body, success entity,
+/// or the collection creator its `{param}` path acts under (#56) — and `None`
+/// for an entity-less endpoint (custom-JSON success, no body, no `{param}`
+/// collection: the documented hand-written `Json<serde_json::Value>` shape).
+/// SECURITY-SENSITIVE consumers must use THIS resolver: the lenient fallback is
+/// a convenience for repo-binding in stubs, but classifying an endpoint's
+/// guarding by it is fail-OPEN — an `auth_required` `GET /stats` that never
+/// reads the module's first entity would inherit that entity's `public_read`
+/// and silently ship anonymous ([`Design::endpoint_is_public_read_get`]), and
+/// JC0549(c) would falsely refuse a `public: true` custom GET in a per-user
+/// module as unimplementable.
+pub(crate) fn endpoint_repo_entity_strict<'a>(
+    m: &'a ModuleDesign,
+    ep: &'a Endpoint,
+) -> Option<&'a str> {
+    if m.entities.is_empty() {
+        return None;
+    }
+    ep.request_body
+        .as_ref()
+        .map(|rb| rb.entity.as_str())
+        .or(ep.success.entity.as_deref())
+        .or_else(|| {
+            collection_path(ep)
+                .and_then(|coll| creator_at(m, &coll))
+                .and_then(|c| c.request_body.as_ref())
+                .map(|rb| rb.entity.as_str())
+        })
+}
+
 fn collect_tenant_owned<'a>(
     design: &Design,
     module: &'a ModuleDesign,
@@ -2449,5 +2582,111 @@ pub(crate) mod tests {
             s.contains("A server-owned default value"),
             "published schema must document the `default` field key"
         );
+    }
+
+    #[test]
+    fn public_read_defaults_false_and_round_trips() {
+        // WHY (#105): serde-default false + skip-when-false means an existing
+        // design.json without the key parses unchanged AND serializes WITHOUT
+        // `public_read`, so every non-opt-in design round-trips byte-identically.
+        let e: Entity = serde_json::from_str(
+            r#"{ "name": "Post", "fields": [ { "name": "title", "type": "string" } ] }"#,
+        )
+        .unwrap();
+        assert!(!e.public_read, "absent key defaults to false");
+        let back = serde_json::to_value(&e).unwrap();
+        assert!(
+            back.get("public_read").is_none(),
+            "false is not serialized: {back}"
+        );
+        let on: Entity = serde_json::from_str(
+            r#"{ "name": "Post", "public_read": true,
+                 "fields": [ { "name": "title", "type": "string" } ] }"#,
+        )
+        .unwrap();
+        assert!(on.public_read);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["public_read"],
+            serde_json::json!(true),
+            "an opted-in entity keeps the flag across a round trip"
+        );
+    }
+
+    #[test]
+    fn published_schema_accepts_public_read() {
+        let s = include_str!("../../../../docs/contracts/design-schema.json");
+        assert!(
+            s.contains("\"public_read\""),
+            "published schema must admit the entity public_read key (#105)"
+        );
+    }
+
+    #[test]
+    fn entity_is_public_read_requires_the_per_user_shape() {
+        // WHY (#105): this classifier is the single predicate the generator,
+        // testgen, and lints key public reads on — it must be true ONLY for a
+        // `public_read` entity that is per-user owned (auth design + identity
+        // fk + not tenant-owned), mirroring genroute's
+        // `entity_is_per_user_owned` so validation and emission agree.
+        let src = r#"{
+            "name": "feed", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin"] },
+            "dependencies": ["db", "auth"],
+            "modules": [{
+                "name": "posts",
+                "entities": [
+                    { "name": "Post", "public_read": true,
+                      "belongs_to": [{ "entity": "User" }],
+                      "fields": [{ "name": "title", "type": "string" }] },
+                    { "name": "Draft",
+                      "belongs_to": [{ "entity": "User" }],
+                      "fields": [{ "name": "title", "type": "string" }] },
+                    { "name": "Tag", "public_read": true,
+                      "fields": [{ "name": "label", "type": "string" }] },
+                    { "name": "User", "fields": [{ "name": "email", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "list_posts", "method": "GET", "path": "/",
+                      "success": { "status": 200, "entity": "Post", "list": true } }
+                ]
+            }]
+        }"#;
+        let d: Design = serde_json::from_str(src).unwrap();
+        assert!(
+            d.entity_is_public_read("Post"),
+            "public_read + identity fk + auth + no tenancy → public-read"
+        );
+        assert!(
+            !d.entity_is_public_read("Draft"),
+            "per-user owned but NOT opted in → owner-scoped as before"
+        );
+        assert!(
+            !d.entity_is_public_read("Tag"),
+            "opted in but no identity fk → not public-read"
+        );
+        assert!(!d.entity_is_public_read("Nope"), "unknown entity → false");
+
+        // No active auth model → the per-user shape doesn't exist → false.
+        let mut no_auth = d.clone();
+        no_auth.auth = None;
+        no_auth.dependencies.retain(|dep| dep != "auth");
+        assert!(!no_auth.entity_is_public_read("Post"));
+
+        // Tenant-owned (Post belongs_to the tenancy root) → false: the tenant
+        // guard scopes it, public_read is identity-owned-only.
+        let mut tenant: Design = serde_json::from_str(src).unwrap();
+        tenant.tenancy = Some(
+            serde_json::from_str(r#"{ "entity": "Org", "member_roles": ["owner"] }"#).unwrap(),
+        );
+        tenant.modules[0].entities.push(
+            serde_json::from_str(
+                r#"{ "name": "Org", "fields": [{ "name": "label", "type": "string" }] }"#,
+            )
+            .unwrap(),
+        );
+        tenant.modules[0].entities[0]
+            .belongs_to
+            .push(serde_json::from_str(r#"{ "entity": "Org" }"#).unwrap());
+        assert!(!tenant.entity_is_public_read("Post"));
     }
 }

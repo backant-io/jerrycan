@@ -38,6 +38,7 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
         // Default table name (`users`) is exactly the target — no override.
         table: None,
         belongs_to: vec![],
+        public_read: false,
         fields: vec![
             field("id", FieldType::Uuid, true, false),
             field("email", FieldType::String, true, true),

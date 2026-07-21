@@ -104,6 +104,29 @@ Fix every question before scaffolding.
   - A SAME-module relation gets a real DB `FOREIGN KEY` and the `on_delete` is enforced
     by the database. A CROSS-module relation gets only an indexed fk column (no DB
     constraint); `on_delete` is then YOUR handler's job, not the DB's.
+- `public_read?` — defaults to `false`. The **public-read / owner-write** switch — the
+  feed/blog/listing/job-board shape: anyone (even anonymous) reads, only the owner
+  writes. Valid ONLY on a per-user identity-owned entity (a `belongs_to` the auth
+  identity, NOT tenant-owned, in an auth design) — anything else is rejected with
+  `JC0549`. When `true`:
+  - **Reads (GET list + detail) are PUBLIC.** The generated handler takes no
+    `CurrentUser` — even if the endpoint declares `auth_required` (the entity flag
+    drives the guard split) — the repo keeps the unscoped `all()`/`get()`, the OpenAPI
+    operation carries no `security` stanza, and no 401 test is generated for the reads.
+    A public list returns the **whole collection** — every owner's rows.
+  - **Writes stay owner-scoped exactly as without the flag:** guarded, server-injected
+    `user_id` on create, `update_for`/`remove_for` keyed on the session user (a
+    non-owner's update/delete → 404, hiding existence). A write endpoint that is
+    `public` or unguarded is rejected (`JC0549`). The generated isolation test proves
+    the whole contract: anon read 200 (containing another user's row), anon write 401,
+    non-owner write 404 with the row surviving, owner write 200.
+  - A GET with `required_roles` **keeps its guard** — an explicit role demand outranks
+    the entity-level read-open default.
+
+  Without the flag, an unguarded (or `public: true`) GET on a per-user entity is
+  rejected as unimplementable (`JC0549`): the owner-scoped repo has no unscoped read
+  and the handler no session user. The fork is: set `public_read: true`, or keep the
+  GET authenticated.
 - `fields` (REQUIRED) — at least one (see Field).
 
 The SQL **table name** defaults to `snake_case(entity)`, pluralized — `Ticket` →
@@ -207,7 +230,10 @@ Every entity has an `id` primary key; you usually do NOT declare it:
   a `public` endpoint there (even one with no `request_body` of its own) would bypass
   the Tenant guard and expose one tenant's rows. **Put public endpoints — webhooks, an
   inbound-ingest route, a login/register — in their OWN module** that has no
-  tenant-owned entity (entity-less is fine).
+  tenant-owned entity (entity-less is fine). For "anyone READS this entity, only its
+  owner writes" (feeds, posts, listings), do NOT mark the GETs of an owner-scoped
+  entity `public` — that is rejected as unimplementable (`JC0549`); set
+  `public_read: true` on the entity instead (see Entity above).
 - `probe?` — `"auto"` (default) or `"skip"`. `skip` tells the generator NOT to emit the
   happy-path 2xx probe for an endpoint whose success needs a credential it can't
   synthesize (login, signed webhook, api-key route) — otherwise that probe is
@@ -316,7 +342,9 @@ auth + a public route · jobs/cron · a signed webhook. Lift one as a starting p
   columns; `2` for storage buckets or realtime. v0 rejects `json` in db mode.
 - **Jobs require `db`.** A `jobs` array with no `db` dependency is rejected.
 - **`public` is exclusive.** It cannot combine with `auth_required` / `required_roles`,
-  and not on a tenant-owned entity.
+  and not on a tenant-owned entity. And it is NOT how you open reads on an owner-scoped
+  entity — that's the entity-level `public_read: true` (public reads, owner-only
+  writes); a `public`/unguarded GET there is rejected as unimplementable.
 
 ## Next: scaffold + implement
 With a valid design, run `jerrycan new <name> --design design.json`, then implement the

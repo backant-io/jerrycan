@@ -91,3 +91,16 @@ tempfile = "3"
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
 pkg-fmt = "tgz"
+
+# The `platform` module (behind the `cli` feature) is internal codegen — the
+# `jerrycan` bin and MCP server share it, but it is NOT a supported stable Rust
+# API; downstream crates are not expected to construct its config structs by
+# literal. `platform::Entity` is a serde-deserialized design.json struct, so
+# adding an opt-in field to it (0.6.1: `public_read`, #105) is additive for every
+# real consumer (design authors) yet trips `constructible_struct_adds_field`,
+# which for a 0.x crate would force a spurious 0.x-major bump. Scope-allow that one
+# lint for this package. TRADEOFF (tracked, #145): this also stops the lint from
+# catching a *genuinely* breaking field-add to another `platform` struct — re-enable
+# it once the platform config structs are `#[non_exhaustive]` (a future 0.x-major).
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"

@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.6.1 — 2026-07-21
+
+The public-read / owner-write ownership shape (#105) — the mainstream feed /
+post / listing / job-board model: **anyone reads, only the owner writes**.
+
+### New: `public_read` on an entity (#105)
+An identity-owned (per-user, #79) entity may set `"public_read": true`. Its reads
+become public while its writes stay owner-scoped:
+- **Reads** (GET list + detail) are unguarded and unscoped — a public list
+  returns every owner's rows (the feed intent). No session required.
+- **Writes** (POST/PUT/PATCH/DELETE) are unchanged from #79: authenticated,
+  server-injected `user_id` on create, `update_for`/`remove_for` keyed on the
+  caller (404 for a non-owner — existence hidden), unscoped `update`/`remove`
+  never emitted.
+
+Opt-in and additive: absent the flag, every existing design generates
+byte-identical output. The precedent is the storage `visibility: public` bucket
+(open reads + owner-stamped writes), lifted to HTTP entities.
+
+### Validation
+- **`JC0549`** refuses the unsafe spellings: a `public_read` write that is
+  `public`/unguarded (writes must stay owner-gated); `public_read` on a
+  non-identity-owned or tenant-owned entity (identity-owned-only in v1);
+  `public_read` with no auth model. It also closes a latent trap — an unguarded
+  GET on a per-user entity that had *not* opted into `public_read` used to
+  generate an unimplementable stub; now it's a clear fork ("set `public_read:
+  true` to make reads public, or keep the GET authenticated").
+
+### Behavior
+- One shared guarding predicate now drives the generator, the OpenAPI, and
+  testgen: a `public_read` GET drops its OpenAPI `security` stanza and generates
+  no `*_without_auth_is_401` probe, so a correct public-read feed's acceptance
+  suite is green (previously the GET ran unguarded but the suite still asserted a
+  401 — a red-when-correct test).
+- JL0006 stays silent on a public_read module's now-legitimate unscoped reads but
+  still fires on an unscoped write; JL0004 (unguarded mutation) still fires on any
+  unguarded write.
+- The Supabase migrator routes a public-SELECT + owner-write source table to the
+  `public_read` entity shape instead of the previous silently-unimplementable
+  `public: true` GET stub.
+
+### Docs
+- `docs/ai/00-designing.md` and `14-tenancy.md` (with their embedded twins) teach
+  the public-read/owner-write shape.
+
+### Packaging
+- The `platform` module is internal codegen, not a stable Rust API;
+  `constructible_struct_adds_field` is scope-allowed for the `jerrycan` package
+  (`[package.metadata.cargo-semver-checks.lints]`) so an additive `platform::Entity`
+  field doesn't force a spurious 0.x-major bump (tracked: #145).
+
 ## 0.6.0 — 2026-07-21
 
 First 0.6 minor — a new generated capability: **membership management**. Every

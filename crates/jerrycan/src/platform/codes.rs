@@ -258,6 +258,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs tenancy",
     },
     CodeInfo {
+        code: "JC0549",
+        title: "public_read misuse, or an unimplementable unguarded read on an owner-scoped entity",
+        cause: "`public_read` demands the per-user owner-write shape: it fires when a write endpoint (POST/PUT/PATCH/DELETE) of a public_read entity is `public` or unguarded (the open door — public reads with open writes), when the entity is not identity-owned (no belongs_to the auth identity) or IS tenant-owned (public reads would bypass the Tenant guard), or when the design has no active auth model (owner-gated writes need a session); the SAME code also flags an unguarded GET on a per-user owner-scoped entity that has NOT opted into public_read — such a read is unimplementable, because the entity's repo emits only the owner-scoped accessors while the unguarded handler receives no session user",
+        fix: "keep every write of a public_read entity `auth_required: true` (never `public`), give the entity a `belongs_to` the auth identity outside any tenancy, and set auth.model to `session` or `jwt`; for the unguarded read, either set `public_read: true` on the entity to make its reads public, or keep the GET authenticated (`auth_required: true`)",
+        doc: "jerrycan docs auth",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
