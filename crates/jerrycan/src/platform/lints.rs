@@ -206,6 +206,9 @@ fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diag
             } else {
                 "call the owner-scoped accessor (all_for/get_for/remove_for) with the session user's id (_user.0.id)".to_string()
             },
+            // The #124 exemption is tenant-only (a path-verified Dep<Tenant>
+            // guard); per-user refs never exempt anything.
+            exempt_fns: BTreeSet::new(),
         };
         scan_unscoped(root, &h, false, !reads_public, out);
     }
@@ -248,6 +251,8 @@ fn scan_unscoped(
         hits: Vec::new(),
         flag_insert: h.is_flat,
         flag_reads,
+        exempt_fns: &h.exempt_fns,
+        fn_stack: Vec::new(),
         src: &src,
     };
     syn::visit::Visit::visit_file(&mut v, &ast);
@@ -313,10 +318,33 @@ struct UnscopedVisitor<'a> {
     /// `all`/`get` reads are the legitimate public surface there, so only the
     /// write needles stay armed.
     flag_reads: bool,
+    /// Fn names (operation_ids) whose `get`/`update`/`remove`/`insert` hits are
+    /// exempt (#124): the tenant's own PathScoped detail handlers. `all()` is
+    /// NEVER exempt — see [`HandlerRef::exempt_fns`].
+    exempt_fns: &'a BTreeSet<String>,
+    /// Enclosing-`fn` frames, innermost last (#124), so each hit attributes to
+    /// its handler. A stack, not a slot: a nested named fn attributes to
+    /// ITSELF, and a helper is never an operation_id → it stays armed
+    /// (under-suppress, never over-suppress).
+    fn_stack: Vec<String>,
     src: &'a [&'a str],
 }
 
 impl<'ast> syn::visit::Visit<'ast> for UnscopedVisitor<'_> {
+    // #124: frame every named fn (free or impl method) so a hit attributes to
+    // the innermost one. Closures keep their enclosing frame — inline closure
+    // code is part of the handler body.
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.fn_stack.push(node.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, node);
+        self.fn_stack.pop();
+    }
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.fn_stack.push(node.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, node);
+        self.fn_stack.pop();
+    }
+
     fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
         let name = c.method.to_string();
         // `all` takes no args (the scoped accessors carry the owner id); the others
@@ -331,6 +359,7 @@ impl<'ast> syn::visit::Visit<'ast> for UnscopedVisitor<'_> {
         };
         if let Some(display) = display
             && receiver_is_repo(&c.receiver)
+            && self.armed_in_current_fn(display)
         {
             let line = c.method.span().start().line;
             let allowed = self
@@ -364,6 +393,22 @@ impl<'ast> syn::visit::Visit<'ast> for UnscopedVisitor<'_> {
 }
 
 impl UnscopedVisitor<'_> {
+    /// Whether the `display` needle still fires inside the CURRENT fn frame
+    /// (#124): inside one of the tenant's own PathScoped detail handlers
+    /// (`exempt_fns`) the guard already verified membership in the path tenant,
+    /// so `get`/`update`/`remove`/`insert` on the tenant repo are legitimate —
+    /// but `all()` stays armed even there (fn-level suppression cannot see
+    /// which repo the `repo` binding holds; a correct detail handler calls
+    /// `get`, not `all`). Attribution is to the INNERMOST frame, and no frame
+    /// (top-level macro/item code) is never exempt.
+    fn armed_in_current_fn(&self, display: &str) -> bool {
+        display == "all()"
+            || !self
+                .fn_stack
+                .last()
+                .is_some_and(|f| self.exempt_fns.contains(f))
+    }
+
     /// Scan a macro's raw token stream for the unscoped `repo.<method>(` calls the
     /// AST walk cannot see. `TokenStream::to_string()` inserts spacing between tokens
     /// (`repo . all ()`), so we strip whitespace first and then substring-match the
@@ -390,6 +435,10 @@ impl UnscopedVisitor<'_> {
             .iter()
             .filter(|(needle, _)| tokens.contains(needle))
             .map(|(_, display)| *display)
+            // #124: the fn frame is live here too (scan_macro runs inside the
+            // same walk), so the exempt suppression mirrors the AST arm exactly
+            // — otherwise wrapping a call in `json!` would flip the verdict.
+            .filter(|display| self.armed_in_current_fn(display))
             .collect();
         if matched.is_empty() {
             return;
@@ -1079,6 +1128,150 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
         assert!(
             !diags.iter().any(|d| d.code == "JL0006"),
             "a scoped all_for_memberships inside a macro must not fire JL0006: {diags:?}"
+        );
+    }
+
+    // ---- JL0006 fn attribution + tenant-detail exemption (issue #124) ----
+
+    /// A tenant module that HOSTS a tenant-owned child (#124): Club is the
+    /// tenancy entity and Book (belongs_to Club) lives in the SAME `clubs`
+    /// module, so `collect_owned_handlers` drags the tenant's OWN handlers into
+    /// the JL0006 scan alongside the child's.
+    fn child_hosting_tenant_design() -> Design {
+        serde_json::from_value(serde_json::json!({
+            "name": "club-api",
+            "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+            "modules": [{
+                "name": "clubs",
+                "entities": [
+                    { "name": "Club", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Book",
+                      "belongs_to": [{ "entity": "Club" }],
+                      "fields": [{ "name": "title", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "list_clubs", "method": "GET", "path": "/",
+                      "success": { "status": 200, "entity": "Club", "list": true } },
+                    { "operation_id": "get_club", "method": "GET", "path": "/{id}",
+                      "success": { "status": 200, "entity": "Club" } },
+                    { "operation_id": "list_books", "method": "GET", "path": "/{club_id}/books",
+                      "success": { "status": 200, "entity": "Book", "list": true } }
+                ]
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// Issue #124: in a child-hosting tenant module, the tenant's own PathScoped
+    /// detail handler (`get_club`) legitimately calls the unscoped
+    /// `repo.get/update/remove` on the TENANT repo — membership in the path
+    /// tenant was already verified by the `Dep<Tenant>` guard — so JL0006 must
+    /// be SILENT there, while the same needles stay ARMED in the tenant's
+    /// Collection handler (`list_clubs` must steer to `all_for_member`) and in
+    /// the child's handlers (the real JL0006 target). WHY (Rule 9): without fn
+    /// attribution the lint false-positives on correct code, training agents to
+    /// scatter allow-hatches that ALSO mute real leaks on those lines.
+    #[test]
+    fn jl0006_exempts_the_tenants_own_path_scoped_detail_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/clubs/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        // Lines 2 and 12 are ARMED (`all()` in the Collection handler; the
+        // child's unscoped `all()`); lines 6-8 are the exempt detail calls.
+        std::fs::write(
+            &handlers,
+            "\
+async fn list_clubs(repo: Dep<ClubRepo>) -> Result<()> {
+    let _ = repo.all().await?;
+    Ok(())
+}
+async fn get_club(repo: Dep<ClubRepo>, _tenant: Dep<Tenant>) -> Result<()> {
+    let _ = repo.get(id).await?;
+    let _ = repo.update(id, item).await?;
+    let _ = repo.remove(id).await?;
+    Ok(())
+}
+async fn list_books(repo: Dep<BookRepo>) -> Result<()> {
+    let _ = repo.all().await?;
+    Ok(())
+}
+",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &child_hosting_tenant_design());
+        let lines: Vec<Option<u64>> = hits.iter().map(|h| h.line).collect();
+        assert_eq!(
+            lines,
+            vec![Some(2), Some(12)],
+            "silent on the tenant's own PathScoped detail calls (lines 6-8), \
+             armed on the Collection `all()` and the child's `all()`: {hits:?}"
+        );
+    }
+
+    /// Issue #124: `repo.all()` stays armed EVEN INSIDE the exempt detail
+    /// handler. WHY: fn-level suppression cannot see which repo the `repo`
+    /// binding holds — a correct tenant detail handler calls `get`, not `all` —
+    /// so keeping `all()` armed cheaply bounds the "agent bound the CHILD repo
+    /// as `repo` in the tenant's detail handler" residual.
+    #[test]
+    fn jl0006_keeps_all_armed_inside_an_exempt_detail_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/clubs/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn get_club(repo: Dep<ClubRepo>) -> Result<()> {\n    let _ = repo.all().await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &child_hosting_tenant_design());
+        assert_eq!(
+            hits.len(),
+            1,
+            "`all()` is never exempted, even in the tenant's own detail fn: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.all()` line");
+        assert!(
+            hits[0].message.contains("all()"),
+            "names the `all()` needle: {:?}",
+            hits[0]
+        );
+    }
+
+    /// Issue #124: the MACRO token scanner attributes to the enclosing fn too —
+    /// scan_macro runs inside the same walk, so the fn frame is live. A
+    /// macro-wrapped `repo.get(` inside the exempt detail handler is suppressed
+    /// exactly like the plain call, while a macro-wrapped `repo.all()` in the
+    /// SAME fn stays armed. WHY (Rule 9): if the macro arm's suppression drifted
+    /// from the AST visitor's, the exemption would be spelling-dependent —
+    /// wrapping a call in `json!` would flip the verdict on identical code.
+    #[test]
+    fn jl0006_macro_scan_attributes_to_the_enclosing_fn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/clubs/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn get_club(repo: Dep<ClubRepo>) -> Result<()> {\n    let _ = serde_json::json!({ \"club\": repo.get(id).await? });\n    let _ = serde_json::json!({ \"rows\": repo.all().await? });\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &child_hosting_tenant_design());
+        assert_eq!(
+            hits.len(),
+            1,
+            "the macro-wrapped `get(` is exempt in the detail fn, the macro-wrapped \
+             `all()` stays armed: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(3), "points at the `all()` macro line");
+        assert!(
+            hits[0].message.contains("all()"),
+            "names the `all()` needle: {:?}",
+            hits[0]
         );
     }
 

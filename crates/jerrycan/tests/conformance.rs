@@ -828,6 +828,195 @@ fn public_read_feed_goes_green_on_a_correct_scaffold() {
     );
 }
 
+/// The #124 conformance fixture: a tenant module (`clubs`) that HOSTS a
+/// tenant-owned child (Book belongs_to Club in the SAME module), so the
+/// JL0006 scan reads the tenant's OWN handlers alongside the child's.
+const CLUB_HOSTED_CHILD: &str = r#"{
+  "name": "club-api",
+  "contract_version": 1,
+  "auth": { "model": "session", "roles": ["owner", "member"] },
+  "dependencies": ["db", "auth"],
+  "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+  "modules": [
+    {
+      "name": "users",
+      "entities": [{ "name": "User", "fields": [{ "name": "email", "type": "string" }] }],
+      "endpoints": [
+        { "operation_id": "register", "method": "POST", "path": "/register",
+          "public": true,
+          "request_body": { "entity": "User" },
+          "success": { "status": 201, "entity": "User" } }
+      ]
+    },
+    {
+      "name": "clubs",
+      "entities": [
+        { "name": "Club", "fields": [{ "name": "name", "type": "string" }] },
+        { "name": "Book", "belongs_to": [{ "entity": "Club", "on_delete": "cascade" }],
+          "fields": [{ "name": "title", "type": "string" }] }
+      ],
+      "endpoints": [
+        { "operation_id": "list_clubs", "method": "GET", "path": "/",
+          "auth_required": true,
+          "success": { "status": 200, "entity": "Club", "list": true } },
+        { "operation_id": "create_club", "method": "POST", "path": "/",
+          "auth_required": true,
+          "request_body": { "entity": "Club" },
+          "success": { "status": 201, "entity": "Club" } },
+        { "operation_id": "get_club", "method": "GET", "path": "/{id}",
+          "auth_required": true,
+          "success": { "status": 200, "entity": "Club" },
+          "errors": [{ "status": 404, "when": "unknown id or not a member" }] },
+        { "operation_id": "list_books", "method": "GET", "path": "/{club_id}/books",
+          "auth_required": true,
+          "success": { "status": 200, "entity": "Book", "list": true } },
+        { "operation_id": "create_book", "method": "POST", "path": "/{club_id}/books",
+          "auth_required": true,
+          "request_body": { "entity": "Book" },
+          "success": { "status": 201, "entity": "Book" } }
+      ]
+    }
+  ]
+}"#;
+
+/// The CORRECT #124 clubs handlers: the tenant's own PathScoped detail route
+/// (`get_club`) calls the unscoped `repo.get` on the TENANT repo — legitimate,
+/// because the `Dep<Tenant>` guard already verified membership in the path
+/// club — while the hosted child stays on the scoped accessors.
+const CLUB_HANDLERS_CORRECT: &str = r#"//! Correct #124 clubs handlers: unscoped tenant detail read, scoped child.
+use jerrycan::prelude::*;
+use super::model::*;
+use super::repo::*;
+use shared::Tenant;
+use shared::CurrentUser;
+
+pub(crate) async fn list_clubs(repo: Dep<ClubRepo>, user: CurrentUser) -> Result<Json<Vec<Club>>> {
+    Ok(Json(repo.all_for_member(user.0.id.clone()).await?))
+}
+
+pub(crate) async fn create_club(repo: Dep<ClubRepo>, user: CurrentUser, Json(body): Json<Club>) -> Result<Created<Club>> {
+    let mut club = body;
+    club.id = repo.create_with_membership(user.0.id.clone(), club.clone()).await?;
+    Ok(Created(club))
+}
+
+pub(crate) async fn get_club(repo: Dep<ClubRepo>, _tenant: Dep<Tenant>, Path(club_id): Path<i64>) -> Result<Json<Club>> {
+    // Membership in the path club was already verified by the Dep<Tenant> guard;
+    // the unscoped get on the TENANT repo is the correct call here (#124).
+    repo.get(club_id).await?.map(Json).ok_or_else(Error::not_found)
+}
+
+pub(crate) async fn list_books(repo: Dep<BookRepo>, _tenant: Dep<Tenant>, Path(_club_id): Path<i64>) -> Result<Json<Vec<Book>>> {
+    Ok(Json(repo.all_for(_tenant.id()).await?))
+}
+
+pub(crate) async fn create_book(repo: Dep<BookRepo>, _tenant: Dep<Tenant>, Path(club_id): Path<i64>, Json(body): Json<BookRequest>) -> Result<Created<Book>> {
+    let mut book = Book { id: 0, club_id, title: body.title };
+    book.id = repo.insert(book.clone()).await?;
+    Ok(Created(book))
+}
+"#;
+
+/// The trivial users handler for the #124 fixture.
+const CLUB_USERS_HANDLERS: &str = r#"//! Correct users handlers for the #124 fixture.
+use jerrycan::prelude::*;
+use super::model::*;
+use super::repo::*;
+
+pub(crate) async fn register(repo: Dep<UserRepo>, Json(body): Json<User>) -> Result<Created<User>> {
+    let mut user = body.clone();
+    user.id = repo.insert(body).await?;
+    Ok(Created(user))
+}
+"#;
+
+/// Issue #124 end-to-end: a child-hosting tenant app with CORRECT handlers
+/// passes the full `jerrycan check` gate — JL0006 stays silent on the tenant's
+/// own path-verified detail read (`repo.get` in `get_club`, the pre-fix false
+/// positive) — while a REAL leak (the child's `list_books` swapped to the
+/// unscoped `repo.all()`) still fails the same gate with JL0006 pointing at
+/// that line. WHY (Rule 9): the exemption must be surgical — green on correct
+/// code, red on the exact leak class the lint exists for.
+#[test]
+#[ignore = "heavy: scaffold + implement + check green, then leak + check red (#124 tenant-detail exemption)"]
+fn child_hosting_tenant_app_goes_green_on_correct_handlers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, CLUB_HOSTED_CHILD).unwrap();
+    let app = tmp.path().join("club-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .args(["new"])
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(
+        st.success(),
+        "the child-hosting tenant design must scaffold"
+    );
+
+    // Implement the correct handlers: get_club reads the guard-verified tenant
+    // via the unscoped `repo.get`, the child stays on the scoped accessors.
+    install_handler(
+        &app,
+        "crates/routes/clubs/src/handlers.rs",
+        CLUB_HANDLERS_CORRECT,
+    );
+    install_handler(
+        &app,
+        "crates/routes/users/src/handlers.rs",
+        CLUB_USERS_HANDLERS,
+    );
+
+    // GREEN: the full gate passes — pre-#124 this was a false JL0006 on
+    // `get_club`'s legitimate `repo.get(club_id)`.
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON doc");
+    assert_eq!(
+        payload["ok"], true,
+        "correct child-hosting tenant handlers must pass the gate (JL0006 silent \
+         on the tenant's own detail read): {}",
+        payload["diagnostics"]
+    );
+
+    // RED: a real unscoped call in the CHILD's handler still fails the gate —
+    // the exemption never reaches the child (the actual JL0006 target).
+    install_handler(
+        &app,
+        "crates/routes/clubs/src/handlers.rs",
+        &CLUB_HANDLERS_CORRECT.replace("repo.all_for(_tenant.id())", "repo.all()"),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON doc");
+    assert_eq!(
+        payload["ok"], false,
+        "the child's unscoped repo.all() must still fail the gate"
+    );
+    let diags = payload["diagnostics"].as_array().unwrap();
+    assert!(
+        diags.iter().any(|d| d["code"] == "JL0006"
+            && d["file"] == "crates/routes/clubs/src/handlers.rs"
+            && d["message"].as_str().unwrap().contains("all()")),
+        "JL0006 must name the child's unscoped all(): {diags:?}"
+    );
+}
+
 /// Issue #53 end-to-end: body-omittable server-owned fields. J4's shape (a public
 /// `POST /subscribers` whose `confirmed`/`status` default server-side) AND J2's
 /// shape (a nested `POST /habits/{habit_id}/checkins` whose parent fk comes from

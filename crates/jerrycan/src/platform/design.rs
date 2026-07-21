@@ -559,6 +559,16 @@ pub struct HandlerRef {
     pub leak_desc: &'static str,
     /// The registered fix text (the scoped accessors to call instead).
     pub suggestion: String,
+    /// Handler fn names (operation_ids, per the JL0002 contract) whose
+    /// `get`/`update`/`remove`/`insert` hits JL0006 must NOT flag (issue #124):
+    /// the TENANT entity's own PathScoped detail handlers, where membership in
+    /// the path tenant was already verified by the `Dep<Tenant>` guard and the
+    /// tenant repo intentionally keeps its unscoped methods (per-user
+    /// suppression only). `repo.all()` stays armed even in these fns —
+    /// fn-level suppression cannot see which repo the `repo` binding holds,
+    /// and a correct detail handler calls `get`, not `all`. Empty for every
+    /// per-user ref and for tenant modules without a hosted child's handlers.
+    pub exempt_fns: std::collections::BTreeSet<String>,
 }
 
 /// The JL0006 fix text for a TENANT-owned handler (both route shapes, issue #94):
@@ -596,12 +606,39 @@ impl Design {
             let is_flat = owned
                 .iter()
                 .any(|e| super::genroute::entity_is_flat_tenant_owned(e, self));
+            // Issue #124: a tenant module that also hosts a tenant-owned child
+            // drags the tenant's OWN handlers into this scan, where the
+            // PathScoped detail handlers legitimately call the unscoped
+            // `repo.get/update/remove` on the TENANT repo (membership in the
+            // path tenant is already guard-verified). Exempt exactly those fns
+            // — resolved with the STRICT repo-entity resolver on purpose: a
+            // lint must UNDER-exempt (a residual false positive has the
+            // line-scoped allow hatch) and never OVER-exempt (which would
+            // silence a real leak in a handler the fallback mis-bound).
+            let exempt_fns: std::collections::BTreeSet<String> = self
+                .tenancy
+                .as_ref()
+                .map(|t| {
+                    m.endpoints
+                        .iter()
+                        .filter(|ep| {
+                            endpoint_repo_entity_strict(m, ep) == Some(t.entity.as_str())
+                                && matches!(
+                                    self.endpoint_tenant_shape(m, ep),
+                                    TenantShape::PathScoped { .. }
+                                )
+                        })
+                        .map(|ep| ep.operation_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             out.push(HandlerRef {
                 rel_path: format!("{src_rel}/handlers.rs"),
                 is_flat,
                 owned_desc: "a tenant-owned",
                 leak_desc: "another tenant's rows",
                 suggestion: TENANT_SCOPED_SUGGESTION.to_string(),
+                exempt_fns,
             });
         }
         for sub in &m.subroutes {
