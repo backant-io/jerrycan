@@ -1727,6 +1727,12 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
 /// The insert differs by pk type exactly as `insert` does (integer pk assigned by
 /// the DB and read back from the row; client-supplied text pk known up front and
 /// inserted via `Entity::insert(..).exec(..)`).
+///
+/// Issue #107 adds the member-management surface on the same repo — `members_of`
+/// / `add_member` / `set_member_role` / `remove_member` / `count_admins` — real
+/// SQL keyed on the path tenant fk, with role validation (422), the last-admin
+/// guard (409), and duplicate adds surfacing UNIQUE as 409 via `db_error`. The
+/// `{Tenant}Member` row struct + MEMBER_ROLES const live in `tenant_member_row`.
 fn tenant_own_methods(e: &Entity, design: &Design) -> String {
     let Some(tenancy) = design.tenancy.as_ref() else {
         return String::new();
@@ -1740,8 +1746,10 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
     let table = design.table_name(entity);
     let members = format!("{}_members", snake);
     let fk_col = Design::fk_column(&tenancy.entity);
-    // The seed role is the FIRST declared member_role ("creator becomes organizer");
-    // `member` is a safe fallback if a design declares tenancy with no roles.
+    // The seed role is the FIRST declared member_role ("creator becomes organizer").
+    // JC0548 guarantees a non-empty list at design time, so the `member` fallback is
+    // dead code — kept (consistently with testgen/storagegen/openapi) only so an
+    // unvalidated design handed straight to the generator cannot panic.
     let role = tenancy
         .member_roles
         .first()
@@ -1797,6 +1805,17 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
              \x20   }}"
         )
     };
+    // Member-management surface (issue #107): every method keys on the PATH
+    // tenant fk. A String (text-pk) fk is MOVED into the last statement's bound
+    // values, so the earlier pre-check reads clone it; an integer fk is `Copy`
+    // (a `.clone()` there would trip `clippy::clone_on_copy` in the app).
+    let fkc = if key == "String" { ".clone()" } else { "" };
+    let roles_msg = if tenancy.member_roles.is_empty() {
+        "member".to_string()
+    } else {
+        tenancy.member_roles.join(", ")
+    };
+    let admin = role;
     format!(
         r#"
     // Membership lifecycle (issue #78) — the tenant entity's own repo. Create via
@@ -1817,6 +1836,170 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
             .await
             .map_err(db_error)
     }}
+
+    // Member management (issue #107) — the tool-owned member surface. Every
+    // method keys on the PATH tenant fk the membership guard already verified.
+    // `role` must be one of the declared MEMBER_ROLES (422 — no DB CHECK backs
+    // the column); the last "{admin}" can never be removed or demoted (409), so a
+    // tenant is never left admin-less; a duplicate add surfaces the
+    // UNIQUE(user_id, {fk_col}) index as 409 via db_error — no second mapping here.
+    pub async fn members_of(&self, fk: {key}) -> Result<Vec<{entity}Member>> {{
+        {entity}Member::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            self.db.conn().get_database_backend(),
+            self.db.sql(
+                "SELECT id, user_id, role FROM {members} WHERE {fk_col} = ? ORDER BY id",
+            ),
+            [fk.into()],
+        ))
+        .all(self.db.conn())
+        .await
+        .map_err(db_error)
+    }}
+
+    pub async fn add_member(&self, fk: {key}, user_id: String, role: String) -> Result<()> {{
+        if !MEMBER_ROLES.contains(&role.as_str()) {{
+            return Err(Error::unprocessable("role must be one of: {roles_msg}"));
+        }}
+        self.db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "INSERT INTO {members} (user_id, {fk_col}, role) VALUES (?, ?, ?)",
+                ),
+                [user_id.into(), fk.into(), role.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(())
+    }}
+
+    pub async fn set_member_role(&self, fk: {key}, user_id: String, role: String) -> Result<bool> {{
+        if !MEMBER_ROLES.contains(&role.as_str()) {{
+            return Err(Error::unprocessable("role must be one of: {roles_msg}"));
+        }}
+        let target = {entity}Member::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            self.db.conn().get_database_backend(),
+            self.db.sql(
+                "SELECT id, user_id, role FROM {members} WHERE user_id = ? AND {fk_col} = ?",
+            ),
+            [user_id.clone().into(), fk{fkc}.into()],
+        ))
+        .one(self.db.conn())
+        .await
+        .map_err(db_error)?;
+        if target.is_some_and(|m| m.role == "{admin}")
+            && role != "{admin}"
+            && self.count_admins(fk{fkc}).await? == 1
+        {{
+            return Err(Error::conflict("cannot demote the last {admin}"));
+        }}
+        let r = self
+            .db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "UPDATE {members} SET role = ? WHERE user_id = ? AND {fk_col} = ?",
+                ),
+                [role.into(), user_id.into(), fk.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected() > 0)
+    }}
+
+    pub async fn remove_member(&self, fk: {key}, user_id: String) -> Result<bool> {{
+        let target = {entity}Member::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            self.db.conn().get_database_backend(),
+            self.db.sql(
+                "SELECT id, user_id, role FROM {members} WHERE user_id = ? AND {fk_col} = ?",
+            ),
+            [user_id.clone().into(), fk{fkc}.into()],
+        ))
+        .one(self.db.conn())
+        .await
+        .map_err(db_error)?;
+        if target.is_some_and(|m| m.role == "{admin}")
+            && self.count_admins(fk{fkc}).await? == 1
+        {{
+            return Err(Error::conflict("cannot remove the last {admin}"));
+        }}
+        let r = self
+            .db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql("DELETE FROM {members} WHERE user_id = ? AND {fk_col} = ?"),
+                [user_id.into(), fk.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected() > 0)
+    }}
+
+    pub async fn count_admins(&self, fk: {key}) -> Result<i64> {{
+        let row = self
+            .db
+            .conn()
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT COUNT(*) AS n FROM {members} WHERE {fk_col} = ? AND role = ?",
+                ),
+                [fk.into(), "{admin}".into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        match row {{
+            Some(r) => r.try_get::<i64>("", "n").map_err(db_error),
+            None => Ok(0),
+        }}
+    }}
+"#
+    )
+}
+
+/// The serializable member-row type + the baked `member_roles` const backing the
+/// member-management surface (issue #107) — module-scope companions to
+/// `tenant_own_methods`, emitted ONLY beside the tenancy entity's own repo
+/// (empty everywhere else, so all other repo output stays byte-identical).
+/// `MEMBER_ROLES[0]` is the admin role by convention; JC0548 guarantees a
+/// non-empty, duplicate-free list at design time, so the `["member"]` fallback
+/// is dead code mirroring the seed-role fallback above.
+fn tenant_member_row(e: &Entity, design: &Design) -> String {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return String::new();
+    };
+    if e.name != tenancy.entity {
+        return String::new();
+    }
+    let entity = &e.name;
+    let members = format!("{}_members", Design::to_snake(entity));
+    let quoted = if tenancy.member_roles.is_empty() {
+        "\"member\"".to_string()
+    } else {
+        tenancy
+            .member_roles
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        r#"/// Roles a `{members}` row may hold — design.json `tenancy.member_roles`. The
+/// FIRST entry is the admin role: it gates member management and is protected
+/// by the last-admin rule (jerrycan issue #107).
+const MEMBER_ROLES: &[&str] = &[{quoted}];
+
+/// One `{members}` row — the member-surface list/lookup shape (issue #107).
+#[derive(serde::Serialize, sea_orm::FromQueryResult)]
+pub struct {entity}Member {{
+    pub id: i64,
+    pub user_id: String,
+    pub role: String,
+}}
+
 "#
     )
 }
@@ -1943,6 +2126,9 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
     // entity); mutually exclusive with `scoped` (an entity can't be BOTH the tenant
     // and belong_to the tenant).
     let tenant_own = tenant_own_methods(e, design);
+    // Module-scope companions to `tenant_own`: the `{Tenant}Member` row struct +
+    // MEMBER_ROLES const (issue #107). Empty for every non-tenant entity.
+    let member_row = tenant_member_row(e, design);
     // The insert differs by pk type. An auto-increment integer pk is assigned by
     // the DB, so `ActiveModel::insert` returns the persisted row (with its id).
     // A client-supplied text pk (string/uuid) is already known, and
@@ -1991,7 +2177,7 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
         )
     };
     format!(
-        r#"pub struct {entity}Repo {{
+        r#"{member_row}pub struct {entity}Repo {{
     db: Db,
 }}
 
@@ -2064,6 +2250,11 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
         imports.push("ConnectionTrait");
     }
     imports.push("EntityTrait");
+    if has_tenant_own {
+        // `find_by_statement` (the typed `{Tenant}Member` rows, issue #107) is a
+        // FromQueryResult trait method — only the tenant's own module needs it.
+        imports.push("FromQueryResult");
+    }
     if needs_filter {
         imports.push("QueryFilter");
     }
@@ -2405,7 +2596,144 @@ fn route_lines(m: &ModuleDesign, indent: &str) -> String {
     out
 }
 
-fn module_body(m: &ModuleDesign, indent: &str, mode: GenMode) -> String {
+/// True when this module (or subroute) DECLARES the tenancy entity and the mode
+/// carries both halves the member surface stands on: db (the `{tenant}_members`
+/// table + the #107 repo methods live in the SQL repo only) and auth (the
+/// membership-verifying `Dep<Tenant>` guard + `CurrentUser`). Gates every #107
+/// emission site — mod decl, route lines, members.rs — so a non-tenancy design
+/// (and every other module of a tenancy design) stays byte-identical.
+fn emits_member_surface(m: &ModuleDesign, mode: GenMode, design: &Design) -> bool {
+    mode.db
+        && mode.auth
+        && design
+            .tenancy
+            .as_ref()
+            .is_some_and(|t| m.entities.iter().any(|e| e.name == t.entity))
+}
+
+/// The TOOL-OWNED member-management handlers (issue #107): `members.rs` beside
+/// the tenant module's agent-owned handlers.rs — fully implemented (like
+/// storagegen's bucket handlers, never agent stubs), calling the #107 repo
+/// methods. `None` for every module that doesn't emit the surface.
+///
+/// Mounted path-scoped (`/{fk}/members…`), so the shared `Dep<Tenant>` guard
+/// verifies membership in the PATH tenant and 404s outsiders before any handler
+/// runs. Writes additionally require the admin role (`member_roles[0]`,
+/// matching the seed-role convention above) via `tenant.require_role` — except
+/// self-removal, where any member may leave (the guard already proved
+/// membership; the repo's last-admin rule still applies).
+pub(crate) fn members_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Option<String> {
+    if !emits_member_surface(m, mode, design) {
+        return None;
+    }
+    let tenancy = design.tenancy.as_ref().expect("gated on tenancy");
+    let entity = &tenancy.entity;
+    let fk_col = Design::fk_column(entity);
+    // The admin role: FIRST declared member_role, same fallback as the seed role
+    // in `tenant_own_methods` (JC0548 guarantees non-empty roles at design time;
+    // the dead fallbacks still must agree byte-for-byte).
+    let admin = tenancy
+        .member_roles
+        .first()
+        .map(String::as_str)
+        .unwrap_or("member");
+    Some(format!(
+        r#"//! GENERATED by jerrycan — member management for the `{entity}` tenant
+//! (issue #107). TOOL-OWNED: regenerated by `jerrycan generate`; do not
+//! hand-edit (custom logic belongs in the agent-owned handlers.rs, not here).
+//!
+//! Every route here is path-scoped under `/{{{fk_col}}}`, so the shared
+//! `Dep<Tenant>` guard verifies the caller's membership in the PATH tenant and
+//! 404s outsiders before these handlers run. Writes additionally require the
+//! admin role `{admin}` (`member_roles[0]`); the one exception is self-removal —
+//! any member may leave. Role validation (422), duplicate adds (409), and the
+//! last-admin lockout (409) live in the repo methods.
+use super::repo::{{{entity}Member, {entity}Repo}};
+use jerrycan::prelude::*;
+use shared::{{CurrentUser, Tenant}};
+
+/// POST /{{{fk_col}}}/members body. `user_id` is OPAQUE — no FK backs it
+/// (migrated-uuid support), so existence is not DB-verified.
+#[derive(serde::Deserialize)]
+pub(crate) struct AddMemberRequest {{
+    pub(crate) user_id: String,
+    pub(crate) role: String,
+}}
+
+/// PATCH /{{{fk_col}}}/members/{{user_id}} body: the member's new role.
+#[derive(serde::Deserialize)]
+pub(crate) struct SetMemberRoleRequest {{
+    pub(crate) role: String,
+}}
+
+/// GET /{{{fk_col}}}/members — the roster `[{{id, user_id, role}}]`. Any member
+/// may read it: the guard is the whole gate.
+pub(crate) async fn list_members(
+    tenant: Dep<Tenant>,
+    repo: Dep<{entity}Repo>,
+) -> Result<Json<Vec<{entity}Member>>> {{
+    Ok(Json(repo.members_of(tenant.id()).await?))
+}}
+
+/// POST /{{{fk_col}}}/members — add a member (201). Admin-gated; an out-of-set
+/// role is 422, a duplicate membership 409 (the UNIQUE index via db_error).
+pub(crate) async fn add_member(
+    tenant: Dep<Tenant>,
+    repo: Dep<{entity}Repo>,
+    Json(body): Json<AddMemberRequest>,
+) -> Result<Created<serde_json::Value>> {{
+    tenant.require_role("{admin}")?;
+    repo.add_member(tenant.id(), body.user_id.clone(), body.role.clone())
+        .await?;
+    Ok(Created(
+        serde_json::json!({{ "user_id": body.user_id, "role": body.role }}),
+    ))
+}}
+
+/// PATCH /{{{fk_col}}}/members/{{user_id}} — change a member's role (204).
+/// Admin-gated; an out-of-set role is 422, demoting the last `{admin}` 409, an
+/// unknown member 404.
+pub(crate) async fn set_member_role(
+    tenant: Dep<Tenant>,
+    repo: Dep<{entity}Repo>,
+    Path(user_id): Path<String>,
+    Json(body): Json<SetMemberRoleRequest>,
+) -> Result<NoContent> {{
+    tenant.require_role("{admin}")?;
+    if repo
+        .set_member_role(tenant.id(), user_id, body.role)
+        .await?
+    {{
+        Ok(NoContent)
+    }} else {{
+        Err(Error::not_found())
+    }}
+}}
+
+/// DELETE /{{{fk_col}}}/members/{{user_id}} — remove a member (204).
+/// Self-removal ("leave") needs no admin role — the guard already proved the
+/// caller's membership; removing ANYONE ELSE is admin-gated. Removing the last
+/// `{admin}` is 409, an unknown member 404.
+pub(crate) async fn remove_member(
+    tenant: Dep<Tenant>,
+    user: CurrentUser,
+    repo: Dep<{entity}Repo>,
+    Path(user_id): Path<String>,
+) -> Result<NoContent> {{
+    if user_id != user.0.id {{
+        tenant.require_role("{admin}")?;
+    }}
+    if repo.remove_member(tenant.id(), user_id).await? {{
+        Ok(NoContent)
+    }} else {{
+        Err(Error::not_found())
+    }}
+}}
+"#
+    ))
+}
+
+fn module_body(m: &ModuleDesign, indent: &str, mode: GenMode, design: &Design) -> String {
     let mut body = format!("{indent}Module::new(\"{}\")\n", m.name);
     for e in &m.entities {
         if mode.db {
@@ -2421,6 +2749,18 @@ fn module_body(m: &ModuleDesign, indent: &str, mode: GenMode) -> String {
         }
     }
     body.push_str(&route_lines(m, &format!("{indent}    ")));
+    // The member-management surface (issue #107): tool-owned routes registered
+    // AFTER the design's own — path-scoped on the tenant fk so the shared guard's
+    // by-name lookup verifies membership in the PATH tenant. The fk param name
+    // agrees with the tenant's own detail routes by construction
+    // (`normalize_tenant_detail_routes` rewrote `{id}` → `{fk}` at load), so the
+    // router's one-param-name-per-position rule holds.
+    if emits_member_surface(m, mode, design) {
+        let fk = Design::fk_column(&design.tenancy.as_ref().expect("gated").entity);
+        body.push_str(&format!(
+            "{indent}    .route(\"/{{{fk}}}/members\", get(members::list_members).post(members::add_member))\n{indent}    .route(\"/{{{fk}}}/members/{{user_id}}\", patch(members::set_member_role).delete(members::remove_member))\n"
+        ));
+    }
     for sub in &m.subroutes {
         body.push_str(&format!(
             "{indent}    .mount(\"{}\", subroutes::{}::module())\n",
@@ -2431,8 +2771,14 @@ fn module_body(m: &ModuleDesign, indent: &str, mode: GenMode) -> String {
     body
 }
 
-fn mod_decls(m: &ModuleDesign) -> String {
+fn mod_decls(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     let mut out = String::from("mod deps;\nmod handlers;\n");
+    // `members` (issue #107) sits between handlers and model: `mod` decls are
+    // emitted in ALPHABETICAL order so rustfmt's `reorder_modules` is a no-op
+    // (same reasoning as main.rs's module decls, issue #120).
+    if emits_member_surface(m, mode, design) {
+        out.push_str("mod members;\n");
+    }
     if !m.entities.is_empty() {
         out.push_str("mod model;\nmod repo;\n");
     }
@@ -2442,21 +2788,21 @@ fn mod_decls(m: &ModuleDesign) -> String {
     out
 }
 
-pub(crate) fn lib_rs(m: &ModuleDesign, mode: GenMode) -> String {
+pub(crate) fn lib_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     format!(
         "//! Route module `{name}` — TOOL-OWNED, regenerated by `jerrycan generate`.\n//! The sole public item is `module()`; agent code lives in handlers/model/repo/deps.\n#![forbid(unsafe_code)]\n\n{mods}\nuse jerrycan::prelude::*;\n\n/// Build this module's routes, subroutes, and scoped dependencies.\npub fn module() -> Module {{\n    deps::configure(\n{body}    )\n}}\n",
         name = m.name,
-        mods = mod_decls(m),
-        body = module_body(m, "        ", mode),
+        mods = mod_decls(m, mode, design),
+        body = module_body(m, "        ", mode, design),
     )
 }
 
-fn subroute_mod_rs(m: &ModuleDesign, mode: GenMode) -> String {
+fn subroute_mod_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     format!(
         "//! Subroute `{name}` — TOOL-OWNED mod.rs; same fractal shape as a module.\n\n{mods}\nuse jerrycan::prelude::*;\n\npub(crate) fn module() -> Module {{\n    deps::configure(\n{body}    )\n}}\n",
         name = m.name,
-        mods = mod_decls(m),
-        body = module_body(m, "        ", mode),
+        mods = mod_decls(m, mode, design),
+        body = module_body(m, "        ", mode, design),
     )
 }
 
@@ -2486,8 +2832,17 @@ fn is_salient_decl(trimmed: &str) -> bool {
 fn is_tool_decl(trimmed: &str) -> bool {
     matches!(
         trimmed,
-        "mod deps;" | "mod handlers;" | "mod model;" | "mod repo;" | "mod subroutes;"
+        "mod deps;" | "mod handlers;" | "mod members;" | "mod model;" | "mod repo;"
+            | "mod subroutes;"
     ) || trimmed == "use jerrycan::prelude::*;"
+        // members.rs (issue #107) — its two tool-emitted imports: the fixed
+        // shared-guard line and the `use super::repo::{XMember, XRepo};` shape
+        // (matched narrowly so an agent's own `use super::repo::…` in a lib.rs
+        // is still recognized as agent wiring).
+        || trimmed == "use shared::{CurrentUser, Tenant};"
+        || (trimmed.starts_with("use super::repo::{")
+            && trimmed.ends_with("Repo};")
+            && trimmed.contains("Member, "))
         || trimmed
             .strip_prefix("pub(crate) mod ")
             .and_then(|r| r.strip_suffix(';'))
@@ -2603,12 +2958,13 @@ pub fn write_module_reporting(
     )?;
     write_tool_owned(
         &src.join("lib.rs"),
-        &lib_rs(m, mode),
+        &lib_rs(m, mode, design),
         &mut created,
         &root,
         &mut dropped,
     )?;
     write_unit_files(&src, m, mode, design, &mut created, &root)?;
+    write_members(&src, m, mode, design, &mut created, &root, &mut dropped)?;
     write_subroutes(&src, m, mode, design, &mut created, &root, &mut dropped)?;
     // db mode: agent-owned create-once migrations for this crate (module + subroutes).
     if mode.db {
@@ -2648,6 +3004,33 @@ fn write_unit_files(
     Ok(())
 }
 
+/// Write — or, when the design no longer emits the surface (tenancy dropped,
+/// entity moved) — REMOVE the tool-owned `members.rs` beside this module's
+/// handlers (issue #107). Removal mirrors mounting's stale-crate cleanup: a
+/// leftover would be unreferenced (`mod members;` is gone from lib.rs) but
+/// would sit in the crate as dead tool output.
+fn write_members(
+    dir: &Path,
+    m: &ModuleDesign,
+    mode: GenMode,
+    design: &Design,
+    created: &mut Vec<String>,
+    root: &Path,
+    dropped: &mut DroppedDecls,
+) -> Result<(), String> {
+    let path = dir.join("members.rs");
+    match members_rs(m, mode, design) {
+        Some(content) => write_tool_owned(&path, &content, created, root, dropped),
+        None => {
+            if path.exists() {
+                fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+                created.push(rel(&path, root));
+            }
+            Ok(())
+        }
+    }
+}
+
 fn write_subroutes(
     src: &Path,
     m: &ModuleDesign,
@@ -2670,12 +3053,13 @@ fn write_subroutes(
         let dir = sub_root.join(sub.name.replace('-', "_"));
         write_tool_owned(
             &dir.join("mod.rs"),
-            &subroute_mod_rs(sub, mode),
+            &subroute_mod_rs(sub, mode, design),
             created,
             root,
             dropped,
         )?;
         write_unit_files(&dir, sub, mode, design, created, root)?;
+        write_members(&dir, sub, mode, design, created, root, dropped)?;
         write_subroutes(&dir, sub, mode, design, created, root, dropped)?; // arbitrary depth
     }
     Ok(())
@@ -2818,6 +3202,62 @@ pub fn route_map(design: &Design) -> Vec<RouteEntry> {
     out
 }
 
+/// The implicit member-management routes (issue #107): the tool-owned
+/// `/{fk}/members` + `/{fk}/members/{user_id}` pair `module_body` registers for
+/// the tenant module, as mount-resolved `RouteEntry` rows (handlers named by
+/// their OpenAPI operation ids). Deliberately NOT folded into `route_map`:
+/// testgen and the OpenAPI emitter own their member-surface output separately,
+/// so polluting the design-endpoint table would double-emit there. Design-time
+/// conflict detection (`router_param_conflict`, JC0542) and the route listing DO
+/// consume these, so a design endpoint colliding with the reserved paths fails
+/// `check` instead of aborting `App::build` (JC0500), and `jerrycan routes`
+/// shows the full live surface. Empty without tenancy (or without db/auth) —
+/// the same `emits_member_surface` gate the generator runs.
+pub fn implicit_member_routes(design: &Design) -> Vec<RouteEntry> {
+    let mode = GenMode {
+        db: design.wants_db(),
+        auth: design.wants_auth(),
+    };
+    fn walk(
+        m: &ModuleDesign,
+        prefix: &str,
+        top: &str,
+        mode: GenMode,
+        design: &Design,
+        out: &mut Vec<RouteEntry>,
+    ) {
+        let base = format!("{}{}", prefix, m.effective_mount());
+        if emits_member_surface(m, mode, design) {
+            let tenancy = design.tenancy.as_ref().expect("gated on tenancy");
+            let fk = Design::fk_column(&tenancy.entity);
+            let snake = Design::to_snake(&tenancy.entity);
+            let collection = format!("{}/{{{fk}}}/members", base.trim_end_matches('/'));
+            let item = format!("{collection}/{{user_id}}");
+            for (method, path, handler) in [
+                ("GET", &collection, format!("list_{snake}_members")),
+                ("POST", &collection, format!("add_{snake}_member")),
+                ("PATCH", &item, format!("set_{snake}_member_role")),
+                ("DELETE", &item, format!("remove_{snake}_member")),
+            ] {
+                out.push(RouteEntry {
+                    method: method.to_string(),
+                    path: path.clone(),
+                    module: top.to_string(),
+                    handler,
+                });
+            }
+        }
+        for sub in &m.subroutes {
+            walk(sub, &base, top, mode, design, out);
+        }
+    }
+    let mut out = Vec::new();
+    for m in &design.modules {
+        walk(m, "", &m.name, mode, design, &mut out);
+    }
+    out
+}
+
 pub fn module_by_path<'a>(design: &'a Design, path: &str) -> Option<&'a ModuleDesign> {
     let mut parts = path.split('/');
     let first = parts.next()?;
@@ -2849,6 +3289,65 @@ pub(crate) mod tests {
 
     fn todos() -> ModuleDesign {
         demo().modules.into_iter().next().unwrap()
+    }
+
+    /// #107: `implicit_member_routes` is the conflict walker's + route lister's
+    /// view of the tool-owned `/{fk}/members` surface `module_body` registers —
+    /// mount-resolved rows for the tenant module ONLY, handlers named by their
+    /// OpenAPI operation ids, and NONE without tenancy or without db/auth. It
+    /// must stay OUT of `route_map` (testgen/OpenAPI own their member-surface
+    /// emission), so a design that never emits the surface sees no rows at all.
+    #[test]
+    fn implicit_member_routes_mirror_the_registered_member_surface() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "clubs-api", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+            "modules": [{
+                "name": "clubs",
+                "entities": [{ "name": "Club", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "name", "type": "string" } ]}],
+                "endpoints": [
+                    { "operation_id": "list_clubs", "method": "GET", "path": "/",
+                      "auth_required": true,
+                      "success": { "status": 200, "entity": "Club", "list": true } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let rows = implicit_member_routes(&d);
+        let flat: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("GET", "/clubs/{club_id}/members"),
+                ("POST", "/clubs/{club_id}/members"),
+                ("PATCH", "/clubs/{club_id}/members/{user_id}"),
+                ("DELETE", "/clubs/{club_id}/members/{user_id}"),
+            ],
+            "the four registered member routes, mount-resolved"
+        );
+        assert!(rows.iter().all(|r| r.module == "clubs"));
+        assert_eq!(rows[0].handler, "list_club_members");
+        assert_eq!(rows[3].handler, "remove_club_member");
+        // The member routes never leak into the design-endpoint table.
+        assert!(
+            route_map(&d).iter().all(|r| !r.path.contains("/members")),
+            "route_map stays design-endpoints-only"
+        );
+        // No tenancy (the MINIMAL demo): no surface.
+        assert!(implicit_member_routes(&demo()).is_empty());
+        // Memory mode (no `db` dependency): no members table, no surface.
+        let mut mem = d.clone();
+        mem.dependencies.retain(|dep| dep != "db");
+        assert!(implicit_member_routes(&mem).is_empty());
     }
 
     /// The DDL must declare the fk columns the Model derives from belongs_to (the
@@ -4243,6 +4742,466 @@ pub(crate) mod tests {
         );
     }
 
+    /// Issue #107 / 0.6.0 Task 1: the tenant entity's own repo carries the full
+    /// member-management surface — list/add/re-role/remove plus the
+    /// `count_admins` helper backing the last-admin guard — as REAL SQL keyed on
+    /// the PATH tenant fk the membership guard already verified. Without these,
+    /// every tenancy app hand-writes `INSERT INTO {tenant}_members …` (the #107
+    /// finding), which is exactly the raw-SQL drift a generated surface kills.
+    #[test]
+    fn tenant_entity_repo_gets_member_management_methods() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains("pub async fn members_of(&self, fk: i64) -> Result<Vec<ClubMember>>"),
+            "members_of lists the roster as typed rows:\n{src}"
+        );
+        assert!(
+            src.contains(
+                "SELECT id, user_id, role FROM club_members WHERE club_id = ? ORDER BY id"
+            ),
+            "members_of reads only the path tenant's rows:\n{src}"
+        );
+        assert!(
+            src.contains(
+                "pub async fn add_member(&self, fk: i64, user_id: String, role: String) -> Result<()>"
+            ),
+            "add_member exists:\n{src}"
+        );
+        assert!(
+            src.contains(
+                "pub async fn set_member_role(&self, fk: i64, user_id: String, role: String) -> Result<bool>"
+            ),
+            "set_member_role exists:\n{src}"
+        );
+        assert!(
+            src.contains("UPDATE club_members SET role = ? WHERE user_id = ? AND club_id = ?"),
+            "set_member_role updates scoped to (user, tenant):\n{src}"
+        );
+        assert!(
+            src.contains(
+                "pub async fn remove_member(&self, fk: i64, user_id: String) -> Result<bool>"
+            ),
+            "remove_member exists:\n{src}"
+        );
+        assert!(
+            src.contains("DELETE FROM club_members WHERE user_id = ? AND club_id = ?"),
+            "remove_member deletes scoped to (user, tenant):\n{src}"
+        );
+        assert!(
+            src.contains("pub async fn count_admins(&self, fk: i64) -> Result<i64>"),
+            "count_admins helper exists:\n{src}"
+        );
+        assert!(
+            src.contains("SELECT COUNT(*) AS n FROM club_members WHERE club_id = ? AND role = ?"),
+            "count_admins counts one tenant's admins:\n{src}"
+        );
+    }
+
+    /// #107 review nit (Rule 9): `add_member`'s INSERT column order AND its
+    /// bound-value order must agree POSITIONALLY — a swapped bind array (e.g.
+    /// `[fk, user_id, role]`) still compiles and passes every shape-only test,
+    /// but writes the tenant id into `user_id` and the user id into the fk,
+    /// silently corrupting every membership it creates. Pin both the SQL column
+    /// list and the exact bind array, in the add_member body specifically.
+    #[test]
+    fn add_member_binds_match_the_insert_column_order() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        let add_body =
+            &src[src.find("fn add_member").unwrap()..src.find("fn set_member_role").unwrap()];
+        assert!(
+            add_body.contains("INSERT INTO club_members (user_id, club_id, role) VALUES (?, ?, ?)"),
+            "add_member inserts (user_id, fk, role) in that column order:\n{add_body}"
+        );
+        assert!(
+            add_body.contains("[user_id.into(), fk.into(), role.into()]"),
+            "add_member's bind array must be [user_id, fk, role] — the SAME order as \
+             the INSERT columns (a swapped bind compiles but corrupts memberships):\n{add_body}"
+        );
+    }
+
+    /// The member surface's row type and role rule are BAKED into the generated
+    /// code: a serializable `{Tenant}Member` row (a later handler returns
+    /// `[{id, user_id, role}]` without hand-rolling a DTO), and the design's
+    /// `member_roles` as a const validated on add/re-role → 422 (no DB CHECK
+    /// backs the column). A duplicate add is NOT pre-checked in the repo — the
+    /// UNIQUE(user_id, fk) index fires and jerrycan-db's `db_error` maps it to
+    /// 409, so there is exactly ONE conflict mapping and no drift.
+    #[test]
+    fn member_row_type_roles_const_and_validation_are_baked_in() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains("#[derive(serde::Serialize, sea_orm::FromQueryResult)]")
+                && src.contains("pub struct ClubMember {"),
+            "typed serializable member row:\n{src}"
+        );
+        assert!(
+            src.contains("pub id: i64,")
+                && src.contains("pub user_id: String,")
+                && src.contains("pub role: String,"),
+            "row shape is id + user_id + role:\n{src}"
+        );
+        assert!(
+            src.contains("const MEMBER_ROLES: &[&str] = &[\"owner\", \"member\"];"),
+            "declared member_roles baked as a const:\n{src}"
+        );
+        assert!(
+            src.contains("if !MEMBER_ROLES.contains(&role.as_str())")
+                && src.contains("Error::unprocessable(\"role must be one of: owner, member\")"),
+            "an out-of-set role is refused as 422:\n{src}"
+        );
+        // `find_by_statement` (typed member rows) is a FromQueryResult trait
+        // method, so the trait joins the facade imports for this module.
+        assert!(
+            src.contains(
+                "use jerrycan::db::sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait, EntityTrait, FromQueryResult, QueryOrder};"
+            ),
+            "FromQueryResult joins the trait imports:\n{src}"
+        );
+        // No second conflict path: add_member carries no Error::conflict of its
+        // own — the UNIQUE index + db_error IS the 409.
+        let add_body =
+            &src[src.find("fn add_member").unwrap()..src.find("fn set_member_role").unwrap()];
+        assert!(
+            !add_body.contains("Error::conflict"),
+            "duplicate adds must surface via db_error, not a second mapping:\n{add_body}"
+        );
+    }
+
+    /// Integrity (#107 design §B): the LAST admin can neither be demoted nor
+    /// removed — both paths 409 — otherwise the tenant is permanently locked out
+    /// of member management (nobody left holding member_roles[0], and the write
+    /// gate is admin-only). Re-affirming the admin role on the last admin stays
+    /// legal: the demote guard fires only when the role actually changes.
+    #[test]
+    fn member_writes_enforce_the_last_admin_guard() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains("Error::conflict(\"cannot demote the last owner\")"),
+            "demoting the last admin is refused:\n{src}"
+        );
+        assert!(
+            src.contains("Error::conflict(\"cannot remove the last owner\")"),
+            "removing the last admin is refused:\n{src}"
+        );
+        // Both writes consult the per-tenant admin count.
+        assert_eq!(
+            src.matches("self.count_admins(fk).await? == 1").count(),
+            2,
+            "both writes check the per-tenant admin count:\n{src}"
+        );
+        // The admin role is the FIRST declared member_role, bound in count_admins.
+        assert!(
+            src.contains("[fk.into(), \"owner\".into()]"),
+            "count_admins counts the first declared role:\n{src}"
+        );
+        assert!(
+            src.contains("&& role != \"owner\""),
+            "re-setting the same admin role is not a demotion:\n{src}"
+        );
+    }
+
+    /// NO-DRIFT (byte-identity): the member surface exists ONLY on the tenancy
+    /// entity's own repo. A non-tenant entity in a tenancy design, and every
+    /// entity in a non-tenancy design, emit exactly the pre-#107 repo — no
+    /// member methods, no row struct, no roles const, no FromQueryResult import.
+    #[test]
+    fn member_surface_is_confined_to_the_tenant_repo() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        // (a) tenancy design, NON-tenant module: leads (V1_FULL modules[1]).
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let leads = repo_rs(&d.modules[1], mode, &d).unwrap();
+        for needle in [
+            "members_of",
+            "add_member",
+            "set_member_role",
+            "remove_member",
+            "count_admins",
+            "MEMBER_ROLES",
+            "LeadMember",
+        ] {
+            assert!(
+                !leads.contains(needle),
+                "non-tenant repo must not carry `{needle}`:\n{leads}"
+            );
+        }
+        // (b) the SAME tenant module with tenancy stripped: nothing member-shaped
+        // remains, including the FromQueryResult import — byte-identical output.
+        let mut d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        d.tenancy = None;
+        let clubs = repo_rs(&d.modules[0], mode, &d).unwrap();
+        for needle in [
+            "members_of",
+            "add_member",
+            "set_member_role",
+            "remove_member",
+            "count_admins",
+            "MEMBER_ROLES",
+            "ClubMember",
+            "FromQueryResult",
+        ] {
+            assert!(
+                !clubs.contains(needle),
+                "non-tenancy repo must not carry `{needle}`:\n{clubs}"
+            );
+        }
+    }
+
+    /// A TEXT-pk tenant (uuid/string id — the migrated-Supabase shape): the fk
+    /// param is `String`, so the guard pre-checks clone it and the final bound
+    /// statement still receives the owned value.
+    #[test]
+    fn member_methods_take_a_text_tenant_fk_when_the_tenant_pk_is_text() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "orgs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["admin", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Org", "member_roles": ["admin", "member"] },
+                "modules": [
+                    { "name": "orgs",
+                      "entities": [{ "name": "Org", "fields": [
+                          { "name": "id", "type": "string" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [
+                          { "operation_id": "create_org", "method": "POST", "path": "/", "auth_required": true,
+                            "request_body": { "entity": "Org" },
+                            "success": { "status": 201, "entity": "Org" } } ] }
+                ] }"#,
+        )
+        .unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        assert!(
+            src.contains("pub async fn members_of(&self, fk: String) -> Result<Vec<OrgMember>>"),
+            "text tenant pk means a String fk param:\n{src}"
+        );
+        assert!(
+            src.contains("self.count_admins(fk.clone()).await? == 1"),
+            "a String fk is cloned into the admin-count pre-check:\n{src}"
+        );
+    }
+
+    /// Issue #107 / 0.6.0 Task 2: the tenant module gains a TOOL-OWNED, fully
+    /// implemented members.rs (like storagegen's bucket handlers — never agent
+    /// stubs) whose four handlers call the Task-1 repo methods under the right
+    /// gates: `Dep<Tenant>` everywhere (the path-scoped guard 404s non-members),
+    /// `require_role(member_roles[0])` on every write, and the self-removal
+    /// exception on DELETE (comparing the path `user_id` to the CALLER'S id, so
+    /// any member can leave without holding the admin role).
+    #[test]
+    fn tenant_module_emits_the_tool_owned_member_surface() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let src = members_rs(&d.modules[0], mode, &d).expect("tenant module emits members.rs");
+        // list: guard-only (no require_role), scoped to the PATH tenant.
+        assert!(
+            src.contains("pub(crate) async fn list_members(")
+                && src.contains("Ok(Json(repo.members_of(tenant.id()).await?))"),
+            "list_members reads the path tenant's roster:\n{src}"
+        );
+        let list_body =
+            &src[src.find("fn list_members").unwrap()..src.find("fn add_member").unwrap()];
+        assert!(
+            !list_body.contains("require_role"),
+            "any member may list — no role gate on reads:\n{list_body}"
+        );
+        // add: admin gate BEFORE the repo call.
+        let add_body =
+            &src[src.find("fn add_member").unwrap()..src.find("fn set_member_role").unwrap()];
+        let gate = add_body
+            .find("tenant.require_role(\"owner\")?;")
+            .expect("add is admin-gated");
+        let call = add_body
+            .find("repo.add_member(tenant.id(), body.user_id.clone(), body.role.clone())")
+            .expect("add calls the T1 repo method");
+        assert!(
+            gate < call,
+            "the role gate must run BEFORE the write:\n{add_body}"
+        );
+        // set-role: admin gate + 404 on an unknown member.
+        let set_body =
+            &src[src.find("fn set_member_role").unwrap()..src.find("fn remove_member").unwrap()];
+        let gate = set_body
+            .find("tenant.require_role(\"owner\")?;")
+            .expect("set is admin-gated");
+        let call = set_body
+            .find(".set_member_role(tenant.id(), user_id, body.role)")
+            .expect("set calls the T1 repo method");
+        assert!(
+            gate < call,
+            "the role gate must run BEFORE the write:\n{set_body}"
+        );
+        assert!(
+            set_body.contains("Err(Error::not_found())"),
+            "an unknown member is 404:\n{set_body}"
+        );
+        // remove: the SELF-REMOVAL exception — the admin gate applies ONLY when the
+        // target is someone else, so any member can leave.
+        let rm_body = &src[src.find("fn remove_member").unwrap()..];
+        assert!(
+            rm_body.contains(
+                "if user_id != user.0.id {\n        tenant.require_role(\"owner\")?;\n    }"
+            ),
+            "self-removal skips the admin gate; removing others requires it:\n{rm_body}"
+        );
+        assert!(
+            rm_body.contains("repo.remove_member(tenant.id(), user_id).await?"),
+            "remove calls the T1 repo method:\n{rm_body}"
+        );
+        // remove is the only handler needing the caller's identity for the compare.
+        assert!(
+            rm_body.contains("user: CurrentUser"),
+            "remove takes the caller to compare ids:\n{rm_body}"
+        );
+        // Every handler is guard-scoped: 4 handlers, 4 `Dep<Tenant>` params.
+        assert_eq!(
+            src.matches("tenant: Dep<Tenant>").count(),
+            4,
+            "all four handlers take the membership-verifying guard:\n{src}"
+        );
+    }
+
+    /// The member routes are REGISTERED path-scoped in the tenant module's
+    /// tool-owned lib.rs — `mod members;` + two `.route` lines on the tenant fk
+    /// param, so the shared guard's by-name fk lookup verifies membership in the
+    /// PATH tenant (the whole point of mounting under `/{fk}`). The fk name
+    /// matches the tenant's own detail routes by construction
+    /// (`normalize_tenant_detail_routes`), keeping the router's
+    /// one-param-name-per-position rule intact.
+    #[test]
+    fn member_routes_are_mounted_in_the_tenant_module_lib() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let lib = lib_rs(&d.modules[0], mode, &d);
+        assert!(
+            lib.contains("mod members;\n"),
+            "members module declared:\n{lib}"
+        );
+        assert!(
+            lib.contains(
+                ".route(\"/{club_id}/members\", get(members::list_members).post(members::add_member))"
+            ),
+            "collection routes on the tenant fk param:\n{lib}"
+        );
+        assert!(
+            lib.contains(
+                ".route(\"/{club_id}/members/{user_id}\", patch(members::set_member_role).delete(members::remove_member))"
+            ),
+            "item routes on the tenant fk param:\n{lib}"
+        );
+        // Alphabetical mod order (rustfmt reorder_modules must stay a no-op).
+        assert!(
+            lib.contains("mod handlers;\nmod members;\nmod model;"),
+            "mod decls stay alphabetically sorted:\n{lib}"
+        );
+    }
+
+    /// NO-DRIFT (byte-identity): the member surface is emitted ONLY for the
+    /// module that declares the tenancy entity, in db+auth mode. A non-tenant
+    /// module, a tenancy-stripped design, and memory/no-auth modes all emit
+    /// exactly the pre-#107 lib.rs (no `members` token) and no members.rs.
+    #[test]
+    fn member_surface_is_confined_to_the_tenant_module_and_db_auth_mode() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        // (a) tenancy design, NON-tenant module.
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        assert!(
+            members_rs(&d.modules[1], mode, &d).is_none(),
+            "leads is not the tenant"
+        );
+        assert!(
+            !lib_rs(&d.modules[1], mode, &d).contains("members"),
+            "non-tenant lib.rs must not mention members"
+        );
+        // (b) the SAME tenant module with tenancy stripped: byte-identical lib.rs.
+        let mut dt: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let with = lib_rs(&dt.modules[0], mode, &dt);
+        assert!(members_rs(&dt.modules[0], mode, &dt).is_some());
+        dt.tenancy = None;
+        let without = lib_rs(&dt.modules[0], mode, &dt);
+        assert!(members_rs(&dt.modules[0], mode, &dt).is_none());
+        assert!(
+            !without.contains("members"),
+            "stripped design: no members:\n{without}"
+        );
+        assert_eq!(
+            with.replace(
+                "            .route(\"/{club_id}/members\", get(members::list_members).post(members::add_member))\n            .route(\"/{club_id}/members/{user_id}\", patch(members::set_member_role).delete(members::remove_member))\n",
+                ""
+            )
+            .replace("mod members;\n", ""),
+            without,
+            "the ONLY lib.rs delta is the member surface"
+        );
+        // (c) mode gates: no db (no members table/repo) or no auth (no guard) → none.
+        let dt: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        for (db, auth) in [(false, true), (true, false), (false, false)] {
+            let mode = GenMode { db, auth };
+            assert!(
+                members_rs(&dt.modules[0], mode, &dt).is_none(),
+                "db={db} auth={auth} must not emit the surface"
+            );
+            assert!(
+                !lib_rs(&dt.modules[0], mode, &dt).contains("members"),
+                "db={db} auth={auth} lib.rs must not mention members"
+            );
+        }
+    }
+
     /// The tenant's own COLLECTION handlers are steered to the membership-lifecycle
     /// methods by construction: `create_*` to `create_with_membership` (never the bare
     /// `insert`, which would leave the tenant memberless), and the tenant `list_*` to
@@ -4306,7 +5265,7 @@ pub(crate) mod tests {
         };
 
         // Route table: the router now captures `club_id`, so the guard verifies it.
-        let lib = lib_rs(&d.modules[0], mode);
+        let lib = lib_rs(&d.modules[0], mode, &d);
         assert!(
             lib.contains(
                 ".route(\"/{club_id}\", get(handlers::get_club).delete(handlers::delete_club))"
@@ -4577,7 +5536,7 @@ pub(crate) mod tests {
     #[test]
     fn lib_rs_groups_routes_by_path_and_mounts_subroutes() {
         let m = todos();
-        let lib = lib_rs(&m, GenMode::default());
+        let lib = lib_rs(&m, GenMode::default(), &demo());
         assert!(lib.contains("pub fn module() -> Module"), "{lib}");
         assert!(
             lib.contains(".route(\"/\", get(handlers::list_todos).post(handlers::create_todo))"),
@@ -4617,7 +5576,7 @@ pub(crate) mod tests {
             db: true,
             auth: true,
         };
-        let lib = lib_rs(&d.modules[1], mode);
+        let lib = lib_rs(&d.modules[1], mode, &d);
         assert!(
             lib.contains(".provide_dep(repo::api_key_repo)"),
             "lib.rs must reference the snake_case repo factory: {lib}"
@@ -4750,6 +5709,7 @@ pub(crate) mod tests {
             db: true,
             auth: true,
         };
+        let d = demo();
         let m = todos(); // has entities + a `comments` subroute
         let comments = &m.subroutes[0];
 
@@ -4757,12 +5717,21 @@ pub(crate) mod tests {
         // `write_subroutes`; reproduce that line so this guard covers it too.
         let sub_decl = format!("pub(crate) mod {};\n", comments.name.replace('-', "_"));
 
+        // The tenant module's emissions (issue #107): `mod members;` in its lib.rs
+        // plus members.rs's own tool-emitted imports must all be recognized, or a
+        // clean regeneration of a TENANCY app would false-positive.
+        let dt: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let tenant_lib = lib_rs(&dt.modules[0], mode, &dt);
+        let tenant_members = members_rs(&dt.modules[0], mode, &dt).expect("tenant module emits");
+
         let emissions = [
-            mod_decls(&m),
-            lib_rs(&m, mode),
-            subroute_mod_rs(comments, mode),
-            mod_decls(comments),
+            mod_decls(&m, mode, &d),
+            lib_rs(&m, mode, &d),
+            subroute_mod_rs(comments, mode, &d),
+            mod_decls(comments, mode, &d),
             sub_decl,
+            tenant_lib,
+            tenant_members,
         ];
 
         let mut seen = std::collections::HashSet::new();
@@ -4784,10 +5753,13 @@ pub(crate) mod tests {
         for expected in [
             "mod deps;",
             "mod handlers;",
+            "mod members;",
             "mod model;",
             "mod repo;",
             "mod subroutes;",
             "use jerrycan::prelude::*;",
+            "use shared::{CurrentUser, Tenant};",
+            "use super::repo::{ClubMember, ClubRepo};",
             "pub(crate) mod comments;",
         ] {
             assert!(

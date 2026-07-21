@@ -380,8 +380,8 @@ hand-written variant must pin the id to the path param too: a body id could addr
 another tenant's or user's row (issue #92).)
 
 ## Creating a tenant auto-seeds membership + membership-filtered list
-There is **no hand-written membership INSERT**. The tenant entity's own repo gets two
-generated methods, and its collection handlers are steered to them:
+There is **no hand-written membership INSERT**. The tenant entity's own repo gets
+these generated methods, and its collection handlers are steered to the first two:
 
 - `create_with_membership(user_id, item)` inserts the tenant AND seeds the creator
   into `{tenant}_members` as the first declared `member_role`, in one transaction —
@@ -389,11 +389,58 @@ generated methods, and its collection handlers are steered to them:
   next request. "Creator becomes organizer" is guaranteed, not an agent TODO.
 - `all_for_member(user_id)` lists ONLY the tenants the caller belongs to
   (`JOIN {tenant}_members ... WHERE user_id = ?`), never the unscoped `all()`.
+- `members_of(fk)`, `add_member(fk, user_id, role)`, `set_member_role(fk, user_id,
+  role)`, `remove_member(fk, user_id)`, plus the `count_admins(fk)` helper, back
+  the generated member-management routes (next section) — real SQL against
+  `{tenant}_members`, keyed on the path tenant fk the guard verified. You rarely
+  call these yourself: the generated member handlers already do.
 
 The generated collection handlers carry a stub comment naming these methods, so a
 `POST /clubs/` create routes to `create_with_membership(_user.0.id, ...)` and a
 `GET /clubs/` list to `all_for_member(_user.0.id)`. This is what makes the guard
 above work end to end: the create is what puts the membership row in place.
+
+## Member management is generated — list, add, set-role, remove (no raw SQL)
+Every tenancy app gets a complete, tool-owned member-management surface — you never
+hand-write an `INSERT INTO {tenant}_members ...` to invite someone. Four routes are
+registered on the tenant module, path-scoped under the tenant fk, so the same
+membership-verified `Tenant` guard runs first (a non-member of the addressed tenant
+gets `404` before any handler):
+
+- `GET /{tenant}/{fk}/members` — the roster `[{id, user_id, role}]`. Any member may
+  read it; the guard is the whole gate.
+- `POST /{tenant}/{fk}/members` — add `{user_id, role}` → `201`. Admin-gated. A
+  duplicate membership is `409` (the `UNIQUE(user_id, fk)` index); `user_id` is
+  opaque (no FK to a user table — migrated-uuid support), so existence is not
+  DB-verified.
+- `PATCH /{tenant}/{fk}/members/{user_id}` — set `{role}` → `204`. Admin-gated; an
+  unknown member is `404`.
+- `DELETE /{tenant}/{fk}/members/{user_id}` — remove → `204`. Admin-gated, EXCEPT
+  self-removal: any member may DELETE their **own** membership ("leave") without
+  the admin role. An unknown member is `404`.
+
+The rules the generated handlers and repo enforce:
+
+- **The admin role is `member_roles[0]`** — position 0 of the design's
+  `tenancy.member_roles`, by convention (this is why `JC0548` requires the list to
+  be non-empty and duplicate-free). Writes call
+  `tenant.require_role(member_roles[0])`; a non-admin write is `403`.
+- **`role ∈ member_roles`** on add and set-role — an out-of-set role is `422` (the
+  membership table has no DB CHECK on the role column; the generated code is the
+  validator).
+- **Last-admin protection**: removing or demoting the last member holding the
+  admin role is `409` — a tenant can never be left admin-less (nobody could manage
+  members again). This applies to self-removal too.
+
+The routes are first-class: they appear in the generated OpenAPI (with the `role`
+enum pinned to the declared `member_roles`) and in `jerrycan routes`, and the
+generated acceptance suite covers them (list, add, non-admin 403, set-role,
+remove, last-admin 409, self-leave, out-of-set-role 422). Those tests pass on a
+fresh scaffold — the handlers are real generated code, not stubs — and turn red
+only if the surface breaks. A single-role design emits only the four
+role-independent tests (list, add, last-admin remove 409, out-of-set-role 422) —
+the other five need a seeded non-admin member, which a one-role design cannot
+express.
 
 ## Errors you'll hit
 - No session (missing/invalid cookie or bearer) → `401 JC0401`. The `Tenant` factory
@@ -402,6 +449,9 @@ above work end to end: the create is what puts the membership row in place.
   (no existence leak — a non-member cannot tell a real tenant from a missing one).
 - A write to a tenant the caller doesn't belong to, or a `require_role` mismatch →
   `403 JC0403`.
+- On the member routes: an out-of-set `role` on add/set-role → `422`; a duplicate
+  add, or removing/demoting the last admin → `409`; a non-admin member write
+  (other than self-removal) → `403`.
 - `JL0006` (a generation lint, not a runtime error): a handler for a tenant-owned or
   identity-owned entity called an unscoped repo method, so it could read or delete
   another tenant's (or user's) rows. Fix: call the scoped accessor for the route's
@@ -427,6 +477,10 @@ above work end to end: the create is what puts the membership row in place.
 - Don't hand-write the membership seed on tenant create. `create_with_membership`
   does it in one transaction; a hand-rolled INSERT is the thing that gets dropped and
   locks the creator out of their own tenant.
+- Don't hand-write member invite/remove/list routes or raw `{tenant}_members` SQL.
+  The generated member surface (above) already ships them with the admin gate, the
+  last-admin rule, and role validation — a hand-rolled variant is where those
+  protections silently go missing.
 - Don't share one membership seed across tests. Each acceptance test uses its own
   `sqlite::memory:` and seeds its own `{tenant}_members` rows, so a leaked membership
   can't make an isolation test pass by accident.

@@ -211,7 +211,7 @@ pub const REGISTRY: &[CodeInfo] = &[
     CodeInfo {
         code: "JC0542",
         title: "conflicting path parameters across sibling routes",
-        cause: "two routes reach the same path segment position through an identical prefix but name that position's `{param}` differently (e.g. `/tickets/{id}` and `/tickets/{ticket_id}/comments`) — the router keys each position by a SINGLE parameter name, so registering both aborts `App::build` at startup with JC0500 `conflicting path parameters` (after a clean scaffold, mid-test)",
+        cause: "two routes reach the same path segment position through an identical prefix but name that position's `{param}` differently (e.g. `/tickets/{id}` and `/tickets/{ticket_id}/comments`) — the router keys each position by a SINGLE parameter name, so registering both aborts `App::build` at startup with JC0500 `conflicting path parameters` (after a clean scaffold, mid-test); with `tenancy`, the implicit member-management routes (`/{tenant_fk}/members`, `/{tenant_fk}/members/{user_id}`, issue #107) join this check, so a tenant-module endpoint with a custom param name, or one occupying a reserved member path, conflicts the same way",
         fix: "give the shared segment ONE parameter name in every route that reaches it (rename `{ticket_id}`→`{id}` or vice versa), or restructure the nesting so the position is not shared (mount the diverging routes under distinct static prefixes)",
         doc: "jerrycan docs app",
     },
@@ -249,6 +249,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         cause: "a realtime `changes` entity reaches the tenant only through an intermediate parent (a grandchild chain like Contact -> Account -> Org), so its row image carries no tenant key column — change events could not be tenant-scoped and every tenant's rows would broadcast to every authenticated principal",
         fix: "the changes entity must be the tenant itself or a DIRECT child of it: flatten the relationship (give the entity its own belongs_to the tenant) or drop it from `changes`",
         doc: "jerrycan docs realtime",
+    },
+    CodeInfo {
+        code: "JC0548",
+        title: "invalid tenancy member_roles",
+        cause: "`tenancy.member_roles` is empty, repeats a role, or contains a role outside ^[A-Za-z0-9_-]+$ — `member_roles[0]` is the admin role the generated member-management surface gates on, the list becomes the generated MEMBER_ROLES allow-list and the OpenAPI `role` enum, and role names are interpolated UNESCAPED into generated Rust string literals (the MEMBER_ROLES const, the membership seed, `require_role` gates), so an empty or duplicated list breaks the admin-role convention and a quote or backslash emits a crate that fails to compile",
+        fix: "declare a non-empty, duplicate-free member_roles list of identifier-shaped names (letters, digits, `_`, `-`), admin role first (e.g. [\"owner\", \"member\"])",
+        doc: "jerrycan docs tenancy",
     },
     CodeInfo {
         code: "JC0530",
@@ -350,6 +357,32 @@ mod tests {
             dual.fix.contains("path parameter") && dual.fix.contains("split"),
             "JC0544 must name both remedies: {}",
             dual.fix
+        );
+    }
+
+    #[test]
+    fn jc0548_names_all_three_member_roles_failure_modes() {
+        // WHY: JC0548 is the agent's stop after `check` rejects a tenancy design's
+        // member_roles (#107) — the registry must name all three ways to be wrong
+        // (empty / duplicated / non-identifier), the admin-role convention the
+        // list backs, and the unescaped-interpolation reason for the charset.
+        let info = lookup("JC0548").unwrap();
+        assert!(
+            info.cause.contains("empty")
+                && info.cause.contains("repeats")
+                && info.cause.contains("[A-Za-z0-9_-]"),
+            "cause must name all three failure modes: {}",
+            info.cause
+        );
+        assert!(
+            info.cause.contains("member_roles[0]") && info.cause.contains("UNESCAPED"),
+            "cause must state the admin convention and the interpolation risk: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("non-empty") && info.fix.contains("admin role first"),
+            "fix must state the required shape: {}",
+            info.fix
         );
     }
 

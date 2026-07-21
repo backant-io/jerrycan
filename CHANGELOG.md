@@ -1,10 +1,57 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-07-21
 
-- `jerrycan onboard`: prints the guided build runbook; `--emit-skill --agent <id>` installs the jerrycan-backend skill for claude-code / cursor / codex / windsurf / generic.
-- Skill: explicit entry-path branching (existing project / from scratch / migrate from Supabase) + Phase 1c Supabase-migration runbook.
-- Release: tag-triggered prebuilt binaries (macOS arm64/x64, Linux x64/arm64 musl) + `cargo binstall jerrycan` support.
+First 0.6 minor — a new generated capability: **membership management**. Every
+many-membership tenancy app used to hand-seed `{tenant}_members` via raw SQL
+(the top eval friction); now the framework generates a full member surface.
+
+### New: member-management surface (#107)
+When a design has `tenancy`, jerrycan generates, on the tenant module, a real
+(not stub) member surface:
+- `GET  /{tenant}/{fk}/members` — list the roster (any member).
+- `POST /{tenant}/{fk}/members` `{user_id, role}` — add (admin-gated).
+- `PATCH /{tenant}/{fk}/members/{user_id}` `{role}` — change role (admin-gated).
+- `DELETE /{tenant}/{fk}/members/{user_id}` — remove; **self-removal** ("leave")
+  is allowed without the admin role.
+
+Authorization is correct-by-construction: writes require the **admin role**
+(`member_roles[0]`); the `Dep<Tenant>` guard 404s non-members of the addressed
+tenant (no cross-tenant management); **last-admin lockout** is refused (409 on
+removing/demoting the sole admin, including self); an out-of-set `role` is 422;
+a duplicate member is 409. The routes appear in the generated OpenAPI, and
+acceptance tests cover every gate.
+
+### Validation
+- **`JC0548`** — `member_roles` must be non-empty, duplicate-free, and
+  identifier-shaped (role names are interpolated into generated code).
+- **JC0542 hardened** — the implicit member routes now participate in
+  design-time conflict detection, and the comparison is segment-normalized, so a
+  trailing-slash or `//` collision (e.g. a hand-rolled `GET /{fk}/members/`) is
+  caught by `check` instead of panicking at `App::build`. Closes #140 (and the
+  pre-existing `/x` vs `/x/` design-route class).
+- **Supabase migrator** synthesizes a default `member_roles = ["admin","member"]`
+  when the source membership table has no role constraint (#139).
+
+### Behavior notes
+- Every tenancy app gains the member surface (additive routes; existing routes
+  unchanged). Non-tenancy apps are byte-identical to 0.5.4.
+- A design with empty/duplicated `member_roles` — including a pre-0.6.0 app
+  regenerated on 0.6.0 — now fails `check` with `JC0548`; add a valid roles list.
+
+### Deferred (tracked)
+- Last-admin guard is check-then-act (a concurrency race, #138); an entity named
+  `{Tenant}Member` collides with the members table (#141); storage `write_roles`
+  is now unblocked (#132); no live realtime-socket revocation on remove/re-role;
+  `require_role` stays single-role exact-match.
+
+### Onboarding & distribution
+- **`jerrycan onboard`** — prints the guided build runbook; `--emit-skill --agent <id>` installs the jerrycan-backend skill for claude-code / cursor / codex / windsurf / generic.
+- Skill: explicit entry-path branching (existing project / from scratch / migrate from Supabase) + a Phase 1c Supabase-migration runbook.
+- Release: tag-triggered **prebuilt binaries** (macOS arm64/x64, Linux x64/arm64 musl) + `cargo binstall jerrycan`.
+
+Framework Rust API additive (`cargo semver-checks` clean); the surface is
+generated-app code.
 
 ## 0.5.4 — 2026-07-21
 

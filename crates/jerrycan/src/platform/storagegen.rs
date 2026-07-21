@@ -368,11 +368,14 @@ pub fn acceptance_rs(design: &Design) -> String {
         let table = design.table_name(&tenancy.entity);
         let members = format!("{}_members", Design::to_snake(&tenancy.entity));
         let fk = Design::fk_column(&tenancy.entity);
+        // The seed role is member_roles[0]; JC0548 guarantees a non-empty list at
+        // design time, so the fallback is dead code — `"member"` to match
+        // genroute's (equally dead) seed-role fallback byte-for-byte.
         let role = tenancy
             .member_roles
             .first()
             .map(String::as_str)
-            .unwrap_or("owner");
+            .unwrap_or("member");
         let (cols1, vals1) = super::testgen::tenant_row_cols_vals(entity, "1", 1);
         let (cols2, vals2) = super::testgen::tenant_row_cols_vals(entity, "2", 2);
         let setup = format!(

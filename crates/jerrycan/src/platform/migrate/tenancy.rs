@@ -88,10 +88,20 @@ pub fn detect(db: &PgDatabase) -> TenancyDetection {
             .map(|fk| fk.ref_table.clone())
     });
 
-    let member_roles = membership_table
+    let mut member_roles = membership_table
         .as_ref()
         .map(|mt| membership_roles(db, mt))
         .unwrap_or_default();
+    // #139: a source membership table with NO role constraint (no CHECK IN, no
+    // enum) yields an empty role set — which the emitted design's tenancy block
+    // would fail JC0548 on (0.6.0 requires non-empty `member_roles`, since
+    // `member_roles[0]` is the admin role the generated member surface gates
+    // on). Synthesize the default pair, admin first, so role-less migrations
+    // keep translating; `authmap::build_auth` derives auth.roles from the same
+    // list, so the design stays self-consistent.
+    if membership_table.is_some() && member_roles.is_empty() {
+        member_roles = vec!["admin".to_string(), "member".to_string()];
+    }
 
     TenancyDetection {
         tenant_table,
@@ -377,6 +387,55 @@ create policy own on public.todos using (user_id = auth.uid());
             ),
             other => panic!("customers must gap, got {other:?}"),
         }
+    }
+
+    /// #139 (0.6.0 release blocker): a source membership table with NO role
+    /// constraint (no CHECK IN, no enum — common in hand-rolled Supabase
+    /// schemas) must NOT emit an empty `member_roles`: the migrated design
+    /// would fail JC0548 (`member_roles` non-empty is what makes
+    /// `member_roles[0]` a reliable admin role for the generated member
+    /// surface), turning a previously-translatable migration into a hard
+    /// check failure. The default pair is synthesized, admin FIRST.
+    #[test]
+    fn a_role_less_membership_table_synthesizes_the_default_member_roles() {
+        let schema = r#"
+create table public.teams (id uuid primary key, name text not null);
+create table public.team_members (
+    team_id uuid not null references public.teams(id) on delete cascade,
+    user_id uuid not null,
+    role text not null,
+    primary key (team_id, user_id)
+);
+create table public.notes (
+    id uuid primary key,
+    team_id uuid not null references public.teams(id),
+    body text not null
+);
+alter table public.notes enable row level security;
+create policy m on public.notes using
+    (team_id in (select team_id from public.team_members where user_id = auth.uid()));
+"#;
+        let db = PgDatabase::fold(&parse::split_and_parse(schema));
+        let det = detect(&db);
+        assert_eq!(det.membership_table.as_deref(), Some("public.team_members"));
+        assert_eq!(
+            det.member_roles,
+            vec!["admin", "member"],
+            "no role CHECK/enum -> the default pair, admin first (JC0548 needs non-empty)"
+        );
+        // The scoped translation itself is untouched by the synthesized roles.
+        let access = table_access(&db, &det);
+        assert!(matches!(access["public.notes"], TableAccess::Tenant { .. }));
+    }
+
+    /// The synthesized default NEVER overrides declared roles: a membership
+    /// table WITH a role CHECK keeps its declared set verbatim (the #139 fix
+    /// touches only the empty-roles path).
+    #[test]
+    fn declared_member_roles_are_never_overridden_by_the_default() {
+        let db = PgDatabase::fold(&parse::split_and_parse(ORG_SCHEMA));
+        let det = detect(&db);
+        assert_eq!(det.member_roles, vec!["owner", "member"]);
     }
 
     #[test]
