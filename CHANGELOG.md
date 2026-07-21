@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.5.4 — 2026-07-21
+
+Storage-tenancy security patch — continues the transitive-tenancy work into the
+storage subsystem (after HTTP routes in 0.5.1 and realtime in 0.5.3).
+
+### Security
+- **Transitive bucket owners — closed.** A storage bucket whose `owner` was a
+  *transitively* tenant-owned (grandchild) entity was mis-classified as
+  user-scoped: no `Dep<Tenant>` guard and no `tenant_id` stamping, so any
+  authenticated user could read/write it. Bucket ownership now uses the
+  transitive `tenant_path` resolver — a grandchild-owned bucket is membership-
+  guarded and tenant-stamped like a direct-owned one. Direct-owned buckets are
+  byte-identical.
+- **`JC0545` for ambiguous bucket owners.** A bucket owner that reaches the
+  tenant through more than one `belongs_to` path (a diamond) is refused at design
+  time instead of silently degrading to per-user scope.
+- **#109 — honest status.** A private tenant bucket's `download` accepts a
+  session OR a signed URL; the `Option<Dep<Tenant>>` extractor discarded the
+  guard's real status, so an authenticated **non-member** was reported **401**
+  instead of **403**. A new error-preserving `Result<T, Error>` request extractor
+  (`jerrycan-core`) keeps the guard's status: missing session → 401, non-member →
+  403, foreign-tenant member → 404, valid signed URL → works.
+
+### Deferred (tracked)
+- Owner-write / shared-read role split (#132, gated on the #107 membership
+  surface); cross-scope key-existence oracle (#133); storage's first-membership
+  arbitrariness (facet of #104) → 0.6.0.
+
+Framework Rust API additive only (`jerrycan-core` gains the `Result<T,Error>`
+extractor; `cargo semver-checks` clean). Non-storage apps and direct-owned
+buckets are byte-identical to 0.5.3.
+
 ## 0.5.3 — 2026-07-20
 
 Security patch — closes a **critical realtime broadcast leak**. A `changes`
