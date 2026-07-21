@@ -934,6 +934,8 @@ fn entity_by_table<'a>(design: &'a Design, table: &str) -> Option<&'a Entity> {
 /// role-gated DELETE on this module requires (so the isolation DELETE leg clears
 /// the role check and exercises the SCOPED `remove_for` — proving cross-tenant
 /// isolation, not a 403 role rejection), falling back to the first member role.
+/// The final fallback is dead code under JC0548 (member_roles is non-empty at
+/// design time) — `"member"` to match genroute's equally dead seed-role fallback.
 fn isolation_member_role<'a>(design: &'a Design, module: &'a ModuleDesign) -> &'a str {
     module
         .endpoints
@@ -948,7 +950,7 @@ fn isolation_member_role<'a>(design: &'a Design, module: &'a ModuleDesign) -> &'
                 .and_then(|t| t.member_roles.first())
                 .map(String::as_str)
         })
-        .unwrap_or("owner")
+        .unwrap_or("member")
 }
 
 /// The columns + values for a tenant row seeded at the given pk: id = the pk
@@ -1350,6 +1352,122 @@ fn tenant_collection_isolation_test(design: &Design, module: &ModuleDesign) -> S
     )
 }
 
+/// True when this module's acceptance file carries the #107 member-surface
+/// tests: db+auth+tenancy and the module DECLARES the tenancy entity — the same
+/// gate genroute's `emits_member_surface` uses, so the tests exist exactly where
+/// the generated member routes do and every other module (and every non-tenancy
+/// design) stays byte-identical.
+fn emits_member_surface_tests(design: &Design, module: &ModuleDesign) -> bool {
+    design.wants_db()
+        && design.wants_auth()
+        && design
+            .tenancy
+            .as_ref()
+            .is_some_and(|t| module.entities.iter().any(|e| e.name == t.entity))
+}
+
+/// The member-management surface tests (issue #107, spec §D): list/add/re-role/
+/// remove plus the SECURITY rules — the admin (`member_roles[0]`) gate (403), the
+/// last-admin lockout (409 on demote AND remove), self-removal without the admin
+/// role (204), and the role allow-list (422). WHY (Rule 9): the member routes are
+/// TOOL-OWNED with REAL generated handlers (members.rs), so unlike the stub
+/// probes these PASS on a fresh scaffold and turn RED only when the generated
+/// surface itself breaks — they are the runtime backstop for the #107 rules, and
+/// (like the enum reject probes) they are EXCLUDED from `expected_failing`.
+///
+/// `member_app()` seeds the tenant + memberships via RAW SQL (the same shape as
+/// `tenant_seed`), never through the module's own creator: the creator is an
+/// AGENT STUB on a fresh scaffold, so an HTTP-seeded setup would 500 before the
+/// member surface was ever reached. User 1 holds the admin role; user 2 (when a
+/// second role is declared) is the non-admin member the 403/self-removal probes
+/// act as. The tests that NEED that non-admin second role (403, re-role, remove,
+/// demote-409, self-leave) are emitted only for a multi-role design; a
+/// single-role design keeps list/add/last-admin-409/422.
+fn member_surface_tests(design: &Design, module: &ModuleDesign) -> String {
+    if !emits_member_surface_tests(design, module) {
+        return String::new();
+    }
+    let tenancy = design.tenancy.as_ref().expect("gated on tenancy");
+    let Some(entity) = module.entities.iter().find(|e| e.name == tenancy.entity) else {
+        return String::new();
+    };
+    let mount = module.effective_mount();
+    let base = mount.trim_end_matches('/').to_string();
+    let snake = Design::to_snake(&tenancy.entity);
+    let table = design.table_name(&tenancy.entity);
+    let members = format!("{snake}_members");
+    let fk = Design::fk_column(&tenancy.entity);
+    // The admin role is member_roles[0] by convention (JC0548 guarantees a
+    // non-empty list at design time; the dead fallback matches genroute's).
+    let admin = tenancy
+        .member_roles
+        .first()
+        .map(String::as_str)
+        .unwrap_or("member");
+    let second = tenancy.member_roles.get(1).map(String::as_str);
+    // A single-role design can only add another admin; a multi-role design adds
+    // a NON-admin member (the spec's "non-admin role" add).
+    let add_role = second.unwrap_or(admin);
+    let hk = design.test_auth_header();
+    let (cols, vals) = tenant_row_cols_vals(entity, "1", 1);
+    let mut migration_items = String::new();
+    collect_workspace_migration_items(design, module, &mut migration_items);
+    let auth_extend = format!(".extend(jerrycan::auth::Auth::with_secret(\"{TEST_SECRET}\"))");
+    let (_, ext_extends) = extension_wiring(design);
+    let second_seed = second
+        .map(|role| {
+            format!(
+                "    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (2, 1, '{role}')\")\n        .await\n        .expect(\"seed non-admin membership\");\n"
+            )
+        })
+        .unwrap_or_default();
+
+    let mut t = format!(
+        "/// #107 member surface: TOOL-OWNED routes with REAL generated handlers, so\n/// these tests pass on a fresh scaffold and turn RED only if the generated\n/// surface (admin gate, last-admin lockout, self-removal, role allow-list)\n/// breaks. Seeded via raw SQL — the HTTP surface under test is exactly what\n/// removes that need from application code.\nasync fn member_app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant row\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (1, 1, '{admin}')\")\n        .await\n        .expect(\"seed admin membership\");\n{second_seed}    App::new(){auth_extend}{ext_extends}.extend(db).provide_dep(shared::tenant).mount(\"{mount}\", module()).into_test()\n}}\n\n"
+    );
+
+    // list: any member sees the roster (the membership guard is the whole gate).
+    t.push_str(&format!(
+        "#[tokio::test]\nasync fn list_{snake}_members_returns_200() {{\n    let t = member_app().await;\n    let res = t.get_with(\"{base}/1/members\", &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(res.status().as_u16(), 200, \"design: any member lists the roster; body: {{}}\", res.text());\n    let rows: serde_json::Value = serde_json::from_str(&res.text()).expect(\"roster json\");\n    let has_admin = rows.as_array().map(|a| a.iter().any(|m| m[\"user_id\"] == serde_json::json!(\"1\") && m[\"role\"] == serde_json::json!(\"{admin}\"))).unwrap_or(false);\n    assert!(has_admin, \"the roster must list the seeded {admin} (user 1); body: {{}}\", res.text());\n}}\n\n"
+    ));
+    // add: an admin adds a member (non-admin role when one is declared) → 201.
+    t.push_str(&format!(
+        "#[tokio::test]\nasync fn add_{snake}_member_returns_201() {{\n    let t = member_app().await;\n    let res = t.post_json_with(\"{base}/1/members\", &serde_json::json!({{\"user_id\": \"9\", \"role\": \"{add_role}\"}}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(res.status().as_u16(), 201, \"design: an {admin} adds a member -> 201; body: {{}}\", res.text());\n}}\n\n"
+    ));
+    if let Some(role2) = second {
+        // SECURITY: member management is admin-gated — a non-admin add is 403.
+        t.push_str(&format!(
+            "/// SECURITY (#107): member management is gated on the {admin} role — a\n/// {role2} may read the roster but must NOT be able to add members.\n#[tokio::test]\nasync fn add_{snake}_member_without_the_admin_role_is_403() {{\n    let t = member_app().await;\n    let res = t.post_json_with(\"{base}/1/members\", &serde_json::json!({{\"user_id\": \"9\", \"role\": \"{role2}\"}}), &[(\"{hk}\", &test_cookie_for(2))]).await;\n    assert_eq!(res.status().as_u16(), 403, \"design: member add requires the {admin} role — a {role2} must 403; body: {{}}\", res.text());\n}}\n\n"
+        ));
+        // set-role: the write must PERSIST (roster reflects it), not just 204.
+        t.push_str(&format!(
+            "#[tokio::test]\nasync fn set_{snake}_member_role_returns_204() {{\n    let t = member_app().await;\n    let res = t.patch_json_with(\"{base}/1/members/2\", &serde_json::json!({{\"role\": \"{admin}\"}}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(res.status().as_u16(), 204, \"design: an {admin} re-roles a member -> 204; body: {{}}\", res.text());\n    let roster = t.get_with(\"{base}/1/members\", &[(\"{hk}\", &test_cookie_for(1))]).await;\n    let rows: serde_json::Value = serde_json::from_str(&roster.text()).expect(\"roster json\");\n    let promoted = rows.as_array().map(|a| a.iter().any(|m| m[\"user_id\"] == serde_json::json!(\"2\") && m[\"role\"] == serde_json::json!(\"{admin}\"))).unwrap_or(false);\n    assert!(promoted, \"the roster must reflect the new role (the PATCH must persist, not just 204); body: {{}}\", roster.text());\n}}\n\n"
+        ));
+        // remove: the delete must PERSIST (the member leaves the roster).
+        t.push_str(&format!(
+            "#[tokio::test]\nasync fn remove_{snake}_member_returns_204() {{\n    let t = member_app().await;\n    let res = t.delete_with(\"{base}/1/members/2\", &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(res.status().as_u16(), 204, \"design: an {admin} removes a member -> 204; body: {{}}\", res.text());\n    let roster = t.get_with(\"{base}/1/members\", &[(\"{hk}\", &test_cookie_for(1))]).await;\n    let rows: serde_json::Value = serde_json::from_str(&roster.text()).expect(\"roster json\");\n    let gone = rows.as_array().map(|a| a.iter().all(|m| m[\"user_id\"] != serde_json::json!(\"2\"))).unwrap_or(true);\n    assert!(gone, \"the removed member must leave the roster (the DELETE must persist); body: {{}}\", roster.text());\n}}\n\n"
+        ));
+        // SECURITY: demoting the sole admin would lock the tenant out of member
+        // management (the write gate is admin-only) — 409, never applied.
+        t.push_str(&format!(
+            "/// SECURITY (#107): demoting the SOLE {admin} would leave nobody able to\n/// manage members (the write gate is {admin}-only) — the repo must refuse with 409.\n#[tokio::test]\nasync fn set_{snake}_member_role_last_admin_demotion_is_409() {{\n    let t = member_app().await;\n    let res = t.patch_json_with(\"{base}/1/members/1\", &serde_json::json!({{\"role\": \"{role2}\"}}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(res.status().as_u16(), 409, \"design: demoting the sole {admin} must 409 (last-admin lockout); body: {{}}\", res.text());\n}}\n\n"
+        ));
+        // self-removal: any member may LEAVE without the admin role.
+        t.push_str(&format!(
+            "/// #107: self-removal (\"leave\") needs NO admin role — the guard already\n/// proved the caller's membership; only removing OTHERS is admin-gated.\n#[tokio::test]\nasync fn remove_{snake}_member_self_leave_returns_204() {{\n    let t = member_app().await;\n    let res = t.delete_with(\"{base}/1/members/2\", &[(\"{hk}\", &test_cookie_for(2))]).await;\n    assert_eq!(res.status().as_u16(), 204, \"design: a member removes their OWN membership without the {admin} role; body: {{}}\", res.text());\n}}\n\n"
+        ));
+    }
+    // SECURITY: removing the sole admin is refused even as self-removal.
+    t.push_str(&format!(
+        "/// SECURITY (#107): removing the SOLE {admin} — even by themselves — would\n/// leave the tenant admin-less forever; the repo must refuse with 409.\n#[tokio::test]\nasync fn remove_{snake}_member_last_admin_is_409() {{\n    let t = member_app().await;\n    let res = t.delete_with(\"{base}/1/members/1\", &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(res.status().as_u16(), 409, \"design: removing the sole {admin} must 409 (last-admin lockout); body: {{}}\", res.text());\n}}\n\n"
+    ));
+    // An out-of-set role must 422 (no DB CHECK backs the role column).
+    t.push_str(&format!(
+        "#[tokio::test]\nasync fn add_{snake}_member_rejects_out_of_range_role() {{\n    let t = member_app().await;\n    let res = t.post_json_with(\"{base}/1/members\", &serde_json::json!({{\"user_id\": \"9\", \"role\": \"{ENUM_REJECT_SENTINEL}\"}}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(res.status().as_u16(), 422, \"design: a role outside member_roles must 422 (no DB CHECK backs the column); body: {{}}\", res.text());\n}}\n\n"
+    ));
+    t
+}
+
 /// A SQL literal for seeding a tenant-row column. Enum fields use their first
 /// declared value (so a CHECK constraint passes); other fields use a type-shaped
 /// literal. String/text literals are single-quoted for inline DDL execution.
@@ -1448,7 +1566,11 @@ fn extension_wiring(design: &Design) -> (String, String) {
     (comment, extends)
 }
 
-fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool) -> String {
+/// `emit_app`: false when the module's only tests are the #107 member-surface
+/// tests (every design endpoint is an AGENT TODO) — the regular `app()` helper
+/// would then be dead code and trip the generated workspace's `-D warnings`, so
+/// only the helpers the member tests use (imports, cookie mint) are emitted.
+fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool, emit_app: bool) -> String {
     let mount = module.effective_mount();
     // The cookie helpers (`test_cookie`/`test_cookie_for`) are only emitted when
     // the module's generated tests actually reference them — a module with no
@@ -1494,12 +1616,18 @@ fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool) -> Strin
             "    seed_second_tenant(&db).await;\n".to_string()
         };
         // The seed runs raw SQL on the connection, which needs `ConnectionTrait`
-        // in scope; only import it when there's a seed (else `-D warnings` trips).
-        let seed_use = if seed.is_empty() {
+        // in scope; only import it when there's a seed OR the #107 member tests
+        // (whose member_app() also seeds raw SQL) — else `-D warnings` trips.
+        let seed_use = if seed.is_empty() && !emits_member_surface_tests(design, module) {
             String::new()
         } else {
             "use jerrycan::db::sea_orm::ConnectionTrait;\n\n".to_string()
         };
+        if !emit_app {
+            // Only the member-surface tests exist: no app(), no seeds, no
+            // second-tenant helper — member_app() is self-contained.
+            return format!("{seed_use}{auth_login}");
+        }
         // Issue #66: the TestApp must wire the SAME design-declared extensions
         // main.rs does (mounting.rs's `extension_block`), so the generated probes
         // exercise the app the framework actually builds — a realtime handler's
@@ -1530,9 +1658,10 @@ pub fn acceptance_rs(design: &Design, module: &ModuleDesign) -> String {
     render_acceptance(design, module).0
 }
 
-/// Renders the acceptance file AND the count of enum "reject" tests (issue #47)
-/// that PASS on stubs — `write_acceptance` subtracts these from `expected_failing`
-/// so the RED-on-stubs baseline stays exact.
+/// Renders the acceptance file AND the count of generated tests that PASS on
+/// stubs — the enum "reject" probes (issue #47) and the #107 member-surface
+/// tests (tool-owned real handlers) — which `write_acceptance` subtracts from
+/// `expected_failing` so the RED-on-stubs baseline stays exact.
 fn render_acceptance(design: &Design, module: &ModuleDesign) -> (String, usize) {
     let mut out = TestOut {
         code: String::new(),
@@ -1548,6 +1677,15 @@ fn render_acceptance(design: &Design, module: &ModuleDesign) -> (String, usize) 
     let isolation = isolation_test(design, module);
     out.count += isolation.matches("#[tokio::test]").count();
     out.code.push_str(&isolation);
+    // #107: the member-surface tests run against TOOL-OWNED real handlers, so
+    // they PASS on stubs — appended after the isolation tests and, like the
+    // enum reject probes, EXCLUDED from the RED-on-stubs baseline. Whether the
+    // regular app() helper is needed is decided BEFORE appending them (a
+    // tenant module whose every endpoint is a TODO has member tests only).
+    let emit_app = out.code.contains("#[tokio::test]");
+    let member = member_surface_tests(design, module);
+    let member_passing = member.matches("#[tokio::test]").count();
+    out.code.push_str(&member);
     let todos = if out.todos.is_empty() {
         String::new()
     } else {
@@ -1568,10 +1706,10 @@ fn render_acceptance(design: &Design, module: &ModuleDesign) -> (String, usize) 
     let content = format!(
         "{banner}use jerrycan::prelude::*;\nuse {ident}::module;\n\n{preamble}\n{code}{todos}",
         ident = super::genroute::crate_ident(&module.name),
-        preamble = preamble(design, module, uses_cookies),
+        preamble = preamble(design, module, uses_cookies, emit_app),
         code = out.code,
     );
-    (content, out.reject)
+    (content, out.reject + member_passing)
 }
 
 /// Write tests/acceptance.rs for a TOP-LEVEL module. Returns (rel_path, expected_failing).
@@ -1590,8 +1728,9 @@ pub fn write_acceptance(
     let path = root.join(&rel);
     std::fs::create_dir_all(path.parent().expect("parent")).map_err(|e| e.to_string())?;
     std::fs::write(&path, &content).map_err(|e| e.to_string())?;
-    // Enum reject tests (issue #47) pass on stubs, so they are NOT part of the
-    // RED-on-stubs baseline: exclude them from `expected_failing`.
+    // Enum reject tests (issue #47) and the #107 member-surface tests pass on
+    // stubs, so they are NOT part of the RED-on-stubs baseline: exclude them
+    // from `expected_failing`.
     Ok((rel, test_count(&content) - reject))
 }
 

@@ -312,16 +312,38 @@ fn tenancy_module_tests_seed_membership_and_provide_the_guard() {
     );
 
     // The tenant module ITSELF (workspaces) owns no tenant-owned entity, so its
-    // test neither seeds nor provides the guard (no false coupling).
+    // REGULAR app() neither seeds nor provides the guard (no false coupling —
+    // its create tests must see an empty tenant table so the id echo holds).
+    // The #107 member tests bring their own SELF-CONTAINED member_app(); the
+    // membership seeds + guard registration live there, never in app().
     let workspaces = design
         .modules
         .iter()
         .find(|m| m.name == "workspaces")
         .expect("workspaces module");
     let ws_gen = testgen::acceptance_rs(&design, workspaces);
+    let app_fn = ws_gen
+        .split("async fn app()")
+        .nth(1)
+        .expect("app() present")
+        .split("#[tokio::test]")
+        .next()
+        .unwrap();
     assert!(
-        !ws_gen.contains(".provide_dep(shared::tenant)") && !ws_gen.contains("workspace_members"),
-        "non-tenant-owned module needs no seed: {ws_gen}"
+        !app_fn.contains(".provide_dep(shared::tenant)") && !app_fn.contains("workspace_members"),
+        "the tenant module's regular app() must neither seed membership nor provide the guard: {app_fn}"
+    );
+    let member_fn = ws_gen
+        .split("async fn member_app()")
+        .nth(1)
+        .expect("member_app() present (#107)")
+        .split("#[tokio::test]")
+        .next()
+        .unwrap();
+    assert!(
+        member_fn.contains(".provide_dep(shared::tenant)")
+            && member_fn.contains("INSERT INTO \\\"workspace_members\\\""),
+        "member_app() seeds membership and provides the guard itself: {member_fn}"
     );
 }
 
@@ -1953,5 +1975,199 @@ fn unique_tenant_field_seed_does_not_collide_with_the_create_probe() {
     assert!(
         !generated.contains("VALUES (1, 'test-value')"),
         "tenant-1 seed must not reuse the probe's unique slug value (would 409):\n{generated}"
+    );
+}
+
+/// #107 (0.6.0 §D): the TENANT module's acceptance file carries the generated
+/// member-surface tests — list, add (201), non-admin add (403), set-role (204,
+/// persisted), remove (204, persisted), last-admin 409 on BOTH demote and
+/// remove, self-removal without the admin role (204), and out-of-set role
+/// (422). WHY (Rule 9): these routes are tool-owned real handlers, and these
+/// tests are the runtime backstop that keeps the #107 security rules (admin
+/// gate, last-admin lockout, role allow-list) from silently regressing in any
+/// scaffolded app. They run under `jerrycan check` like every generated test.
+#[test]
+fn tenant_module_gets_member_surface_tests() {
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
+    let d: Design = serde_json::from_str(s).unwrap();
+    let workspaces = d
+        .modules
+        .iter()
+        .find(|m| m.name == "workspaces")
+        .expect("workspaces module");
+    let out = testgen::acceptance_rs(&d, workspaces);
+
+    // All nine tests, named after the member-route operation ids.
+    for expected in [
+        "async fn list_workspace_members_returns_200",
+        "async fn add_workspace_member_returns_201",
+        "async fn add_workspace_member_without_the_admin_role_is_403",
+        "async fn set_workspace_member_role_returns_204",
+        "async fn remove_workspace_member_returns_204",
+        "async fn set_workspace_member_role_last_admin_demotion_is_409",
+        "async fn remove_workspace_member_last_admin_is_409",
+        "async fn remove_workspace_member_self_leave_returns_204",
+        "async fn add_workspace_member_rejects_out_of_range_role",
+    ] {
+        assert!(out.contains(expected), "missing {expected}\n{out}");
+    }
+    // member_app() seeds the setup via RAW SQL (never the stubbed creator):
+    // tenant 1, user 1 as the admin (member_roles[0] = owner), user 2 as the
+    // non-admin member the 403/self-leave probes act as.
+    let member_fn = out
+        .split("async fn member_app()")
+        .nth(1)
+        .expect("member_app() helper")
+        .split("#[tokio::test]")
+        .next()
+        .unwrap();
+    assert!(
+        member_fn.contains(
+            "INSERT INTO \\\"workspace_members\\\" (user_id, workspace_id, role) VALUES (1, 1, 'owner')"
+        ) && member_fn.contains(
+            "INSERT INTO \\\"workspace_members\\\" (user_id, workspace_id, role) VALUES (2, 1, 'member')"
+        ),
+        "member_app seeds the admin (user 1) and a non-admin member (user 2) in tenant 1: {member_fn}"
+    );
+    assert!(
+        member_fn.contains("INSERT INTO \\\"workspaces\\\"") && member_fn.contains("'trial'"),
+        "member_app seeds the tenant row with a CHECK-valid enum value: {member_fn}"
+    );
+    assert!(
+        member_fn.contains(".provide_dep(shared::tenant)"),
+        "member_app registers the Tenant factory the member handlers resolve: {member_fn}"
+    );
+    // The probe URLs are path-scoped under the seeded tenant fk, and the jwt
+    // credential is threaded per the auth model.
+    assert!(
+        out.contains("t.get_with(\"/workspaces/1/members\"")
+            && out.contains("/workspaces/1/members/2")
+            && out.contains("(\"authorization\", &test_cookie_for(2))"),
+        "member probes hit the path-scoped member routes as distinct users: {out}"
+    );
+    // The 403 probe acts as the NON-admin (user 2); the last-admin probes act
+    // on the SOLE admin (user 1).
+    let forbidden = test_body(&out, "add_workspace_member_without_the_admin_role_is_403");
+    assert!(
+        forbidden.contains("test_cookie_for(2)") && forbidden.contains("403"),
+        "the 403 probe must act as the non-admin member:\n{forbidden}"
+    );
+    let last_admin = test_body(&out, "remove_workspace_member_last_admin_is_409");
+    assert!(
+        last_admin.contains("/workspaces/1/members/1") && last_admin.contains("409"),
+        "the last-admin probe removes the sole admin (user 1) and expects 409:\n{last_admin}"
+    );
+    // Self-leave: user 2 deletes their OWN membership — 204 without the admin role.
+    let leave = test_body(&out, "remove_workspace_member_self_leave_returns_204");
+    assert!(
+        leave.contains("/workspaces/1/members/2") && leave.contains("test_cookie_for(2)"),
+        "self-leave acts as user 2 on their own membership:\n{leave}"
+    );
+
+    // Confinement: a NON-tenant module of the same design gains nothing…
+    let leads = d.modules.iter().find(|m| m.name == "leads").unwrap();
+    let leads_out = testgen::acceptance_rs(&d, leads);
+    assert!(
+        !leads_out.contains("member_app") && !leads_out.contains("_members_returns_"),
+        "non-tenant modules must not gain member tests: {leads_out}"
+    );
+    // …and a non-tenancy design stays byte-free of the surface.
+    let plain = golden(true);
+    let plain_out = testgen::acceptance_rs(&plain, &plain.modules[0]);
+    assert!(
+        !plain_out.contains("member_app"),
+        "a non-tenancy design must not gain member tests: {plain_out}"
+    );
+}
+
+/// #107: the member-surface tests PASS on a fresh scaffold (tool-owned real
+/// handlers, raw-SQL seeds), so they must be EXCLUDED from the RED-on-stubs
+/// `expected_failing` baseline — exactly like the enum reject probes. WHY
+/// (Rule 9): `jerrycan check` compares observed failures against this count; if
+/// the 9 green member tests were counted, every tenancy app's check would
+/// report a broken baseline forever.
+#[test]
+fn member_surface_tests_are_excluded_from_expected_failing() {
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
+    let d: Design = serde_json::from_str(s).unwrap();
+    let tmp = std::env::temp_dir().join(format!("jc107-{}", std::process::id()));
+    std::fs::create_dir_all(tmp.join("crates/routes/workspaces/tests")).unwrap();
+    let (_rel, expected_failing) = testgen::write_acceptance(&tmp, &d, "workspaces").unwrap();
+    let generated =
+        std::fs::read_to_string(tmp.join("crates/routes/workspaces/tests/acceptance.rs")).unwrap();
+    std::fs::remove_dir_all(&tmp).ok();
+    // workspaces emits 15 tests. Counted toward expected_failing: list(1) +
+    // create(1) + create-401(1) + show(1) + show-404(1) = 5 (the long-standing
+    // baseline). Excluded: the create enum-reject probe (1) and the member
+    // surface (9) — both pass on stubs.
+    assert_eq!(
+        testgen::test_count(&generated),
+        15,
+        "5 endpoint probes + 1 enum reject + 9 member tests: {generated}"
+    );
+    assert_eq!(
+        expected_failing, 5,
+        "the enum reject probe and the 9 member tests must be excluded: {generated}"
+    );
+}
+
+/// #107: a SINGLE-role tenancy design (member_roles = ["owner"]) keeps only the
+/// member tests that need no second, non-admin role: list, add (another admin),
+/// last-admin remove 409, and the 422 role probe. The 403/re-role/remove/
+/// demote/self-leave probes all REQUIRE a seeded non-admin member, which a
+/// one-role design cannot express — emitting them would produce un-greenable
+/// tests (user 2 would be an admin, so the 403 could never fire).
+#[test]
+fn single_role_tenancy_keeps_only_the_roleless_member_tests() {
+    let d: Design = serde_json::from_value(serde_json::json!({
+        "name": "solo-api",
+        "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner"] },
+        "modules": [{
+            "name": "orgs",
+            "entities": [{ "name": "Org", "fields": [
+                { "name": "id", "type": "integer" },
+                { "name": "name", "type": "string" } ]}],
+            "endpoints": [
+                { "operation_id": "create_org", "method": "POST", "path": "/", "auth_required": true,
+                  "request_body": { "entity": "Org" },
+                  "success": { "status": 201, "entity": "Org" } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let out = testgen::acceptance_rs(&d, &d.modules[0]);
+    for expected in [
+        "async fn list_org_members_returns_200",
+        "async fn add_org_member_returns_201",
+        "async fn remove_org_member_last_admin_is_409",
+        "async fn add_org_member_rejects_out_of_range_role",
+    ] {
+        assert!(out.contains(expected), "missing {expected}\n{out}");
+    }
+    for absent in [
+        "without_the_admin_role_is_403",
+        "set_org_member_role_returns_204",
+        "async fn remove_org_member_returns_204",
+        "last_admin_demotion_is_409",
+        "self_leave_returns_204",
+    ] {
+        assert!(
+            !out.contains(absent),
+            "a one-role design must not emit `{absent}` (needs a non-admin member):\n{out}"
+        );
+    }
+    // No second membership is seeded — there is no second role to hold.
+    assert!(
+        !out.contains("VALUES (2, 1,"),
+        "single-role member_app seeds no user-2 membership: {out}"
+    );
+    // The single add test adds another admin (the only declared role).
+    let add = test_body(&out, "add_org_member_returns_201");
+    assert!(
+        add.contains("\"role\": \"owner\""),
+        "single-role add uses the only declared role:\n{add}"
     );
 }

@@ -4806,6 +4806,37 @@ pub(crate) mod tests {
         );
     }
 
+    /// #107 review nit (Rule 9): `add_member`'s INSERT column order AND its
+    /// bound-value order must agree POSITIONALLY — a swapped bind array (e.g.
+    /// `[fk, user_id, role]`) still compiles and passes every shape-only test,
+    /// but writes the tenant id into `user_id` and the user id into the fk,
+    /// silently corrupting every membership it creates. Pin both the SQL column
+    /// list and the exact bind array, in the add_member body specifically.
+    #[test]
+    fn add_member_binds_match_the_insert_column_order() {
+        let d: Design = serde_json::from_str(CLUBS_LIFECYCLE).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        )
+        .unwrap();
+        let add_body =
+            &src[src.find("fn add_member").unwrap()..src.find("fn set_member_role").unwrap()];
+        assert!(
+            add_body.contains("INSERT INTO club_members (user_id, club_id, role) VALUES (?, ?, ?)"),
+            "add_member inserts (user_id, fk, role) in that column order:\n{add_body}"
+        );
+        assert!(
+            add_body.contains("[user_id.into(), fk.into(), role.into()]"),
+            "add_member's bind array must be [user_id, fk, role] — the SAME order as \
+             the INSERT columns (a swapped bind compiles but corrupts memberships):\n{add_body}"
+        );
+    }
+
     /// The member surface's row type and role rule are BAKED into the generated
     /// code: a serializable `{Tenant}Member` row (a later handler returns
     /// `[{id, user_id, role}]` without hand-rolling a DTO), and the design's
