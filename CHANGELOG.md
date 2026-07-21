@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `jerrycan onboard`: prints the guided build runbook; `--emit-skill --agent <id>` installs the jerrycan-backend skill for claude-code / cursor / codex / windsurf / generic.
+- Skill: explicit entry-path branching (existing project / from scratch / migrate from Supabase) + Phase 1c Supabase-migration runbook.
+- Release: tag-triggered prebuilt binaries (macOS arm64/x64, Linux x64/arm64 musl) + `cargo binstall jerrycan` support.
+
 ## 0.5.4 — 2026-07-21
 
 Storage-tenancy security patch — continues the transitive-tenancy work into the
