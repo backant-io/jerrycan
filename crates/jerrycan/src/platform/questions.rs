@@ -934,10 +934,13 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 // `Design::entity_is_per_user_owned` — the one shared classifier
                 // (#105 §F); db mode is the extra gate because only `sql_repo`
                 // suppresses the unscoped reads (a memory repo keeps plain
-                // `all`/`get`, so the stub stays implementable there).
+                // `all`/`get`, so the stub stays implementable there). `public:
+                // true` is NOT a carve-out: it is just the second spelling of an
+                // unguarded read (public cannot combine with a guard), and the
+                // stub it generates is exactly as unimplementable — only the
+                // `public_read` entity flag makes an open read coherent here.
                 let per_user_owned = d.entity_is_per_user_owned(e);
                 if !ep.is_guarded()
-                    && !ep.public
                     && d.wants_db()
                     && per_user_owned
                     && !d.entity_is_public_read(&e.name)
@@ -2629,6 +2632,43 @@ mod tests {
         assert!(
             jc0549(&validate(&mem)).is_empty(),
             "memory mode has no owner-scoped repo suppression"
+        );
+    }
+
+    /// #105 §E, the `public: true` spelling of the same residual (the shape the
+    /// Supabase migrator used to emit for a public-read owner table): `public`
+    /// is just an unguarded read with the lint carve-out, and its stub is
+    /// exactly as unimplementable — the old `!ep.public` exemption let it slide
+    /// through validation into a dead-end scaffold. Only the `public_read`
+    /// entity flag makes an open read coherent; WITH the flag the same
+    /// public-marked GETs are the blessed migrated-feed shape.
+    #[test]
+    fn public_get_on_owner_scoped_entity_without_public_read_is_rejected() {
+        let mut d: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        d.modules[0].entities[0].public_read = false;
+        for ep in &mut d.modules[0].endpoints {
+            if matches!(ep.method, HttpMethod::GET) {
+                ep.public = true;
+            }
+        }
+        let qs = validate(&d);
+        let hits = jc0549(&qs);
+        assert_eq!(
+            hits.len(),
+            2,
+            "both public GETs (list + detail) must be flagged: {qs:?}"
+        );
+
+        let mut ok: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        for ep in &mut ok.modules[0].endpoints {
+            if matches!(ep.method, HttpMethod::GET) {
+                ep.public = true;
+            }
+        }
+        let qs2 = validate(&ok);
+        assert!(
+            qs2.is_empty(),
+            "public GETs + the public_read flag is the migrated feed shape: {qs2:?}"
         );
     }
 

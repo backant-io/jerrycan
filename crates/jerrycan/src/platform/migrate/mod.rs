@@ -519,6 +519,42 @@ fn emit_from_db(
     // and the generated code agree (no migrate-vs-regenerate drift).
     design.normalize_tenant_detail_routes();
 
+    // public_read reconcile (#105, spec §E): a PublicRead source table whose
+    // entity lands PER-USER OWNED in the design (identity fk to auth.users, no
+    // tenancy — `Design::entity_is_per_user_owned`, the shared classifier) gets
+    // `public_read: true`. Without the flag the emitted `public: true` GETs sat
+    // on a per-user entity whose repo has no unscoped read and whose handler has
+    // no session user — the unimplementable stub §E closes — so the migrated
+    // feed could never be implemented as generated. With it, the generator
+    // produces the real public-read/owner-write shape the source RLS declared
+    // (anyone reads, only the owner writes). Classified against the ASSEMBLED
+    // design (post-tenancy), so a tenant-owned public-read table is never
+    // flipped — that path keeps the strip_public downgrade + advisory above.
+    let public_read_tables: BTreeSet<&String> = access_map
+        .iter()
+        .filter(|(_, a)| matches!(a, TableAccess::PublicRead { .. }))
+        .map(|(tk, _)| tk)
+        .collect();
+    let flip: Vec<String> = design
+        .modules
+        .iter()
+        .flat_map(|m| m.entities.iter())
+        .filter(|e| {
+            table_to_entity
+                .iter()
+                .any(|(tk, name)| name == &e.name && public_read_tables.contains(tk))
+                && design.entity_is_per_user_owned(e)
+        })
+        .map(|e| e.name.clone())
+        .collect();
+    for m in &mut design.modules {
+        for e in &mut m.entities {
+            if flip.contains(&e.name) {
+                e.public_read = true;
+            }
+        }
+    }
+
     // Same gate `jerrycan new` runs — the translator must produce a valid design.
     let questions = crate::platform::questions::validate(&design);
     if !questions.is_empty() {
@@ -1083,6 +1119,84 @@ create publication supabase_realtime for table public.customers;
                 std::fs::read(out_dir.join(rel)).unwrap(),
                 std::fs::read(out_dir2.join(rel)).unwrap(),
                 "{rel} deterministic"
+            );
+        }
+    }
+
+    /// #105 (spec §E close-the-residual): a Supabase feed table — SELECT public
+    /// (`using (true)`), writes owner-scoped (`user_id = auth.uid()`), with a
+    /// real fk to auth.users — must migrate to the public-read/owner-write
+    /// shape: `public_read: true` on the entity. Before this, the migrator
+    /// emitted `public: true` GETs on a per-user entity, whose scaffold was the
+    /// unimplementable stub (the repo has no unscoped read and the handler no
+    /// session user) — a migrated feed could never be implemented as generated.
+    #[test]
+    fn a_public_read_owner_table_migrates_to_the_public_read_entity_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(
+            export_dir.join("schema.sql"),
+            r#"
+create table public.posts (
+    id uuid primary key,
+    user_id uuid not null references auth.users(id) on delete cascade,
+    title text not null);
+alter table public.posts enable row level security;
+create policy posts_read on public.posts for select using (true);
+create policy posts_insert on public.posts for insert with check (user_id = auth.uid());
+create policy posts_update on public.posts for update using (user_id = auth.uid());
+create policy posts_delete on public.posts for delete using (user_id = auth.uid());
+"#,
+        )
+        .unwrap();
+        let out = run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: tmp.path().join("app"),
+            name: Some("feed".into()),
+            bulk_threshold: 5000,
+        })
+        .expect("a public-read owner table must migrate");
+        assert!(
+            crate::platform::questions::validate(&out.design).is_empty(),
+            "the migrated design must be question-free: {:?}",
+            crate::platform::questions::validate(&out.design)
+        );
+        let post = out
+            .design
+            .modules
+            .iter()
+            .flat_map(|m| m.entities.iter())
+            .find(|e| e.name == "Post")
+            .expect("Post entity");
+        assert!(
+            post.public_read,
+            "the source's public-SELECT + owner-write RLS must become the \
+             public_read entity flag (not bare public GETs on a per-user entity, \
+             which scaffold an unimplementable stub)"
+        );
+        let posts_module = out
+            .design
+            .modules
+            .iter()
+            .find(|m| m.entities.iter().any(|e| e.name == "Post"))
+            .unwrap();
+        let ep = |op: &str| {
+            posts_module
+                .endpoints
+                .iter()
+                .find(|e| e.operation_id == op)
+                .unwrap_or_else(|| panic!("{op} endpoint"))
+        };
+        // Reads stay public on the wire; writes stay guarded — the generator's
+        // shared predicate does the rest (unguarded GET handlers, owner-scoped
+        // writes, no security stanza, no 401 probe on the reads).
+        assert!(ep("list_posts").public && !ep("list_posts").auth_required);
+        assert!(ep("get_post").public && !ep("get_post").auth_required);
+        for op in ["create_post", "update_post", "delete_post"] {
+            assert!(
+                ep(op).auth_required && !ep(op).public,
+                "{op} must stay owner-gated"
             );
         }
     }
