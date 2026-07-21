@@ -1136,7 +1136,10 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
     /// A tenant module that HOSTS a tenant-owned child (#124): Club is the
     /// tenancy entity and Book (belongs_to Club) lives in the SAME `clubs`
     /// module, so `collect_owned_handlers` drags the tenant's OWN handlers into
-    /// the JL0006 scan alongside the child's.
+    /// the JL0006 scan alongside the child's. `export_club` is an ENTITY-LESS
+    /// custom detail endpoint (custom-JSON success, no body) — PathScoped by
+    /// its `{id}` path, but the strict resolver binds it to NO entity, so it
+    /// must never enter the exemption set (pinned below).
     fn child_hosting_tenant_design() -> Design {
         serde_json::from_value(serde_json::json!({
             "name": "club-api",
@@ -1157,6 +1160,8 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
                       "success": { "status": 200, "entity": "Club", "list": true } },
                     { "operation_id": "get_club", "method": "GET", "path": "/{id}",
                       "success": { "status": 200, "entity": "Club" } },
+                    { "operation_id": "export_club", "method": "GET", "path": "/{id}/export",
+                      "success": { "status": 200 } },
                     { "operation_id": "list_books", "method": "GET", "path": "/{club_id}/books",
                       "success": { "status": 200, "entity": "Book", "list": true } }
                 ]
@@ -1271,6 +1276,76 @@ async fn list_books(repo: Dep<BookRepo>) -> Result<()> {
         assert!(
             hits[0].message.contains("all()"),
             "names the `all()` needle: {:?}",
+            hits[0]
+        );
+    }
+
+    /// Issue #124 hardening: the exemption requires the PathScoped detail
+    /// SHAPE, not just "resolves to the tenant repo". The tenant's Collection
+    /// handler (`list_clubs`, `GET /`) also resolves strictly to Club, but no
+    /// path tenant was guard-verified there — an unscoped `repo.update(` in it
+    /// is a cross-tenant WRITE leak and must stay flagged. WHY (Rule 9):
+    /// dropping the `TenantShape::PathScoped` conjunct in
+    /// `collect_owned_handlers` survived the whole suite before this test —
+    /// the existing Collection-handler probe uses `repo.all()`, which is never
+    /// exempted and so cannot pin this conjunct.
+    #[test]
+    fn jl0006_keeps_the_tenants_collection_handler_armed_for_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/clubs/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn list_clubs(repo: Dep<ClubRepo>) -> Result<()> {\n    let _ = repo.update(id, item).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &child_hosting_tenant_design());
+        assert_eq!(
+            hits.len(),
+            1,
+            "a Collection handler is NOT PathScoped — its unscoped write stays armed: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.update(` line");
+        assert!(
+            hits[0].message.contains("update(...)"),
+            "names the `update` needle: {:?}",
+            hits[0]
+        );
+    }
+
+    /// Issue #124 hardening: the exemption resolves the endpoint's repo entity
+    /// with the STRICT resolver on purpose. `export_club` (`GET /{id}/export`,
+    /// custom-JSON success — no success.entity, no request_body) IS PathScoped,
+    /// and the lenient resolver's first-entity fallback would mis-bind it to
+    /// Club and exempt its whole fn — fail-OPEN, since an entity-less handler
+    /// may bind ANY repo (here the child's BookRepo): its unscoped `repo.get(`
+    /// is a real cross-tenant read. Strict resolves it to NO entity, so the fn
+    /// never enters the exemption set. WHY (Rule 9): swapping
+    /// `endpoint_repo_entity_strict` for `endpoint_repo_entity` in
+    /// `collect_owned_handlers` survived the whole suite before this test.
+    #[test]
+    fn jl0006_does_not_exempt_an_entity_less_custom_tenant_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/clubs/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn export_club(repo: Dep<BookRepo>, _tenant: Dep<Tenant>) -> Result<()> {\n    let _ = repo.get(id).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &child_hosting_tenant_design());
+        assert_eq!(
+            hits.len(),
+            1,
+            "an entity-less custom endpoint resolves to no entity under the strict \
+             resolver — its fn is never exempt: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.get(` line");
+        assert!(
+            hits[0].message.contains("get(...)"),
+            "names the `get` needle: {:?}",
             hits[0]
         );
     }

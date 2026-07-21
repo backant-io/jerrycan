@@ -32,6 +32,8 @@ Renaming `/{slug}` → `/{fk}` is **not** a safe fix: the guard parses the path 
 
 **Fix:** attribute each JL0006 hit to its enclosing `fn` (add an `ItemFn` frame to the visitor; handler fn names are `operation_id`s by the JL0002 contract, lints.rs:502). Compute, in `collect_owned_handlers` (where `&self` + `&ModuleDesign` are in scope), the set of exempt handler names = endpoints where `endpoint_repo_entity(m, ep) == Some(tenancy.entity)` **and** `endpoint_tenant_shape(m, ep) == PathScoped`; carry it on `HandlerRef` (design.rs:550). Suppress `get`/`update`/`remove`/`insert` hits **only** inside an exempt fn.
 
+**Errata (as implemented):** the shipped exemption deliberately uses the **strict** resolver (`endpoint_repo_entity_strict`), not the lenient `endpoint_repo_entity` named above — for a security lint the safe direction is to UNDER-exempt (a residual false positive has the line-scoped `// jerrycan:allow JL0006` hatch), whereas the lenient first-entity fallback would over-exempt an entity-less custom endpoint and silence a real leak.
+
 **Stays armed (must not be suppressed):**
 - `repo.all()` **everywhere**, including inside an exempt detail fn — fn-level suppression cannot see which repo the `repo` binding holds, so keeping `all()` armed cheaply bounds the "agent bound a child repo as `repo` in the tenant's detail handler" residual. (A correct tenant detail handler calls `get`, not `all`.)
 - All hits in the tenant's **Collection** handlers (`repo.all()` in `list_clubs` must still steer to `all_for_member` — a real leak otherwise).
