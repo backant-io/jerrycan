@@ -1136,7 +1136,11 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
     /// A tenant module that HOSTS a tenant-owned child (#124): Club is the
     /// tenancy entity and Book (belongs_to Club) lives in the SAME `clubs`
     /// module, so `collect_owned_handlers` drags the tenant's OWN handlers into
-    /// the JL0006 scan alongside the child's. `export_club` is an ENTITY-LESS
+    /// the JL0006 scan alongside the child's. `get_club` is GUARDED
+    /// (`auth_required: true`) — the exemption exists BECAUSE the `Dep<Tenant>`
+    /// guard verified membership, and genroute emits that guard only for
+    /// guarded endpoints, so only a guarded detail route may be exempt (the
+    /// unguarded variants are pinned below). `export_club` is an ENTITY-LESS
     /// custom detail endpoint (custom-JSON success, no body) — PathScoped by
     /// its `{id}` path, but the strict resolver binds it to NO entity, so it
     /// must never enter the exemption set (pinned below).
@@ -1159,6 +1163,7 @@ async fn show_lead(repo: Dep<LeadRepo>) -> Result<()> {
                     { "operation_id": "list_clubs", "method": "GET", "path": "/",
                       "success": { "status": 200, "entity": "Club", "list": true } },
                     { "operation_id": "get_club", "method": "GET", "path": "/{id}",
+                      "auth_required": true,
                       "success": { "status": 200, "entity": "Club" } },
                     { "operation_id": "export_club", "method": "GET", "path": "/{id}/export",
                       "success": { "status": 200 } },
@@ -1346,6 +1351,97 @@ async fn list_books(repo: Dep<BookRepo>) -> Result<()> {
         assert!(
             hits[0].message.contains("get(...)"),
             "names the `get` needle: {:?}",
+            hits[0]
+        );
+    }
+
+    /// The green-gate anonymous-read hole (0.6.2 final review): the #124
+    /// exemption's whole justification is the guard-verified path membership,
+    /// but genroute emits the `Dep<Tenant>` guard only when `ep.is_guarded()`.
+    /// An UNGUARDED `get_club` (`GET /{id}`, no `auth_required` — serde
+    /// default false) is still PathScoped and strict-resolves to the tenant,
+    /// so WITHOUT the `is_guarded()` conjunct it enters the exemption set and
+    /// its `repo.get(club_id)` — a real ANONYMOUS tenant read — ships with a
+    /// green `jerrycan check`. WHY (Rule 9): dropping the `is_guarded()`
+    /// conjunct in `collect_owned_handlers` must fail THIS test — the
+    /// guarded-fixture tests above cannot pin it (their `get_club` is exempt
+    /// either way).
+    #[test]
+    fn jl0006_keeps_an_unguarded_tenant_detail_handler_armed() {
+        let mut design = child_hosting_tenant_design();
+        let ep = design.modules[0]
+            .endpoints
+            .iter_mut()
+            .find(|e| e.operation_id == "get_club")
+            .unwrap();
+        assert!(
+            ep.auth_required,
+            "fixture precondition: get_club is guarded"
+        );
+        ep.auth_required = false;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/clubs/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn get_club(repo: Dep<ClubRepo>) -> Result<()> {\n    let _ = repo.get(club_id).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &design);
+        assert_eq!(
+            hits.len(),
+            1,
+            "an UNGUARDED tenant detail route has no Dep<Tenant> guard — its \
+             unscoped `repo.get(` is an anonymous tenant read and must stay armed: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.get(` line");
+        assert!(
+            hits[0].message.contains("get(...)"),
+            "names the `get` needle: {:?}",
+            hits[0]
+        );
+    }
+
+    /// The write variant of the green-gate hole: a `public: true` mutating
+    /// tenant detail route (`DELETE /{id}`, success = tenant) is unguarded by
+    /// construction (validation forbids `public` + `auth_required`), so no
+    /// `Dep<Tenant>` guard is emitted — its unscoped `repo.remove(` is an
+    /// ANONYMOUS tenant delete and must stay armed. WHY (Rule 9): `public`
+    /// reaches `is_guarded() == false` through a different design field than
+    /// the missing-`auth_required` read variant, so this pins the conjunct
+    /// against a rewrite keyed on `auth_required` alone.
+    #[test]
+    fn jl0006_keeps_a_public_tenant_detail_write_armed() {
+        let mut design = child_hosting_tenant_design();
+        design.modules[0].endpoints.push(
+            serde_json::from_value(serde_json::json!({
+                "operation_id": "delete_club", "method": "DELETE", "path": "/{id}",
+                "public": true,
+                "success": { "status": 200, "entity": "Club" }
+            }))
+            .unwrap(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/clubs/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(
+            &handlers,
+            "async fn delete_club(repo: Dep<ClubRepo>) -> Result<()> {\n    repo.remove(club_id).await?;\n    Ok(())\n}\n",
+        )
+        .unwrap();
+        let hits = jl0006_only(root, &design);
+        assert_eq!(
+            hits.len(),
+            1,
+            "a `public: true` tenant detail write has no guard — its unscoped \
+             `repo.remove(` is an anonymous tenant delete and must stay armed: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.remove(` line");
+        assert!(
+            hits[0].message.contains("remove(...)"),
+            "names the `remove` needle: {:?}",
             hits[0]
         );
     }

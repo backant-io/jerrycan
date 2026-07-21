@@ -907,8 +907,12 @@ pub fn validate(d: &Design) -> Vec<Question> {
     //     module resolves to NO entity and is not caught — that shape carries no
     //     signal to resolve its entity (the #143 family).
     //   - The route is a hole only when the tenant fk appears in NONE of its
-    //     path params: a multi-param `/{fk}/{sub}` binds the fk — the guard
-    //     membership-checks it — so only an fk-less parameterized path fires.
+    //     path params — checked against the MOUNT-RESOLVED path (the node's
+    //     `effective_mount()` + `ep.path`, exactly as `endpoint_tenant_shape`
+    //     resolves it): a multi-param `/{fk}/{sub}` binds the fk, and so does a
+    //     mount-carried fk (subroute mount `/{fk}/history`, path `/{year}`) —
+    //     the guard membership-checks the full route either way — so only a
+    //     route whose resolved path never names the fk fires.
     if let Some(tenancy) = &d.tenancy {
         let fk = Design::fk_column(&tenancy.entity);
         let normalized = {
@@ -929,6 +933,8 @@ pub fn validate(d: &Design) -> Vec<Question> {
             qs: &mut Vec<Question>,
         ) {
             let fk_token = format!("{{{fk}}}");
+            let mount = m.effective_mount();
+            let mount = mount.strip_suffix('/').unwrap_or(&mount);
             for (i, ep) in m.endpoints.iter().enumerate() {
                 if super::design::endpoint_repo_entity_strict(m, ep) != Some(tenant) {
                     continue;
@@ -936,7 +942,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 let Some(param) = trailing_path_param(&ep.path) else {
                     continue;
                 };
-                if !ep.path.contains(&fk_token) {
+                if !format!("{mount}{}", ep.path).contains(&fk_token) {
                     qs.push(q(
                         format!("{ptr}/endpoints/{i}"),
                         format!(
@@ -3365,6 +3371,49 @@ mod tests {
                 "`{path}` must not trip JC0550: {qs:?}"
             );
         }
+    }
+
+    /// A tenant-strict endpoint whose fk arrives via the SUBROUTE MOUNT
+    /// (mount `/{club_id}/history`, path `/{year}`, success = tenant) is
+    /// fully guard-bound: `endpoint_tenant_shape` resolves the route as
+    /// `mount + path`, sees the fk, classifies it PathScoped, and genroute
+    /// emits the membership-checking `Dep<Tenant>` from the full route. WHY
+    /// (Rule 9): JC0550 matching `ep.path` alone falsely refused this shape
+    /// (fail-closed, but a refusal of a correct design) — the predicate must
+    /// match the same mount-resolved path the guard actually binds.
+    #[test]
+    fn mount_carried_tenant_fk_does_not_trip_jc0550() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "clubs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "clubs",
+                      "entities": [{ "name": "Club", "fields": [
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [
+                          { "operation_id": "get_club", "method": "GET", "path": "/{id}",
+                            "auth_required": true,
+                            "success": { "status": 200, "entity": "Club" } } ],
+                      "subroutes": [
+                          { "name": "history", "mount": "/{club_id}/history",
+                            "entities": [{ "name": "Snapshot",
+                                "belongs_to": [{ "entity": "Club" }],
+                                "fields": [{ "name": "year", "type": "integer" }] }],
+                            "endpoints": [
+                                { "operation_id": "get_club_year", "method": "GET",
+                                  "path": "/{year}", "auth_required": true,
+                                  "success": { "status": 200, "entity": "Club" } } ] } ] }
+                ] }"#,
+        )
+        .unwrap();
+        let qs = validate(&d);
+        assert!(
+            !qs.iter().any(|q| q.question.contains("JC0550")),
+            "a mount-carried tenant fk is guard-bound from the full route — \
+             JC0550 must not refuse it: {qs:?}"
+        );
     }
 
     /// A CHILD entity's `/{slug}` detail route is NOT the tenant's own detail

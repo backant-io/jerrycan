@@ -614,7 +614,12 @@ impl Design {
             // — resolved with the STRICT repo-entity resolver on purpose: a
             // lint must UNDER-exempt (a residual false positive has the
             // line-scoped allow hatch) and never OVER-exempt (which would
-            // silence a real leak in a handler the fallback mis-bound).
+            // silence a real leak in a handler the fallback mis-bound). The
+            // `is_guarded()` conjunct is load-bearing: genroute emits the
+            // membership-checking `Dep<Tenant>` param only for guarded
+            // endpoints, so an UNGUARDED (or `public: true`) tenant detail
+            // route has NO guard — its unscoped `repo.get/update/remove` is an
+            // anonymous tenant read/write and must stay armed.
             let exempt_fns: std::collections::BTreeSet<String> = self
                 .tenancy
                 .as_ref()
@@ -627,6 +632,7 @@ impl Design {
                                     self.endpoint_tenant_shape(m, ep),
                                     TenantShape::PathScoped { .. }
                                 )
+                                && ep.is_guarded()
                         })
                         .map(|ep| ep.operation_id.clone())
                         .collect()
