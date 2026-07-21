@@ -437,7 +437,10 @@ enum pinned to the declared `member_roles`) and in `jerrycan routes`, and the
 generated acceptance suite covers them (list, add, non-admin 403, set-role,
 remove, last-admin 409, self-leave, out-of-set-role 422). Those tests pass on a
 fresh scaffold — the handlers are real generated code, not stubs — and turn red
-only if the surface breaks.
+only if the surface breaks. A single-role design emits only the four
+role-independent tests (list, add, last-admin remove 409, out-of-set-role 422) —
+the other five need a seeded non-admin member, which a one-role design cannot
+express.
 
 ## Errors you'll hit
 - No session (missing/invalid cookie or bearer) → `401 JC0401`. The `Tenant` factory

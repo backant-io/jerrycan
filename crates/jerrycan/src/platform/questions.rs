@@ -274,8 +274,10 @@ fn member_roles_conflict(d: &Design) -> Option<DesignConflict> {
 /// so the validator neither rejects a design the router accepts nor accepts one it
 /// panics on: a static segment and a param segment DIVERGE into different children
 /// (`/users/me` + `/users/{id}` is fine), two DIFFERENT literals diverge, the SAME
-/// param name at a position agrees (`/{id}` + `/{id}/comments` is fine), and only
-/// two DIFFERENT param names at the same node conflict. Analyzed over the
+/// param name at a position agrees (`/{id}` + `/{id}/comments` is fine), two
+/// DIFFERENT param names at the same node conflict, and a SECOND raw spelling
+/// terminating at an occupied node (`/x` + `/x/` — the router drops empty
+/// segments, #140) is the trie's `duplicate route registration`. Analyzed over the
 /// mount-resolved route table (`genroute::route_map`), so subroute-mount params
 /// (which occupy real positions) are included — PLUS the implicit member routes
 /// (`genroute::implicit_member_routes`, issue #107), which `App::build` registers
@@ -285,11 +287,18 @@ fn member_roles_conflict(d: &Design) -> Option<DesignConflict> {
 /// abort at startup.
 fn router_param_conflict(d: &Design) -> Option<DesignConflict> {
     /// A structure-only twin of `router::Node`: static children keyed by literal,
-    /// plus at most ONE param slot carrying its name and the first route to set it.
+    /// at most ONE param slot carrying its name and the first route to set it,
+    /// plus the trie's endpoint-occupancy marker (#140) — the RAW path of the
+    /// first route to TERMINATE here. The runtime groups methods by raw path
+    /// string (one `.route()` line per spelling), so a second spelling that
+    /// collapses to the same node (`/x` vs `/x/` — empty segments are dropped)
+    /// is a second `Trie::insert` and aborts with `duplicate route registration`;
+    /// the same raw path re-terminating is the SAME line (methods merged), fine.
     #[derive(Default)]
     struct Node {
         statics: std::collections::HashMap<String, Node>,
         param: Option<(String, String, Box<Node>)>,
+        route: Option<String>,
     }
     // The router registers routes from the LOAD-normalized design
     // (`normalize_tenant_detail_routes` rewrites the tenant's own `{id}` detail
@@ -314,12 +323,20 @@ fn router_param_conflict(d: &Design) -> Option<DesignConflict> {
     // A design endpoint that OCCUPIES a reserved member path is a second
     // `.route()` registration of the same path — `App::build` aborts with
     // JC0500 `duplicate route registration` (methods don't disambiguate: the
-    // member surface registers its own route lines). Param names already agree
-    // here (a mismatch is the trie conflict below), so string equality is exact.
-    if let Some(taken) = member_routes
-        .iter()
-        .find(|mr| design_routes.iter().any(|dr| dr.path == mr.path))
-    {
+    // member surface registers its own route lines). Compared as SEGMENT
+    // vectors, not raw strings (#140): the router drops empty path segments
+    // (`router::segments` filters them), so `/{fk}/members/` — the natural
+    // hand-rolled spelling, collection routes are trailing-slash by convention
+    // — and `//` variants land on the SAME trie node as the reserved pair. A
+    // raw-string compare would pass them clean and abort at startup instead.
+    // (Param names already agree here — a mismatch is the trie conflict below.)
+    fn segs(p: &str) -> Vec<&str> {
+        p.split('/').filter(|s| !s.is_empty()).collect()
+    }
+    if let Some(taken) = member_routes.iter().find(|mr| {
+        let reserved = segs(&mr.path);
+        design_routes.iter().any(|dr| segs(&dr.path) == reserved)
+    }) {
         let tenant = &d
             .tenancy
             .as_ref()
@@ -363,6 +380,23 @@ fn router_param_conflict(d: &Design) -> Option<DesignConflict> {
             } else {
                 node = node.statics.entry(seg.to_string()).or_default();
             }
+        }
+        // Mirror `Trie::insert`'s occupancy branch (#140): a DIFFERENT raw
+        // spelling terminating at an occupied node is a second registration.
+        if let Some(first_route) = &node.route {
+            if first_route != &path {
+                return Some(DesignConflict {
+                    code: "JC0542",
+                    message: format!(
+                        "routes `{first_route}` and `{path}` are two spellings of the same route — the router drops empty path segments (a trailing or doubled `/`), so both occupy the same position and the second registration aborts `App::build` at startup with JC0500 `duplicate route registration` (after a clean scaffold, mid-test). Spell the path identically on both endpoints (identical spellings share one registration, each method intact), or move one endpoint to a distinct path. See `jerrycan explain JC0542`."
+                    ),
+                    hint: format!(
+                        "`{first_route}` and `{path}` collapse to the same router position — use ONE spelling for both endpoints, or give one a distinct path"
+                    ),
+                });
+            }
+        } else {
+            node.route = Some(path);
         }
     }
     None
@@ -2753,6 +2787,70 @@ mod tests {
             c.message.contains("/clubs/{club_id}/members")
                 && c.message.contains("member-management"),
             "names the reserved path and the member surface: {}",
+            c.message
+        );
+        assert!(
+            c.message.contains("duplicate route registration"),
+            "states the startup failure it prevents: {}",
+            c.message
+        );
+        assert!(!c.hint.is_empty());
+    }
+
+    /// #140: SLASH-VARIANTS of a reserved member path — `/{club_id}/members/`
+    /// (the natural hand-rolled shape: collection routes are trailing-slash by
+    /// convention), a doubled-slash spelling, and the item path with a trailing
+    /// slash. The router drops empty path segments (`segments()` filters them),
+    /// so each spelling registers the SAME trie node as the member surface and
+    /// `App::build` aborts with JC0500 `duplicate route registration` —
+    /// previously AFTER a clean check (the occupancy compare was raw-string).
+    /// The check must compare segment vectors and reject every spelling up
+    /// front with JC0542.
+    #[test]
+    fn slash_variants_of_a_reserved_member_path_are_a_conflict() {
+        for shape in [
+            "/{club_id}/members/",
+            "/{club_id}//members",
+            "/{club_id}/members/{user_id}/",
+        ] {
+            let c = design_conflict(&club_tenancy(shape))
+                .unwrap_or_else(|| panic!("`{shape}` must conflict with the member surface"));
+            assert_eq!(c.code, "JC0542", "`{shape}` must be JC0542");
+            assert!(
+                c.message.contains("member-management"),
+                "`{shape}` must name the member surface: {}",
+                c.message
+            );
+        }
+    }
+
+    /// #140: two spellings of ONE route — `GET /archive` and `POST /archive/`
+    /// — emit two `.route()` lines (`route_lines` groups by RAW path), which
+    /// the router collapses onto one trie node: the second registration aborts
+    /// `App::build` with JC0500 `duplicate route registration`, after a clean
+    /// check. The twin must mirror the trie's endpoint occupancy so the design
+    /// fails `check` up front, naming both spellings.
+    #[test]
+    fn slash_variant_duplicate_design_routes_are_a_conflict() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "dup-slash", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{ "name": "tickets",
+                "entities": [{ "name": "Ticket", "fields": [{ "name": "s", "type": "string" }] }],
+                "endpoints": [
+                    { "operation_id": "list_archived", "method": "GET", "path": "/archive",
+                      "success": { "status": 200 } },
+                    { "operation_id": "archive_ticket", "method": "POST", "path": "/archive/",
+                      "success": { "status": 201 } }
+                ] }]
+        }"#,
+        )
+        .unwrap();
+        let c = design_conflict(&d).expect("slash-variant duplicate routes must be a conflict");
+        assert_eq!(c.code, "JC0542");
+        assert!(
+            c.message.contains("`/tickets/archive`") && c.message.contains("`/tickets/archive/`"),
+            "names both spellings: {}",
             c.message
         );
         assert!(
