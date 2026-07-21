@@ -877,16 +877,38 @@ pub fn validate(d: &Design) -> Vec<Question> {
     // JC0550 (#88): the tenant entity's OWN detail route must address the tenant
     // by its pk fk. The load normalization rewrites only the literal `{id}`
     // (→ `{fk}`), so a route addressed by any OTHER param (`/{slug}`,
-    // `/by-slug/{slug}`, a multi-param custom) survives it — and the membership
-    // guard, which verifies the tenant NAMED BY THE PATH FK, cannot bind it: the
-    // handler would be generated with a bare `CurrentUser` and NO membership
-    // check at all, silently. Renaming the param is NOT a fix — the guard parses
-    // the path value as the tenant PK type, so a slug would be reinterpreted as
-    // a pk — hence a loud refusal (the JC0549 pattern: a latent unimplementable
-    // shape becomes a clear fork). Checked over a normalized clone (the
+    // `/by-slug/{slug}`) survives it — and the membership guard, which verifies
+    // the tenant NAMED BY THE PATH FK, cannot bind it: the handler would be
+    // generated with a bare `CurrentUser` and NO membership check at all,
+    // silently. Renaming the param is NOT a fix — the guard parses the path
+    // value as the tenant PK type, so a slug would be reinterpreted as a pk —
+    // hence a loud refusal (the JC0549 pattern: a latent unimplementable shape
+    // becomes a clear fork). Checked over a normalized clone (the
     // `router_param_conflict` precedent): production callers hand `validate()` a
     // load-normalized design already, and re-normalizing is idempotent, so the
     // conventional `/{id}` passes for direct (test/programmatic) callers too.
+    //
+    // Two resolution rules keep the refusal honest (this check is
+    // SECURITY-SENSITIVE, so it follows the JC0549(c) precedent):
+    //   - The target entity is resolved with design.rs's STRICT resolver
+    //     (`super::design::endpoint_repo_entity_strict` — qualified, because the
+    //     module-local lenient `endpoint_repo_entity` above shadows the design.rs
+    //     glob and LACKS the collection-creator arm). The local resolver both
+    //     OVER-fires — a sibling's bodyless `DELETE /siblings/{id}` in the tenant
+    //     module falls back to the first entity (the tenant) and is refused while
+    //     the refusal's own message says to use `/{id}` — and UNDER-fires: a
+    //     NON-FIRST tenant's bodyless `DELETE /{slug}` falls back to the first
+    //     entity (a sibling) and the real no-membership-check hole ships
+    //     question-free. Strict resolves the creator arm (the non-first tenant
+    //     fires), returns the sibling's own entity (siblings never fire), and
+    //     returns `None` for an entity-less custom endpoint (`GET
+    //     /export/{format}` never fires). Accepted residual: a creator-less
+    //     bodyless tenant detail route with a non-pk param in a single-entity
+    //     module resolves to NO entity and is not caught — that shape carries no
+    //     signal to resolve its entity (the #143 family).
+    //   - The route is a hole only when the tenant fk appears in NONE of its
+    //     path params: a multi-param `/{fk}/{sub}` binds the fk — the guard
+    //     membership-checks it — so only an fk-less parameterized path fires.
     if let Some(tenancy) = &d.tenancy {
         let fk = Design::fk_column(&tenancy.entity);
         let normalized = {
@@ -906,14 +928,15 @@ pub fn validate(d: &Design) -> Vec<Question> {
             ptr: &str,
             qs: &mut Vec<Question>,
         ) {
+            let fk_token = format!("{{{fk}}}");
             for (i, ep) in m.endpoints.iter().enumerate() {
-                if endpoint_repo_entity(m, ep) != Some(tenant) {
+                if super::design::endpoint_repo_entity_strict(m, ep) != Some(tenant) {
                     continue;
                 }
                 let Some(param) = trailing_path_param(&ep.path) else {
                     continue;
                 };
-                if param != fk {
+                if !ep.path.contains(&fk_token) {
                     qs.push(q(
                         format!("{ptr}/endpoints/{i}"),
                         format!(
@@ -3380,6 +3403,188 @@ mod tests {
         assert!(
             !qs.iter().any(|q| q.question.contains("JC0550")),
             "a child entity's `/{{slug}}` detail route must not trip JC0550: {qs:?}"
+        );
+    }
+
+    /// A SIBLING entity hosted in the tenant module with a bodyless
+    /// `DELETE /trophies/{id}` (204, no `success.entity`) is NOT the tenant's
+    /// own detail route: with a `POST /trophies` creator the strict resolver
+    /// binds the SIBLING, and without one it binds no entity at all — JC0550
+    /// must stay silent in both shapes. The module-local lenient resolver's
+    /// first-entity fallback resolved the with-creator shape to the TENANT and
+    /// falsely refused `{id}` — while the refusal's own message says to use
+    /// `/{id}`.
+    #[test]
+    fn sibling_bodyless_delete_in_tenant_module_does_not_trip_jc0550() {
+        for with_creator in [true, false] {
+            let creator = if with_creator {
+                r#"{ "operation_id": "create_trophy", "method": "POST", "path": "/trophies",
+                     "request_body": { "entity": "Trophy" },
+                     "success": { "status": 201, "entity": "Trophy" } },"#
+            } else {
+                ""
+            };
+            let d: Design = serde_json::from_str(&format!(
+                r#"{{ "name": "clubs-api", "contract_version": 1,
+                    "auth": {{ "model": "session", "roles": ["owner", "member"] }},
+                    "dependencies": ["db", "auth"],
+                    "tenancy": {{ "entity": "Club", "member_roles": ["owner", "member"] }},
+                    "modules": [{{
+                        "name": "clubs",
+                        "entities": [
+                            {{ "name": "Club", "fields": [
+                                {{ "name": "id", "type": "integer" }},
+                                {{ "name": "name", "type": "string" }} ]}},
+                            {{ "name": "Trophy",
+                               "belongs_to": [{{ "entity": "Club" }}],
+                               "fields": [
+                                {{ "name": "id", "type": "integer" }},
+                                {{ "name": "title", "type": "string" }} ]}}],
+                        "endpoints": [
+                            {{ "operation_id": "get_club", "method": "GET", "path": "/{{id}}",
+                               "auth_required": true,
+                               "success": {{ "status": 200, "entity": "Club" }} }},
+                            {creator}
+                            {{ "operation_id": "delete_trophy", "method": "DELETE",
+                               "path": "/trophies/{{id}}", "auth_required": true,
+                               "success": {{ "status": 204 }} }}
+                        ]
+                    }}]
+                }}"#
+            ))
+            .unwrap();
+            let qs = validate(&d);
+            assert!(
+                !qs.iter().any(|q| q.question.contains("JC0550")),
+                "a sibling's bodyless `DELETE /trophies/{{id}}` (creator present: {with_creator}) must not trip JC0550: {qs:?}"
+            );
+        }
+    }
+
+    /// The under-fire hole, closed: the tenant declared as a NON-FIRST entity
+    /// in its module, with a bodyless `DELETE /{slug}` whose collection creator
+    /// (`POST /`, body = tenant) IS the tenant. The lenient first-entity
+    /// fallback resolved it to the sibling and shipped the no-membership-check
+    /// hole question-free; the strict creator arm resolves the tenant and
+    /// refuses. Asserted for db+auth AND db-less/memory-mode tenancy — in
+    /// memory mode there is no implicit member surface, so JC0542 cannot catch
+    /// the shape and JC0550 is the ONLY design-time refusal.
+    #[test]
+    fn non_first_tenant_bodyless_slug_delete_trips_jc0550() {
+        for deps in [r#"["db", "auth"]"#, r#"["auth"]"#] {
+            let d: Design = serde_json::from_str(&format!(
+                r#"{{ "name": "clubs-api", "contract_version": 1,
+                    "auth": {{ "model": "session", "roles": ["owner", "member"] }},
+                    "dependencies": {deps},
+                    "tenancy": {{ "entity": "Club", "member_roles": ["owner", "member"] }},
+                    "modules": [{{
+                        "name": "clubs",
+                        "entities": [
+                            {{ "name": "Trophy",
+                               "belongs_to": [{{ "entity": "Club" }}],
+                               "fields": [
+                                {{ "name": "id", "type": "integer" }},
+                                {{ "name": "title", "type": "string" }} ]}},
+                            {{ "name": "Club", "fields": [
+                                {{ "name": "id", "type": "integer" }},
+                                {{ "name": "slug", "type": "string" }} ]}}],
+                        "endpoints": [
+                            {{ "operation_id": "create_club", "method": "POST", "path": "/",
+                               "request_body": {{ "entity": "Club" }},
+                               "success": {{ "status": 201, "entity": "Club" }} }},
+                            {{ "operation_id": "delete_club", "method": "DELETE", "path": "/{{slug}}",
+                               "auth_required": true,
+                               "success": {{ "status": 204 }} }}
+                        ]
+                    }}]
+                }}"#
+            ))
+            .unwrap();
+            let qs = validate(&d);
+            let hit = qs
+                .iter()
+                .find(|q| q.question.contains("JC0550"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "deps {deps}: a non-first tenant's bodyless `DELETE /{{slug}}` must trip JC0550: {qs:?}"
+                    )
+                });
+            assert!(
+                hit.question.contains("delete_club")
+                    && hit.question.contains("{slug}")
+                    && hit.question.contains("{club_id}"),
+                "JC0550 must name the operation, param, and fk: {}",
+                hit.question
+            );
+        }
+    }
+
+    /// An entity-less CUSTOM endpoint in a single-entity tenant module — a
+    /// `GET /export/{format}` with a custom-JSON success (no `success.entity`,
+    /// no body, no creator at `/export`) — reads NO entity's repo, so it is
+    /// not the tenant's detail route: strict resolution returns `None` and
+    /// JC0550 must stay silent. The lenient fallback tied it to the tenant and
+    /// falsely refused `{format}` as an unverifiable tenant param.
+    #[test]
+    fn entity_less_custom_get_does_not_trip_jc0550() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "clubs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+                "modules": [{
+                    "name": "clubs",
+                    "entities": [{ "name": "Club", "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "name", "type": "string" } ]}],
+                    "endpoints": [
+                        { "operation_id": "create_club", "method": "POST", "path": "/",
+                          "request_body": { "entity": "Club" },
+                          "success": { "status": 201, "entity": "Club" } },
+                        { "operation_id": "export_clubs", "method": "GET",
+                          "path": "/export/{format}", "auth_required": true,
+                          "success": { "status": 200 } }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let qs = validate(&d);
+        assert!(
+            !qs.iter().any(|q| q.question.contains("JC0550")),
+            "an entity-less custom `GET /export/{{format}}` must not trip JC0550: {qs:?}"
+        );
+    }
+
+    /// A multi-param tenant route that CARRIES the fk — `GET /{club_id}/{version}`
+    /// on the tenant — binds the fk (the guard membership-checks the tenant
+    /// named by it), so JC0550 must not fire: the predicate is "no fk among the
+    /// path params", not "the trailing param is not the fk".
+    #[test]
+    fn multi_param_tenant_route_with_fk_present_does_not_trip_jc0550() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "clubs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+                "modules": [{
+                    "name": "clubs",
+                    "entities": [{ "name": "Club", "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "name", "type": "string" } ]}],
+                    "endpoints": [
+                        { "operation_id": "get_club_version", "method": "GET",
+                          "path": "/{club_id}/{version}", "auth_required": true,
+                          "success": { "status": 200, "entity": "Club" } }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let qs = validate(&d);
+        assert!(
+            !qs.iter().any(|q| q.question.contains("JC0550")),
+            "a multi-param tenant route carrying the fk must not trip JC0550: {qs:?}"
         );
     }
 

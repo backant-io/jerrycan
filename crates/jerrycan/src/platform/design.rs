@@ -2355,6 +2355,59 @@ pub(crate) mod tests {
         );
     }
 
+    /// The immutable pre-pass in `normalize_own_detail_routes` is load-bearing,
+    /// not a style choice: resolution reads OTHER endpoints' paths (the
+    /// collection-creator arm), so a mutate-as-you-go rename would mis-resolve
+    /// later endpoints against half-rewritten collection paths. Fixture: the
+    /// creator's OWN path contains `{id}` (a replace-style `POST /{id}` whose
+    /// body is the tenant) and the tenant is NOT the module's first entity. An
+    /// interleaved implementation renames the creator first (→ `/{club_id}`),
+    /// so the dependent bodyless `DELETE /{id}/{version}`'s creator lookup at
+    /// `/{id}` misses, falls back to the FIRST entity (the sibling), and skips
+    /// the rename — leaving a dead `{id}` the guard cannot bind. The pre-pass
+    /// resolves both against pristine paths and renames both.
+    #[test]
+    fn normalize_pre_pass_resolves_against_pristine_paths() {
+        let mut d: Design = serde_json::from_str(
+            r#"{ "name": "clubs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+                "modules": [{
+                    "name": "clubs",
+                    "entities": [
+                        { "name": "Trophy",
+                          "belongs_to": [{ "entity": "Club" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "title", "type": "string" }] },
+                        { "name": "Club", "fields": [
+                            { "name": "id", "type": "integer" },
+                            { "name": "name", "type": "string" }] }],
+                    "endpoints": [
+                        { "operation_id": "replace_club", "method": "POST", "path": "/{id}",
+                          "request_body": { "entity": "Club" },
+                          "success": { "status": 200, "entity": "Club" } },
+                        { "operation_id": "purge_club_version", "method": "DELETE",
+                          "path": "/{id}/{version}",
+                          "success": { "status": 204 } }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        d.normalize_tenant_detail_routes();
+        assert_eq!(
+            d.modules[0].endpoints[0].path, "/{club_id}",
+            "the tenant-bodied creator itself is renamed"
+        );
+        assert_eq!(
+            d.modules[0].endpoints[1].path, "/{club_id}/{version}",
+            "the creator-resolved dependent is renamed too — an interleaved \
+             implementation loses the creator at `/{{id}}` mid-rename and \
+             leaves this `{{id}}` behind"
+        );
+    }
+
     #[test]
     fn field_default_round_trips_and_defaults_to_none() {
         // Issue #53a: a field may carry a server-owned `default`; it survives a
