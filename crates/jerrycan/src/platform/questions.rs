@@ -930,14 +930,12 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 continue;
             };
             if matches!(ep.method, HttpMethod::GET) {
-                // (c) The latent-bug closure. Per-user ownership mirrors
-                // genroute's `entity_is_per_user_owned` (auth + identity fk +
-                // no tenant path); db mode is the extra gate because only
-                // `sql_repo` suppresses the unscoped reads (a memory repo keeps
-                // plain `all`/`get`, so the stub stays implementable there).
-                let per_user_owned = d.wants_auth()
-                    && Design::has_identity_fk(e)
-                    && d.tenant_path(&e.name).is_none();
+                // (c) The latent-bug closure. Per-user ownership IS
+                // `Design::entity_is_per_user_owned` — the one shared classifier
+                // (#105 §F); db mode is the extra gate because only `sql_repo`
+                // suppresses the unscoped reads (a memory repo keeps plain
+                // `all`/`get`, so the stub stays implementable there).
+                let per_user_owned = d.entity_is_per_user_owned(e);
                 if !ep.is_guarded()
                     && !ep.public
                     && d.wants_db()

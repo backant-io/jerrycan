@@ -220,6 +220,21 @@ fn endpoint_emits_realtime_publish(ep: &Endpoint, design: &Design) -> bool {
     !matches!(ep.method, HttpMethod::GET) && design.server_publishable_broadcast().is_some()
 }
 
+/// True when this endpoint is a PUBLIC read on a `public_read` entity (issue
+/// #105): a GET whose repo entity opted into public_read takes NO `CurrentUser`
+/// — regardless of its declared `auth_required` — so the read is public by
+/// construction (the entity flag drives it; the design doesn't hand-set auth
+/// per GET). Writes always keep their guard, and a role-gated GET
+/// (`required_roles`) keeps its guard too: an explicit role demand outranks the
+/// entity-level read-open default (stripping it would silently drop the role
+/// check the design asked for). False for every non-`public_read` design,
+/// keeping output byte-identical.
+fn endpoint_is_public_read_get(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> bool {
+    matches!(ep.method, HttpMethod::GET)
+        && ep.required_roles.is_empty()
+        && endpoint_repo_entity(m, ep).is_some_and(|entity| design.entity_is_public_read(entity))
+}
+
 fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> String {
     let mut params = Vec::new();
     if let Some(e) = endpoint_repo_entity(m, ep) {
@@ -230,11 +245,12 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
     // caller belongs to the tenant NAMED IN THE PATH (401 from a missing session,
     // 404 from a non-member of that tenant), closing the #78 cross-tenant leak. A
     // flat (membership-set) or collection endpoint takes the bare authenticated
-    // session and scopes to the membership SET / body tenant fk instead.
+    // session and scopes to the membership SET / body tenant fk instead. A
+    // public_read GET (#105) takes NO guard at all — its read is public.
     if mode.auth && ep.is_guarded() {
         if endpoint_uses_tenant_guard(m, ep, design) {
             params.push("_tenant: Dep<Tenant>".to_string());
-        } else {
+        } else if !endpoint_is_public_read_get(m, ep, design) {
             params.push("_user: CurrentUser".to_string());
         }
     }
@@ -454,7 +470,9 @@ fn tenant_collection_comment(
 /// construction: a list to `all_for(_user.0.id)`, a `/{id}` read to
 /// `get_for(_user.0.id, _id)`. The unscoped `all()/get()` are NOT generated on a
 /// per-user repo (they don't compile), so this comment names the ONLY reachable
-/// accessor. Emitted only for a GET handler on a per-user entity in db+auth mode;
+/// accessor. A `public_read` entity (issue #105) flips the steer: its reads are
+/// PUBLIC, so the comment names the unscoped `all()`/`get(id)` the repo now
+/// emits. Emitted only for a GET handler on a per-user entity in db+auth mode;
 /// every other handler — and every non-per-user design — stays byte-identical.
 fn owner_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> String {
     if !(mode.db && mode.auth) || !matches!(ep.method, HttpMethod::GET) {
@@ -468,6 +486,20 @@ fn owner_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &
     };
     if !entity_is_per_user_owned(e, mode, design) {
         return String::new();
+    }
+    // public_read (#105): the read is PUBLIC — steer to the unscoped `all()`/
+    // `get(id)` (which the repo now emits) instead of the owner-scoped accessors;
+    // there is no `_user` param to scope by (handler_params dropped it). Writes
+    // keep the owner-scoped steering through their own comments/accessors.
+    if design.entity_is_public_read(entity) {
+        let call = if ep.success.list {
+            format!("{entity}Repo::all()")
+        } else {
+            format!("{entity}Repo::get(_id)")
+        };
+        return format!(
+            "    // public read (issue #105): this {entity} is public_read — the read is UNSCOPED\n    // and serves every owner's rows. Call `{call}` (no session needed). Writes stay\n    // owner-scoped: route them through `update_for`/`remove_for` with the session\n    // user's id.\n"
+        );
     }
     let call = if ep.success.list {
         format!("{entity}Repo::all_for(_user.0.id)")
@@ -500,10 +532,14 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
             .endpoints
             .iter()
             .any(|ep| ep.is_guarded() && endpoint_uses_tenant_guard(m, ep, design));
-        let needs_user = m
-            .endpoints
-            .iter()
-            .any(|ep| ep.is_guarded() && !endpoint_uses_tenant_guard(m, ep, design));
+        // …and a public_read GET (#105) takes NO guard param at all, so it must
+        // not count toward the CurrentUser import (mirror handler_params exactly,
+        // or a public-read-only module emits an unused import).
+        let needs_user = m.endpoints.iter().any(|ep| {
+            ep.is_guarded()
+                && !endpoint_uses_tenant_guard(m, ep, design)
+                && !endpoint_is_public_read_get(m, ep, design)
+        });
         if needs_tenant {
             uses.push_str("use shared::Tenant;\n");
         }
@@ -2004,21 +2040,19 @@ pub struct {entity}Member {{
     )
 }
 
-/// True when this entity is OWNER-scoped by the AUTHENTICATED USER (issue #79):
-/// it carries an identity fk (`user_id` — a belongs_to aimed at the auth identity
-/// entity, the same COLUMN-name resolution JC0540/#34 use) in an auth design, and
-/// is NOT tenant-owned (a tenant-owned entity is scoped by the TENANT instead, via
-/// `scoped_methods`). Such an entity's repo emits ONLY the owner-scoped
-/// `all_for/get_for/remove_for/update_for` accessors; the unscoped
-/// `all/get/remove/update` are suppressed, so a cross-user read/delete cannot be
-/// written at all — the #79 leak is made impossible by construction, not merely
-/// linted. db-mode only (this is `sql_repo`'s concern; the memory-mode struct has
-/// no fk columns to scope by, so memory output stays byte-identical).
+/// True when this entity is OWNER-scoped by the AUTHENTICATED USER (issue #79).
+/// Such an entity's repo emits the owner-scoped
+/// `all_for/get_for/remove_for/update_for` accessors and suppresses the unscoped
+/// `all/get/remove/update`, so a cross-user read/delete cannot be written at all
+/// — the #79 leak is made impossible by construction, not merely linted (a
+/// `public_read` entity, #105, gets its unscoped READS back — see `sql_repo`).
+/// The classifier itself lives on [`Design::entity_is_per_user_owned`] — the ONE
+/// shared per-user predicate (#105 §F) — re-gated on `mode.auth` (generation
+/// derives it from `wants_auth()`; a non-auth mode has no session to scope by).
+/// db-mode only in effect (this is `sql_repo`'s concern; the memory-mode struct
+/// has no fk columns to scope by, so memory output stays byte-identical).
 fn entity_is_per_user_owned(e: &Entity, mode: GenMode, design: &Design) -> bool {
-    // A tenant-owned entity — directly OR transitively (issue #102) — is scoped by
-    // the TENANT (via `scoped_methods`), never per-user, so exclude any entity with a
-    // tenant path. `tenant_path` is `None` when there is no tenancy.
-    mode.auth && Design::has_identity_fk(e) && design.tenant_path(&e.name).is_none()
+    mode.auth && design.entity_is_per_user_owned(e)
 }
 
 /// Owner-scoped accessors for a per-user identity-owned entity (issue #79) — keyed
@@ -2049,12 +2083,21 @@ fn owner_scoped_methods(e: &Entity, mode: GenMode, design: &Design) -> String {
     // (issue #92): a text pk is moved into the ownership-check query, so clone it there
     // and keep the owned `id` to `Set` below; an integer pk is `Copy` (empty suffix).
     let pk_clone = if key == "String" { ".clone()" } else { "" };
+    // A public_read entity (#105) keeps its unscoped READS (see `sql_repo`), so the
+    // "unscoped … are NOT generated" claim would be wrong there — say what actually
+    // holds: reads are public, WRITES must go through the owner-scoped accessors.
+    let header = if design.entity_is_public_read(entity) {
+        format!(
+            "    // Owner-scoped accessors (issues #79/#105) — this {entity} is public_read: the\n    // unscoped all/get above serve the PUBLIC reads, but every WRITE must go through\n    // update_for/remove_for below, keyed on the session user (`_user.0.id`). The\n    // unscoped update/remove are NOT generated, so a cross-user write can't be\n    // written. `{fk_col}` is the session user's id."
+        )
+    } else {
+        format!(
+            "    // Owner-scoped accessors (issue #79) — this {entity} belongs to the authenticated\n    // user; handlers MUST scope to the session user (`_user.0.id`) via these. The\n    // unscoped all/get/remove/update are NOT generated, so a cross-user read/delete\n    // can't be written. `{fk_col}` is the session user's id."
+        )
+    };
     format!(
         r#"
-    // Owner-scoped accessors (issue #79) — this {entity} belongs to the authenticated
-    // user; handlers MUST scope to the session user (`_user.0.id`) via these. The
-    // unscoped all/get/remove/update are NOT generated, so a cross-user read/delete
-    // can't be written. `{fk_col}` is the session user's id.
+{header}
     pub async fn all_for(&self, {fk_col}: {fk_ty}) -> Result<Vec<{entity}>> {{
         {snake}::Entity::find()
             .filter({snake}::Column::{fk_pascal}.eq({fk_col}))
@@ -2120,8 +2163,12 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
     // Per-user (issue #79): a guarded identity-owned entity emits ONLY owner-scoped
     // accessors — the unscoped all/get/remove/update are suppressed so the leaky
     // call can't be written. Mutually exclusive with `scoped` (tenant-owned).
+    // public_read (#105) is the THIRD state on top: the unscoped READS come back
+    // (its GETs are public and serve every owner's rows) while the unscoped
+    // update/remove stay suppressed — public read, owner write.
     let owner_scoped = owner_scoped_methods(e, mode, design);
     let per_user = !owner_scoped.is_empty();
+    let public_read = per_user && design.entity_is_public_read(&e.name);
     // The tenant entity's OWN membership-lifecycle methods (empty for every other
     // entity); mutually exclusive with `scoped` (an entity can't be BOTH the tenant
     // and belong_to the tenant).
@@ -2161,20 +2208,25 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
     };
     // The unscoped read/write accessors. Suppressed for a per-user entity (#79) so
     // the leaky cross-user call cannot be written — only the owner-scoped `*_for`
-    // methods remain. `insert` is always emitted (a create is scoped by the
-    // server-injected owner fk, not by the repo method). Non-per-user output stays
-    // byte-identical: `{reads}{insert_body}{writes}` reproduces the original layout.
-    let (reads, writes) = if per_user {
-        (String::new(), String::new())
-    } else {
-        (
-            format!(
-                "    pub async fn all(&self) -> Result<Vec<{entity}>> {{\n        {snake}::Entity::find()\n            .order_by_asc({snake}::Column::Id)\n            .all(self.db.conn())\n            .await\n            .map_err(db_error)\n    }}\n\n    pub async fn get(&self, id: {key}) -> Result<Option<{entity}>> {{\n        {snake}::Entity::find_by_id(id)\n            .one(self.db.conn())\n            .await\n            .map_err(db_error)\n    }}\n\n"
-            ),
-            format!(
-                "\n\n    pub async fn remove(&self, id: {key}) -> Result<bool> {{\n        let r = {snake}::Entity::delete_by_id(id)\n            .exec(self.db.conn())\n            .await\n            .map_err(db_error)?;\n        Ok(r.rows_affected > 0)\n    }}\n\n    pub async fn update(&self, id: {key}, item: {entity}) -> Result<bool> {{\n        let m = {snake}::ActiveModel {{\n            id: Set(id),\n{update_sets}        }};\n        match m.update(self.db.conn()).await {{\n            Ok(_) => Ok(true),\n            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),\n            Err(e) => Err(db_error(e)),\n        }}\n    }}"
-            ),
-        )
+    // methods remain — EXCEPT that a public_read entity (#105) keeps the unscoped
+    // READS: its GET handlers are public and legitimately serve the whole
+    // collection; its unscoped update/remove stay suppressed. `insert` is always
+    // emitted (a create is scoped by the server-injected owner fk, not by the repo
+    // method). Non-per-user output stays byte-identical:
+    // `{reads}{insert_body}{writes}` reproduces the original layout.
+    let unscoped_reads = format!(
+        "    pub async fn all(&self) -> Result<Vec<{entity}>> {{\n        {snake}::Entity::find()\n            .order_by_asc({snake}::Column::Id)\n            .all(self.db.conn())\n            .await\n            .map_err(db_error)\n    }}\n\n    pub async fn get(&self, id: {key}) -> Result<Option<{entity}>> {{\n        {snake}::Entity::find_by_id(id)\n            .one(self.db.conn())\n            .await\n            .map_err(db_error)\n    }}\n\n"
+    );
+    let unscoped_writes = format!(
+        "\n\n    pub async fn remove(&self, id: {key}) -> Result<bool> {{\n        let r = {snake}::Entity::delete_by_id(id)\n            .exec(self.db.conn())\n            .await\n            .map_err(db_error)?;\n        Ok(r.rows_affected > 0)\n    }}\n\n    pub async fn update(&self, id: {key}, item: {entity}) -> Result<bool> {{\n        let m = {snake}::ActiveModel {{\n            id: Set(id),\n{update_sets}        }};\n        match m.update(self.db.conn()).await {{\n            Ok(_) => Ok(true),\n            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),\n            Err(e) => Err(db_error(e)),\n        }}\n    }}"
+    );
+    let (reads, writes) = match (per_user, public_read) {
+        // Plain per-user (#79): everything unscoped is suppressed.
+        (true, false) => (String::new(), String::new()),
+        // public_read (#105): public reads, owner-only writes.
+        (true, true) => (unscoped_reads, String::new()),
+        // Not per-user: the original unscoped surface, byte-identical.
+        _ => (unscoped_reads, unscoped_writes),
     };
     format!(
         r#"{member_row}pub struct {entity}Repo {{
@@ -3751,6 +3803,241 @@ pub(crate) mod tests {
         assert!(
             !users.contains("pub async fn all_for("),
             "User is not owner-scoped: {users}"
+        );
+    }
+
+    /// The public-read/owner-write feed design (issue #105): Post is a per-user
+    /// identity-owned entity that opted into `public_read` (anyone reads, only the
+    /// owner writes); Draft is the same shape WITHOUT the flag. `list_posts` is
+    /// declared `auth_required` (the flag must override it); `get_post` is an
+    /// unguarded detail read (legit ONLY because of the flag).
+    pub(crate) const PUBLIC_READ: &str = r#"{
+        "name": "feedapp",
+        "contract_version": 1,
+        "auth": { "model": "session", "roles": ["user"] },
+        "dependencies": ["db", "auth"],
+        "modules": [
+            { "name": "users",
+              "entities": [{ "name": "User", "fields": [
+                  { "name": "email", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "list_users", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "User", "list": true } }
+              ] },
+            { "name": "posts",
+              "entities": [
+                  { "name": "Post", "public_read": true,
+                    "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                    "fields": [{ "name": "title", "type": "string" }] },
+                  { "name": "Draft",
+                    "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                    "fields": [{ "name": "body", "type": "string" }] }
+              ],
+              "endpoints": [
+                  { "operation_id": "list_posts", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Post", "list": true } },
+                  { "operation_id": "get_post", "method": "GET", "path": "/{id}",
+                    "success": { "status": 200, "entity": "Post" } },
+                  { "operation_id": "create_post", "method": "POST", "path": "/",
+                    "auth_required": true,
+                    "request_body": { "entity": "Post" },
+                    "success": { "status": 201, "entity": "Post" } },
+                  { "operation_id": "update_post", "method": "PUT", "path": "/{id}",
+                    "auth_required": true,
+                    "request_body": { "entity": "Post" },
+                    "success": { "status": 200, "entity": "Post" } },
+                  { "operation_id": "delete_post", "method": "DELETE", "path": "/{id}",
+                    "auth_required": true,
+                    "success": { "status": 204 } },
+                  { "operation_id": "list_drafts", "method": "GET", "path": "/drafts",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Draft", "list": true } }
+              ] }
+        ]
+    }"#;
+
+    /// Issue #105 — the public-read/owner-write THIRD repo state. A `public_read`
+    /// per-user entity (Post) gets the UNSCOPED `all()`/`get()` READS back (its
+    /// GETs are public and serve every owner's rows) while WRITES stay owner-scoped
+    /// ONLY: `update_for`/`remove_for` are kept and the unscoped `update`/`remove`
+    /// stay suppressed, so a cross-user write still cannot compile. `insert` stays
+    /// (a create is scoped by the server-injected owner fk). A NON-public_read
+    /// sibling in the SAME module (Draft) keeps the full #79 suppression — the
+    /// third state is reachable ONLY through the entity flag, so every existing
+    /// per-user design is byte-identical. WHY (Rule 9): without this state the
+    /// feed shape (#105) forced either a leaky handler or an unimplementable stub;
+    /// keeping the write suppression is what stops "public read" from silently
+    /// becoming "public write".
+    #[test]
+    fn public_read_entity_keeps_public_reads_and_owner_writes() {
+        let d: Design = serde_json::from_str(PUBLIC_READ).unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let src = repo_rs(&d.modules[1], mode, &d).unwrap();
+        let (posts, drafts) = src
+            .split_once("pub struct DraftRepo")
+            .expect("both repos emitted");
+        // Post (public_read): the unscoped READS are emitted…
+        assert!(
+            posts.contains("pub async fn all(&self) -> Result<Vec<Post>>"),
+            "public_read emits the unscoped all(): {posts}"
+        );
+        assert!(
+            posts.contains("pub async fn get(&self, id: i64) -> Result<Option<Post>>"),
+            "public_read emits the unscoped get(): {posts}"
+        );
+        // …the writes stay owner-scoped only…
+        assert!(
+            posts.contains("pub async fn update_for(&self, user_id: i64, id: i64, item: Post)"),
+            "owner-scoped update_for kept: {posts}"
+        );
+        assert!(
+            posts.contains("pub async fn remove_for(&self, user_id: i64, id: i64)"),
+            "owner-scoped remove_for kept: {posts}"
+        );
+        assert!(
+            !posts.contains("pub async fn remove(&self, id: i64)"),
+            "unscoped remove must stay suppressed on a public_read entity: {posts}"
+        );
+        assert!(
+            !posts.contains("pub async fn update(&self, id: i64, item:"),
+            "unscoped update must stay suppressed on a public_read entity: {posts}"
+        );
+        // …and the create keeps its server-scoped insert.
+        assert!(
+            posts.contains("pub async fn insert(&self, item: Post)"),
+            "{posts}"
+        );
+        // Draft (NOT public_read, same module) keeps the full #79 suppression.
+        assert!(
+            !drafts.contains("pub async fn all(&self) -> Result<Vec<Draft>>"),
+            "a non-public_read per-user entity keeps its reads suppressed: {drafts}"
+        );
+        assert!(
+            drafts.contains("pub async fn all_for(&self, user_id: i64) -> Result<Vec<Draft>>"),
+            "{drafts}"
+        );
+    }
+
+    /// Issue #105 — the guarding split. A GET on a `public_read` entity takes NO
+    /// `CurrentUser` — even when the design declares it `auth_required` (the entity
+    /// flag drives it, correct-by-construction) — and its stub steers to the
+    /// UNSCOPED `repo.all()`/`get(_id)` (the read is public; `all_for(_user.0.id)`
+    /// would reference a param that no longer exists). Writes keep the guard AND
+    /// the owner-scoped steering; a NON-public_read sibling GET in the same module
+    /// keeps both its `CurrentUser` and the #79 owner-scope steer.
+    #[test]
+    fn public_read_gets_are_unguarded_and_writes_stay_guarded() {
+        let d: Design = serde_json::from_str(PUBLIC_READ).unwrap();
+        let h = handlers_rs(
+            &d.modules[1],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        );
+        // The declared-guarded list GET loses its CurrentUser — the flag overrides.
+        assert!(
+            h.contains("pub(crate) async fn list_posts(_repo: Dep<PostRepo>) ->"),
+            "public_read GET takes no CurrentUser even when auth_required: {h}"
+        );
+        assert!(
+            h.contains(
+                "pub(crate) async fn get_post(_repo: Dep<PostRepo>, Path(_id): Path<i64>) ->"
+            ),
+            "{h}"
+        );
+        // Writes keep the guard.
+        assert!(
+            h.contains("pub(crate) async fn create_post(_repo: Dep<PostRepo>, _user: CurrentUser,"),
+            "a write on a public_read entity keeps its guard: {h}"
+        );
+        assert!(
+            h.contains("pub(crate) async fn update_post(_repo: Dep<PostRepo>, _user: CurrentUser,"),
+            "{h}"
+        );
+        assert!(
+            h.contains("pub(crate) async fn delete_post(_repo: Dep<PostRepo>, _user: CurrentUser,"),
+            "{h}"
+        );
+        // The non-public sibling GET keeps its guard.
+        assert!(
+            h.contains(
+                "pub(crate) async fn list_drafts(_repo: Dep<DraftRepo>, _user: CurrentUser)"
+            ),
+            "a non-public_read GET keeps CurrentUser: {h}"
+        );
+        // Steering: public reads go to the UNSCOPED repo methods…
+        let list_stub = h
+            .split("async fn list_posts")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            list_stub.contains("PostRepo::all()"),
+            "public list steers to the unscoped all(): {list_stub}"
+        );
+        assert!(
+            !list_stub.contains("all_for"),
+            "no owner-scope steer on a public read: {list_stub}"
+        );
+        let get_stub = h
+            .split("async fn get_post")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            get_stub.contains("PostRepo::get(_id)"),
+            "public detail steers to the unscoped get(): {get_stub}"
+        );
+        // …while the non-public sibling keeps the #79 owner-scope steer.
+        let drafts_stub = h
+            .split("async fn list_drafts")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            drafts_stub.contains("DraftRepo::all_for(_user.0.id)"),
+            "the non-public sibling keeps the owner-scope steer: {drafts_stub}"
+        );
+    }
+
+    /// A module whose ONLY guarded endpoints are public_read GETs emits no handler
+    /// that takes `_user` — so `use shared::CurrentUser;` must NOT be emitted
+    /// (an unused import trips `-D warnings` on freshly generated code).
+    #[test]
+    fn public_read_only_module_omits_the_current_user_import() {
+        let mut d: Design = serde_json::from_str(PUBLIC_READ).unwrap();
+        let m = &mut d.modules[1];
+        m.entities.retain(|e| e.name == "Post");
+        m.endpoints
+            .retain(|ep| matches!(ep.method, HttpMethod::GET) && ep.operation_id != "list_drafts");
+        let h = handlers_rs(
+            &d.modules[1],
+            GenMode {
+                db: true,
+                auth: true,
+            },
+            &d,
+        );
+        assert!(
+            !h.contains("use shared::CurrentUser;"),
+            "no handler takes _user, so the import must be dropped: {h}"
+        );
+        assert!(
+            h.contains("async fn list_posts(_repo: Dep<PostRepo>)"),
+            "{h}"
         );
     }
 

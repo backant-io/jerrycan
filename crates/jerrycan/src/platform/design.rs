@@ -1044,23 +1044,31 @@ impl Design {
         e.belongs_to.iter().any(Self::is_identity_fk)
     }
 
+    /// True when `e` is OWNER-scoped by the AUTHENTICATED USER (issue #79): an
+    /// auth design, an identity fk (`user_id` — a belongs_to aimed at the auth
+    /// identity entity, the same COLUMN-name resolution JC0540/#34 use), and NOT
+    /// tenant-owned — directly OR transitively (issue #102): an entity with a
+    /// tenant path is scoped by the TENANT (via `scoped_methods`), never
+    /// per-user. THE single per-user classifier (#105 §F): repo emission
+    /// (genroute), the JC0549 validation (questions), the isolation-test shape
+    /// (testgen), the JL0006 module scan (lints), and [`Self::entity_is_public_read`]
+    /// all resolve through this ONE method, so the mirror sites cannot drift
+    /// apart — mirror drift is exactly how the #102-class holes shipped.
+    pub(crate) fn entity_is_per_user_owned(&self, e: &Entity) -> bool {
+        self.wants_auth() && Self::has_identity_fk(e) && self.tenant_path(&e.name).is_none()
+    }
+
     /// The public-read/owner-write classifier (issue #105): entity `entity`
     /// opted in via `public_read: true` AND is per-user owned. The per-user leg
-    /// MIRRORS genroute's `entity_is_per_user_owned` (`mode.auth` — which
-    /// generation sets from `wants_auth()` — plus an identity fk plus no tenant
-    /// path, direct or transitive), so the classifier, the repo emission, the
-    /// testgen shape, and the lint config agree on WHICH entities get public
-    /// reads with owner-gated writes. Resolves by NAME across the tree so a
-    /// caller holding only an endpoint's repo-entity name agrees with one
-    /// holding the `Entity`. False for every non-opt-in entity, so existing
-    /// designs are untouched.
+    /// IS [`Self::entity_is_per_user_owned`] — the one shared classifier — so
+    /// this flag, the repo emission, the testgen shape, and the lint config
+    /// agree on WHICH entities get public reads with owner-gated writes.
+    /// Resolves by NAME across the tree so a caller holding only an endpoint's
+    /// repo-entity name agrees with one holding the `Entity`. False for every
+    /// non-opt-in entity, so existing designs are untouched.
     pub(crate) fn entity_is_public_read(&self, entity: &str) -> bool {
-        self.find_entity(entity).is_some_and(|e| {
-            e.public_read
-                && self.wants_auth()
-                && Self::has_identity_fk(e)
-                && self.tenant_path(entity).is_none()
-        })
+        self.find_entity(entity)
+            .is_some_and(|e| e.public_read && self.entity_is_per_user_owned(e))
     }
 
     /// The server-owned-FK rule (issue #34), design-level: a GUARDED endpoint

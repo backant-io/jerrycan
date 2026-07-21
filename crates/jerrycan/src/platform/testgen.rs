@@ -1176,22 +1176,6 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
     t
 }
 
-/// True when `e` is per-user identity-owned: it carries an identity fk (`user_id`,
-/// belongs_to the auth identity) and is NOT tenant-owned (a tenant-owned entity is
-/// scoped by the tenant instead). Mirrors genroute's `entity_is_per_user_owned`
-/// (the two must agree: genroute suppresses the unscoped methods for exactly the
-/// entities testgen writes an owner-isolation test for).
-fn entity_is_per_user_owned(design: &Design, e: &Entity) -> bool {
-    // TENANT ownership wins and is TRANSITIVE (issue #102): a multi-parent entity
-    // that ALSO carries `user_id` (e.g. `Comment belongs_to [Ticket, User]`, where
-    // Ticket reaches the tenant) is tenant-owned via that chain, NOT per-user — so
-    // it gets the cross-TENANT isolation test, not the #79 per-user one. Keyed on
-    // `tenant_path(..).is_none()` so it agrees with genroute's transitive
-    // `entity_is_per_user_owned` (the two MUST stay in sync). A direct tenant child
-    // resolves to `Some` too, so existing designs are byte-identical.
-    Design::has_identity_fk(e) && design.tenant_path(&e.name).is_none()
-}
-
 /// The per-user (#79) isolation test: user 1 creates a row (the server injects
 /// user 1's id); user 2 must not be able to read, list, or delete it. WHY (Rule 9):
 /// the identity-owned shape JC0540 steers agents toward had NO backstop — an
@@ -1204,10 +1188,14 @@ fn per_user_isolation_test(design: &Design, module: &ModuleDesign) -> String {
     if !(design.wants_db() && design.wants_auth()) {
         return String::new();
     }
+    // Per-user classification is `Design::entity_is_per_user_owned` — the ONE
+    // shared predicate (#105 §F): genroute suppresses the unscoped methods for
+    // exactly the entities this test covers (TENANT ownership wins and is
+    // TRANSITIVE, #102 — such entities get the cross-tenant test instead).
     let Some(entity) = module
         .entities
         .iter()
-        .find(|e| entity_is_per_user_owned(design, e))
+        .find(|e| design.entity_is_per_user_owned(e))
     else {
         return String::new();
     };
