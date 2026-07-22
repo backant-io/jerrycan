@@ -299,12 +299,9 @@ async fn cross_module_fk_lets_per_module_migration_insert_under_fk_enforcement()
     );
 
     let db = jerrycan::db::Db::connect("sqlite::memory:").await.unwrap();
-    // FK enforcement ON — without it the bug would be masked (sqlite ignores FKs
-    // by default). This is the exact enforcement the eval's gen-tests run under.
-    db.conn()
-        .execute_unprepared("PRAGMA foreign_keys=ON")
-        .await
-        .unwrap();
+    // FK enforcement is ON — `Db::connect` pins `foreign_keys=ON` on every
+    // SQLite connection (no manual PRAGMA needed). Without enforcement the bug
+    // would be masked; this is the exact enforcement gen-tests runs under.
     db.migrate_owned(&leads_only).await.unwrap();
 
     // Insert a lead whose workspace_id points at a workspace row that does NOT
