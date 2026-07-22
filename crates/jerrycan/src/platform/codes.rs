@@ -265,6 +265,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs auth",
     },
     CodeInfo {
+        code: "JC0550",
+        title: "tenant detail route addresses the tenant by a non-pk param",
+        cause: "the tenant entity's own detail route carries a path parameter that is not the tenant's fk (e.g. `/{slug}` instead of `/{id}`/`/{club_id}`) — the membership guard verifies the tenant NAMED BY THE PATH FK and parses that path value as the tenant's pk type, so a non-pk param can neither be bound nor membership-checked, and the handler would be generated with no membership check at all (a silent cross-tenant read); renaming the param is not a fix, because a slug value is not a pk",
+        fix: "address the tenant's own detail route by pk: use `/{id}` (auto-normalized to the tenant fk) or the explicit `/{fk}` directly; slug-based tenant addressing (resolving slug→pk before the membership query) is not yet supported",
+        doc: "jerrycan docs tenancy",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -408,6 +415,26 @@ mod tests {
         assert!(
             info.fix.contains("flatten") && info.fix.contains("drop"),
             "fix must name both remedies: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0550_names_the_fk_binding_and_both_pk_remedies() {
+        // WHY: JC0550 converts the silent no-membership-check on a tenant
+        // entity's own detail route addressed by a non-pk param (#88) into a
+        // design-time refusal — `jerrycan explain JC0550` must state WHY a
+        // rename is not the fix (the guard parses the path value as the tenant
+        // pk) and name both pk-shaped remedies (`/{id}` or the explicit fk).
+        let info = lookup("JC0550").unwrap();
+        assert!(
+            info.cause.contains("membership") && info.cause.contains("pk"),
+            "cause must tie the path-fk binding to the membership guard: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("/{id}") && info.fix.contains("fk"),
+            "fix must name both pk remedies: {}",
             info.fix
         );
     }

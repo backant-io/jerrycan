@@ -559,6 +559,16 @@ pub struct HandlerRef {
     pub leak_desc: &'static str,
     /// The registered fix text (the scoped accessors to call instead).
     pub suggestion: String,
+    /// Handler fn names (operation_ids, per the JL0002 contract) whose
+    /// `get`/`update`/`remove`/`insert` hits JL0006 must NOT flag (issue #124):
+    /// the TENANT entity's own PathScoped detail handlers, where membership in
+    /// the path tenant was already verified by the `Dep<Tenant>` guard and the
+    /// tenant repo intentionally keeps its unscoped methods (per-user
+    /// suppression only). `repo.all()` stays armed even in these fns —
+    /// fn-level suppression cannot see which repo the `repo` binding holds,
+    /// and a correct detail handler calls `get`, not `all`. Empty for every
+    /// per-user ref and for tenant modules without a hosted child's handlers.
+    pub exempt_fns: std::collections::BTreeSet<String>,
 }
 
 /// The JL0006 fix text for a TENANT-owned handler (both route shapes, issue #94):
@@ -596,12 +606,45 @@ impl Design {
             let is_flat = owned
                 .iter()
                 .any(|e| super::genroute::entity_is_flat_tenant_owned(e, self));
+            // Issue #124: a tenant module that also hosts a tenant-owned child
+            // drags the tenant's OWN handlers into this scan, where the
+            // PathScoped detail handlers legitimately call the unscoped
+            // `repo.get/update/remove` on the TENANT repo (membership in the
+            // path tenant is already guard-verified). Exempt exactly those fns
+            // — resolved with the STRICT repo-entity resolver on purpose: a
+            // lint must UNDER-exempt (a residual false positive has the
+            // line-scoped allow hatch) and never OVER-exempt (which would
+            // silence a real leak in a handler the fallback mis-bound). The
+            // `is_guarded()` conjunct is load-bearing: genroute emits the
+            // membership-checking `Dep<Tenant>` param only for guarded
+            // endpoints, so an UNGUARDED (or `public: true`) tenant detail
+            // route has NO guard — its unscoped `repo.get/update/remove` is an
+            // anonymous tenant read/write and must stay armed.
+            let exempt_fns: std::collections::BTreeSet<String> = self
+                .tenancy
+                .as_ref()
+                .map(|t| {
+                    m.endpoints
+                        .iter()
+                        .filter(|ep| {
+                            endpoint_repo_entity_strict(m, ep) == Some(t.entity.as_str())
+                                && matches!(
+                                    self.endpoint_tenant_shape(m, ep),
+                                    TenantShape::PathScoped { .. }
+                                )
+                                && ep.is_guarded()
+                        })
+                        .map(|ep| ep.operation_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             out.push(HandlerRef {
                 rel_path: format!("{src_rel}/handlers.rs"),
                 is_flat,
                 owned_desc: "a tenant-owned",
                 leak_desc: "another tenant's rows",
                 suggestion: TENANT_SCOPED_SUGGESTION.to_string(),
+                exempt_fns,
             });
         }
         for sub in &m.subroutes {
@@ -849,12 +892,32 @@ impl Design {
     /// `entity` (the tenant module); recurse so a tenant entity declared in a
     /// subroute is still found. Never touches a module that merely OWNS a
     /// tenant-owned child.
+    ///
+    /// Scoped to endpoints whose resolved repo entity IS the tenant entity
+    /// (issue #89): a sibling entity hosted in the same module keeps its own
+    /// `/{id}` detail routes — there `{id}` is the SIBLING's key, and renaming
+    /// it to the tenant fk would mis-scope the sibling's detail route to the
+    /// tenant guard. Resolution is the lenient [`endpoint_repo_entity`]: its
+    /// first-entity fallback preserves the normalization of a bodyless tenant
+    /// detail route (a `DELETE /{id}` with no success entity) in a
+    /// single-entity tenant module. Because that resolver reads OTHER
+    /// endpoints' paths (collection-creator resolution, #56), the targets are
+    /// collected in an immutable pre-pass BEFORE any path is rewritten — never
+    /// resolve mid-rename against half-rewritten collection paths.
     fn normalize_own_detail_routes(m: &mut ModuleDesign, entity: &str, fk_token: &str) {
         if m.entities.iter().any(|e| e.name == entity) {
-            for ep in &mut m.endpoints {
-                if ep.path.contains("{id}") {
-                    ep.path = ep.path.replace("{id}", fk_token);
-                }
+            let targets: Vec<usize> = m
+                .endpoints
+                .iter()
+                .enumerate()
+                .filter(|(_, ep)| {
+                    ep.path.contains("{id}") && endpoint_repo_entity(m, ep) == Some(entity)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            for i in targets {
+                let path = &mut m.endpoints[i].path;
+                *path = path.replace("{id}", fk_token);
             }
         }
         for sub in &mut m.subroutes {
@@ -2218,6 +2281,11 @@ pub(crate) mod tests {
         // collection root (`POST`/`GET "/"`) is unaffected. This is the security
         // fix: without the rename the guard's path branch misses and leaks another
         // tenant's row.
+        //
+        // Issue #89: a SIBLING entity hosted in the SAME (tenant-declaring) module
+        // keeps its own `/trophies/{id}` detail routes — `{id}` there is the
+        // TROPHY's key, and renaming it to `{club_id}` would mis-scope the
+        // sibling's detail route to the tenant guard.
         let mut d: Design = serde_json::from_str(
             r#"{ "name": "clubs-api", "contract_version": 1,
                 "auth": { "model": "session", "roles": ["owner", "member"] },
@@ -2225,9 +2293,15 @@ pub(crate) mod tests {
                 "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
                 "modules": [
                     { "name": "clubs",
-                      "entities": [{ "name": "Club", "fields": [
-                          { "name": "id", "type": "integer" },
-                          { "name": "name", "type": "string" } ]}],
+                      "entities": [
+                          { "name": "Club", "fields": [
+                              { "name": "id", "type": "integer" },
+                              { "name": "name", "type": "string" } ]},
+                          { "name": "Trophy",
+                            "belongs_to": [{ "entity": "Club" }],
+                            "fields": [
+                              { "name": "id", "type": "integer" },
+                              { "name": "title", "type": "string" } ]}],
                       "endpoints": [
                           { "operation_id": "create_club", "method": "POST", "path": "/",
                             "request_body": { "entity": "Club" },
@@ -2235,6 +2309,16 @@ pub(crate) mod tests {
                           { "operation_id": "get_club", "method": "GET", "path": "/{id}",
                             "success": { "status": 200, "entity": "Club" } },
                           { "operation_id": "delete_club", "method": "DELETE", "path": "/{id}",
+                            "success": { "status": 204 } },
+                          { "operation_id": "create_trophy", "method": "POST", "path": "/trophies",
+                            "request_body": { "entity": "Trophy" },
+                            "success": { "status": 201, "entity": "Trophy" } },
+                          { "operation_id": "get_trophy", "method": "GET", "path": "/trophies/{id}",
+                            "success": { "status": 200, "entity": "Trophy" } },
+                          { "operation_id": "update_trophy", "method": "PUT", "path": "/trophies/{id}",
+                            "request_body": { "entity": "Trophy" },
+                            "success": { "status": 200, "entity": "Trophy" } },
+                          { "operation_id": "delete_trophy", "method": "DELETE", "path": "/trophies/{id}",
                             "success": { "status": 204 } } ] },
                     { "name": "books", "mount": "/clubs/{club_id}",
                       "entities": [{ "name": "Book",
@@ -2267,6 +2351,24 @@ pub(crate) mod tests {
         );
         // The collection root is untouched.
         assert_eq!(d.modules[0].endpoints[0].path, "/");
+        // #89: the sibling entity's OWN detail routes in the SAME module keep
+        // `{id}` — it is the trophy's key, not the tenant's. `get_trophy` and
+        // `update_trophy` resolve to Trophy via their explicit entity;
+        // `delete_trophy` (bodyless, no success entity) resolves via its
+        // collection creator `POST /trophies` — which the immutable pre-pass
+        // must consult BEFORE any path is rewritten.
+        assert_eq!(
+            d.modules[0].endpoints[4].path, "/trophies/{id}",
+            "sibling GET detail untouched"
+        );
+        assert_eq!(
+            d.modules[0].endpoints[5].path, "/trophies/{id}",
+            "sibling PUT detail untouched"
+        );
+        assert_eq!(
+            d.modules[0].endpoints[6].path, "/trophies/{id}",
+            "sibling DELETE detail untouched"
+        );
         // The nested child (`books/{id}` — the BOOK) and the flat child
         // (`customers/{id}`) keep `{id}` — normalizing them would misname a
         // non-tenant key.
@@ -2293,6 +2395,59 @@ pub(crate) mod tests {
         assert_eq!(
             plain.modules[0].endpoints[0].path,
             snapshot.modules[0].endpoints[0].path
+        );
+    }
+
+    /// The immutable pre-pass in `normalize_own_detail_routes` is load-bearing,
+    /// not a style choice: resolution reads OTHER endpoints' paths (the
+    /// collection-creator arm), so a mutate-as-you-go rename would mis-resolve
+    /// later endpoints against half-rewritten collection paths. Fixture: the
+    /// creator's OWN path contains `{id}` (a replace-style `POST /{id}` whose
+    /// body is the tenant) and the tenant is NOT the module's first entity. An
+    /// interleaved implementation renames the creator first (→ `/{club_id}`),
+    /// so the dependent bodyless `DELETE /{id}/{version}`'s creator lookup at
+    /// `/{id}` misses, falls back to the FIRST entity (the sibling), and skips
+    /// the rename — leaving a dead `{id}` the guard cannot bind. The pre-pass
+    /// resolves both against pristine paths and renames both.
+    #[test]
+    fn normalize_pre_pass_resolves_against_pristine_paths() {
+        let mut d: Design = serde_json::from_str(
+            r#"{ "name": "clubs-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+                "modules": [{
+                    "name": "clubs",
+                    "entities": [
+                        { "name": "Trophy",
+                          "belongs_to": [{ "entity": "Club" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "title", "type": "string" }] },
+                        { "name": "Club", "fields": [
+                            { "name": "id", "type": "integer" },
+                            { "name": "name", "type": "string" }] }],
+                    "endpoints": [
+                        { "operation_id": "replace_club", "method": "POST", "path": "/{id}",
+                          "request_body": { "entity": "Club" },
+                          "success": { "status": 200, "entity": "Club" } },
+                        { "operation_id": "purge_club_version", "method": "DELETE",
+                          "path": "/{id}/{version}",
+                          "success": { "status": 204 } }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        d.normalize_tenant_detail_routes();
+        assert_eq!(
+            d.modules[0].endpoints[0].path, "/{club_id}",
+            "the tenant-bodied creator itself is renamed"
+        );
+        assert_eq!(
+            d.modules[0].endpoints[1].path, "/{club_id}/{version}",
+            "the creator-resolved dependent is renamed too — an interleaved \
+             implementation loses the creator at `/{{id}}` mid-rename and \
+             leaves this `{{id}}` behind"
         );
     }
 
