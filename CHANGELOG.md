@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.2 — 2026-07-22
+
+Closes the residual tenant-guard gaps left by the #78 ownership-safety effort
+(the core membership-query tenant filter landed in 0.5.0). A
+correctness/security patch — every existing design generates byte-identical
+output.
+
+### Security / correctness (#88, #89, #124)
+- **`JC0550`** (#88) refuses a tenant entity's own detail route addressed by a
+  non-pk param (e.g. `/{slug}`) instead of silently generating it with **no
+  membership check**. The guard verifies the tenant named by the path fk, so a
+  non-pk param cannot be membership-checked; the conventional `/{id}` still
+  auto-normalizes to `/{fk}`, and an explicit `/{fk}` passes. (Renaming a
+  slug→fk was rejected as unsafe — the guard parses the path value as the pk
+  type.) The fk is matched against the mount-resolved path, so a mount-carried
+  fk is not falsely refused.
+- **Detail-route normalization** (#89) now targets only the tenant entity's own
+  routes — a sibling entity's `/{id}` in the same module is no longer
+  mis-renamed to the tenant fk (resolved in an immutable pre-pass).
+- **JL0006** (#124) attributes each unscoped-repo-call flag to its enclosing
+  handler and exempts the tenant's own path-verified, **guarded** detail
+  handlers (which legitimately call unscoped methods on the
+  already-membership-verified tenant repo), while keeping `repo.all()` armed
+  everywhere and Collection, child, and **unguarded** handlers fully armed. A
+  false positive on correct code becomes silent; a real leak stays flagged. The
+  exemption uses the strict repo-entity resolver and requires the endpoint to be
+  guarded — it under-exempts by design (residual false positives keep the
+  `// jerrycan:allow JL0006` hatch; over-exempting would silence a leak).
+
+### Notes
+- Follow-ups filed: #147 (make the JL0006 exemption signature-aware), #148
+  (require the guard on tenant / tenant-owned GETs in auth designs).
+
 ## 0.6.1 — 2026-07-21
 
 The public-read / owner-write ownership shape (#105) — the mainstream feed /
