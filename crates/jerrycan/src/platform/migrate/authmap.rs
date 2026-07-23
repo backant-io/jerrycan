@@ -32,6 +32,10 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
         index: false,
         values: None,
         default: None,
+        min: None,
+        max: None,
+        min_len: None,
+        max_len: None,
     };
     let user = Entity {
         name: "User".into(),

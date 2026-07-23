@@ -188,6 +188,24 @@ pub struct Field {
     /// membership when present).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,
+    /// Inclusive integer lower bound (issue #80). Integer fields only; JC0552
+    /// refuses misplacement, `min > max`, and any constraint on the pk `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<i64>,
+    /// Inclusive integer upper bound (issue #80). Integer fields only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<i64>,
+    /// Inclusive minimum string length in Unicode code points (issue #80).
+    /// String fields only, never combined with `values`; capped at 4096 so a
+    /// fixture `"a".repeat(min_len)` stays bounded. `u64` makes a negative
+    /// length a parse error for free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_len: Option<u64>,
+    /// Inclusive maximum string length in Unicode code points (issue #80).
+    /// String fields only, never combined with `values`; `max_len: 0` on a
+    /// required field is refused as unfillable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_len: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -1762,6 +1780,63 @@ pub(crate) mod tests {
                 && s.contains("\"origins\"")
                 && s.contains("\"allow_credentials\"")
         );
+    }
+
+    #[test]
+    fn field_constraint_keys_round_trip_and_stay_absent_when_unset() {
+        // #80: the four constraint keys (min/max integer range, min_len/max_len
+        // string length) parse and survive a round trip; being serde-default None
+        // + skip_serializing_if, an unconstrained design stays byte-identical
+        // through canonical_design_json — the byte-identity gate for every
+        // existing design.
+        let constrained: Design = serde_json::from_str(
+            r#"{ "name": "shop", "contract_version": 0, "dependencies": ["db"],
+                "modules": [{ "name": "items",
+                    "entities": [{ "name": "Item", "fields": [
+                        { "name": "quantity", "type": "integer", "min": 1, "max": 600 },
+                        { "name": "bio", "type": "string", "min_len": 1, "max_len": 280 }
+                    ]}],
+                    "endpoints": [{ "operation_id": "list_items", "method": "GET", "path": "/",
+                        "success": { "status": 200, "entity": "Item", "list": true } }] }] }"#,
+        )
+        .unwrap();
+        let f = &constrained.modules[0].entities[0].fields[0];
+        assert_eq!((f.min, f.max), (Some(1), Some(600)));
+        assert_eq!((f.min_len, f.max_len), (None, None));
+        let g = &constrained.modules[0].entities[0].fields[1];
+        assert_eq!((g.min_len, g.max_len), (Some(1), Some(280)));
+        let back: Design =
+            serde_json::from_str(&serde_json::to_string(&constrained).unwrap()).unwrap();
+        assert_eq!(back.modules[0].entities[0].fields[0].max, Some(600));
+        assert_eq!(back.modules[0].entities[0].fields[1].max_len, Some(280));
+
+        // An unconstrained design serializes NO constraint keys, and the
+        // canonical writer round-trips it byte-identically.
+        let plain: Design = serde_json::from_str(MINIMAL).unwrap();
+        let canon = crate::platform::scaffold::canonical_design_json(&plain);
+        for key in ["\"min\"", "\"max\"", "\"min_len\"", "\"max_len\""] {
+            assert!(
+                !canon.contains(key),
+                "unconstrained design must not serialize {key}: {canon}"
+            );
+        }
+        let re: Design = serde_json::from_str(&canon).unwrap();
+        assert_eq!(
+            canon,
+            crate::platform::scaffold::canonical_design_json(&re),
+            "canonical round trip is byte-identical"
+        );
+    }
+
+    #[test]
+    fn published_schema_accepts_the_field_constraint_keys() {
+        let s = include_str!("../../../../docs/contracts/design-schema.json");
+        for key in ["\"min\"", "\"max\"", "\"min_len\"", "\"max_len\""] {
+            assert!(
+                s.contains(key),
+                "design-schema.json must define {key} (#80)"
+            );
+        }
     }
 
     #[test]

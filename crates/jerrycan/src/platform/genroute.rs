@@ -3471,6 +3471,10 @@ pub(crate) mod tests {
             index: false,
             values: None,
             default: None,
+            min: None,
+            max: None,
+            min_len: None,
+            max_len: None,
         });
         d.modules[1].entities[0].belongs_to[0].on_delete = OnDelete::SetNull;
         let ddl = migration_ddl(&d.modules[1], false, &d)
@@ -6210,6 +6214,10 @@ pub(crate) mod tests {
                 index: false,
                 values: None,
                 default: None,
+                min: None,
+                max: None,
+                min_len: None,
+                max_len: None,
             },
         );
         let ddl = migration_ddl(&m, false, &demo()).unwrap();
@@ -6246,6 +6254,10 @@ pub(crate) mod tests {
                 index: false,
                 values: None,
                 default: None,
+                min: None,
+                max: None,
+                min_len: None,
+                max_len: None,
             },
         );
         let ddl = migration_ddl(&m, false, &demo()).unwrap();

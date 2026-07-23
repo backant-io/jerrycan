@@ -279,6 +279,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs testing",
     },
     CodeInfo {
+        code: "JC0552",
+        title: "invalid field range/length constraint",
+        cause: "a field's `min`/`max`/`min_len`/`max_len` constraint (#80) is unusable: range keys on a non-integer field or length keys on a non-string field, an empty range (min > max, or min_len > max_len), a length bound combined with enum `values` (the enum already fixes the exact allowed strings), `max_len: 0` on a required field (unfillable), any constraint key on the pk `id` (ids are server-assigned; the generated probes and seeds assume them free), a `min_len` above the 4096 fixture ceiling, or a `default` outside the field's own bounds — each would generate an app whose validator or acceptance fixtures could never pass",
+        fix: "put `min`/`max` on integer fields and `min_len`/`max_len` on string fields (inclusive, length in Unicode code points), keep min <= max and min_len <= max_len with min_len at most 4096, drop length bounds from enum `values` fields and every constraint key from `id`, and pick a `default` inside the field's declared bounds",
+        doc: "jerrycan docs validation",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -463,6 +470,25 @@ mod tests {
         assert!(
             info.fix.contains("gen-tests") && info.fix.contains("existence"),
             "fix must name gen-tests and the file-existence signal: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0552_names_the_constraint_rules_and_their_remedies() {
+        // WHY: JC0552 is the agent's stop after design validation rejects a
+        // field range/length constraint (#80) — the registry must name the
+        // placement rule (min/max on integer, min_len/max_len on string), the
+        // pk-id refusal, and the concrete fixes including the 4096 ceiling.
+        let info = lookup("JC0552").unwrap();
+        assert!(
+            info.cause.contains("min_len") && info.cause.contains("pk `id`"),
+            "cause must name the length keys and the pk-id refusal: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("integer fields") && info.fix.contains("4096"),
+            "fix must name the placement rule and the ceiling: {}",
             info.fix
         );
     }
