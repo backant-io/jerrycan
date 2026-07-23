@@ -13,12 +13,27 @@
 
 ## Install
 
-```sh
-# In an app, depend on the framework facade:
-cargo add jerrycan --features db,auth,validate,observe
+The intended path: point your coding agent at jerrycan with one line. It
+installs the CLI, wires jerrycan into the agent (MCP), and leaves a guided
+runbook behind:
 
-# Install the CLI / MCP server:
-cargo install jerrycan
+```sh
+curl -fsSL https://jerrycan.cc/install.sh | bash -s -- --agent claude-code
+```
+
+Agent ids: `claude-code` · `cursor` · `codex` · `windsurf` · `generic`.
+
+Prefer to install the CLI / MCP server directly:
+
+```sh
+cargo binstall jerrycan   # prebuilt binaries
+cargo install jerrycan    # or build from source
+```
+
+Or add the framework to a Rust app:
+
+```sh
+cargo add jerrycan --features db,auth,validate,observe
 ```
 
 ## Learn more

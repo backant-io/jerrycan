@@ -20,13 +20,27 @@ Agents design, generate, verify and package complete backends. You never write t
 [![CI](https://github.com/backant-io/jerrycan/actions/workflows/ci.yml/badge.svg)](https://github.com/backant-io/jerrycan/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/jerrycan.svg)](https://crates.io/crates/jerrycan)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
-[![rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org)
 
 [jerrycan.cc](https://jerrycan.cc) · [AI-native docs](docs/ai) · [Why jerrycan exists](https://jerrycan.cc/blog/humanitys-last-backend-framework) · [llms.txt](https://jerrycan.cc/llms.txt)
 
 </div>
 
 ---
+
+**Paste this into your AI agent** — Claude Code, Cursor, Codex, Windsurf, or any capable one:
+
+```text
+Fetch https://jerrycan.cc/start and follow it to set up jerrycan and build my backend.
+```
+
+Rather run it yourself? One line installs the CLI, wires jerrycan into your agent, and leaves a guided runbook behind:
+
+```bash
+curl -fsSL https://jerrycan.cc/install.sh | bash -s -- --agent claude-code
+```
+
+<sub>Agent ids: `claude-code` · `cursor` · `codex` · `windsurf` · `generic`. Until the site routes ship, use the mirror: `curl -fsSL https://raw.githubusercontent.com/backant-io/jerrycan/main/scripts/install.sh | bash -s -- --agent <id>`</sub>
 
 ```console
 $ jerrycan new --design bookmarks.json       # describe it once
@@ -41,7 +55,37 @@ $ jerrycan --json check                      # build · clippy · audit · tests
   {"ok":true,"diagnostics":[]}               # all green: safe + tested, no internals leaked
 ```
 
-> **0.2.0, published on [crates.io](https://crates.io/crates/jerrycan). Early but real.** Expect rough edges as it grows.
+> **Published on [crates.io](https://crates.io/crates/jerrycan), with prebuilt binaries on [GitHub Releases](https://github.com/backant-io/jerrycan/releases). Early but real.** Expect rough edges as it grows.
+
+## 30-second agent onboarding
+
+The intended path. One line installs the CLI, connects jerrycan to your coding agent, and leaves a guided runbook behind:
+
+```bash
+curl -fsSL https://jerrycan.cc/install.sh | bash -s -- --agent claude-code
+```
+
+That does three things for you:
+
+* **Installs the `jerrycan` binary** — the CLI, and the MCP server your agent talks to. (MCP is just the standard way an agent calls an outside tool; you don't have to configure it.)
+* **Wires it into your agent** — for Claude Code it runs `claude mcp add` for you and drops in the bundled [`jerrycan-backend` skill](.claude/skills/jerrycan-backend); for Cursor / Codex / Windsurf it writes the right MCP config file.
+* **Runs `jerrycan onboard`** — printing the guided runbook your agent follows: design → scaffold → generate tests → implement → check → package → deploy.
+
+Then just ask, in plain language — *"Build me a backend for …"* — and the agent drives the whole loop. Point any other agent at [docs/ai](docs/ai) or [jerrycan.cc/llms.txt](https://jerrycan.cc/llms.txt); the docs are written to be sufficient on their own.
+
+<details>
+<summary><b>Wire the MCP server by hand instead</b></summary>
+
+```bash
+# Claude Code
+claude mcp add jerrycan -- jerrycan mcp
+```
+
+```jsonc
+// Cursor / any stdio MCP client
+{ "mcpServers": { "jerrycan": { "command": "jerrycan", "args": ["mcp"] } } }
+```
+</details>
 
 ## Key features
 
@@ -53,32 +97,63 @@ $ jerrycan --json check                      # build · clippy · audit · tests
 * **Deploy anywhere, deployed by the agent.** `jerrycan package` produces a static binary, a hardened container image, k8s manifests, or a systemd unit, with an SBOM. `jerrycan deploy render` writes a deploy kit the agent executes with an API key: design file to live URL, no human in the loop.
 * **Docs that can't lie.** Every example in the docs is a doctest executed in CI.
 
-## Quickstart
+## How it works
 
-### For your agent (the intended path)
+The agent drives one fixed loop; jerrycan does the generation and the gating:
 
-```bash
-cargo install jerrycan          # the CLI + MCP server
+```
+jerrycan_design    → requirements become a validated design.json (pointed questions, not guesses)
+jerrycan_scaffold  → a crate-per-module workspace, one route crate per module
+jerrycan_gen_tests → failing acceptance tests, generated from the design
+   (the agent implements the handler bodies, guided by the docs tools)
+jerrycan_check     → build + clippy + audit + tests + jerrycan lints, machine-readable diagnostics
+jerrycan_package   → hardened artifacts + SBOM, only when everything is green
+jerrycan_deploy    → a deploy kit for the target platform (Render first), run by the agent
 ```
 
-Wire the MCP server into your agent, then ask for a backend in one prompt:
+<details>
+<summary><b>Project layout of the framework itself</b></summary>
+
+```
+crates/
+├── jerrycan          # facade + the CLI/MCP binary, apps depend on this
+├── jerrycan-core     # routing, extractors, DI, modules, middleware, errors, test client
+├── jerrycan-macros   # #[jerrycan::main]
+├── jerrycan-db       # data layer + migrations (SeaORM)
+├── jerrycan-auth     # sessions, JWT, OAuth2, guards
+├── jerrycan-validate  # validation + OpenAPI
+├── jerrycan-observe   # logs, /healthz, /metrics
+├── jerrycan-ratelimit # rate limiting (429 JC0429)
+├── jerrycan-jobs      # background jobs, cron, retries (Postgres / Redis)
+├── jerrycan-storage   # object storage: design-modeled buckets, local + S3, signed URLs
+└── jerrycan-realtime  # realtime: Postgres Changes + Broadcast + Presence (WebSocket)
+docs/
+├── ai/               # the AI-native docs, every example is a CI-run doc-test
+└── contracts/        # MCP tool schemas, design.json schema, CLI UX spec
+```
+</details>
+
+## Does it actually work?
+
+Yes, and it's *measured*, not asserted. A **docs-only** agent (given only `jerrycan docs`, no framework source, no fixtures) builds real backends that pass `jerrycan check` and serve real HTTP:
+
+* **5/5** of the reference CRUD apps: green on the first run, zero doc gaps.
+* The full **multi-tenant SaaS slice**: green across 6 modules + 2 background jobs, driven **live over HTTP**. Auth, per-tenant isolation, signed webhooks, CSV import, scoped API keys, OAuth. A **negative control** (breaking tenant scoping) correctly turns the gate **red**, so the green isn't hollow.
+
+It's wired as an **un-skippable release gate** (CI + a fail-fast pre-publish block), so it can't silently regress. Full write-up: [`conformance/eval/results.md`](conformance/eval/results.md).
+
+## For humans
+
+Prefer to drive it yourself, or add the framework to a Rust app directly? Get the CLI without the installer script:
 
 ```bash
-# Claude Code
-claude mcp add jerrycan -- jerrycan mcp
+cargo binstall jerrycan   # prebuilt binaries (all 4 targets, from GitHub Releases)
+cargo install jerrycan    # or build the CLI from source
 ```
 
-```jsonc
-// Cursor / any stdio MCP client
-{ "mcpServers": { "jerrycan": { "command": "jerrycan", "args": ["mcp"] } } }
-```
-
-The agent drives the whole loop: design → scaffold → gen-tests → implement → check → package → deploy. Claude Code users also get the bundled [`jerrycan-backend` skill](.claude/skills/jerrycan-backend) that guides the process end to end. Point any other agent at [docs/ai](docs/ai) or [jerrycan.cc/llms.txt](https://jerrycan.cc/llms.txt); the docs are written to be sufficient on their own.
-
-### For humans
+Add the framework to your own app, with the extensions you need:
 
 ```bash
-# In your app: the framework, with the extensions you need
 cargo add jerrycan --features db,auth,validate,observe
 ```
 
@@ -112,48 +187,9 @@ let t = app().into_test().override_dep(Db::fake());
 assert_eq!(t.get("/todos/").await.status(), jerrycan::http::StatusCode::OK);
 ```
 
-## How it works
+jerrycan stands on the Rust ecosystem you already trust, and emits plain Rust you own:
 
-The agent drives one fixed loop; jerrycan does the generation and the gating:
-
-```
-jerrycan_design    → requirements become a validated design.json (pointed questions, not guesses)
-jerrycan_scaffold  → a crate-per-module workspace, one route crate per module
-jerrycan_gen_tests → failing acceptance tests, generated from the design
-   (the agent implements the handler bodies, guided by the docs tools)
-jerrycan_check     → build + clippy + audit + tests + jerrycan lints, machine-readable diagnostics
-jerrycan_package   → hardened artifacts + SBOM, only when everything is green
-jerrycan_deploy    → a deploy kit for the target platform (Render first), run by the agent
-```
-
-<details>
-<summary><b>Project layout of the framework itself</b></summary>
-
-```
-crates/
-├── jerrycan          # facade + the CLI/MCP binary, apps depend on this
-├── jerrycan-core     # routing, extractors, DI, modules, middleware, errors, test client
-├── jerrycan-macros   # #[jerrycan::main]
-├── jerrycan-db       # data layer + migrations (SeaORM)
-├── jerrycan-auth     # sessions, JWT, OAuth2, guards
-├── jerrycan-validate  # validation + OpenAPI
-├── jerrycan-observe   # logs, /healthz, /metrics
-├── jerrycan-ratelimit # rate limiting (429 JC0429)
-└── jerrycan-jobs      # background jobs, cron, retries (Postgres / Redis)
-docs/
-├── ai/               # the AI-native docs, every example is a CI-run doc-test
-└── contracts/        # MCP tool schemas, design.json schema, CLI UX spec
-```
-</details>
-
-## Does it actually work?
-
-Yes, and it's *measured*, not asserted. A **docs-only** agent (given only `jerrycan docs`, no framework source, no fixtures) builds real backends that pass `jerrycan check` and serve real HTTP:
-
-* **5/5** of the reference CRUD apps: green on the first run, zero doc gaps.
-* The full **multi-tenant SaaS slice**: green across 6 modules + 2 background jobs, driven **live over HTTP**. Auth, per-tenant isolation, signed webhooks, CSV import, scoped API keys, OAuth. A **negative control** (breaking tenant scoping) correctly turns the gate **red**, so the green isn't hollow.
-
-It's wired as an **un-skippable release gate** (CI + a fail-fast pre-publish block), so it can't silently regress. Full write-up: [`conformance/eval/results.md`](conformance/eval/results.md).
+[Rust](https://www.rust-lang.org) · [Tokio](https://tokio.rs) · [hyper](https://hyper.rs) · [SeaORM](https://www.sea-ql.org/SeaORM/) · [serde](https://serde.rs) · [clippy](https://github.com/rust-lang/rust-clippy) · [cargo-audit](https://github.com/rustsec/rustsec)
 
 ## What it's for, and what it's not
 
@@ -162,12 +198,6 @@ It's wired as an **un-skippable release gate** (CI + a fail-fast pre-publish blo
 **Also shipping (contract v2):** design-modeled object storage (`storage.buckets`) and realtime (Postgres Changes + Broadcast + Presence).
 
 **Not (yet):** GraphQL / gRPC, edge / serverless. jerrycan runs as a normal long-lived service. We'd rather name the edges than oversell the middle.
-
-## Built with
-
-jerrycan stands on the Rust ecosystem you already trust, and emits plain Rust you own:
-
-[Rust](https://www.rust-lang.org) · [Tokio](https://tokio.rs) · [hyper](https://hyper.rs) · [SeaORM](https://www.sea-ql.org/SeaORM/) · [serde](https://serde.rs) · [clippy](https://github.com/rust-lang/rust-clippy) · [cargo-audit](https://github.com/rustsec/rustsec)
 
 ## Roadmap
 
