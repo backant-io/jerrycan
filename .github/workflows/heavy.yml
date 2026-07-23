@@ -156,6 +156,12 @@ jobs:
   onboarding-eval:
     needs: onboarding-tarball
     runs-on: ubuntu-latest
+    # Inside a job container GitHub defaults run-steps to `sh -e` (dash on
+    # Debian), which rejects `set -o pipefail` — the first live run died on
+    # exactly that. bookworm-slim ships bash; use it for every step.
+    defaults:
+      run:
+        shell: bash
     # A first-time user's machine: Debian with no Rust, no cargo, and none of
     # curl/python3 preinstalled (slim). GitHub mounts its own Node for the JS
     # actions below, so they run without Node in the image; actions/checkout
