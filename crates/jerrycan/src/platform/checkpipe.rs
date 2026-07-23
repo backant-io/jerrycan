@@ -334,6 +334,13 @@ pub fn run_tests_full(
 /// writes the file even when every endpoint is an all-TODO banner, so a
 /// gen-tested design never false-alarms — only a never-gen-tested scaffold
 /// trips JC0551. Module scope narrows to that module (mirrors `test_packages`).
+///
+/// #156 — the same gate covers the jobs surface: a design with declared jobs
+/// must have `crates/jobs/tests/acceptance.rs` on disk (gen-tests writes it via
+/// `jobsgen::write_jobs_acceptance`), or a jobs-only design — cron jobs, no
+/// endpoint-bearing modules — never trips JC0551 and reads ok:true with zero
+/// tests. Jobs are top-level, so the check runs only in workspace scope
+/// (module scope narrows to that module's package — mirrors `test_packages`).
 pub fn missing_acceptance_tests(
     root: &Path,
     design: &crate::platform::design::Design,
@@ -342,7 +349,7 @@ pub fn missing_acceptance_tests(
     fn endpoint_count(m: &crate::platform::design::ModuleDesign) -> usize {
         m.endpoints.len() + m.subroutes.iter().map(endpoint_count).sum::<usize>()
     }
-    design
+    let mut out: Vec<Diagnostic> = design
         .modules
         .iter()
         .filter(|m| module.is_none_or(|only| m.name == only))
@@ -361,7 +368,21 @@ pub fn missing_acceptance_tests(
                 doc_url: None,
             })
         })
-        .collect()
+        .collect();
+    if module.is_none() && design.wants_jobs() {
+        let rel = "crates/jobs/tests/acceptance.rs";
+        if !root.join(rel).exists() {
+            out.push(Diagnostic {
+                code: "JC0551".into(),
+                file: Some(rel.into()),
+                line: None,
+                message: "no acceptance tests for jobs — run `jerrycan gen-tests`".into(),
+                suggestion: Some("run `jerrycan gen-tests`".into()),
+                doc_url: None,
+            });
+        }
+    }
+    out
 }
 
 /// External tool steps. A missing tool is an ENVIRONMENT failure (exit 3), not a gate failure.
