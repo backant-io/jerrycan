@@ -147,3 +147,17 @@ Repo · crates.io · docs · license (MIT) · a one-line repeat of the headline.
 - Exact hero punctuation (words locked).
 - Color palette + typography.
 - Whether to include a live in-browser "try it" element (nice-to-have, not v1).
+
+---
+
+## Update note (2026-07-23) — CTA superseded (onboarding spec §4.6, Rule 7)
+
+The locked "GitHub + `cargo install`" CTA in §5.9 / §7 is **superseded** by the
+agent-first onboarding from the onboarding redesign (spec §4.6). The primary CTA
+is now the pasteable one-liner —
+`Fetch https://jerrycan.cc/start and follow it to set up jerrycan and build my backend.`
+— with the shell installer
+`curl -fsSL https://jerrycan.cc/install.sh | bash -s -- --agent <id>` as the
+run-it-yourself alternative. `cargo binstall` / `cargo install` remain as
+secondary "install the CLI directly" paths. This note records the change; the
+section copy above is intentionally left intact per the locked-copy rule.
