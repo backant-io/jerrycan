@@ -475,10 +475,10 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         // supply (login, signed webhook, api-key route): no un-greenable success
         // probe — emit a TODO instead. Detected by heuristic OR declared
         // explicitly with `probe: skip` (issue #11) so a design the heuristic
-        // misses can still reach `ok:true`. The heuristic-detected ones are never
-        // session-guarded (a guard would be threaded, making the success
-        // greenable), so they get no 401 test; a `probe: skip` endpoint CAN be
-        // guarded — its 401 guard test still emits below (issue #123b).
+        // misses can still reach `ok:true`. Heuristic shape (b) (a non-session
+        // 401/403 route) is unguarded by definition, so it gets no 401 test;
+        // heuristic shape (a) (a signature webhook) and a `probe: skip` endpoint
+        // CAN be guarded — their 401 guard test still emits below (issue #123b).
         let probe_skip = ep.probe == ProbePolicy::Skip;
         let gated = endpoint_is_credential_gated(ep) || probe_skip;
 
