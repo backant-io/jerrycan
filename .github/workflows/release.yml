@@ -64,6 +64,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     # A retired/unavailable runner otherwise queues until the 24h run limit.
     timeout-minutes: 45
+    # With build-tool: cargo the vendored sqlite3.c must be compiled by a
+    # musl-targeting C compiler; don't leave that to the cc crate's heuristic.
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@v4
         with:
