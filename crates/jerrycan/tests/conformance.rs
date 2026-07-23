@@ -98,6 +98,39 @@ fn reset_pg_public_schema(pg_url: &str) {
 fn db_mode_scaffold_passes_jerrycan_check() {
     let tmp = tempfile::tempdir().unwrap();
     let app = scaffold_golden_db(tmp.path());
+    // The documented workflow, in order: gen-tests → implement → check. Since
+    // #123a a never-gen-tested scaffold is refused with JC0551, and the gate's
+    // tests step then runs the generated acceptance suite — so the db fixtures
+    // must be in place for the full gate to be green.
+    for module in ["todos", "users"] {
+        let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+            .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
+            .args(["gen-tests", "--module", module])
+            .status()
+            .unwrap();
+        assert!(st.success(), "gen-tests {module} must succeed");
+    }
+    for (fixture, target) in [
+        (
+            "db/todos_handlers.rs",
+            "crates/routes/todos/src/handlers.rs",
+        ),
+        (
+            "db/comments_handlers.rs",
+            "crates/routes/todos/src/subroutes/comments/handlers.rs",
+        ),
+        (
+            "db/users_handlers.rs",
+            "crates/routes/users/src/handlers.rs",
+        ),
+    ] {
+        std::fs::copy(
+            repo_root().join("conformance/fixtures").join(fixture),
+            app.join(target),
+        )
+        .unwrap();
+    }
     let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
         .current_dir(&app)
         .env("CARGO_TARGET_DIR", common::shared_app_target())
@@ -132,9 +165,16 @@ fn scaffolded_app_builds_with_zero_warnings() {
     );
 }
 
+/// #123a: the full pipeline on a freshly-scaffolded, NEVER-gen-tested app must
+/// not read green — the pre-fix `check` folded a zero-test `cargo test` (exit
+/// 0) into ok:true, so a scaffold nobody ever tested shipped a green verdict.
+/// The pipeline is fail-fast per class, so JC0551 being the failing class is
+/// itself the proof that build/clippy/audit/deny/tests are all green on a
+/// fresh scaffold; the verdict then flips on the acceptance step, naming each
+/// endpoint-bearing module and the exact gen-tests command that fixes it.
 #[test]
 #[ignore = "heavy: full verification pipeline incl. cargo-audit/cargo-deny"]
-fn fresh_scaffold_passes_jerrycan_check() {
+fn fresh_scaffold_check_refuses_hollow_green_with_jc0551() {
     let tmp = tempfile::tempdir().unwrap();
     let app = scaffold_golden(tmp.path());
     let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
@@ -146,11 +186,29 @@ fn fresh_scaffold_passes_jerrycan_check() {
     let payload: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("check --json emits one JSON document");
     assert_eq!(
-        payload["ok"], true,
-        "diagnostics: {}",
-        payload["diagnostics"]
+        payload["ok"], false,
+        "a never-gen-tested scaffold must NOT read green: {payload}"
     );
-    assert!(out.status.success());
+    let diags = payload["diagnostics"].as_array().unwrap();
+    assert!(
+        !diags.is_empty() && diags.iter().all(|d| d["code"] == "JC0551"),
+        "every diagnostic is JC0551 — the acceptance step is the failing class, \
+         proving each earlier class (build/clippy/audit/deny/tests) was green: {diags:?}"
+    );
+    for m in ["todos", "users"] {
+        assert!(
+            diags.iter().any(|d| {
+                let msg = d["message"].as_str().unwrap();
+                msg.contains(&format!("module `{m}`"))
+                    && msg.contains(&format!("jerrycan gen-tests --module {m}"))
+            }),
+            "JC0551 names `{m}` and its gen-tests command: {diags:?}"
+        );
+    }
+    assert!(
+        !out.status.success(),
+        "a red check verdict must exit non-zero"
+    );
 }
 
 /// Scaffold the golden app in auth+observe mode (in-memory repos) against the
@@ -231,6 +289,19 @@ fn auth_observe_app_builds_checks_and_guards() {
             app.join(target),
         )
         .unwrap();
+    }
+
+    // #123a: gen-tests before check — the honest gate refuses a never-gen-tested
+    // module with JC0551, and the acceptance suite it now runs (incl. the 401
+    // guard probes) must be green on the implemented auth handlers.
+    for module in ["todos", "users"] {
+        let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+            .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
+            .args(["gen-tests", "--module", module])
+            .status()
+            .unwrap();
+        assert!(st.success(), "gen-tests {module} must succeed");
     }
 
     // Full gate green (JL0004 must be satisfied — guarded mutations).
@@ -365,7 +436,18 @@ fn agent_generates_working_crud_service_via_mcp_only() {
     );
     assert!(!err, "{payload}");
 
-    // 3. the "agent" implements the handlers (canned fixtures).
+    // 3. gen-tests via MCP (#123a: the check tool refuses a never-gen-tested
+    // module with JC0551, so the agent loop runs gen-tests before check —
+    // exactly the workflow the scaffold's next_step orders).
+    for module in ["todos", "users"] {
+        let (err, payload) = c.call_tool(
+            "jerrycan_gen_tests",
+            serde_json::json!({"directory": app.to_str().unwrap(), "module": module}),
+        );
+        assert!(!err, "{payload}");
+    }
+
+    // 4. the "agent" implements the handlers (canned fixtures).
     for (fixture, target) in [
         ("todos_handlers.rs", "crates/routes/todos/src/handlers.rs"),
         (
@@ -381,7 +463,8 @@ fn agent_generates_working_crud_service_via_mcp_only() {
         .unwrap();
     }
 
-    // 4. verify: the full gate must be green.
+    // 5. verify: the full gate must be green (incl. the generated acceptance
+    // suite, which the canned implementations satisfy).
     let (err, payload) = c.call_tool(
         "jerrycan_check",
         serde_json::json!({"directory": app.to_str().unwrap()}),
@@ -394,7 +477,7 @@ fn agent_generates_working_crud_service_via_mcp_only() {
     );
     c.shutdown();
 
-    // 5. serve and exercise the CRUD loop over real HTTP.
+    // 6. serve and exercise the CRUD loop over real HTTP.
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
@@ -776,6 +859,20 @@ fn public_read_feed_goes_green_on_a_correct_scaffold() {
         "writes keep their 401 probes:\n{acceptance}"
     );
 
+    // #123a: the users module needs its acceptance file too, or the final
+    // `jerrycan check` refuses the app with JC0551 (never-gen-tested module).
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "gen-tests", "--module", "users"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "gen-tests users: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     // RED: stubs (500) fail the generated suite.
     let red = Command::new("cargo")
         .current_dir(&app)
@@ -973,6 +1070,19 @@ fn child_hosting_tenant_app_goes_green_on_correct_handlers() {
         "crates/routes/users/src/handlers.rs",
         CLUB_USERS_HANDLERS,
     );
+
+    // #123a: gen-tests before check — the honest gate refuses a never-gen-tested
+    // module with JC0551, and the generated suite (incl. the member-surface and
+    // isolation tests) must be green on the correct handlers.
+    for module in ["users", "clubs"] {
+        let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+            .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
+            .args(["gen-tests", "--module", module])
+            .status()
+            .unwrap();
+        assert!(st.success(), "gen-tests {module} must succeed");
+    }
 
     // GREEN: the full gate passes — pre-#124 this was a false JL0006 on
     // `get_club`'s legitimate `repo.get(club_id)`.
@@ -1522,6 +1632,19 @@ fn golden_app_deploys_everywhere() {
             app.join(target),
         )
         .unwrap();
+    }
+
+    // #123a: `package` shares the check gate, which now refuses a
+    // never-gen-tested module with JC0551 — gen-tests first, as the workflow
+    // orders (the canned implementations satisfy the generated suite).
+    for module in ["todos", "users"] {
+        let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+            .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
+            .args(["gen-tests", "--module", module])
+            .status()
+            .unwrap();
+        assert!(st.success(), "gen-tests {module} must succeed");
     }
 
     // ONE command emits every artifact (after a green check gate).

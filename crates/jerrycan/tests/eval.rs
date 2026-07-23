@@ -80,6 +80,29 @@ fn run_one(spec: &str) -> Result<(), String> {
         std::fs::copy(entry.path(), &target).map_err(|e| format!("copy {fname}: {e}"))?;
     }
 
+    // gen-tests per top-level module (#123a: the honest check gate refuses a
+    // never-gen-tested module with JC0551, and the generated acceptance suite
+    // it then runs must be green on the reference fixtures).
+    let design: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(app.join("design.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("design json: {e}"))?;
+    for m in design["modules"]
+        .as_array()
+        .ok_or("design has no modules")?
+    {
+        let name = m["name"].as_str().ok_or("module without a name")?;
+        let st = Command::new(jc())
+            .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
+            .args(["gen-tests", "--module", name])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !st.success() {
+            return Err(format!("gen-tests {name} failed"));
+        }
+    }
+
     // check (full gate)
     let out = Command::new(jc())
         .current_dir(&app)

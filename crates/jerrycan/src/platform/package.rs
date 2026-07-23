@@ -38,12 +38,11 @@ const STUB_MARKER: &str = "not implemented — replace this stub";
 /// stub marker, relative to `root` (sorted). A stubbed handler serves JC0500, so
 /// shipping it is never safe.
 ///
-/// This is a PACKAGE-ONLY gate. `jerrycan check` is deliberately green on a fresh
-/// scaffold — its lints stay clean (a hard conformance contract: "jerrycan lints
-/// must be clean on a fresh scaffold") and there are no tests yet, so the stub
-/// guard for `check` is the gen-tests acceptance suite (stubs fail it with JC0500).
-/// `package` is the ship step, so it must independently refuse an app whose
-/// handlers are unimplemented, even when the agent never ran gen-tests.
+/// This is a PACKAGE-ONLY gate. `check` refuses a never-gen-tested scaffold with
+/// JC0551 (#123a) and the gen-tests acceptance suite fails stubs with JC0500, but
+/// neither statically proves every handler is implemented (an all-TODO module's
+/// banner-only file satisfies JC0551 with zero tests). `package` is the ship
+/// step, so it must independently refuse an app whose handlers are unimplemented.
 fn unimplemented_stubs(root: &Path) -> Vec<String> {
     fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -412,10 +411,11 @@ mod tests {
     /// them; once a handler's body no longer carries the marker, the gate clears.
     ///
     /// WHY (Rule 9): this is the invariant `package_refuses_when_check_is_red`
-    /// encodes — jerrycan must never SHIP an app whose handlers still 500. `check`
-    /// is intentionally green on a fresh scaffold (lints stay clean by contract), so
-    /// the refusal has to live in `package`; a gate that couldn't tell an
-    /// implemented handler from a stub would let unimplemented code deploy.
+    /// encodes — jerrycan must never SHIP an app whose handlers still 500. A
+    /// gen-tested all-TODO module passes `check` with zero tests (JC0551 only
+    /// demands the file), so the refusal must ALSO live in `package`; a gate that
+    /// couldn't tell an implemented handler from a stub would let unimplemented
+    /// code deploy.
     #[test]
     fn stub_gate_flags_scaffold_then_clears_when_implemented() {
         let tmp = tempfile::tempdir().unwrap();

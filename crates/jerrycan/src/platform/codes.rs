@@ -272,6 +272,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs tenancy",
     },
     CodeInfo {
+        code: "JC0551",
+        title: "no acceptance tests for a module with endpoints",
+        cause: "`jerrycan check` found no `crates/routes/<module>/tests/acceptance.rs` for a top-level module that declares endpoints — the module was never gen-tested, so the tests step ran ZERO acceptance tests and its exit-0 green would be hollow (a never-tested scaffold must not read ok:true)",
+        fix: "run `jerrycan gen-tests --module <module>` to generate the acceptance suite, then implement handlers until it passes; the FILE's existence is the signal (an all-TODO design's banner-only file satisfies it — jerrycan never demands tests the design cannot green)",
+        doc: "jerrycan docs testing",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -435,6 +442,27 @@ mod tests {
         assert!(
             info.fix.contains("/{id}") && info.fix.contains("fk"),
             "fix must name both pk remedies: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0551_names_the_hollow_green_and_the_file_existence_signal() {
+        // WHY: JC0551 converts the hollow green (#123a — `check` ok:true on a
+        // never-gen-tested scaffold, because a zero-test `cargo test` exits 0)
+        // into a red the agent can act on. `jerrycan explain JC0551` must state
+        // the cause (zero acceptance tests ran) and that FILE existence — not
+        // test count — is the signal, so an all-TODO gen-tested design never
+        // false-alarms.
+        let info = lookup("JC0551").unwrap();
+        assert!(
+            info.cause.contains("acceptance.rs") && info.cause.contains("hollow"),
+            "cause must tie the missing file to the hollow green: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("gen-tests") && info.fix.contains("existence"),
+            "fix must name gen-tests and the file-existence signal: {}",
             info.fix
         );
     }
