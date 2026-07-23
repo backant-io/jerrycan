@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.6.3 — 2026-07-23
+
+Gate honesty: every change makes a guarantee the framework *claims* actually
+hold or be proven. "Green means safe."
+
+### Security / correctness
+- **Honest `check` (#123a) — `JC0551`.** `jerrycan check` (and the MCP `check`
+  tool and the `package` gate) now refuses with **`JC0551`** when a module that
+  has endpoints has no generated acceptance tests. A freshly-scaffolded app that
+  never ran `gen-tests` used to read `ok:true` with **zero tests** — a hollow
+  green. **Behavior change:** such apps now flip green→red; the fix is the
+  already-documented `jerrycan gen-tests` step (the scaffold's `next_step`
+  already orders it before `check`). A gen-tested app — even one whose endpoints
+  are all TODO stubs — stays green.
+- **`probe:"skip"` keeps the auth-guard test (#123b).** Marking an endpoint
+  `probe:"skip"` no longer also deletes its `<op>_without_auth_is_401` negative
+  test for a **guarded** endpoint — a passing security assertion was being
+  silently dropped along with the skipped happy-path probe. **Behavior change:**
+  a guarded `probe:"skip"` endpoint gains a `_without_auth_is_401` test on regen
+  (its `expected_failing` count rises by one); on a correct app the new test
+  passes, and it turns red only where a guard was hand-weakened.
+- **SQLite FK enforcement pinned & proven (#121).** `Db::connect` now sets
+  SQLite `foreign_keys=ON` explicitly (via sea-orm's `map_sqlx_sqlite_opts`)
+  instead of relying on the sqlx default, and a new test proves foreign-key
+  rejection + `ON DELETE CASCADE` through the connection pool. (Enforcement
+  already worked via sqlx's default — this makes the guarantee explicit and
+  CI-proven, so a future upstream default change can't silently disable it.)
+
+### Docs
+- **The auth identity entity must be named `User` (#123c).** Owner-scoping, the
+  server-injected identity fk, and `public_read` all key on the literal derived
+  column `user_id`; `docs/ai/10-auth.md` and `14-tenancy.md` now state this
+  plainly and drop the misleading "typically a `User`/`Account`" phrasing — an
+  identity named `Account` (fk `account_id`) silently gets **no** owner-scoping
+  and a client-writable fk. A future opt-in `auth.identity` is tracked (#150).
+
+### Dependencies
+- `sea-orm` requirement floor raised to **`1.1.17`** (the version that introduced
+  `map_sqlx_sqlite_opts`, used for the explicit SQLite FK pin). A consumer that
+  co-pins `sea-orm` below 1.1.17 (e.g. `=1.0.x`) will no longer resolve with
+  jerrycan-db 0.6.3.
+
+### Notes
+- Follow-ups filed: #150 (generalize owner-scoping via an opt-in `auth.identity`),
+  #152 (Supabase-migrate capstone hollow-green), #153 (complete the 401-guard
+  test for the non-`skip` no-creator/`{id}` and multi-param branches), #156
+  (a `JC0551` sibling for jobs-only designs).
+
 ## 0.6.2 — 2026-07-22
 
 Closes the residual tenant-guard gaps left by the #78 ownership-safety effort
