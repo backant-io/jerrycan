@@ -109,3 +109,137 @@ jobs:
         run: |
           timeout 60 bash -c 'until curl -sf http://127.0.0.1:9000/minio/health/live; do sleep 1; done'
           cargo test -p jerrycan-storage --features storage-s3 --test s3_minio
+
+  # === Onboarding eval (spec §4.7) ===========================================
+  # Proves the PUBLISHED onboarding path end to end, exactly as a first-time
+  # user hits it: the real release-profile musl CLI, packed byte-for-byte like a
+  # GitHub release asset, is served over loopback and installed by the real
+  # scripts/install.sh — then the installed binary onboards and scaffolds.
+  # Split in two so the install runs in a pristine debian:bookworm-slim with NO
+  # Rust/cargo/curl/python (a clean machine), while the binary is built on the
+  # normal runner. Independent of the `heavy` job above; same workflow_dispatch.
+  onboarding-tarball:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Same pin as the heavy job / release.yml — keep in sync with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.97
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl tools
+        # musl-gcc, needed to statically link the x86_64-unknown-linux-musl binary.
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the release-profile CLI (static musl)
+        # Default features only == exactly what `cargo install`/the release ships
+        # (release.yml builds this same bin via taiki-e with no extra features).
+        run: cargo build --release --target x86_64-unknown-linux-musl -p jerrycan --bin jerrycan
+      - name: Pack the release asset (binary at tarball root + '<hash>  <file>' sha256)
+        # Mirrors taiki-e/upload-rust-binary-action from release.yml: asset name
+        # jerrycan-<target>.tar.gz, the `jerrycan` binary at the tarball ROOT, and
+        # a `<sha256>  <file>` checksum sidecar (sha256sum's default format) — the
+        # exact layout scripts/install.sh downloads, extracts, and verifies.
+        run: |
+          set -euo pipefail
+          TARGET=x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp "target/$TARGET/release/jerrycan" jerrycan
+          tar -czf "dist/jerrycan-$TARGET.tar.gz" jerrycan
+          rm -f jerrycan
+          ( cd dist && sha256sum "jerrycan-$TARGET.tar.gz" > "jerrycan-$TARGET.tar.gz.sha256" )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onboarding-tarball
+          path: dist/
+          if-no-files-found: error
+
+  onboarding-eval:
+    needs: onboarding-tarball
+    runs-on: ubuntu-latest
+    # A first-time user's machine: Debian with no Rust, no cargo, and none of
+    # curl/python3 preinstalled (slim). GitHub mounts its own Node for the JS
+    # actions below, so they run without Node in the image; actions/checkout
+    # finds no git here and falls back to its REST tarball download (tar+gzip are
+    # Debian-essential, so that extraction still works — no git install needed).
+    container:
+      image: debian:bookworm-slim
+    steps:
+      - name: Install the few tools the slim image lacks
+        # curl: install.sh downloads the asset with it. python3: serves the asset
+        # over loopback + parses the JSON summary (no jq on the box).
+        # ca-certificates: TLS roots. git is deliberately NOT installed — verified
+        # `jerrycan new` is pure filesystem I/O (no Command::/git/cargo in
+        # scaffold.rs), so scaffolding succeeds in this cargo-less container.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates python3
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: onboarding-tarball
+          path: dist
+      - name: Install via scripts/install.sh and assert the onboarding path
+        run: |
+          set -euo pipefail
+          TARGET=x86_64-unknown-linux-musl
+          # Serve the asset at <base>/v<version>/<asset> — the real release URL
+          # shape — so JERRYCAN_INSTALL_BASE_URL + _VERSION resolve straight to it.
+          VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          SERVE="${RUNNER_TEMP:-/tmp}/serve"
+          mkdir -p "$SERVE/v$VERSION"
+          cp "dist/jerrycan-$TARGET.tar.gz" "dist/jerrycan-$TARGET.tar.gz.sha256" "$SERVE/v$VERSION/"
+
+          # Serve over loopback on a free port (mirrors scripts/install-test.sh).
+          PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+          python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$SERVE" >/dev/null 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          BASE_URL="http://127.0.0.1:$PORT"
+          ready=0
+          for _ in $(seq 1 50); do
+            if curl -fsS "$BASE_URL/v$VERSION/jerrycan-$TARGET.tar.gz" -o /dev/null 2>/dev/null; then ready=1; break; fi
+            sleep 0.1
+          done
+          [ "$ready" -eq 1 ] || { echo "local http server never became ready on $PORT" >&2; exit 1; }
+
+          # (1) install.sh must exit 0. NO_RUSTUP/NO_MODIFY_PATH: touch nothing global.
+          INSTALL_DIR="$HOME/.jerrycan/bin"
+          OUT="${RUNNER_TEMP:-/tmp}/install.json"
+          JERRYCAN_INSTALL_BASE_URL="$BASE_URL" \
+          JERRYCAN_INSTALL_VERSION="$VERSION" \
+          JERRYCAN_INSTALL_DIR="$INSTALL_DIR" \
+          JERRYCAN_NO_RUSTUP=1 \
+          JERRYCAN_NO_MODIFY_PATH=1 \
+            bash scripts/install.sh --agent generic --json >"$OUT"
+          echo "PASS: install.sh exited 0"
+
+          # (2) stdout is a single JSON doc with .ok == true (python3, no jq).
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["ok"] is True, d' "$OUT"
+          echo "PASS: install summary JSON .ok == true"
+
+          BIN="$INSTALL_DIR/jerrycan"
+          # (3) the installed CLI runs.
+          "$BIN" --version
+          echo "PASS: jerrycan --version runs"
+
+          # (4) `onboard` prints the guided runbook. Capture then grep (avoids a
+          # pipefail SIGPIPE if grep -q closes the pipe before onboard finishes).
+          "$BIN" onboard > "${RUNNER_TEMP:-/tmp}/onboard.txt"
+          grep -q "Entry path" "${RUNNER_TEMP:-/tmp}/onboard.txt"
+          echo "PASS: jerrycan onboard printed the runbook (Entry path)"
+
+          # (5) emitting the generic skill exits 0.
+          "$BIN" onboard --emit-skill --agent generic
+          echo "PASS: onboard --emit-skill --agent generic exited 0"
+
+          # (6) scaffold from the EMBEDDED todo-api design must succeed. `jerrycan
+          # new` is pure fs (no cargo in this container), so we assert scaffold
+          # ONLY. check-green is intentionally NOT re-run here: the `heavy` job
+          # above already builds this byte-identical design and asserts `jerrycan
+          # check` => ok (conformance::fresh_scaffold_passes_jerrycan_check), so a
+          # host-side check step would be pure duplication (YAGNI).
+          "$BIN" new eval-app --design crates/jerrycan/embedded/designs/todo-api.design.json
+          test -f eval-app/design.json
+          test -f eval-app/Cargo.toml
+          echo "PASS: jerrycan new scaffolded eval-app from the embedded todo-api design"
+          echo "onboarding eval: all assertions passed"
