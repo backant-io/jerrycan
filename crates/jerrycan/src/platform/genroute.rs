@@ -666,7 +666,7 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
             if !f.required {
                 out.push_str("    #[serde(default)]\n");
             }
-            out.push_str(&enum_validate_attr(e, f, "    ", ""));
+            out.push_str(&constraint_validate_attr(e, f, "    ", ""));
             out.push_str(&format!(
                 "    pub {}: {},\n",
                 rust_ident(&f.name),
@@ -675,7 +675,7 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
         }
         out.push_str("}\n\n");
     }
-    out.push_str(&enum_deserialize_fns(&m.entities));
+    out.push_str(&constraint_deserialize_fns(&m.entities));
     Some(out)
 }
 
@@ -695,14 +695,26 @@ fn keyword_field_attrs(name: &str, indent: &str, db: bool) -> String {
     s
 }
 
-/// The `#[serde(deserialize_with = ...)]` line wiring an enum `values` field to
-/// its generated allow-list validator (issue #47), or empty for a non-enum field
-/// so every design WITHOUT `values` stays byte-identical. `path_prefix` is
-/// `"super::"` for the db-mode SeaORM Model (nested in `pub mod {snake}`, so the
-/// root-level validator is reached via `super::`) and `""` for the root-level
-/// memory struct and the `{Entity}Request` DTO.
-fn enum_validate_attr(entity: &Entity, f: &Field, indent: &str, path_prefix: &str) -> String {
-    if f.values.is_none() {
+/// True when a field declares any #80 range/length key that needs a runtime
+/// check. JC0552 already guarantees placement — `min`/`max` only on integer
+/// fields, `min_len`/`max_len` only on string fields, never on the pk `id`,
+/// never combined with `values` — so emission needs no special-casing beyond
+/// this gate. `min_len: 0` alone is vacuous (every string satisfies it, and an
+/// unsigned `count() < 0` check would trip rustc's `unused_comparisons`), so
+/// it does not gate a validator in.
+fn field_has_bounds(f: &Field) -> bool {
+    f.min.is_some() || f.max.is_some() || f.min_len.is_some_and(|v| v > 0) || f.max_len.is_some()
+}
+
+/// The `#[serde(deserialize_with = ...)]` line wiring an enum `values` field
+/// (issue #47) or a range/length-constrained field (issue #80) to its generated
+/// validator, or empty for a field with NEITHER so every design without them
+/// stays byte-identical. `path_prefix` is `"super::"` for the db-mode SeaORM
+/// Model (nested in `pub mod {snake}`, so the root-level validator is reached
+/// via `super::`) and `""` for the root-level memory struct and the
+/// `{Entity}Request` DTO.
+fn constraint_validate_attr(entity: &Entity, f: &Field, indent: &str, path_prefix: &str) -> String {
+    if f.values.is_none() && !field_has_bounds(f) {
         return String::new();
     }
     format!(
@@ -713,42 +725,119 @@ fn enum_validate_attr(entity: &Entity, f: &Field, indent: &str, path_prefix: &st
 }
 
 /// The root-level `de_{entity}_{field}` validators for every enum `values` field
-/// across a module's entities (issue #47). Each rejects an out-of-range value with
-/// a serde error, which the `Json` extractor surfaces as `422 JC0422` — so invalid
-/// enum input is refused at the request boundary, on EVERY write path (create AND
-/// update), BEFORE the database (whose CHECK stays as defense-in-depth). Empty when
-/// no entity declares `values`. serde paths are fully qualified so the module's
-/// `use` list is untouched (the db root imports nothing; the memory root imports
-/// only serde's derives).
-fn enum_deserialize_fns(entities: &[Entity]) -> String {
+/// (issue #47) and every range/length-constrained field (issue #80) across a
+/// module's entities. Each rejects an out-of-range value with a serde error,
+/// which the `Json` extractor surfaces as `422 JC0422` — so invalid input is
+/// refused at the request boundary, on EVERY write path (create AND update),
+/// BEFORE the database (whose CHECK stays as defense-in-depth). Empty when no
+/// entity declares `values` or a constraint key. serde paths are fully qualified
+/// so the module's `use` list is untouched (the db root imports nothing; the
+/// memory root imports only serde's derives).
+fn constraint_deserialize_fns(entities: &[Entity]) -> String {
     let mut out = String::new();
     for e in entities {
         let snake = Design::to_snake(&e.name);
         for f in &e.fields {
-            let Some(values) = &f.values else {
-                continue;
-            };
-            let allowed = values
-                .iter()
-                .map(|v| format!("\"{v}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let msg = format!("{} must be one of: {}", f.name, values.join(", "));
-            let name = format!("de_{snake}_{}", f.name);
-            if f.required {
-                out.push_str(&format!(
-                    "// Enum validator (issue #47): out-of-range `{field}` → serde error → 422.\nfn {name}<'de, D>(de: D) -> std::result::Result<String, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <String as serde::Deserialize>::deserialize(de)?;\n    const ALLOWED: &[&str] = &[{allowed}];\n    if !ALLOWED.contains(&value.as_str()) {{\n        return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n    }}\n    Ok(value)\n}}\n\n",
-                    field = f.name,
-                ));
-            } else {
-                out.push_str(&format!(
-                    "// Enum validator (issue #47): checks `{field}` when present (optional).\nfn {name}<'de, D>(de: D) -> std::result::Result<Option<String>, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <Option<String> as serde::Deserialize>::deserialize(de)?;\n    if let Some(ref inner) = value {{\n        const ALLOWED: &[&str] = &[{allowed}];\n        if !ALLOWED.contains(&inner.as_str()) {{\n            return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n        }}\n    }}\n    Ok(value)\n}}\n\n",
-                    field = f.name,
-                ));
+            if let Some(values) = &f.values {
+                let allowed = values
+                    .iter()
+                    .map(|v| format!("\"{v}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let msg = format!("{} must be one of: {}", f.name, values.join(", "));
+                let name = format!("de_{snake}_{}", f.name);
+                if f.required {
+                    out.push_str(&format!(
+                        "// Enum validator (issue #47): out-of-range `{field}` → serde error → 422.\nfn {name}<'de, D>(de: D) -> std::result::Result<String, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <String as serde::Deserialize>::deserialize(de)?;\n    const ALLOWED: &[&str] = &[{allowed}];\n    if !ALLOWED.contains(&value.as_str()) {{\n        return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n    }}\n    Ok(value)\n}}\n\n",
+                        field = f.name,
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "// Enum validator (issue #47): checks `{field}` when present (optional).\nfn {name}<'de, D>(de: D) -> std::result::Result<Option<String>, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <Option<String> as serde::Deserialize>::deserialize(de)?;\n    if let Some(ref inner) = value {{\n        const ALLOWED: &[&str] = &[{allowed}];\n        if !ALLOWED.contains(&inner.as_str()) {{\n            return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n        }}\n    }}\n    Ok(value)\n}}\n\n",
+                        field = f.name,
+                    ));
+                }
+            } else if field_has_bounds(f) {
+                out.push_str(&bounds_deserialize_fn(&snake, f));
             }
         }
     }
     out
+}
+
+/// One `de_{entity}_{field}` validator for a range/length-constrained field
+/// (issue #80): deserialize the inner type, then check each declared bound,
+/// rejecting with a serde error the `Json` extractor surfaces as 422 JC0422 —
+/// the same mechanism as the enum allow-list (#47). String length counts
+/// Unicode code points (`chars().count()`, matching OpenAPI minLength/
+/// maxLength and the SQL `length()` CHECK), NEVER `.len()` bytes. JC0552
+/// guarantees `min`/`max` only on integer fields and `min_len`/`max_len` only
+/// on string fields, so the inner type follows `field_type` directly.
+fn bounds_deserialize_fn(snake: &str, f: &Field) -> String {
+    let name = format!("de_{snake}_{}", f.name);
+    let inner_ty = f.field_type.rust_type(); // "i64" or "String" per JC0552
+    if f.required {
+        let checks = bounds_checks(f, "value", "    ");
+        format!(
+            "// Constraint validator (issue #80): out-of-range `{field}` → serde error → 422.\nfn {name}<'de, D>(de: D) -> std::result::Result<{inner_ty}, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <{inner_ty} as serde::Deserialize>::deserialize(de)?;\n{checks}    Ok(value)\n}}\n\n",
+            field = f.name,
+        )
+    } else {
+        // An integer is Copy (bind by value); a String must stay in place
+        // (bind by ref) because the whole Option is returned after the check.
+        let binding = if f.field_type == FieldType::Integer {
+            "Some(inner)"
+        } else {
+            "Some(ref inner)"
+        };
+        let checks = bounds_checks(f, "inner", "        ");
+        format!(
+            "// Constraint validator (issue #80): checks `{field}` when present (optional).\nfn {name}<'de, D>(de: D) -> std::result::Result<Option<{inner_ty}>, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <Option<{inner_ty}> as serde::Deserialize>::deserialize(de)?;\n    if let {binding} = value {{\n{checks}    }}\n    Ok(value)\n}}\n\n",
+            field = f.name,
+        )
+    }
+}
+
+/// The `if <violated> {{ return Err(custom("...")) }}` blocks for every bound a
+/// field declares, checking `var` at `indent`. A field emits ALL its applicable
+/// checks in one fn. `min_len: 0` is vacuous on an unsigned count (and would
+/// trip rustc's `unused_comparisons` in the generated app), so it emits nothing.
+fn bounds_checks(f: &Field, var: &str, indent: &str) -> String {
+    let mut rules: Vec<(String, String)> = Vec::new();
+    if let Some(mn) = f.min {
+        rules.push((
+            format!("{var} < {mn}"),
+            format!("{} must be at least {mn}", f.name),
+        ));
+    }
+    if let Some(mx) = f.max {
+        rules.push((
+            format!("{var} > {mx}"),
+            format!("{} must be at most {mx}", f.name),
+        ));
+    }
+    if let Some(mn) = f.min_len
+        && mn > 0
+    {
+        rules.push((
+            format!("{var}.chars().count() < {mn}"),
+            format!("{} must be at least {mn} characters", f.name),
+        ));
+    }
+    if let Some(mx) = f.max_len {
+        rules.push((
+            format!("{var}.chars().count() > {mx}"),
+            format!("{} must be at most {mx} characters", f.name),
+        ));
+    }
+    rules
+        .iter()
+        .map(|(cond, msg)| {
+            format!(
+                "{indent}if {cond} {{\n{indent}    return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n{indent}}}\n"
+            )
+        })
+        .collect()
 }
 
 /// PascalCase a snake_case column name for SeaORM's `Column` variants:
@@ -819,11 +908,11 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design, auth: bool) -> Opti
             fields.push_str(&keyword_field_attrs(&f.name, "        ", true));
             let ident = rust_ident(&f.name);
             if f.required {
-                fields.push_str(&enum_validate_attr(e, f, "        ", "super::"));
+                fields.push_str(&constraint_validate_attr(e, f, "        ", "super::"));
                 fields.push_str(&format!("        pub {ident}: {base},\n"));
             } else {
                 fields.push_str("        #[serde(default)]\n");
-                fields.push_str(&enum_validate_attr(e, f, "        ", "super::"));
+                fields.push_str(&constraint_validate_attr(e, f, "        ", "super::"));
                 fields.push_str(&format!("        pub {ident}: Option<{base}>,\n"));
             }
         }
@@ -905,7 +994,7 @@ pub use {snake}::Model as {entity};
             out.push_str(&request_dto_rs(e, design, true));
         }
     }
-    out.push_str(&enum_deserialize_fns(&m.entities));
+    out.push_str(&constraint_deserialize_fns(&m.entities));
     Some(out)
 }
 
@@ -961,11 +1050,11 @@ fn request_dto_rs(e: &Entity, design: &Design, for_update: bool) -> String {
         fields.push_str(&keyword_field_attrs(&f.name, "    ", false));
         let ident = rust_ident(&f.name);
         if f.required {
-            fields.push_str(&enum_validate_attr(e, f, "    ", ""));
+            fields.push_str(&constraint_validate_attr(e, f, "    ", ""));
             fields.push_str(&format!("    pub {ident}: {base},\n"));
         } else {
             fields.push_str("    #[serde(default)]\n");
-            fields.push_str(&enum_validate_attr(e, f, "    ", ""));
+            fields.push_str(&constraint_validate_attr(e, f, "    ", ""));
             fields.push_str(&format!("    pub {ident}: Option<{base}>,\n"));
         }
     }
@@ -2327,7 +2416,7 @@ fn ddl_typed(
 /// bigserial, quoting) are library-owned, never hand-rolled strings. `design`
 /// resolves fk target key types/tables and the tenancy membership table.
 fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Option<String> {
-    use sea_query::{Alias, ColumnDef, Expr, ForeignKey, ForeignKeyAction, Index, Table};
+    use sea_query::{Alias, ColumnDef, Expr, ForeignKey, ForeignKeyAction, Func, Index, Table};
     if m.entities.is_empty() {
         return None;
     }
@@ -2433,6 +2522,31 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
             // Enum `values` constrain the column to that set via a CHECK.
             if let Some(values) = &f.values {
                 col.check(Expr::col(Alias::new(f.name.as_str())).is_in(values.clone()));
+            }
+            // Range/length constraints (#80) land as a CHECK too — defense-in-
+            // depth behind the request-boundary validator (which 422s first).
+            // Half-bound form when only one side is declared. `length()` counts
+            // characters on both SQLite and Postgres, matching the validator's
+            // chars().count().
+            if f.min.is_some() || f.max.is_some() {
+                let val = Expr::col(Alias::new(f.name.as_str()));
+                col.check(match (f.min, f.max) {
+                    (Some(mn), Some(mx)) => val.between(mn, mx),
+                    (Some(mn), None) => val.gte(mn),
+                    (None, Some(mx)) => val.lte(mx),
+                    (None, None) => unreachable!("gated above"),
+                });
+            }
+            if f.min_len.is_some() || f.max_len.is_some() {
+                let len = Expr::expr(
+                    Func::cust(Alias::new("length")).arg(Expr::col(Alias::new(f.name.as_str()))),
+                );
+                col.check(match (f.min_len, f.max_len) {
+                    (Some(mn), Some(mx)) => len.between(mn, mx),
+                    (Some(mn), None) => len.gte(mn),
+                    (None, Some(mx)) => len.lte(mx),
+                    (None, None) => unreachable!("gated above"),
+                });
             }
             table.col(&mut col);
             // An indexed field gets a standalone CREATE INDEX after the table.
@@ -6749,6 +6863,199 @@ pub(crate) mod tests {
         assert!(
             src.contains("Result<Option<String>, D::Error>"),
             "optional validator returns Option<String>: {src}"
+        );
+    }
+
+    /// Issue #80: a request-body entity with range/length-constrained fields —
+    /// `quantity` (integer, min 1 / max 600), `code` (string, max_len 5), an
+    /// OPTIONAL `note` (string, min_len 2), plus a defaulted enum `status` so the
+    /// UPDATE DTO is emitted too. Exercises all three attach sites (memory Model,
+    /// db Model, request DTOs) and the migration CHECK.
+    pub(crate) const CONSTRAINT_DTO: &str = r#"{
+        "name": "shop-app", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["admin"] },
+        "dependencies": ["db", "auth"],
+        "modules": [
+            { "name": "users",
+              "entities": [{ "name": "User", "fields": [{ "name": "email", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_users", "method": "GET", "path": "/",
+                  "auth_required": true,
+                  "success": { "status": 200, "entity": "User", "list": true } }] },
+            { "name": "items",
+              "entities": [{ "name": "Item",
+                  "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                  "fields": [
+                      { "name": "quantity", "type": "integer", "min": 1, "max": 600 },
+                      { "name": "code", "type": "string", "max_len": 5 },
+                      { "name": "note", "type": "string", "required": false, "min_len": 2 },
+                      { "name": "status", "type": "string", "values": ["new", "done"], "default": "new" }
+                  ]}],
+              "endpoints": [
+                  { "operation_id": "create_item", "method": "POST", "path": "/",
+                    "auth_required": true,
+                    "request_body": { "entity": "Item" },
+                    "success": { "status": 201, "entity": "Item" } },
+                  { "operation_id": "update_item", "method": "PUT", "path": "/{id}",
+                    "auth_required": true,
+                    "request_body": { "entity": "Item" },
+                    "success": { "status": 200, "entity": "Item" } }
+              ] }
+        ]
+    }"#;
+
+    /// Issue #80: a `min`/`max` integer field and a `max_len` string field must
+    /// reject out-of-range input at the request boundary (422), exactly like the
+    /// enum `values` mechanism (#47) they extend — in memory mode (plain serde
+    /// struct). WHY (Rule 9): without the generated bound checks, a design
+    /// declaring `1..=600` still accepts 0 and 601, forcing hand-written
+    /// validation that breaks the fixture/probe chain (the #80 gap).
+    #[test]
+    fn constrained_field_validates_at_deserialize_memory() {
+        let d: Design = serde_json::from_str(CONSTRAINT_DTO).unwrap();
+        let src = model_rs(&d.modules[1]).unwrap(); // items: constrained fields
+        assert!(
+            src.contains("#[serde(deserialize_with = \"de_item_quantity\")]"),
+            "range field wired to its validator: {src}"
+        );
+        assert!(
+            src.contains("fn de_item_quantity"),
+            "range validator fn emitted: {src}"
+        );
+        assert!(
+            src.contains("value < 1") && src.contains("value > 600"),
+            "both bounds checked (rejects 0 and 601, accepts 300): {src}"
+        );
+        assert!(
+            src.contains("quantity must be at least 1")
+                && src.contains("quantity must be at most 600"),
+            "error messages name the bound: {src}"
+        );
+        // String length counts Unicode code points (chars().count(), matching
+        // OpenAPI minLength/maxLength) — NOT .len() bytes.
+        assert!(
+            src.contains("fn de_item_code") && src.contains("value.chars().count() > 5"),
+            "max_len check uses chars().count(), rejecting a 6-char string: {src}"
+        );
+        assert!(
+            !src.contains(".len()"),
+            "length must never be bytes (.len()): {src}"
+        );
+        // Optional field: validates only when Some, returns Option<String>.
+        assert!(
+            src.contains("fn de_item_note") && src.contains("Result<Option<String>, D::Error>"),
+            "optional constrained field gets the Option variant: {src}"
+        );
+        assert!(
+            src.contains("inner.chars().count() < 2"),
+            "optional min_len checked on the inner value: {src}"
+        );
+    }
+
+    /// Same, in db mode: the SeaORM Model (nested in `pub mod {snake}`) reaches
+    /// the root-level validator via `super::`, and BOTH request DTOs (create
+    /// `ItemRequest` + update `ItemUpdateRequest`) wire it at root — all three
+    /// attach sites carry the constraint.
+    #[test]
+    fn constrained_field_validates_at_deserialize_db() {
+        let d: Design = serde_json::from_str(CONSTRAINT_DTO).unwrap();
+        let src = model_rs_db(&d.modules[1], &d, true).unwrap();
+        assert!(
+            src.contains("#[serde(deserialize_with = \"super::de_item_quantity\")]"),
+            "db Model wires the range validator via super::: {src}"
+        );
+        assert!(
+            src.contains("#[serde(deserialize_with = \"super::de_item_code\")]"),
+            "db Model wires the length validator via super::: {src}"
+        );
+        assert!(
+            src.contains("fn de_item_quantity")
+                && src.contains("value < 1")
+                && src.contains("value > 600"),
+            "bound checks emitted once at root: {src}"
+        );
+        // The create DTO and the update DTO EACH carry the root-prefix attr.
+        assert!(
+            src.contains("pub struct ItemRequest") && src.contains("pub struct ItemUpdateRequest"),
+            "both DTOs emitted: {src}"
+        );
+        assert_eq!(
+            src.matches("#[serde(deserialize_with = \"de_item_quantity\")]")
+                .count(),
+            2,
+            "create AND update DTO both validate quantity: {src}"
+        );
+        assert_eq!(
+            src.matches("#[serde(deserialize_with = \"de_item_code\")]")
+                .count(),
+            2,
+            "create AND update DTO both validate code: {src}"
+        );
+    }
+
+    /// Issue #80 defense-in-depth: a constrained column gets a CHECK mirroring
+    /// the `values` precedent — `BETWEEN` for a two-sided range, the half-bound
+    /// form when only one side is declared, and `length()` (characters on both
+    /// SQLite and Postgres, matching the validator's chars().count()) for
+    /// string length.
+    #[test]
+    fn constrained_columns_get_check_ddl() {
+        let d: Design = serde_json::from_str(CONSTRAINT_DTO).unwrap();
+        let ddl = migration_ddl(&d.modules[1], false, &d).unwrap();
+        assert!(
+            ddl.contains("CHECK (\"quantity\" BETWEEN 1 AND 600)"),
+            "two-sided integer range → BETWEEN: {ddl}"
+        );
+        assert!(
+            ddl.contains("CHECK (length(\"code\") <= 5)"),
+            "max_len only → half-bound length CHECK: {ddl}"
+        );
+        assert!(
+            ddl.contains("CHECK (length(\"note\") >= 2)"),
+            "min_len only → half-bound length CHECK: {ddl}"
+        );
+        // The enum CHECK is untouched beside the new ones.
+        assert!(
+            ddl.contains("IN ('new', 'done')"),
+            "values CHECK still emitted: {ddl}"
+        );
+        // Same CHECKs on the Postgres dialect.
+        let pg = migration_ddl(&d.modules[1], true, &d).unwrap();
+        assert!(
+            pg.contains("CHECK (\"quantity\" BETWEEN 1 AND 600)")
+                && pg.contains("CHECK (length(\"code\") <= 5)"),
+            "postgres DDL carries the same CHECKs: {pg}"
+        );
+    }
+
+    /// No-drift (issue #80 byte-identity gate): a field with NO `values` and NO
+    /// constraint key produces byte-identical model/DTO/DDL output — every new
+    /// branch gates on "has a constraint or values". Mirrors
+    /// `enum_free_entity_emits_no_validator` for the #80 keys.
+    #[test]
+    fn unconstrained_field_output_is_byte_identical() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        // Lead: no values, no min/max/min_len/max_len.
+        let mem = model_rs(&d.modules[1]).unwrap();
+        assert!(
+            !mem.contains("deserialize_with") && !mem.contains("fn de_"),
+            "unconstrained memory model gains no validator: {mem}"
+        );
+        let db = model_rs_db(&d.modules[1], &d, false).unwrap();
+        assert!(
+            !db.contains("deserialize_with") && !db.contains("fn de_"),
+            "unconstrained db model gains no validator: {db}"
+        );
+        let ddl = migration_ddl(&d.modules[1], false, &d).unwrap();
+        assert!(
+            !ddl.to_lowercase().contains("check"),
+            "unconstrained columns gain no CHECK: {ddl}"
+        );
+        // Workspaces keeps EXACTLY its one enum CHECK — the #80 branch adds none.
+        let ws = migration_ddl(&d.modules[0], false, &d).unwrap();
+        assert_eq!(
+            ws.matches("CHECK").count(),
+            1,
+            "enum-only entity keeps exactly the values CHECK: {ws}"
         );
     }
 
