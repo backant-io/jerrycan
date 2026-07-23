@@ -238,7 +238,11 @@ Every entity has an `id` primary key; you usually do NOT declare it:
   happy-path 2xx probe for an endpoint whose success needs a credential it can't
   synthesize (login, signed webhook, api-key route) — otherwise that probe is
   un-greenable and `jerrycan check` can never reach `ok:true`. With `skip` the generator
-  emits an AGENT TODO; you write the credentialed success + rejection tests yourself.
+  emits an AGENT TODO; you write the credentialed success test yourself. A guarded
+  endpoint (`auth_required`/`required_roles`) STILL gets its generated
+  `_without_auth_is_401` test — `skip` drops only the success probe, never the
+  auth-guard assertion. An unguarded `skip` endpoint (a login, a signed webhook) has no
+  generated guard test, so write its 401/403 rejection test yourself too.
 - `request_body?` — `{ "entity": "<Name>" }` ONLY. The body is the named entity; the
   entity must be declared in THIS module. There is no narrower/custom input DTO in the
   design — for an endpoint that takes untrusted public input, defend it IN-HANDLER
@@ -248,8 +252,10 @@ Every entity has an `id` primary key; you usually do NOT declare it:
     OpenAPI request schema and the happy-path probe body drop the same fields); the
     entity RESPONSE shape is unchanged. Three drop reasons — a body can hit several at
     once:
-    1. **Identity fk (guarded):** the body `belongs_to` the auth identity entity
-       (derived fk `user_id`) AND the endpoint is guarded → `user_id` is omitted; the
+    1. **Identity fk (guarded):** the body `belongs_to` the auth identity entity —
+       which MUST be named literally `User`, so the derived fk is `user_id` (see
+       10-auth.md: an identity named anything else gets NO owner-scoping and its fk
+       stays client-writable) — AND the endpoint is guarded → `user_id` is omitted; the
        handler injects the session user's id. An unguarded endpoint keeps it (no session
        to inject).
     2. **`default` field:** any field with a `default` is omitted; the server applies

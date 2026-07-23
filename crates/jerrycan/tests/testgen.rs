@@ -1060,6 +1060,78 @@ fn probe_skip_hint_drops_the_ungreenable_success_probe() {
     );
 }
 
+/// Issue #123(b): `probe: "skip"` on a GUARDED endpoint drops ONLY the
+/// un-greenable success probe — the `_without_auth_is_401` guard test survives.
+/// WHY (Rule 9): the 401 test is a GREENABLE security assertion (the generated
+/// guard rejects a credential-less request before any handler logic, so it
+/// needs no credential and no seed); before this fix `skip` silently deleted
+/// it, so a hand-weakened guard stayed green. A param path pins its `{param}`
+/// to a literal id — the guard 401s before the id is ever looked up.
+#[test]
+fn probe_skip_on_a_guarded_endpoint_keeps_the_401_guard_test() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "vault-api",
+        "contract_version": 1,
+        "auth": { "model": "session", "roles": ["admin"] },
+        "dependencies": ["auth"],
+        "modules": [{
+            "name": "vault",
+            "endpoints": [
+                // Guarded, but its success needs a credential the generator
+                // can't synthesize — marked probe: skip.
+                { "operation_id": "rotate_key", "method": "POST", "path": "/rotate",
+                  "auth_required": true, "probe": "skip",
+                  "success": { "status": 202 } },
+                // The same, on a parameterized path.
+                { "operation_id": "reveal_secret", "method": "GET", "path": "/{id}/reveal",
+                  "auth_required": true, "probe": "skip",
+                  "success": { "status": 200 } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    // The un-greenable success probes stay dropped...
+    assert!(
+        !generated.contains("async fn rotate_key_returns_"),
+        "probe: skip still drops the un-greenable success probe: {generated}"
+    );
+    // ...but the 401 guard tests survive the skip.
+    assert!(
+        generated.contains("async fn rotate_key_without_auth_is_401"),
+        "a guarded probe:skip endpoint keeps its 401 guard test: {generated}"
+    );
+    assert!(
+        generated.contains("async fn reveal_secret_without_auth_is_401"),
+        "a guarded param-path probe:skip endpoint keeps its 401 guard test: {generated}"
+    );
+    // The param path is pinned to a literal id — a 401 rejection needs no seed.
+    assert!(
+        generated.contains("\"/vault/1/reveal\""),
+        "the 401 probe pins the path param to a literal id: {generated}"
+    );
+    // The TODO is retained, now asking for the success test ONLY (the rejection
+    // test is generated, so the old "write the rejection test yourself" is gone).
+    assert!(
+        generated
+            .contains("// AGENT TODO: rotate_key (POST /vault/rotate) is marked `probe: skip`"),
+        "the probe:skip TODO is retained: {generated}"
+    );
+    assert!(
+        !generated.contains("and its 401/403 rejection test"),
+        "a guarded skip TODO must not ask for the generated rejection test: {generated}"
+    );
+    // expected_failing flows through push_401_test's count — no special-casing.
+    let tmp = std::env::temp_dir().join(format!("jc123b-{}", std::process::id()));
+    std::fs::create_dir_all(tmp.join("crates/routes/vault/tests")).unwrap();
+    let (_rel, expected_failing) = testgen::write_acceptance(&tmp, &design, "vault").unwrap();
+    assert_eq!(
+        expected_failing, 2,
+        "both 401 guard tests count toward expected_failing: {generated}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
 /// A db-mode module whose EVERY endpoint is a TODO (e.g. a billing module whose
 /// only route is a signature-gated webhook) emits ZERO `#[tokio::test]` functions.
 /// The generated file must then carry NO `app()` helper and NO `use` imports —
@@ -1983,6 +2055,56 @@ fn skipped_creator_suppresses_sibling_id_probes() {
         "only the 404 missing-id probe is a counted RED-on-stubs test: {generated}"
     );
     std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// Issue #123(b): a GUARDED `/{id}` sibling of a `probe: "skip"` creator loses
+/// its seeded success probe (issue #68 — the skipped creator can't seed it) but
+/// KEEPS its `_without_auth_is_401` guard test. WHY (Rule 9): the guard rejects
+/// a credential-less request before the id lookup, so a literal id stands in
+/// and no seed is needed — dropping the test would silently un-test a real guard.
+#[test]
+fn skipped_creator_guarded_sibling_keeps_the_401_guard_test() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "sitemonitor",
+        "contract_version": 1,
+        "auth": { "model": "session", "roles": ["admin"] },
+        "dependencies": ["db", "auth"],
+        "modules": [{
+            "name": "monitors",
+            "entities": [{ "name": "Monitor",
+                "fields": [{ "name": "url", "type": "string" }] }],
+            "endpoints": [
+                { "operation_id": "create_monitor", "method": "POST", "path": "/",
+                  "auth_required": true, "probe": "skip",
+                  "request_body": { "entity": "Monitor" },
+                  "success": { "status": 201, "entity": "Monitor" } },
+                { "operation_id": "get_monitor", "method": "GET", "path": "/{id}",
+                  "auth_required": true,
+                  "success": { "status": 200, "entity": "Monitor" } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    // The seeded success probe stays suppressed (issue #68)...
+    assert!(
+        !generated.contains("async fn get_monitor_returns_200"),
+        "a probe:skip creator still suppresses the sibling success probe: {generated}"
+    );
+    // ...but the guarded sibling keeps its 401 guard test, on a literal id.
+    assert!(
+        generated.contains("async fn get_monitor_without_auth_is_401"),
+        "a guarded sibling of a skipped creator keeps its 401 guard test: {generated}"
+    );
+    assert!(
+        generated.contains("\"/monitors/1\""),
+        "the sibling 401 probe pins {{id}} to a literal — no seed needed: {generated}"
+    );
+    // The guarded skipped creator itself keeps its own 401 guard test too.
+    assert!(
+        generated.contains("async fn create_monitor_without_auth_is_401"),
+        "the guarded skipped creator keeps its own 401 guard test: {generated}"
+    );
 }
 
 /// A subroute-mounted, tenant-owned module: `channels` mounts at

@@ -429,7 +429,9 @@ fn request_expr(
 /// resolvable. The endpoint's OWN `/{id}` param lives in `ep.path` (appended AFTER
 /// `base`, so never touched here) and is substituted separately by the seeded row
 /// id. A FLAT mount carries no `{param}`, so this is the identity — every
-/// non-nested design stays byte-identical.
+/// non-nested design stays byte-identical. Also reused on a FULL path to pin an
+/// endpoint's own `{param}`s for the seedless 401 guard probes (issue #123b) —
+/// the guard rejects before any id is looked up, so a literal `1` suffices.
 fn concrete_mount_base(base: &str) -> String {
     let mut out = String::with_capacity(base.len());
     let mut rest = base;
@@ -473,8 +475,10 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         // supply (login, signed webhook, api-key route): no un-greenable success
         // probe — emit a TODO instead. Detected by heuristic OR declared
         // explicitly with `probe: skip` (issue #11) so a design the heuristic
-        // misses can still reach `ok:true`. These are never session-guarded (a
-        // guard would be threaded), so `guarded` is false and no 401 test is emitted.
+        // misses can still reach `ok:true`. The heuristic-detected ones are never
+        // session-guarded (a guard would be threaded, making the success
+        // greenable), so they get no 401 test; a `probe: skip` endpoint CAN be
+        // guarded — its 401 guard test still emits below (issue #123b).
         let probe_skip = ep.probe == ProbePolicy::Skip;
         let gated = endpoint_is_credential_gated(ep) || probe_skip;
 
@@ -484,10 +488,34 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             } else {
                 "authenticates via a credential/signature the generator can't supply"
             };
+            // Issue #123b: dropping the un-greenable success probe must NOT also
+            // drop the `_without_auth_is_401` guard test — that assertion is
+            // GREENABLE (the generated guard rejects a credential-less request
+            // before any handler logic) and deleting it silently un-tests a real
+            // security guard. Any `{param}` is pinned to a literal id: a 401
+            // rejection happens before the id is ever looked up, so no seed is
+            // needed. The TODO then asks for the success test only; an UNGUARDED
+            // gated endpoint (login, signed webhook) keeps the old ask — its
+            // rejection is handler logic, not a generated guard.
+            let ask = if guarded {
+                "write its success test (with a valid credential) in your own test file; its `_without_auth_is_401` guard test is already generated"
+            } else {
+                "write its success test (with a valid credential) and its 401/403 rejection test in your own test file"
+            };
             out.todos.push(format!(
-                "// AGENT TODO: {fn_base} ({:?} {full_path}) {reason} — write its success test (with a valid credential) and its 401/403 rejection test in your own test file.",
+                "// AGENT TODO: {fn_base} ({:?} {full_path}) {reason} — {ask}.",
                 ep.method
             ));
+            if guarded {
+                push_401_test(
+                    design,
+                    out,
+                    unit,
+                    ep,
+                    &concrete_mount_base(&full_path),
+                    false,
+                );
+            }
         } else if param_count(ep) == 0 {
             let request = request_expr(design, unit, ep, &full_path, guarded, None);
             // A creator that echoes its entity must echo the id it was given —
@@ -530,6 +558,19 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 "// AGENT TODO: {fn_base} ({:?} {full_path}) — its seed creator is `probe: skip` (a hand-written validator rejects the generated fixture), so an auto-seeded {{id}} would 404. Seed a valid row and encode its success case in your own test file.",
                 ep.method
             ));
+            // Issue #123b: the guard test survives the skipped seed — the guard
+            // rejects a credential-less request before the id lookup, so a
+            // literal id stands in and no seeded row is needed.
+            if guarded {
+                push_401_test(
+                    design,
+                    out,
+                    unit,
+                    ep,
+                    &concrete_mount_base(&full_path),
+                    false,
+                );
+            }
         } else if param_count(ep) == 1 {
             // Issue #51: seed the row THIS `/{id}` endpoint addresses via ITS OWN
             // entity's creator (`POST /tasks` for `/tasks/{id}`), walking belongs_to
