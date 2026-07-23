@@ -42,6 +42,10 @@ fn missing_required_arg_is_usage_error_exit_2() {
 
 const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.json");
 
+/// Multi-module design WITH jobs (6 endpoint-bearing modules + 2 cron jobs) —
+/// the whole-design surface `gen-tests` without `--module` must cover.
+const REFERENCE: &str = include_str!("../../../conformance/designs/reference-slice.design.json");
+
 /// #27 regression: a design whose `tenancy.entity` IS the auth identity entity.
 /// It validates clean (no completeness question) but can't scaffold — the
 /// generated membership table would declare `user_id` twice.
@@ -805,4 +809,180 @@ fn onboard_emit_skill_unknown_agent_is_usage_error_naming_ids() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("claude-code"));
+}
+
+/// #156 follow-on: `gen-tests` with NO `--module` covers the whole design —
+/// one acceptance suite per endpoint-bearing module plus the jobs suite once.
+/// WHY: JC0551's jobs diagnostic suggests the bare command (a jobs-only design
+/// has no module name to pass), so the bare form must exist and must clear
+/// every JC0551 the check can raise. Each file must be byte-identical to what
+/// the per-module writer produces, and `expected_failing` must aggregate
+/// without double-counting jobs. The `--module {m}` path's payload stays
+/// frozen — existing goldens and agent runbooks depend on it verbatim.
+#[test]
+fn gen_tests_without_module_covers_every_endpoint_module_and_jobs() {
+    use jerrycan::platform::design::Design;
+    let tmp = tempfile::tempdir().unwrap();
+    let bare = tmp.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(bare.join("design.json"), REFERENCE).unwrap();
+
+    let out = jerrycan()
+        .current_dir(&bare)
+        .args(["--json", "gen-tests"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "bare gen-tests must run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+
+    // Oracle: the same writers, driven directly, into a sibling root.
+    let design = Design::from_path(&bare.join("design.json")).unwrap();
+    let oracle = tmp.path().join("oracle");
+    std::fs::create_dir_all(&oracle).unwrap();
+    let mut expected_files = Vec::new();
+    let mut expected_count = 0usize;
+    let mut users_count = 0usize;
+    for m in &design.modules {
+        // every reference-slice module bears endpoints, so all are covered
+        let (rel, c) =
+            jerrycan::platform::testgen::write_acceptance(&oracle, &design, &m.name).unwrap();
+        expected_files.push(rel);
+        expected_count += c;
+        if m.name == "users" {
+            users_count = c;
+        }
+    }
+    let (jobs_rel, jobs_count) =
+        jerrycan::platform::jobsgen::write_jobs_acceptance(&oracle, &design)
+            .unwrap()
+            .expect("reference slice declares jobs");
+    expected_files.push(jobs_rel);
+    expected_count += jobs_count;
+
+    let created: Vec<String> = payload["tests_created"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        created, expected_files,
+        "one suite per endpoint-bearing module, then jobs once"
+    );
+    for rel in &created {
+        let a = std::fs::read(bare.join(rel)).unwrap_or_else(|e| panic!("{rel} not written: {e}"));
+        let b = std::fs::read(oracle.join(rel)).unwrap();
+        assert_eq!(a, b, "{rel} must match the per-module writer byte-for-byte");
+    }
+    assert_eq!(
+        payload["expected_failing"].as_u64().unwrap() as usize,
+        expected_count,
+        "aggregate = sum of module counts + jobs counted exactly once"
+    );
+    let next = payload["next_step"].as_str().unwrap();
+    for m in &design.modules {
+        assert!(
+            next.contains(&format!("cargo test -p route-{}", m.name)),
+            "next_step must list route-{}: {next}",
+            m.name
+        );
+    }
+    assert!(next.contains("cargo test -p jobs"), "{next}");
+
+    // The single-module path is UNCHANGED: same frozen payload, same bytes.
+    let single = tmp.path().join("single");
+    std::fs::create_dir_all(&single).unwrap();
+    std::fs::write(single.join("design.json"), REFERENCE).unwrap();
+    let out = jerrycan()
+        .current_dir(&single)
+        .args(["--json", "gen-tests", "--module", "users"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(
+        payload["tests_created"],
+        serde_json::json!([
+            "crates/routes/users/tests/acceptance.rs",
+            "crates/jobs/tests/acceptance.rs"
+        ])
+    );
+    let single_total = users_count + jobs_count;
+    assert_eq!(
+        payload["next_step"].as_str().unwrap(),
+        format!(
+            "cargo test -p route-users && cargo test -p jobs (expect {single_total} failures total), implement handlers + job tasks, iterate"
+        ),
+        "the --module path's contract is frozen"
+    );
+    assert_eq!(
+        std::fs::read(single.join("crates/routes/users/tests/acceptance.rs")).unwrap(),
+        std::fs::read(bare.join("crates/routes/users/tests/acceptance.rs")).unwrap(),
+        "both paths write the identical module suite"
+    );
+}
+
+/// #156 actionability proof: on a jobs-only design (cron jobs, zero endpoint
+/// modules) the JC0551 diagnostic says `run \`jerrycan gen-tests\`` — there is
+/// no module to name, so that exact command must run AND clear the diagnostic.
+/// WHY: a gate-honesty release must never ship a diagnostic whose suggested
+/// fix cannot be executed. Full `jerrycan check` needs a compiled scaffold, so
+/// the clear is asserted through the exact step check runs (missing_acceptance_tests).
+#[test]
+fn gen_tests_without_module_clears_jc0551_for_a_jobs_only_design() {
+    use jerrycan::platform::checkpipe::missing_acceptance_tests;
+    use jerrycan::platform::design::Design;
+    const JOBS_ONLY: &str = r#"{
+      "name": "cron-only",
+      "contract_version": 1,
+      "dependencies": ["db"],
+      "jobs": [{ "name": "nightly_cleanup", "schedule": "0 3 * * *" }],
+      "modules": []
+    }"#;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("design.json"), JOBS_ONLY).unwrap();
+    let design = Design::from_path(&tmp.path().join("design.json")).unwrap();
+
+    // The gate refuses the never-gen-tested jobs surface, suggesting the bare command.
+    let before = missing_acceptance_tests(tmp.path(), &design, None);
+    assert_eq!(before.len(), 1, "{before:?}");
+    assert_eq!(
+        before[0].suggestion.as_deref(),
+        Some("run `jerrycan gen-tests`"),
+        "the suggestion is the exact command run below"
+    );
+
+    // Run the suggested command VERBATIM.
+    let out = jerrycan()
+        .current_dir(tmp.path())
+        .args(["--json", "gen-tests"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the suggested fix must be runnable: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(
+        payload["tests_created"],
+        serde_json::json!(["crates/jobs/tests/acceptance.rs"])
+    );
+    let next = payload["next_step"].as_str().unwrap();
+    assert!(
+        next.contains("cargo test -p jobs") && next.contains("implement job tasks"),
+        "{next}"
+    );
+
+    // It cleared: the exact step `jerrycan check` runs no longer raises JC0551.
+    assert!(tmp.path().join("crates/jobs/tests/acceptance.rs").exists());
+    let after = missing_acceptance_tests(tmp.path(), &design, None);
+    assert!(
+        after.is_empty(),
+        "the suggested command must clear the diagnostic that suggests it: {after:?}"
+    );
 }
