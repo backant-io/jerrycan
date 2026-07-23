@@ -63,10 +63,11 @@ enum Cmd {
         #[arg(long)]
         module: Option<String>,
     },
-    /// Generate failing acceptance tests for a module from the design (TDD)
+    /// Generate failing acceptance tests from the design (TDD); omit
+    /// --module to cover every endpoint-bearing module plus the jobs suite
     GenTests {
         #[arg(long)]
-        module: String,
+        module: Option<String>,
     },
     /// AI-native docs, offline
     Docs {
@@ -252,7 +253,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             no_fail_fast,
         } => cmd_check(module.as_deref(), no_fail_fast, cli.json),
         Cmd::Test { module } => cmd_test(module.as_deref()),
-        Cmd::GenTests { module } => cmd_gen_tests(&module, cli.json),
+        Cmd::GenTests { module } => cmd_gen_tests(module.as_deref(), cli.json),
         Cmd::Docs {
             topic,
             search,
@@ -1111,9 +1112,15 @@ fn cmd_test(module: Option<&str>) -> Result<(), Failure> {
     }
 }
 
-fn cmd_gen_tests(module: &str, json_mode: bool) -> Result<(), Failure> {
+fn cmd_gen_tests(module: Option<&str>, json_mode: bool) -> Result<(), Failure> {
     let root = app_root()?;
     let design = load_design(&root.join("design.json"))?;
+    // No --module: generate everything (every endpoint-bearing module + jobs).
+    // This is the command JC0551's jobs diagnostic suggests (#156) — a
+    // jobs-only design has no module name to pass, so the bare form must run.
+    let Some(module) = module else {
+        return gen_tests_all(&root, &design, json_mode);
+    };
     let (rel, count) = jerrycan::platform::testgen::write_acceptance(&root, &design, module)
         .map_err(Failure::usage)?;
     // The declared jobs get their own tool-owned acceptance tests (direct
@@ -1151,6 +1158,67 @@ fn cmd_gen_tests(module: &str, json_mode: bool) -> Result<(), Failure> {
         &payload,
         &format!("{count} acceptance tests written to {rel}"),
     );
+    Ok(())
+}
+
+/// `gen-tests` with no `--module`: one acceptance suite per endpoint-bearing
+/// top-level module, plus the jobs suite once. Module selection mirrors the
+/// JC0551 step (checkpipe::missing_acceptance_tests): a subroute's endpoints
+/// count toward its parent (their tests live in the parent's crate), so the
+/// bare command clears every JC0551 the check can raise — including the jobs
+/// one on a jobs-only design, which has no module name to pass.
+fn gen_tests_all(root: &Path, design: &Design, json_mode: bool) -> Result<(), Failure> {
+    fn endpoint_count(m: &jerrycan::platform::design::ModuleDesign) -> usize {
+        m.endpoints.len() + m.subroutes.iter().map(endpoint_count).sum::<usize>()
+    }
+    let mut tests_created: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    let mut packages: Vec<String> = Vec::new();
+    for m in design.modules.iter().filter(|m| endpoint_count(m) > 0) {
+        let (rel, c) = jerrycan::platform::testgen::write_acceptance(root, design, &m.name)
+            .map_err(Failure::usage)?;
+        tests_created.push(rel);
+        count += c;
+        packages.push(format!("route-{}", m.name));
+    }
+    let jobs =
+        jerrycan::platform::jobsgen::write_jobs_acceptance(root, design).map_err(Failure::usage)?;
+    let has_jobs = jobs.is_some();
+    if let Some((jobs_rel, jobs_count)) = jobs {
+        tests_created.push(jobs_rel);
+        count += jobs_count;
+        packages.push("jobs".to_string());
+    }
+    let next_step = if packages.is_empty() {
+        "nothing to generate — the design declares no endpoints and no jobs".to_string()
+    } else {
+        let run = packages
+            .iter()
+            .map(|p| format!("cargo test -p {p}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let implement = match (packages.len() > usize::from(has_jobs), has_jobs) {
+            (true, true) => "implement handlers + job tasks",
+            (true, false) => "implement handlers",
+            (false, _) => "implement job tasks",
+        };
+        format!("{run} (expect {count} failures total), {implement}, iterate")
+    };
+    let payload = serde_json::json!({
+        "tests_created": tests_created,
+        "expected_failing": count,
+        "next_step": next_step,
+    });
+    let human = match tests_created.as_slice() {
+        [] => "no acceptance tests to write — the design declares no endpoints and no jobs"
+            .to_string(),
+        [only] => format!("{count} acceptance tests written to {only}"),
+        many => format!(
+            "{count} acceptance tests written across {} files",
+            many.len()
+        ),
+    };
+    emit(json_mode, &payload, &human);
     Ok(())
 }
 

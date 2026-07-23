@@ -1132,6 +1132,124 @@ fn probe_skip_on_a_guarded_endpoint_keeps_the_401_guard_test() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
+/// Issue #153: a GUARDED `/{id}` endpoint with NO seed creator keeps its
+/// `_without_auth_is_401` guard test — only the un-seedable success probe
+/// becomes a TODO. WHY (Rule 9): the 401 assertion is GREENABLE without a seed
+/// (the generated guard rejects a credential-less request before the id is
+/// ever looked up, so a literal id stands in); before this fix the no-creator
+/// branch silently dropped it, so a hand-weakened guard on such an endpoint
+/// stayed green — the same hole #123b closed for `probe: skip`. An UNGUARDED
+/// endpoint of the same shape must NOT gain a 401 test (asserting 401 on an
+/// open endpoint would be permanently red on a correct app).
+#[test]
+fn guarded_id_endpoint_without_creator_keeps_the_401_guard_test() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "audit-api",
+        "contract_version": 1,
+        "auth": { "model": "session" },
+        "dependencies": ["auth"],
+        "modules": [{
+            "name": "audits",
+            "endpoints": [
+                // Guarded detail route with no POST creator anywhere in the
+                // module — the success probe cannot be seeded.
+                { "operation_id": "show_audit", "method": "GET", "path": "/{id}",
+                  "auth_required": true,
+                  "success": { "status": 200 } },
+                // The same shape UNGUARDED: no 401 test may be emitted.
+                { "operation_id": "show_open_audit", "method": "GET", "path": "/open/{id}",
+                  "success": { "status": 200 } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    // The un-seedable success probes stay TODOs...
+    assert!(
+        !generated.contains("async fn show_audit_returns_"),
+        "no creator still drops the un-seedable success probe: {generated}"
+    );
+    assert!(
+        generated.contains("// AGENT TODO: show_audit (GET /audits/{id}) has no creator route"),
+        "the no-creator TODO is retained: {generated}"
+    );
+    // ...but the guarded endpoint keeps its 401 guard test, on a literal id.
+    assert!(
+        generated.contains("async fn show_audit_without_auth_is_401"),
+        "a guarded no-creator /{{id}} endpoint keeps its 401 guard test: {generated}"
+    );
+    assert!(
+        generated.contains("\"/audits/1\""),
+        "the 401 probe pins the id param to a literal id: {generated}"
+    );
+    // The unguarded control gains nothing.
+    assert!(
+        !generated.contains("show_open_audit_without_auth_is_401"),
+        "an unguarded no-creator endpoint must NOT get a 401 test: {generated}"
+    );
+    // expected_failing flows through push_401_test's count — no special-casing.
+    let tmp = std::env::temp_dir().join(format!("jc153a-{}", std::process::id()));
+    std::fs::create_dir_all(tmp.join("crates/routes/audits/tests")).unwrap();
+    let (_rel, expected_failing) = testgen::write_acceptance(&tmp, &design, "audits").unwrap();
+    assert_eq!(
+        expected_failing, 1,
+        "the 401 guard test counts toward expected_failing: {generated}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// Issue #153: a GUARDED 2+-param endpoint keeps its `_without_auth_is_401`
+/// guard test with EVERY `{param}` pinned to a literal id — only the seeded
+/// success probe stays a TODO (the generator can't seed a multi-param path).
+/// WHY (Rule 9): same silently-dropped-401 as the no-creator branch — a 401
+/// rejection precedes any id lookup, so no seed is needed and dropping the
+/// test un-tested a real guard. The UNGUARDED control of the same shape must
+/// NOT gain a false 401 assertion.
+#[test]
+fn guarded_multi_param_endpoint_keeps_the_401_guard_test() {
+    let design: Design = serde_json::from_value(serde_json::json!({
+        "name": "grid-api",
+        "contract_version": 1,
+        "auth": { "model": "session" },
+        "dependencies": ["auth"],
+        "modules": [{
+            "name": "grids",
+            "endpoints": [
+                { "operation_id": "get_cell", "method": "GET",
+                  "path": "/{row}/cells/{col}",
+                  "auth_required": true,
+                  "success": { "status": 200 } },
+                { "operation_id": "get_open_cell", "method": "GET",
+                  "path": "/{row}/open/{col}",
+                  "success": { "status": 200 } }
+            ]
+        }]
+    }))
+    .unwrap();
+    let generated = testgen::acceptance_rs(&design, &design.modules[0]);
+    assert!(
+        !generated.contains("async fn get_cell_returns_"),
+        "a multi-param endpoint still gets no auto-seeded success probe: {generated}"
+    );
+    assert!(
+        generated
+            .contains("// AGENT TODO: get_cell (GET /grids/{row}/cells/{col}) needs a creator"),
+        "the multi-param TODO is retained: {generated}"
+    );
+    assert!(
+        generated.contains("async fn get_cell_without_auth_is_401"),
+        "a guarded multi-param endpoint keeps its 401 guard test: {generated}"
+    );
+    assert!(
+        generated.contains("\"/grids/1/cells/1\""),
+        "the 401 probe pins EVERY param to a literal id: {generated}"
+    );
+    assert!(
+        !generated.contains("get_open_cell_without_auth_is_401"),
+        "an unguarded multi-param endpoint must NOT get a 401 test: {generated}"
+    );
+}
+
 /// A db-mode module whose EVERY endpoint is a TODO (e.g. a billing module whose
 /// only route is a signature-gated webhook) emits ZERO `#[tokio::test]` functions.
 /// The generated file must then carry NO `app()` helper and NO `use` imports —

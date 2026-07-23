@@ -23,7 +23,7 @@ a `--json` mode whose output is the same data the MCP tool returns.
 | `jerrycan new <name>` | `--design <file>` (required) | Scaffold workspace from validated design: `app/`, `shared/`, one route crate per module | jerrycan_scaffold |
 | `jerrycan generate route <path>` | alias `g`; `<path>`=`todos` or `todos/comments` | New module crate or subroute; rewires mounting + workspace deterministically; emits failing tests | jerrycan_generate |
 | `jerrycan generate dep <name>` | `--module <m>` (required) | Module-scoped dependency stub (factory fn + registration) | jerrycan_generate |
-| `jerrycan gen-tests` | `--module <m>` (required) | Failing acceptance tests from the module's design slice | jerrycan_gen_tests |
+| `jerrycan gen-tests` | `--module <m>` (optional; omitted = every endpoint-bearing module + the jobs suite) | Failing acceptance tests from the module's design slice | jerrycan_gen_tests |
 | `jerrycan list routes` | `--json` | Route tree: METHOD path → module::handler | jerrycan_list_routes |
 | `jerrycan dev` | `--addr <a>` | Run with auto-reload (debounced rebuild) | — |
 | `jerrycan check` | `--module <m>` | build → clippy(-D warnings) → cargo-audit → cargo-deny → tests → jerrycan lints; first failure class reported, all diagnostics collected | jerrycan_check |

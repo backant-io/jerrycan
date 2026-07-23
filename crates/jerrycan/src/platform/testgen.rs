@@ -601,12 +601,39 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                     "// AGENT TODO: {fn_base} ({:?} {full_path}) has no creator route to seed its {{id}} — encode its success case in your own test file.",
                     ep.method
                 ));
+                // Issue #153: no creator drops only the un-seedable success
+                // probe — the guard test survives (the guard rejects a
+                // credential-less request before the id lookup, so a literal
+                // id stands in and no seeded row is needed; same as #123b).
+                if guarded {
+                    push_401_test(
+                        design,
+                        out,
+                        unit,
+                        ep,
+                        &concrete_mount_base(&full_path),
+                        false,
+                    );
+                }
             }
         } else if param_count(ep) >= 1 {
             out.todos.push(format!(
                 "// AGENT TODO: {fn_base} ({:?} {full_path}) needs a creator at \"/\" to seed ids — encode its success case in your own test file.",
                 ep.method
             ));
+            // Issue #153: a multi-param path blocks only the seeded success
+            // probe — the guard test survives with every `{param}` pinned to a
+            // literal id (a 401 rejection precedes any id lookup; same as #123b).
+            if guarded {
+                push_401_test(
+                    design,
+                    out,
+                    unit,
+                    ep,
+                    &concrete_mount_base(&full_path),
+                    false,
+                );
+            }
         }
 
         for ec in &ep.errors {

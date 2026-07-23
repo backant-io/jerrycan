@@ -352,3 +352,117 @@ fn jc0551_is_satisfied_by_a_banner_only_acceptance_file_and_exempts_endpointless
         "a banner-only acceptance file satisfies JC0551 (file existence, not test count)"
     );
 }
+
+/// #156: JC0551 covers the jobs surface. A jobs-only design (cron jobs, NO
+/// endpoint-bearing modules) never tripped the per-module check, so a design
+/// whose only gen-tests-eligible surface is `crates/jobs/tests/acceptance.rs`
+/// read ok:true with zero tests — the #123a hollow-green hole one surface
+/// over. Same signal: FILE existence (a gen-tested all-TODO jobs file
+/// satisfies it), missing → JC0551 naming the jobs acceptance file.
+#[test]
+fn jc0551_fires_for_a_jobs_only_design_without_the_jobs_acceptance_file() {
+    use jerrycan::platform::checkpipe::missing_acceptance_tests;
+    const JOBS_ONLY: &str = r#"{
+      "name": "cron-only",
+      "contract_version": 1,
+      "dependencies": ["db"],
+      "jobs": [{ "name": "nightly_cleanup", "schedule": "0 3 * * *" }],
+      "modules": []
+    }"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let design: Design = serde_json::from_str(JOBS_ONLY).unwrap();
+    let root = tmp.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // No jobs acceptance file on disk: the jobs surface trips JC0551 — no
+    // endpoint modules exist, so without this the design reads green untested.
+    let ds = missing_acceptance_tests(&root, &design, None);
+    assert_eq!(ds.len(), 1, "{ds:?}");
+    assert_eq!(ds[0].code, "JC0551");
+    assert_eq!(
+        ds[0].file.as_deref(),
+        Some("crates/jobs/tests/acceptance.rs")
+    );
+    assert_eq!(
+        ds[0].message,
+        "no acceptance tests for jobs — run `jerrycan gen-tests`"
+    );
+
+    // The same writer gen-tests uses clears it — file existence is the signal.
+    jerrycan::platform::jobsgen::write_jobs_acceptance(&root, &design)
+        .unwrap()
+        .expect("a jobs design writes the jobs acceptance file");
+    assert!(
+        missing_acceptance_tests(&root, &design, None).is_empty(),
+        "the gen-tested jobs acceptance file satisfies JC0551"
+    );
+}
+
+/// #156: a design with BOTH endpoints and jobs requires BOTH acceptance files —
+/// each surface clears independently, and module scope keeps narrowing to that
+/// module's package (jobs are top-level, mirroring `test_packages`, which only
+/// adds the `jobs` package in workspace scope).
+#[test]
+fn jc0551_requires_both_module_and_jobs_acceptance_files() {
+    use jerrycan::platform::checkpipe::missing_acceptance_tests;
+    const ENDPOINTS_AND_JOBS: &str = r#"{
+      "name": "shop-api",
+      "contract_version": 1,
+      "dependencies": ["db"],
+      "jobs": [{ "name": "send_receipts", "schedule": "0 * * * *" }],
+      "modules": [
+        {
+          "name": "orders",
+          "entities": [{ "name": "Order", "fields": [{ "name": "total", "type": "string" }] }],
+          "endpoints": [
+            { "operation_id": "create_order", "method": "POST", "path": "/",
+              "request_body": { "entity": "Order" },
+              "success": { "status": 201, "entity": "Order" } }
+          ]
+        }
+      ]
+    }"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let design: Design = serde_json::from_str(ENDPOINTS_AND_JOBS).unwrap();
+    let root = tmp.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // Neither file on disk: one JC0551 per surface.
+    let ds = missing_acceptance_tests(&root, &design, None);
+    assert_eq!(ds.len(), 2, "module AND jobs each trip JC0551: {ds:?}");
+    assert!(ds.iter().all(|d| d.code == "JC0551"));
+    assert!(
+        ds.iter()
+            .any(|d| d.file.as_deref() == Some("crates/routes/orders/tests/acceptance.rs")),
+        "{ds:?}"
+    );
+    assert!(
+        ds.iter()
+            .any(|d| d.file.as_deref() == Some("crates/jobs/tests/acceptance.rs")),
+        "{ds:?}"
+    );
+
+    // Module scope narrows to that module's package — the top-level jobs
+    // surface is a workspace concern (mirrors test_packages).
+    let scoped = missing_acceptance_tests(&root, &design, Some("orders"));
+    assert_eq!(scoped.len(), 1, "{scoped:?}");
+    assert_eq!(
+        scoped[0].file.as_deref(),
+        Some("crates/routes/orders/tests/acceptance.rs")
+    );
+
+    // gen-tests the module: the jobs surface still fires.
+    jerrycan::platform::testgen::write_acceptance(&root, &design, "orders").unwrap();
+    let ds = missing_acceptance_tests(&root, &design, None);
+    assert_eq!(ds.len(), 1, "{ds:?}");
+    assert_eq!(
+        ds[0].file.as_deref(),
+        Some("crates/jobs/tests/acceptance.rs")
+    );
+
+    // gen-tests the jobs surface too: green is earned on both.
+    jerrycan::platform::jobsgen::write_jobs_acceptance(&root, &design)
+        .unwrap()
+        .expect("a jobs design writes the jobs acceptance file");
+    assert!(missing_acceptance_tests(&root, &design, None).is_empty());
+}
