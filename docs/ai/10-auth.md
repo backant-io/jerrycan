@@ -94,6 +94,31 @@ assert_eq!(
 # }); }
 ```
 
+## The auth identity entity MUST be named `User`
+
+There is no `auth.identity` design field yet (#150 will add an opt-in one) — the
+generator resolves the identity by the LITERAL derived column `user_id`
+(`snake_case("User") + "_id"`). Three security behaviors key on exactly that
+column, for an entity whose `belongs_to` targets the `User` entity:
+
+- **Per-user owner-scoping** — the generated repo is owner-scoped
+  (`all_for`/`get_for`/`update_for`/`remove_for`, keyed on the session user), so
+  one user can never read, update, or delete another user's rows.
+- **The server-injected fk** — `user_id` is dropped from the request DTO and
+  injected from the session on create, so a client cannot write a row as
+  someone else (see 00-designing.md, "Server-owned fields").
+- **`public_read`** — the public-read / owner-write split resolves the owner
+  through the same `user_id` column.
+
+Name the identity entity anything else — `Account`, `Member`, `Profile` — and
+NONE of this fires, SILENTLY: the design still validates and `jerrycan check`
+stays green, but the owned entities get NO owner-scoping (every authenticated
+user reads and deletes every row) and the fk (`account_id`, …) stays
+CLIENT-WRITABLE — any caller can create rows "owned" by any other user simply by
+sending a different id in the body. That is spoofable ownership, a security
+hole, not a naming nit. Until #150 lands, always name the auth identity entity
+`User`.
+
 ## Variations
 - Passwords: `jerrycan::auth::hash_password(pw)` → `Result<String>` (a PHC
   string for storage); `verify_password(pw, &stored)` → `Result<bool>`

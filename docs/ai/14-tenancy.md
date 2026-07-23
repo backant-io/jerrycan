@@ -48,9 +48,13 @@ Tenancy is for **org/team** entities with memberships — a `Workspace`, `Org`, 
 exactly one identity.
 
 For per-user ownership, do NOT declare a `tenancy` block. Instead give the owned
-entity a `belongs_to` the identity entity your sessions resolve to (typically a
-`User`/`Account`), deriving an indexed owner fk. The generator then makes the leak
-impossible: the repo emits **only** the owner-scoped accessors
+entity a `belongs_to` the identity entity, which MUST be named `User` — the
+derived indexed owner fk `user_id` is the literal column that triggers
+owner-scoping. An identity named anything else (`Account`, `Member`, …) gets NO
+owner-scoping and a client-writable fk, silently (see 10-auth.md, "The auth
+identity entity MUST be named `User`"; #150 tracks an opt-in `auth.identity`).
+With a `User`-owned entity the generator makes the leak impossible: the repo
+emits **only** the owner-scoped accessors
 (`all_for`/`get_for`/`update_for`/`remove_for`, each keyed by the session user's
 id) — the unscoped `all()`/`get()`/`update()`/`remove()` are **not generated**, so
 a handler cannot accidentally read or mutate another user's rows, and a generated

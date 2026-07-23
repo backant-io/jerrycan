@@ -61,6 +61,15 @@ impl Db {
         };
         let mut opts = sea_orm::ConnectOptions::new(url.to_string());
         opts.max_connections(max);
+        if backend == Backend::Sqlite {
+            // FK enforcement is a framework guarantee, so pin it rather than
+            // inherit it: sqlx-sqlite happens to default `foreign_keys=ON`
+            // today, but a guarantee must not rest on an upstream default.
+            // Set through connect options so EVERY pooled connection carries
+            // it by construction (a post-connect `PRAGMA` would be lost on
+            // pool reconnect). Postgres enforces FKs natively — nothing to pin.
+            opts.map_sqlx_sqlite_opts(|o| o.foreign_keys(true));
+        }
         let conn = Database::connect(opts).await.map_err(db_error)?;
         Ok(Self {
             conn,
@@ -402,6 +411,89 @@ mod tests {
         assert_eq!(e.status().as_u16(), 409);
         // Still no internals in the message.
         assert!(!e.message().contains("sqlite"), "{}", e.message());
+    }
+
+    /// SQLite FK enforcement is a FRAMEWORK guarantee, pinned in `Db::connect`
+    /// via `map_sqlx_sqlite_opts(|o| o.foreign_keys(true))` — not an inherited
+    /// sqlx default. This test is the proof: if the pin is ever lost (or an
+    /// upstream default flip would otherwise silently disable enforcement),
+    /// it turns red. Asserts all three faces of the guarantee through the
+    /// pooled connection: the pragma reads ON, an orphan insert is rejected
+    /// as an FK violation, and `ON DELETE CASCADE` fires.
+    #[tokio::test]
+    async fn sqlite_foreign_keys_are_enforced_through_the_pool() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        // (a) The pragma is ON on the pooled connection itself.
+        let row = db
+            .conn()
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA foreign_keys",
+            ))
+            .await
+            .unwrap()
+            .expect("PRAGMA foreign_keys returns a row");
+        let on: i64 = row
+            .try_get::<i64>("", "foreign_keys")
+            .or_else(|_| row.try_get::<i32>("", "foreign_keys").map(i64::from))
+            .unwrap();
+        assert_eq!(on, 1, "foreign_keys must be ON through the pool");
+
+        db.conn()
+            .execute_unprepared("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        db.conn()
+            .execute_unprepared(
+                "CREATE TABLE children (id INTEGER PRIMARY KEY, \
+                 parent_id INTEGER NOT NULL REFERENCES parents(id) ON DELETE CASCADE)",
+            )
+            .await
+            .unwrap();
+        db.conn()
+            .execute_unprepared("INSERT INTO parents (id) VALUES (1)")
+            .await
+            .unwrap();
+
+        // (b) A child pointing at a nonexistent parent is REJECTED — and
+        // specifically as an FK violation, not some other failure.
+        let orphan = db
+            .conn()
+            .execute_unprepared("INSERT INTO children (id, parent_id) VALUES (10, 999)")
+            .await
+            .expect_err("orphan insert must violate the FK");
+        assert!(
+            matches!(
+                orphan.sql_err(),
+                Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_))
+            ),
+            "must be an FK violation, got: {orphan}"
+        );
+
+        // (c) Deleting the parent CASCADE-removes its children.
+        db.conn()
+            .execute_unprepared("INSERT INTO children (id, parent_id) VALUES (11, 1)")
+            .await
+            .unwrap();
+        db.conn()
+            .execute_unprepared("DELETE FROM parents WHERE id = 1")
+            .await
+            .unwrap();
+        let row = db
+            .conn()
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS n FROM children",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let n: i64 = row
+            .try_get::<i64>("", "n")
+            .or_else(|_| row.try_get::<i32>("", "n").map(i64::from))
+            .unwrap();
+        assert_eq!(n, 0, "ON DELETE CASCADE must remove the child rows");
     }
 
     fn demo_migrations() -> Vec<Migration> {

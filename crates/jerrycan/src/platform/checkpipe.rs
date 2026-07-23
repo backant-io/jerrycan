@@ -1,4 +1,5 @@
-//! The verification gate: build → clippy → audit → deny → tests → jerrycan lints.
+//! The verification gate: build → clippy → audit → deny → tests → acceptance
+//! presence (JC0551) → jerrycan lints.
 //! First failing CLASS stops the pipeline; within a class, ALL diagnostics are
 //! collected (cli-ux.md). One diagnostics shape, rendered by CLI and MCP alike.
 
@@ -325,6 +326,44 @@ pub fn run_tests_full(
     Ok(aggregate_packages(&runs))
 }
 
+/// #123a — the honest-check step: every top-level module with ≥1 endpoint
+/// (its own or a subroute's — subroute tests live in the parent's crate) must
+/// have its gen-tests acceptance file on disk, or the tests step's green is
+/// hollow (a zero-test `cargo test` exits 0, so a never-tested scaffold would
+/// read ok:true). FILE EXISTENCE is the signal, not test count: gen-tests
+/// writes the file even when every endpoint is an all-TODO banner, so a
+/// gen-tested design never false-alarms — only a never-gen-tested scaffold
+/// trips JC0551. Module scope narrows to that module (mirrors `test_packages`).
+pub fn missing_acceptance_tests(
+    root: &Path,
+    design: &crate::platform::design::Design,
+    module: Option<&str>,
+) -> Vec<Diagnostic> {
+    fn endpoint_count(m: &crate::platform::design::ModuleDesign) -> usize {
+        m.endpoints.len() + m.subroutes.iter().map(endpoint_count).sum::<usize>()
+    }
+    design
+        .modules
+        .iter()
+        .filter(|m| module.is_none_or(|only| m.name == only))
+        .filter(|m| endpoint_count(m) > 0)
+        .filter_map(|m| {
+            let rel = format!("crates/routes/{}/tests/acceptance.rs", m.name);
+            (!root.join(&rel).exists()).then(|| Diagnostic {
+                code: "JC0551".into(),
+                file: Some(rel),
+                line: None,
+                message: format!(
+                    "no acceptance tests for module `{m}` — run `jerrycan gen-tests --module {m}`",
+                    m = m.name
+                ),
+                suggestion: Some(format!("run `jerrycan gen-tests --module {}`", m.name)),
+                doc_url: None,
+            })
+        })
+        .collect()
+}
+
 /// External tool steps. A missing tool is an ENVIRONMENT failure (exit 3), not a gate failure.
 pub enum ToolStep {
     Missing(String),
@@ -445,6 +484,10 @@ pub fn run_all(
                 run_tests(root, module)
             }
         }),
+    ));
+    steps.push((
+        "acceptance tests",
+        Box::new(|| Ok(missing_acceptance_tests(root, design, module))),
     ));
     steps.push((
         "jerrycan lints",

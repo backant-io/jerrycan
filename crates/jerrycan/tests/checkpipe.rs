@@ -54,14 +54,27 @@ fn libtest_failures_become_diagnostics() {
 fn report_serializes_to_the_mcp_check_shape() {
     let report = CheckReport {
         ok: false,
-        diagnostics: vec![Diagnostic {
-            code: "E0308".into(),
-            file: Some("x.rs".into()),
-            line: Some(1),
-            message: "m".into(),
-            suggestion: None,
-            doc_url: None,
-        }],
+        diagnostics: vec![
+            Diagnostic {
+                code: "E0308".into(),
+                file: Some("x.rs".into()),
+                line: Some(1),
+                message: "m".into(),
+                suggestion: None,
+                doc_url: None,
+            },
+            // The #123a honest-check diagnostic serializes through the SAME
+            // shape as every other class — code+message required, `file` naming
+            // the missing acceptance file, no doc_url.
+            Diagnostic {
+                code: "JC0551".into(),
+                file: Some("crates/routes/todos/tests/acceptance.rs".into()),
+                line: None,
+                message: "no acceptance tests for module `todos` — run `jerrycan gen-tests --module todos`".into(),
+                suggestion: Some("run `jerrycan gen-tests --module todos`".into()),
+                doc_url: None,
+            },
+        ],
         test_modules: vec![],
         next_step: "fix the build diagnostics".into(),
     };
@@ -71,6 +84,15 @@ fn report_serializes_to_the_mcp_check_shape() {
     assert!(v["next_step"].is_string());
     // Optional fields are OMITTED when None (matches outputSchema: only code+message required).
     assert!(v["diagnostics"][0].get("suggestion").is_none());
+    assert_eq!(v["diagnostics"][1]["code"], "JC0551");
+    assert!(
+        v["diagnostics"][1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("gen-tests --module todos"),
+        "JC0551 message names the fix command"
+    );
+    assert!(v["diagnostics"][1].get("line").is_none());
     // The default (fail-fast) payload never grows a `test_modules` key: an empty
     // tally is skipped so the wire shape stays byte-identical to pre-flag runs.
     assert!(
@@ -227,4 +249,106 @@ fn jl0003_flags_hand_edited_generated_files() {
     std::fs::write(&main_rs, content).unwrap();
     let ds = lints::run(&root, &design);
     assert!(ds.iter().any(|d| d.code == "JL0003"), "{ds:?}");
+}
+
+/// #123a: a freshly-scaffolded, never-gen-tested app must trip JC0551 for every
+/// top-level module with endpoints — and stop tripping it the moment gen-tests
+/// writes the acceptance files. WHY (Rule 9): `check` folded a zero-test `cargo
+/// test` (exit 0) into ok:true, so a scaffold that never ran gen-tests read
+/// green; this step is what makes that green honest.
+#[test]
+fn jc0551_fires_on_a_never_gen_tested_scaffold_and_clears_after_gen_tests() {
+    use jerrycan::platform::checkpipe::missing_acceptance_tests;
+    let (_tmp, root, design) = scaffolded();
+
+    // Fresh scaffold: BOTH golden modules (todos incl. its comments subroute,
+    // users) have endpoints and no acceptance file — one JC0551 each, message
+    // naming the module and the exact gen-tests command.
+    let ds = missing_acceptance_tests(&root, &design, None);
+    assert_eq!(
+        ds.len(),
+        2,
+        "one JC0551 per endpoint-bearing module: {ds:?}"
+    );
+    assert!(ds.iter().all(|d| d.code == "JC0551"));
+    for m in ["todos", "users"] {
+        assert!(
+            ds.iter().any(|d| d.message
+                == format!(
+                    "no acceptance tests for module `{m}` — run `jerrycan gen-tests --module {m}`"
+                )
+                && d.file.as_deref() == Some(&*format!("crates/routes/{m}/tests/acceptance.rs"))),
+            "JC0551 for `{m}` with the exact message: {ds:?}"
+        );
+    }
+
+    // Module scope narrows to that module (mirrors test_packages).
+    let scoped = missing_acceptance_tests(&root, &design, Some("todos"));
+    assert_eq!(scoped.len(), 1, "{scoped:?}");
+    assert!(scoped[0].message.contains("`todos`"));
+
+    // gen-tests one module: its JC0551 clears, the other still fires.
+    jerrycan::platform::testgen::write_acceptance(&root, &design, "todos").unwrap();
+    let ds = missing_acceptance_tests(&root, &design, None);
+    assert_eq!(ds.len(), 1, "{ds:?}");
+    assert!(ds[0].message.contains("`users`"));
+
+    // gen-tests the rest: green is earned, not hollow.
+    jerrycan::platform::testgen::write_acceptance(&root, &design, "users").unwrap();
+    assert!(missing_acceptance_tests(&root, &design, None).is_empty());
+}
+
+/// #123a: FILE existence is the signal, NOT test count. An all-TODO design
+/// (every endpoint `probe:"skip"`) gen-tests to a banner-only acceptance file
+/// with ZERO #[tokio::test] fns — that file still satisfies JC0551, because
+/// jerrycan never demands tests the design says cannot be probed. Only a
+/// module with no file at all (never gen-tested) trips; a module with zero
+/// endpoints anywhere in its tree is exempt (nothing to test).
+#[test]
+fn jc0551_is_satisfied_by_a_banner_only_acceptance_file_and_exempts_endpointless_modules() {
+    use jerrycan::platform::checkpipe::missing_acceptance_tests;
+    const ALL_TODO: &str = r#"{
+      "name": "webhooks-only",
+      "contract_version": 0,
+      "auth": { "model": "none" },
+      "dependencies": [],
+      "modules": [
+        {
+          "name": "billing",
+          "entities": [{ "name": "Invoice", "fields": [{ "name": "total", "type": "string" }] }],
+          "endpoints": [
+            { "operation_id": "stripe_webhook", "method": "POST", "path": "/webhook",
+              "probe": "skip",
+              "request_body": { "entity": "Invoice" },
+              "success": { "status": 201, "entity": "Invoice" } }
+          ]
+        },
+        { "name": "docs", "endpoints": [] }
+      ]
+    }"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let design: Design = serde_json::from_str(ALL_TODO).unwrap();
+    let root = tmp.path().join("app");
+    scaffold::scaffold(&root, &design).unwrap();
+
+    // Never gen-tested: only `billing` (has an endpoint) trips — the
+    // endpointless `docs` module is exempt.
+    let ds = missing_acceptance_tests(&root, &design, None);
+    assert_eq!(ds.len(), 1, "{ds:?}");
+    assert!(ds[0].message.contains("`billing`"));
+
+    // gen-tests writes a banner-only file (the skip probe leaves zero tests) —
+    // and that file alone clears JC0551.
+    let (_rel, expected_failing) =
+        jerrycan::platform::testgen::write_acceptance(&root, &design, "billing").unwrap();
+    let acceptance =
+        std::fs::read_to_string(root.join("crates/routes/billing/tests/acceptance.rs")).unwrap();
+    assert!(
+        !acceptance.contains("#[tokio::test]") && expected_failing == 0,
+        "the all-TODO design must emit a banner-only file:\n{acceptance}"
+    );
+    assert!(
+        missing_acceptance_tests(&root, &design, None).is_empty(),
+        "a banner-only acceptance file satisfies JC0551 (file existence, not test count)"
+    );
 }
