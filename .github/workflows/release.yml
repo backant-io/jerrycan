@@ -5,9 +5,19 @@ name: Release
 # fail-fast eval gate — this workflow only attaches binaries + sha256 checksums
 # to the GitHub release, for install.sh and cargo-binstall. Tag AFTER the
 # crates.io publish succeeds, so a binary release can never lead the registry.
+#
+# The manual dispatch path backfills assets onto an EXISTING release whose
+# matrix legs failed (v0.6.0–v0.6.2 shipped 2/4 assets): it checks out the tag
+# and re-uploads, without re-creating the release.
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to backfill assets onto (e.g. v0.6.2)"
+        required: true
+        type: string
 
 # create-gh-release / upload-rust-binary write release assets; nothing else.
 permissions:
@@ -15,7 +25,9 @@ permissions:
 
 jobs:
   create-release:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Tag must match the workspace version
@@ -32,21 +44,35 @@ jobs:
 
   upload-assets:
     needs: create-release
+    # On dispatch create-release is skipped; still run the uploads.
+    if: ${{ !cancelled() && !failure() }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
             os: macos-14
+          # macos-13 (the last x86_64 macOS runner) is retired — its leg queued
+          # 24h then cancelled on v0.6.0–v0.6.2. Cross-compile from arm64
+          # instead; the Apple toolchain supports it natively with plain cargo.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
+    # A retired/unavailable runner otherwise queues until the 24h run limit.
+    timeout-minutes: 45
+    # With build-tool: cargo the vendored sqlite3.c must be compiled by a
+    # musl-targeting C compiler; don't leave that to the cc crate's heuristic.
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
       # Same pin discipline as ci.yml: keep in sync with rust-toolchain.toml.
       - uses: dtolnay/rust-toolchain@1.97
         with:
@@ -58,5 +84,11 @@ jobs:
         with:
           bin: jerrycan
           target: ${{ matrix.target }}
+          # Force plain cargo: the action's own cross-detection invoked `cross`
+          # on the arm64 runner and tried to install an x86_64 host toolchain
+          # (v0.6.x failure). Every leg here is host-native or an Apple
+          # cross-compile that cargo handles directly.
+          build-tool: cargo
           checksum: sha256
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
