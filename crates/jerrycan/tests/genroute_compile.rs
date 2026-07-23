@@ -1203,6 +1203,158 @@ fn guarded_identity_fk_scaffold_accepts_bodies_without_user_id() {
     }
 }
 
+/// The 0.6.5 T2 review battery (#80): every constrained-field shape that broke
+/// a freshly scaffolded app, in one module — a required range int (`quantity`),
+/// an OPTIONAL SINGLE-BOUND string (`note`, max_len only → the
+/// clippy::collapsible_if case), an optional min-only int (`rating`), an
+/// "unbounded" `max: i64::MAX` int (`views` → the unused_comparisons case), and
+/// an optional enum (`priority` → the #47 E0308 twin). Shared by the memory and
+/// db gates below via `constrained_design`.
+const CONSTRAINED_MODULES: &str = r#""modules": [{
+        "name": "items",
+        "entities": [{ "name": "Item", "fields": [
+            { "name": "quantity", "type": "integer", "min": 1, "max": 600 },
+            { "name": "note", "type": "string", "required": false, "max_len": 20 },
+            { "name": "rating", "type": "integer", "required": false, "min": 1 },
+            { "name": "views", "type": "integer", "max": 9223372036854775807 },
+            { "name": "priority", "type": "string", "required": false, "values": ["low", "high"] }
+        ]}],
+        "endpoints": [
+            { "operation_id": "list_items", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Item", "list": true } },
+            { "operation_id": "create_item", "method": "POST", "path": "/",
+              "request_body": { "entity": "Item" },
+              "success": { "status": 201, "entity": "Item" } }
+        ]
+    }]"#;
+
+fn constrained_design(name: &str, deps: &str) -> String {
+    format!(
+        r#"{{ "name": "{name}", "contract_version": 0, "dependencies": [{deps}], {CONSTRAINED_MODULES} }}"#
+    )
+}
+
+/// Scaffold `design` via the real binary and require the whole workspace to
+/// pass `cargo clippy --all-targets -- -D warnings` — the exact gate a
+/// scaffolded app runs on itself (`jerrycan check`).
+fn scaffold_and_strict_clippy(tmp: &Path, name: &str, design: &str) -> std::path::PathBuf {
+    let app = tmp.join(name);
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.join(format!("{name}.design.json"));
+    write(&design_path, design);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(status.success(), "jerrycan new must scaffold {name}");
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "{name} failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    app
+}
+
+/// THE 0.6.5 T2 compile gate (review CRITICAL 1 + 2, IMPORTANT 3): a scaffolded
+/// app whose design declares range/length constraints must compile AND pass its
+/// own strict-clippy gate in BOTH modes — the string-pinning unit tests alone
+/// let three generated-app breakages ship: the memory-mode optional validator
+/// paired an `Option<T>` fn with a bare field (E0308), the optional single-bound
+/// body tripped clippy::collapsible_if, and `max: i64::MAX` tripped
+/// unused_comparisons. The memory app additionally proves at runtime that an
+/// optional constraint still ENFORCES: present-but-violating → serde error,
+/// absent → ok.
+#[test]
+#[ignore = "scaffolds two constrained apps and invokes cargo on them; run with --include-ignored"]
+fn constrained_field_apps_pass_strict_clippy_in_both_modes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Memory mode: bare-typed optional fields (`#[serde(default)]`) — the E0308 case.
+    let mem = scaffold_and_strict_clippy(
+        tmp.path(),
+        "constrained-mem",
+        &constrained_design("constrained-mem", ""),
+    );
+    // db mode: Option-typed optional fields — the collapsible_if case.
+    scaffold_and_strict_clippy(
+        tmp.path(),
+        "constrained-db",
+        &constrained_design("constrained-db", "\"db\""),
+    );
+
+    // Runtime enforcement round-trip at the attach site (the memory struct):
+    // a present-but-violating optional value errors; an absent one passes.
+    let model_path = mem.join("crates/routes/items/src/model.rs");
+    let mut model = fs::read_to_string(&model_path).expect("read memory model.rs");
+    model.push_str(
+        r##"#[cfg(test)]
+mod constraint_roundtrip {
+    use super::Item;
+
+    #[test]
+    fn optional_constraints_enforce_when_present_and_allow_absence() {
+        let ok = serde_json::from_str::<Item>(r#"{"quantity": 5, "views": 1}"#);
+        assert!(ok.is_ok(), "absent optionals must deserialize: {ok:?}");
+        let long = "x".repeat(21);
+        let bad = serde_json::from_str::<Item>(&format!(
+            r#"{{"quantity": 5, "views": 1, "note": "{long}"}}"#
+        ));
+        assert!(bad.is_err(), "21-char note must violate max_len 20");
+        let bad = serde_json::from_str::<Item>(r#"{"quantity": 5, "views": 1, "rating": 0}"#);
+        assert!(bad.is_err(), "rating 0 must violate min 1");
+        let bad =
+            serde_json::from_str::<Item>(r#"{"quantity": 5, "views": 1, "priority": "urgent"}"#);
+        assert!(bad.is_err(), "priority outside values must be rejected");
+        let bad = serde_json::from_str::<Item>(r#"{"quantity": 601, "views": 1}"#);
+        assert!(bad.is_err(), "quantity 601 must violate max 600");
+        let ok = serde_json::from_str::<Item>(
+            r#"{"quantity": 5, "views": 1, "note": "ok", "rating": 3, "priority": "low"}"#,
+        );
+        assert!(ok.is_ok(), "in-range values must pass: {ok:?}");
+    }
+}
+"##,
+    );
+    write(&model_path, &model);
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&mem)
+        .args(["test", "-p", "route-items"])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo test");
+    if !output.status.success() {
+        panic!(
+            "memory constraint round-trip failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");

@@ -675,7 +675,9 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
         }
         out.push_str("}\n\n");
     }
-    out.push_str(&constraint_deserialize_fns(&m.entities));
+    // Memory structs type optional fields BARE (`#[serde(default)]`), so the
+    // validators must NOT use the Option variant (E0308 otherwise).
+    out.push_str(&constraint_deserialize_fns(&m.entities, false));
     Some(out)
 }
 
@@ -699,11 +701,17 @@ fn keyword_field_attrs(name: &str, indent: &str, db: bool) -> String {
 /// check. JC0552 already guarantees placement — `min`/`max` only on integer
 /// fields, `min_len`/`max_len` only on string fields, never on the pk `id`,
 /// never combined with `values` — so emission needs no special-casing beyond
-/// this gate. `min_len: 0` alone is vacuous (every string satisfies it, and an
-/// unsigned `count() < 0` check would trip rustc's `unused_comparisons`), so
-/// it does not gate a validator in.
+/// this gate. Vacuous bounds gate no validator in: `min_len: 0` (every string
+/// satisfies it), and the "unbounded" spellings `min: i64::MIN`,
+/// `max: i64::MAX`, `max_len: u64::MAX` (the value always fits, so the emitted
+/// `<`/`>` comparison would trip rustc's `unused_comparisons` under the
+/// generated app's `-D warnings` gate). OpenAPI + DDL still carry the declared
+/// numbers — only the Rust comparison is the problem.
 fn field_has_bounds(f: &Field) -> bool {
-    f.min.is_some() || f.max.is_some() || f.min_len.is_some_and(|v| v > 0) || f.max_len.is_some()
+    f.min.is_some_and(|v| v > i64::MIN)
+        || f.max.is_some_and(|v| v < i64::MAX)
+        || f.min_len.is_some_and(|v| v > 0)
+        || f.max_len.is_some_and(|v| v < u64::MAX)
 }
 
 /// The `#[serde(deserialize_with = ...)]` line wiring an enum `values` field
@@ -733,7 +741,14 @@ fn constraint_validate_attr(entity: &Entity, f: &Field, indent: &str, path_prefi
 /// entity declares `values` or a constraint key. serde paths are fully qualified
 /// so the module's `use` list is untouched (the db root imports nothing; the
 /// memory root imports only serde's derives).
-fn constraint_deserialize_fns(entities: &[Entity]) -> String {
+///
+/// `optional_is_option` says how the ATTACH SITES type an optional field: the
+/// db Model and the request DTOs emit `Option<T>` (pass `true`), but the
+/// memory-mode structs emit the BARE type with `#[serde(default)]` (pass
+/// `false`) — there the validator must carry the required-variant signature
+/// for BOTH required and optional fields, or the generated app hits E0308
+/// (0.6.5 T2 review, CRITICAL 1; same for the #47 enum validators).
+fn constraint_deserialize_fns(entities: &[Entity], optional_is_option: bool) -> String {
     let mut out = String::new();
     for e in entities {
         let snake = Design::to_snake(&e.name);
@@ -746,7 +761,7 @@ fn constraint_deserialize_fns(entities: &[Entity]) -> String {
                     .join(", ");
                 let msg = format!("{} must be one of: {}", f.name, values.join(", "));
                 let name = format!("de_{snake}_{}", f.name);
-                if f.required {
+                if f.required || !optional_is_option {
                     out.push_str(&format!(
                         "// Enum validator (issue #47): out-of-range `{field}` → serde error → 422.\nfn {name}<'de, D>(de: D) -> std::result::Result<String, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <String as serde::Deserialize>::deserialize(de)?;\n    const ALLOWED: &[&str] = &[{allowed}];\n    if !ALLOWED.contains(&value.as_str()) {{\n        return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n    }}\n    Ok(value)\n}}\n\n",
                         field = f.name,
@@ -758,7 +773,7 @@ fn constraint_deserialize_fns(entities: &[Entity]) -> String {
                     ));
                 }
             } else if field_has_bounds(f) {
-                out.push_str(&bounds_deserialize_fn(&snake, f));
+                out.push_str(&bounds_deserialize_fn(&snake, f, optional_is_option));
             }
         }
     }
@@ -773,10 +788,14 @@ fn constraint_deserialize_fns(entities: &[Entity]) -> String {
 /// maxLength and the SQL `length()` CHECK), NEVER `.len()` bytes. JC0552
 /// guarantees `min`/`max` only on integer fields and `min_len`/`max_len` only
 /// on string fields, so the inner type follows `field_type` directly.
-fn bounds_deserialize_fn(snake: &str, f: &Field) -> String {
+///
+/// `optional_is_option` mirrors `constraint_deserialize_fns`: the memory-mode
+/// structs type an optional field BARE (with `#[serde(default)]`), so only the
+/// db attach sites get the `Option<T>` variant.
+fn bounds_deserialize_fn(snake: &str, f: &Field, optional_is_option: bool) -> String {
     let name = format!("de_{snake}_{}", f.name);
     let inner_ty = f.field_type.rust_type(); // "i64" or "String" per JC0552
-    if f.required {
+    if f.required || !optional_is_option {
         let checks = bounds_checks(f, "value", "    ");
         format!(
             "// Constraint validator (issue #80): out-of-range `{field}` → serde error → 422.\nfn {name}<'de, D>(de: D) -> std::result::Result<{inner_ty}, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <{inner_ty} as serde::Deserialize>::deserialize(de)?;\n{checks}    Ok(value)\n}}\n\n",
@@ -790,27 +809,34 @@ fn bounds_deserialize_fn(snake: &str, f: &Field) -> String {
         } else {
             "Some(ref inner)"
         };
-        let checks = bounds_checks(f, "inner", "        ");
+        let checks = option_bounds_checks(f, binding);
         format!(
-            "// Constraint validator (issue #80): checks `{field}` when present (optional).\nfn {name}<'de, D>(de: D) -> std::result::Result<Option<{inner_ty}>, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <Option<{inner_ty}> as serde::Deserialize>::deserialize(de)?;\n    if let {binding} = value {{\n{checks}    }}\n    Ok(value)\n}}\n\n",
+            "// Constraint validator (issue #80): checks `{field}` when present (optional).\nfn {name}<'de, D>(de: D) -> std::result::Result<Option<{inner_ty}>, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <Option<{inner_ty}> as serde::Deserialize>::deserialize(de)?;\n{checks}    Ok(value)\n}}\n\n",
             field = f.name,
         )
     }
 }
 
-/// The `if <violated> {{ return Err(custom("...")) }}` blocks for every bound a
-/// field declares, checking `var` at `indent`. A field emits ALL its applicable
-/// checks in one fn. `min_len: 0` is vacuous on an unsigned count (and would
-/// trip rustc's `unused_comparisons` in the generated app), so it emits nothing.
-fn bounds_checks(f: &Field, var: &str, indent: &str) -> String {
+/// The (condition, message) pair for every EFFECTIVE bound a field declares,
+/// checking `var`. `min_len: 0` is vacuous on an unsigned count, and the
+/// "unbounded" spellings (`min: i64::MIN`, `max: i64::MAX`,
+/// `max_len: u64::MAX`) are vacuous on the value's own type — each emitted
+/// comparison would trip rustc's `unused_comparisons` under the generated
+/// app's `-D warnings` gate, so none produces a rule (`field_has_bounds`
+/// applies the same gate, keeping attr and fn emission in lockstep).
+fn bounds_rules(f: &Field, var: &str) -> Vec<(String, String)> {
     let mut rules: Vec<(String, String)> = Vec::new();
-    if let Some(mn) = f.min {
+    if let Some(mn) = f.min
+        && mn > i64::MIN
+    {
         rules.push((
             format!("{var} < {mn}"),
             format!("{} must be at least {mn}", f.name),
         ));
     }
-    if let Some(mx) = f.max {
+    if let Some(mx) = f.max
+        && mx < i64::MAX
+    {
         rules.push((
             format!("{var} > {mx}"),
             format!("{} must be at most {mx}", f.name),
@@ -824,17 +850,44 @@ fn bounds_checks(f: &Field, var: &str, indent: &str) -> String {
             format!("{} must be at least {mn} characters", f.name),
         ));
     }
-    if let Some(mx) = f.max_len {
+    if let Some(mx) = f.max_len
+        && mx < u64::MAX
+    {
         rules.push((
             format!("{var}.chars().count() > {mx}"),
             format!("{} must be at most {mx} characters", f.name),
         ));
     }
     rules
+}
+
+/// The `if <violated> {{ return Err(custom("...")) }}` blocks for every
+/// effective bound a field declares, checking `var` at `indent`. A field emits
+/// ALL its applicable checks in one fn.
+fn bounds_checks(f: &Field, var: &str, indent: &str) -> String {
+    bounds_rules(f, var)
         .iter()
         .map(|(cond, msg)| {
             format!(
                 "{indent}if {cond} {{\n{indent}    return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n{indent}}}\n"
+            )
+        })
+        .collect()
+}
+
+/// The Option-variant checks: ONE `if let {binding} = value && <check>`
+/// let-chain per bound. The nested form — `if let Some(..) = value {{ if <one
+/// check> {{ .. }} }}` — trips clippy's `collapsible_if` whenever the field has
+/// exactly one bound (the common case: a lone `max_len` or `min`), turning the
+/// generated app red under its own `jerrycan check` `-D warnings` gate (0.6.5
+/// T2 review, CRITICAL 2). Let-chains are stable in the generated workspace's
+/// edition (2024) and stay clippy-clean for one AND many bounds.
+fn option_bounds_checks(f: &Field, binding: &str) -> String {
+    bounds_rules(f, "inner")
+        .iter()
+        .map(|(cond, msg)| {
+            format!(
+                "    if let {binding} = value\n        && {cond}\n    {{\n        return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n    }}\n"
             )
         })
         .collect()
@@ -994,7 +1047,9 @@ pub use {snake}::Model as {entity};
             out.push_str(&request_dto_rs(e, design, true));
         }
     }
-    out.push_str(&constraint_deserialize_fns(&m.entities));
+    // The db Model and the request DTOs type optional fields `Option<T>`, so
+    // their validators use the Option variant.
+    out.push_str(&constraint_deserialize_fns(&m.entities, true));
     Some(out)
 }
 
@@ -6866,6 +6921,31 @@ pub(crate) mod tests {
         );
     }
 
+    /// The #47 twin of review CRITICAL 1 (0.6.5 T2): an OPTIONAL enum `values`
+    /// field in MEMORY mode. The memory struct types it as a bare `String` with
+    /// `#[serde(default)]`, so the validator must carry the required-variant
+    /// signature — the `Option<String>` variant was an E0308 in every memory
+    /// app declaring an optional enum field.
+    #[test]
+    fn optional_enum_field_gets_bare_validator_in_memory_mode() {
+        let d: Design = serde_json::from_str(ENUM_DTO).unwrap();
+        let src = model_rs(&d.modules[1]).unwrap(); // tasks: optional enum `priority`
+        assert!(
+            src.contains("pub priority: String,"),
+            "memory struct types the optional enum bare: {src}"
+        );
+        assert!(
+            src.contains(
+                "fn de_task_priority<'de, D>(de: D) -> std::result::Result<String, D::Error>"
+            ),
+            "optional enum validator matches the bare field type in memory mode: {src}"
+        );
+        assert!(
+            !src.contains("Result<Option<String>, D::Error>"),
+            "no Option-variant validator in a memory model (E0308 vs the bare field): {src}"
+        );
+    }
+
     /// Issue #80: a request-body entity with range/length-constrained fields —
     /// `quantity` (integer, min 1 / max 600), `code` (string, max_len 5), an
     /// OPTIONAL `note` (string, min_len 2), plus a defaulted enum `status` so the
@@ -6908,7 +6988,11 @@ pub(crate) mod tests {
     /// enum `values` mechanism (#47) they extend — in memory mode (plain serde
     /// struct). WHY (Rule 9): without the generated bound checks, a design
     /// declaring `1..=600` still accepts 0 and 601, forcing hand-written
-    /// validation that breaks the fixture/probe chain (the #80 gap).
+    /// validation that breaks the fixture/probe chain (the #80 gap). The memory
+    /// struct types an OPTIONAL field as the BARE type with `#[serde(default)]`
+    /// (never `Option<T>`), so its validator MUST carry the required-variant
+    /// signature — pairing it with the `Option<T>` variant is an E0308 in every
+    /// scaffolded memory app (0.6.5 T2 review, CRITICAL 1).
     #[test]
     fn constrained_field_validates_at_deserialize_memory() {
         let d: Design = serde_json::from_str(CONSTRAINT_DTO).unwrap();
@@ -6940,14 +7024,24 @@ pub(crate) mod tests {
             !src.contains(".len()"),
             "length must never be bytes (.len()): {src}"
         );
-        // Optional field: validates only when Some, returns Option<String>.
+        // Optional field: the memory struct field is a bare `String` with
+        // `#[serde(default)]`, so the validator takes/returns `String` — the
+        // `Option<String>` variant would be an E0308 against the struct field.
         assert!(
-            src.contains("fn de_item_note") && src.contains("Result<Option<String>, D::Error>"),
-            "optional constrained field gets the Option variant: {src}"
+            src.contains("pub note: String,"),
+            "memory struct types the optional field bare: {src}"
         );
         assert!(
-            src.contains("inner.chars().count() < 2"),
-            "optional min_len checked on the inner value: {src}"
+            src.contains("fn de_item_note<'de, D>(de: D) -> std::result::Result<String, D::Error>"),
+            "optional constrained field gets the required-variant signature in memory mode: {src}"
+        );
+        assert!(
+            !src.contains("Option<"),
+            "memory model must emit no Option-typed validator (E0308 vs the bare field): {src}"
+        );
+        assert!(
+            src.contains("value.chars().count() < 2"),
+            "optional min_len checked directly on the bare value: {src}"
         );
     }
 
@@ -6989,6 +7083,75 @@ pub(crate) mod tests {
                 .count(),
             2,
             "create AND update DTO both validate code: {src}"
+        );
+        // Optional field: db attach sites (Model + DTOs) type it `Option<String>`,
+        // so the validator is the Option variant — and its SINGLE bound must be a
+        // let-chain, because `if let Some(..) = value { if <one check> { .. } }`
+        // trips clippy::collapsible_if under the app's own `-D warnings` gate
+        // (0.6.5 T2 review, CRITICAL 2).
+        assert!(
+            src.contains(
+                "fn de_item_note<'de, D>(de: D) -> std::result::Result<Option<String>, D::Error>"
+            ),
+            "optional constrained field keeps the Option variant in db mode: {src}"
+        );
+        assert!(
+            src.contains(
+                "if let Some(ref inner) = value\n        && inner.chars().count() < 2\n    {"
+            ),
+            "optional bound is a clippy-clean let-chain, not a nested if: {src}"
+        );
+        assert!(
+            !src.contains("if let Some(ref inner) = value {")
+                && !src.contains("if let Some(inner) = value {"),
+            "no collapsible `if let .. = value {{` block form remains: {src}"
+        );
+    }
+
+    /// Review IMPORTANT 3 (0.6.5 T2): `min: i64::MIN`, `max: i64::MAX`, and
+    /// `max_len: u64::MAX` are "unbounded" spellings — every value satisfies
+    /// them, and the emitted `<`/`>` comparison would trip rustc's
+    /// `unused_comparisons` under the generated app's `-D warnings` gate. Each
+    /// vacuous side emits NO check, and a field with ONLY vacuous bounds emits
+    /// no validator at all (same rule as `min_len: 0`). OpenAPI/DDL keep the
+    /// declared numbers — only the Rust comparison is the problem.
+    #[test]
+    fn extreme_bounds_are_unbounded_spellings_and_emit_no_vacuous_check() {
+        const EXTREMES: &str = r#"{
+            "name": "extremes", "contract_version": 0, "dependencies": ["db"],
+            "modules": [{ "name": "things",
+                "entities": [{ "name": "Thing", "fields": [
+                    { "name": "score", "type": "integer", "min": -9223372036854775808, "max": 100 },
+                    { "name": "views", "type": "integer", "max": 9223372036854775807 },
+                    { "name": "label", "type": "string", "max_len": 18446744073709551615 }
+                ]}],
+                "endpoints": [{ "operation_id": "list_things", "method": "GET", "path": "/",
+                    "success": { "status": 200, "entity": "Thing", "list": true } }] }]
+        }"#;
+        let d: Design = serde_json::from_str(EXTREMES).unwrap();
+        let src = model_rs(&d.modules[0]).unwrap();
+        // `score`: the vacuous i64::MIN side emits nothing; the real max does.
+        assert!(
+            src.contains("fn de_thing_score") && src.contains("value > 100"),
+            "the real bound still emits its check: {src}"
+        );
+        assert!(
+            !src.contains("-9223372036854775808"),
+            "no vacuous `< i64::MIN` comparison (unused_comparisons): {src}"
+        );
+        // `views` (max: i64::MAX only) and `label` (max_len: u64::MAX only)
+        // have NO effective bound → no validator fn, no deserialize_with attr.
+        assert!(
+            !src.contains("de_thing_views") && !src.contains("de_thing_label"),
+            "only-vacuous bounds emit no validator at all: {src}"
+        );
+        // Every attach site shares the gate: db mode agrees.
+        let db = model_rs_db(&d.modules[0], &d, false).unwrap();
+        assert!(
+            db.contains("value > 100")
+                && !db.contains("de_thing_views")
+                && !db.contains("9223372036854775807"),
+            "db attach sites gate the vacuous comparisons identically: {db}"
         );
     }
 
