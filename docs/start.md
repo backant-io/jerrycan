@@ -14,13 +14,13 @@ If you are the agent that just fetched this, do these three steps in order.
    the guided skill for your agent):
 
    ```sh
-   curl -fsSL https://jerrycan.cc/install.sh | sh -s -- --agent <your-id>
+   curl -fsSL https://jerrycan.cc/install.sh | bash -s -- --agent <your-id>
    ```
 
    Mirror, if that host is unreachable:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/backant-io/jerrycan/main/scripts/install.sh | sh -s -- --agent <your-id>
+   curl -fsSL https://raw.githubusercontent.com/backant-io/jerrycan/main/scripts/install.sh | bash -s -- --agent <your-id>
    ```
 
 3. **Run the guided build** and follow its output exactly:

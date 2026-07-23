@@ -172,6 +172,14 @@ RCU=$?
 set -e
 if [ "$RCU" -ne 0 ] && printf '%s' "$ERR_OUT" | grep -q "Usage: install.sh"; then ok "unknown flag exits non-zero with usage on stderr"; else bad "unknown-flag handling wrong (rc=$RCU)"; fi
 
+echo "== test 6: truncation guard — last line invokes main =="
+LAST_LINE="$(tail -n 1 "$INSTALL_SH")"
+if [ "$LAST_LINE" = 'main "$@"' ]; then
+  ok "install.sh ends with 'main \"\$@\"' — a truncated curl|bash stream executes nothing"
+else
+  bad "last line of install.sh is '$LAST_LINE', expected 'main \"\$@\"'"
+fi
+
 echo
 echo "==================== $PASS passed, $FAIL failed ===================="
 [ "$FAIL" -eq 0 ]
