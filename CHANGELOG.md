@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.4 — 2026-07-23
+
+Completes the 0.6.3 "gate honesty" coverage.
+
+### Security / correctness
+- **Full 401-guard coverage (#153).** A guarded endpoint now *always* generates
+  its `<op>_without_auth_is_401` test. 0.6.3 fixed the `probe:"skip"` case; this
+  closes the two remaining branches that silently dropped it — a `/{id}` detail
+  route with no seed creator, and a multi-parameter endpoint. **Behavior change:**
+  such designs gain a 401 test on regen (`expected_failing` +1); it passes on a
+  correct app and turns red only where a guard was hand-weakened.
+- **Jobs hollow-green closed (#156).** `JC0551` now also fires when a design
+  declares cron jobs but has no `crates/jobs/tests/acceptance.rs` — a jobs-only
+  app used to read `ok:true` with zero tests. Same file-existence signal and fix
+  (`jerrycan gen-tests`) as the endpoint-module check.
+
+### CLI
+- **`jerrycan gen-tests` no longer requires `--module`.** The bare command now
+  generates the acceptance suite for every endpoint-bearing module *plus* the
+  jobs suite; `--module <name>` still targets a single module (byte-identically).
+  This also makes the `JC0551` jobs diagnostic's suggested fix runnable for a
+  module-less, jobs-only design.
+
+### Notes
+- Follow-up: #159 (the MCP `jerrycan_gen_tests` twin should also accept an
+  optional module).
+
 ## 0.6.3 — 2026-07-23
 
 Gate honesty: every change makes a guarantee the framework *claims* actually
