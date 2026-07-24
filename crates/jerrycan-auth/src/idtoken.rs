@@ -320,6 +320,11 @@ impl Verifier {
         validation.algorithms = vec![Algorithm::RS256];
         validation.set_issuer(&self.issuers);
         validation.set_audience(&self.audiences);
+        // `set_audience` only checks the aud VALUE when the claim is present;
+        // require the claim to EXIST too, or a validly-signed token that omits
+        // `aud` entirely would pass. OIDC id tokens always carry `aud` (the
+        // client_id). Default required set is {"exp"}; this makes it {"exp","aud"}.
+        validation.required_spec_claims.insert("aud".to_string());
         validation.leeway = self.leeway_secs;
         validation.validate_exp = true;
         validation.validate_nbf = true;
@@ -896,6 +901,24 @@ f8sK4lep78Mx9ojs+u8a7fU3rOzqRoFcatjdno2JkI1Hd5siRAX1MA==
         let token = sign(K1_PEM, "kid1", &claims);
         let err = v.verify(&token).await.unwrap_err();
         assert_eq!(err.status().as_u16(), 401, "wrong aud must be 401");
+    }
+
+    #[tokio::test]
+    async fn missing_aud_claim_is_rejected() {
+        // WHY: `set_audience` only validates the aud VALUE when the claim is
+        // present — without requiring presence, a validly-signed token that
+        // simply OMITS `aud` would pass the audience check. OIDC id tokens
+        // always carry `aud` (the client_id), so absence is never legitimate.
+        let source = TestSource::new(vec![rsa_jwk("kid1", K1_N, K1_E)]);
+        let v = verifier_with(source);
+        let mut claims = good_claims();
+        claims
+            .as_object_mut()
+            .expect("claims are an object")
+            .remove("aud");
+        let token = sign(K1_PEM, "kid1", &claims);
+        let err = v.verify(&token).await.unwrap_err();
+        assert_eq!(err.status().as_u16(), 401, "missing aud must be 401");
     }
 
     #[tokio::test]
