@@ -36,9 +36,13 @@ webpki-roots = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
 # Third-party ID-token verifier (feature `idtoken`). RS256 + JWKS component
-# decoding via jsonwebtoken (ring-backed — no `rsa` crate). The JWKS fetch reuses
+# decoding via jsonwebtoken. jsonwebtoken 10 has no built-in `ring` backend, so
+# `idtoken` also pulls `ring` directly and installs an RS256-only CryptoProvider
+# over it (idtoken.rs) — keeping the `rsa` crate (RUSTSEC-2023-0071) and a second
+# native crypto stack (`aws_lc_rs`) out of the artifact. The JWKS fetch reuses
 # the same optional hyper + hyper-rustls client the `oauth` feature pulls.
 jsonwebtoken = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
 
 [features]
 # OAuth2 authorization-code client + provider presets.
@@ -57,10 +61,12 @@ oauth = [
 # build; the v2.5 eval + generated tests opt in explicitly. Needs the oauth types.
 mock-idp = ["oauth"]
 # Third-party ID-token (Sign in with Apple / Google Sign-In) verifier: RS256 JWS
-# validation against a provider JWKS. Pulls jsonwebtoken (ring-backed) plus the
-# same outbound HTTPS client the `oauth` feature uses, for the JWKS fetch.
+# validation against a provider JWKS. Pulls jsonwebtoken plus `ring` (backing the
+# RS256-only CryptoProvider jsonwebtoken 10 requires) plus the same outbound
+# HTTPS client the `oauth` feature uses, for the JWKS fetch.
 idtoken = [
     "dep:jsonwebtoken",
+    "dep:ring",
     "dep:hyper",
     "dep:hyper-util",
     "dep:hyper-rustls",

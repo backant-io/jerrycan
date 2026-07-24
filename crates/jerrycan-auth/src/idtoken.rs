@@ -17,9 +17,10 @@
 //! change (a new preset like [`Verifier::google`]/[`Verifier::apple`]), not a code
 //! change: the verify logic is provider-agnostic. [`Verifier::verify`] selects the
 //! signing key by the token header's `kid`, verifies the **RS256** signature via
-//! `jsonwebtoken` (which wraps `ring` — the SAME crypto backend as the rest of the
-//! crate's TLS, so no `rsa`-crate advisory enters the artifact), and validates the
-//! registered claims.
+//! `jsonwebtoken` over a custom `ring`-backed `CryptoProvider` (the private
+//! `ring_crypto` module below — the SAME crypto backend as the rest of the
+//! crate's TLS, so no `rsa`-crate advisory enters the artifact), and validates
+//! the registered claims.
 //!
 //! ## JWKS source seam (hermetic testing)
 //! The JWKS is fetched through a [`JwksSource`] — object-safe, hand-boxed `Send`
@@ -29,8 +30,11 @@
 //! verifies with no network — the ID-token analogue of [`crate::mock_idp`].
 //!
 //! ## Security posture
-//! - **Algorithm is pinned to RS256.** A token whose header `alg` is anything else
-//!   (`none`, `HS256`, …) is rejected *before* any key lookup — this closes the
+//! - **Algorithm is pinned to RS256, three times over.** A token whose header
+//!   `alg` is anything else (`none`, `HS256`, …) is rejected *before* any key
+//!   lookup; the `Validation` algorithm allowlist is exactly `[RS256]`; and the
+//!   process-wide jsonwebtoken `CryptoProvider` this module installs implements
+//!   ONLY RS256, so no other JWS algorithm can even be evaluated. This closes the
 //!   alg-confusion and unsigned-token holes that a naive verifier leaves open.
 //! - `iss` must match a configured value; `aud` must contain the expected
 //!   audience; `exp`/`nbf` are enforced with a small clock-skew leeway.
@@ -215,6 +219,9 @@ impl Verifier {
         jwks_uri: impl Into<String>,
         audiences: impl IntoIterator<Item = String>,
     ) -> Self {
+        // Make the ring-backed RS256 provider the process default before any
+        // decode can run (jsonwebtoken 10 ships no crypto of its own here).
+        ring_crypto::install();
         Self {
             issuers: issuers.into_iter().collect(),
             jwks_uri: jwks_uri.into(),
@@ -284,6 +291,10 @@ impl Verifier {
     ///    `exp`, `nbf`) via `jsonwebtoken`.
     /// 4. If a nonce was required, check it.
     pub async fn verify(&self, token: &str) -> Result<IdTokenClaims> {
+        // Idempotent belt-and-braces: `custom()` already installed the provider,
+        // but every decode below must be preceded by an install on this thread.
+        ring_crypto::install();
+
         // 1. Header first: pin RS256 and read the kid BEFORE any key lookup or
         //    network. A token whose alg is "none"/HS256/etc. never reaches step 2,
         //    so a forged unsigned/HMAC token can't be validated against an RSA key.
@@ -304,8 +315,16 @@ impl Verifier {
         //    allowed algorithms to RS256 here is a second, independent guard behind
         //    the header check above.
         let mut validation = Validation::new(Algorithm::RS256);
+        // `new(RS256)` already sets the allowlist; re-pin it explicitly so no
+        // jsonwebtoken default change can ever widen the accepted algorithms.
+        validation.algorithms = vec![Algorithm::RS256];
         validation.set_issuer(&self.issuers);
         validation.set_audience(&self.audiences);
+        // `set_audience` only checks the aud VALUE when the claim is present;
+        // require the claim to EXIST too, or a validly-signed token that omits
+        // `aud` entirely would pass. OIDC id tokens always carry `aud` (the
+        // client_id). Default required set is {"exp"}; this makes it {"exp","aud"}.
+        validation.required_spec_claims.insert("aud".to_string());
         validation.leeway = self.leeway_secs;
         validation.validate_exp = true;
         validation.validate_nbf = true;
@@ -406,6 +425,131 @@ fn map_jwt_error(e: jsonwebtoken::errors::Error) -> Error {
         _ => "verification failed",
     };
     unauth(format!("id token: {reason}"))
+}
+
+/// The `ring`-backed jsonwebtoken `CryptoProvider`, implementing **RS256 only**.
+///
+/// jsonwebtoken 10 dropped its built-in `ring` backend for pluggable providers,
+/// and its two built-ins are both unacceptable here: `rust_crypto` pulls the
+/// pure-Rust `rsa` crate (RUSTSEC-2023-0071, the Marvin timing side-channel —
+/// exactly what this module's docs promise never enters the artifact) and
+/// `aws_lc_rs` links a SECOND native crypto stack beside the `ring` the crate's
+/// TLS already uses. So this module takes the third option jsonwebtoken
+/// supports: a custom provider over `ring`'s RSA primitives — the same calls
+/// jsonwebtoken 9 itself made.
+///
+/// Supporting only RS256 is deliberate defense-in-depth: even a caller that
+/// somehow bypassed the header pin AND the `Validation` allowlist could not get
+/// any other JWS algorithm evaluated by this process's provider. The trade-off
+/// of jsonwebtoken's process-global provider model: if the embedding app uses
+/// jsonwebtoken elsewhere with a non-RS256 algorithm, that use fails LOUDLY
+/// with `InvalidAlgorithm` (never verifies against the wrong primitive).
+mod ring_crypto {
+    use jsonwebtoken::crypto::{CryptoProvider, JwkUtils, JwtSigner, JwtVerifier};
+    use jsonwebtoken::errors::{Error as JwtError, ErrorKind, new_error};
+    // jsonwebtoken re-exports the `signature` crate its provider traits build
+    // on, so the trait versions can never skew from the ones `decode` expects.
+    use jsonwebtoken::signature::{Error as SigError, Signer, Verifier};
+    use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, DecodingKeyKind, EncodingKey};
+
+    /// RS256 signer over a PKCS#1-DER RSA private key (what
+    /// `EncodingKey::from_rsa_pem` stores). Production code in this module only
+    /// verifies; the signer exists for the in-crate test token mint.
+    struct Rs256Signer(EncodingKey);
+
+    impl Signer<Vec<u8>> for Rs256Signer {
+        fn try_sign(&self, msg: &[u8]) -> std::result::Result<Vec<u8>, SigError> {
+            let key_pair = ring::signature::RsaKeyPair::from_der(self.0.inner())
+                .map_err(SigError::from_source)?;
+            let mut sig = vec![0u8; key_pair.public().modulus_len()];
+            key_pair
+                .sign(
+                    &ring::signature::RSA_PKCS1_SHA256,
+                    &ring::rand::SystemRandom::new(),
+                    msg,
+                    &mut sig,
+                )
+                .map_err(SigError::from_source)?;
+            Ok(sig)
+        }
+    }
+
+    impl JwtSigner for Rs256Signer {
+        fn algorithm(&self) -> Algorithm {
+            Algorithm::RS256
+        }
+    }
+
+    /// RS256 verifier over either `DecodingKey` shape: PKCS#1 DER (from PEM) or
+    /// raw JWKS `(n, e)` components (the path [`super::decoding_key`] builds).
+    struct Rs256Verifier(DecodingKey);
+
+    impl Verifier<Vec<u8>> for Rs256Verifier {
+        fn verify(&self, msg: &[u8], signature: &Vec<u8>) -> std::result::Result<(), SigError> {
+            let params = &ring::signature::RSA_PKCS1_2048_8192_SHA256;
+            match self.0.kind() {
+                DecodingKeyKind::SecretOrDer(der) => {
+                    ring::signature::UnparsedPublicKey::new(params, der).verify(msg, signature)
+                }
+                DecodingKeyKind::RsaModulusExponent { n, e } => {
+                    ring::signature::RsaPublicKeyComponents { n, e }.verify(params, msg, signature)
+                }
+            }
+            .map_err(SigError::from_source)
+        }
+    }
+
+    impl JwtVerifier for Rs256Verifier {
+        fn algorithm(&self) -> Algorithm {
+            Algorithm::RS256
+        }
+    }
+
+    /// The signer factory: RS256 with an RSA key, or a loud error.
+    /// `pub(super)` so tests can pin the refusal directly.
+    pub(super) fn signer_factory(
+        algorithm: &Algorithm,
+        key: &EncodingKey,
+    ) -> std::result::Result<Box<dyn JwtSigner>, JwtError> {
+        if *algorithm != Algorithm::RS256 {
+            return Err(new_error(ErrorKind::InvalidAlgorithm));
+        }
+        if key.family() != AlgorithmFamily::Rsa {
+            return Err(new_error(ErrorKind::InvalidKeyFormat));
+        }
+        Ok(Box::new(Rs256Signer(key.clone())))
+    }
+
+    /// The verifier factory: RS256 with an RSA key, or a loud error. Refusing
+    /// every other algorithm HERE is the third, lowest-level RS256 pin.
+    pub(super) fn verifier_factory(
+        algorithm: &Algorithm,
+        key: &DecodingKey,
+    ) -> std::result::Result<Box<dyn JwtVerifier>, JwtError> {
+        if *algorithm != Algorithm::RS256 {
+            return Err(new_error(ErrorKind::InvalidAlgorithm));
+        }
+        if key.family() != AlgorithmFamily::Rsa {
+            return Err(new_error(ErrorKind::InvalidKeyFormat));
+        }
+        Ok(Box::new(Rs256Verifier(key.clone())))
+    }
+
+    static PROVIDER: CryptoProvider = CryptoProvider {
+        signer_factory,
+        verifier_factory,
+        // JWK-utility hooks are only reached via `DecodingKey::from_jwk` /
+        // thumbprint APIs, which this crate never calls.
+        jwk_utils: JwkUtils::new_unimplemented(),
+    };
+
+    /// Install the provider as the process default. Idempotent: after the first
+    /// call (ours or anyone's) `install_default` is a no-op `Err`, which is fine
+    /// — with neither backend feature enabled, the only way a default already
+    /// exists is a prior successful install.
+    pub(super) fn install() {
+        let _ = PROVIDER.install_default();
+    }
 }
 
 /// Whether a `jwks_uri` may be fetched. `https://` is always allowed; `http://` is
@@ -620,10 +764,36 @@ f8sK4lep78Mx9ojs+u8a7fU3rOzqRoFcatjdno2JkI1Hd5siRAX1MA==
 
     /// Sign `claims` as an RS256 JWS with `pem`, stamping the header `kid`.
     fn sign(pem: &[u8], kid: &str, claims: &serde_json::Value) -> String {
+        // `encode` goes through the process CryptoProvider; make sure ours is
+        // installed even when a test signs before building its `Verifier`.
+        ring_crypto::install();
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(kid.to_string());
         let key = EncodingKey::from_rsa_pem(pem).expect("valid RSA PEM");
         encode(&header, claims, &key).expect("sign RS256")
+    }
+
+    /// Base64url (no pad) — the JWS segment encoding.
+    fn b64url(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Hand-roll an HS256 token (header/claims/HMAC-SHA256 over the signing
+    /// input) WITHOUT jsonwebtoken — the process provider refuses to sign
+    /// anything but RS256, and a real attacker mints outside our process anyway.
+    fn sign_hs256(secret: &[u8], kid: &str, claims: &serde_json::Value) -> String {
+        use hmac::{Hmac, Mac};
+        let header = json!({ "alg": "HS256", "typ": "JWT", "kid": kid });
+        let signing_input = format!(
+            "{}.{}",
+            b64url(header.to_string().as_bytes()),
+            b64url(claims.to_string().as_bytes())
+        );
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret).expect("any key size works");
+        mac.update(signing_input.as_bytes());
+        let tag = mac.finalize().into_bytes();
+        format!("{signing_input}.{}", b64url(&tag))
     }
 
     /// A well-formed, currently-valid Google-style claim set.
@@ -734,6 +904,24 @@ f8sK4lep78Mx9ojs+u8a7fU3rOzqRoFcatjdno2JkI1Hd5siRAX1MA==
     }
 
     #[tokio::test]
+    async fn missing_aud_claim_is_rejected() {
+        // WHY: `set_audience` only validates the aud VALUE when the claim is
+        // present — without requiring presence, a validly-signed token that
+        // simply OMITS `aud` would pass the audience check. OIDC id tokens
+        // always carry `aud` (the client_id), so absence is never legitimate.
+        let source = TestSource::new(vec![rsa_jwk("kid1", K1_N, K1_E)]);
+        let v = verifier_with(source);
+        let mut claims = good_claims();
+        claims
+            .as_object_mut()
+            .expect("claims are an object")
+            .remove("aud");
+        let token = sign(K1_PEM, "kid1", &claims);
+        let err = v.verify(&token).await.unwrap_err();
+        assert_eq!(err.status().as_u16(), 401, "missing aud must be 401");
+    }
+
+    #[tokio::test]
     async fn wrong_issuer_is_rejected() {
         // WHY: a validly-signed token from an issuer we do not trust must fail —
         // otherwise any RSA key we happened to cache could mint identities.
@@ -814,20 +1002,98 @@ f8sK4lep78Mx9ojs+u8a7fU3rOzqRoFcatjdno2JkI1Hd5siRAX1MA==
         // reject it outright, without ever consulting the JWKS.
         let source = TestSource::new(vec![rsa_jwk("kid1", K1_N, K1_E)]);
         let v = verifier_with(source.clone());
-        let mut header = Header::new(Algorithm::HS256);
-        header.kid = Some("kid1".to_string());
-        let token = encode(
-            &header,
-            &good_claims(),
-            &EncodingKey::from_secret(b"attacker-chosen"),
-        )
-        .expect("sign hs256");
+        let token = sign_hs256(b"attacker-chosen", "kid1", &good_claims());
         let err = v.verify(&token).await.unwrap_err();
         assert_eq!(err.status().as_u16(), 401, "HS256 must be 401");
         assert_eq!(
             source.fetch_count(),
             0,
             "a non-RS256 token must be rejected before any JWKS fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn hs256_keyed_with_the_rsa_jwk_material_is_rejected() {
+        // WHY: the exact GHSA-h395-gr6q-cpjc / key-confusion vector — an HMAC
+        // token whose secret IS the published RSA public key material, hoping a
+        // confused verifier feeds the RSA key to an HMAC primitive. Both
+        // plausible secret spellings (the base64url modulus string an attacker
+        // reads from the JWKS, and its decoded bytes) must fail, without a fetch.
+        use base64::Engine as _;
+        let source = TestSource::new(vec![rsa_jwk("kid1", K1_N, K1_E)]);
+        let v = verifier_with(source.clone());
+        let n_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(K1_N)
+            .expect("K1_N is valid base64url");
+        for secret in [K1_N.as_bytes(), n_bytes.as_slice()] {
+            let token = sign_hs256(secret, "kid1", &good_claims());
+            let err = v.verify(&token).await.unwrap_err();
+            assert_eq!(err.status().as_u16(), 401, "RSA-keyed HS256 must be 401");
+        }
+        assert_eq!(source.fetch_count(), 0, "rejected before any JWKS fetch");
+    }
+
+    #[tokio::test]
+    async fn alg_none_token_is_rejected() {
+        // WHY: the unsigned-token hole — `alg: none` asserts "no signature to
+        // check". Accepting it means anyone can mint identities. It must be
+        // rejected at the header (jsonwebtoken's Algorithm has no `none`, so the
+        // header does not even parse), with or without a trailing signature part,
+        // and without ever touching the JWKS.
+        let source = TestSource::new(vec![rsa_jwk("kid1", K1_N, K1_E)]);
+        let v = verifier_with(source.clone());
+        let header = b64url(br#"{"alg":"none","typ":"JWT","kid":"kid1"}"#);
+        let claims = b64url(good_claims().to_string().as_bytes());
+        for token in [
+            format!("{header}.{claims}."),
+            format!("{header}.{claims}"),
+            format!("{header}.{claims}.{}", b64url(b"junk")),
+        ] {
+            let err = v.verify(&token).await.unwrap_err();
+            assert_eq!(err.status().as_u16(), 401, "alg:none must be 401");
+        }
+        assert_eq!(source.fetch_count(), 0, "rejected before any JWKS fetch");
+    }
+
+    #[test]
+    fn crypto_provider_refuses_every_algorithm_but_rs256() {
+        // WHY: the third, lowest-level pin. Even if BOTH the header check and the
+        // Validation allowlist were bypassed, the process CryptoProvider must be
+        // unable to produce a verifier (or signer) for any non-RS256 algorithm —
+        // notably HS256 over an RSA key, the confusion class this release patches.
+        let rsa_key = DecodingKey::from_rsa_components(K1_N, K1_E).expect("valid components");
+        let hmac_key = DecodingKey::from_secret(b"attacker-chosen");
+        for alg in [
+            Algorithm::HS256,
+            Algorithm::HS384,
+            Algorithm::HS512,
+            Algorithm::ES256,
+            Algorithm::ES384,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+            Algorithm::EdDSA,
+        ] {
+            assert!(
+                ring_crypto::verifier_factory(&alg, &rsa_key).is_err(),
+                "provider must refuse to verify {alg:?}"
+            );
+            assert!(
+                ring_crypto::signer_factory(&alg, &EncodingKey::from_secret(b"s")).is_err(),
+                "provider must refuse to sign {alg:?}"
+            );
+        }
+        // And RS256 with an HMAC-shaped key is a key-format refusal.
+        assert!(
+            ring_crypto::verifier_factory(&Algorithm::RS256, &hmac_key).is_err(),
+            "RS256 over a non-RSA key must be refused"
+        );
+        // The one legitimate combination works.
+        assert!(
+            ring_crypto::verifier_factory(&Algorithm::RS256, &rsa_key).is_ok(),
+            "RS256 over the RSA JWK must be accepted"
         );
     }
 
