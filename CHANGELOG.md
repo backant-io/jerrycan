@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.6.5 — 2026-07-24
+
+The #1 contract gap by eval demand: **field length/range constraints**.
+
+### New: `min` / `max` / `min_len` / `max_len` field keys (#80)
+A field may now declare validation bounds:
+- `min` / `max` — inclusive integer range (integer fields).
+- `min_len` / `max_len` — inclusive string length in **Unicode code points**
+  (string fields).
+
+The generator emits a deserialize-time validator that rejects an out-of-range
+value with **422**, carries the bound into the OpenAPI schema
+(`minimum`/`maximum`/`minLength`/`maxLength`) and the migration `CHECK`, and
+testgen derives an in-range fixture **plus** an out-of-range 422 probe — so a
+constrained design is **green end-to-end on correct handlers with zero
+hand-written validation**. Previously every such field forced a hand-written
+`Valid` impl (and a `probe:"skip"` that dropped sibling probes — the #1 repeated
+hand-work across the eval program). Opt-in and additive: absent the keys, every
+existing design generates byte-identical output.
+
+### Validation
+- **`JC0552`** refuses malformed constraints: a bound on the wrong field type,
+  `min > max` / `min_len > max_len`, length keys combined with `values`, any
+  constraint on the pk `id`, `max_len: 0` on a required field, an out-of-bounds
+  `default`, and a `unique` field whose range admits fewer than 3 distinct values
+  (the test harness seeds up to 3 distinct rows — widen the range or drop
+  `unique`).
+
+### Docs
+- `docs/ai/00-designing.md` documents the four keys and rewrites the
+  `probe:"skip"` guidance — length/range are now declarable (email/url/regex
+  remain the documented `skip` case).
+
+### Notes
+- v1 covers integer + string scalar bounds. Deferred (tracked): `float` ranges,
+  regex/pattern + email/url formats, and structured multi-violation error
+  details (activating the `Valid<T>` machinery). Follow-up #161 (memory-mode
+  optional-default divergence).
+
 ## 0.6.4 — 2026-07-23
 
 Completes the 0.6.3 "gate honesty" coverage.

@@ -4,8 +4,8 @@
 use super::design::*;
 use serde_json::{Value, json};
 
-fn field_schema(t: FieldType) -> Value {
-    match t {
+fn field_schema(f: &Field) -> Value {
+    let mut schema = match f.field_type {
         FieldType::String => json!({ "type": "string" }),
         FieldType::Integer => json!({ "type": "integer", "format": "int64" }),
         FieldType::Float => json!({ "type": "number", "format": "double" }),
@@ -13,7 +13,24 @@ fn field_schema(t: FieldType) -> Value {
         FieldType::Datetime => json!({ "type": "string", "format": "date-time" }),
         FieldType::Uuid => json!({ "type": "string", "format": "uuid" }),
         FieldType::Json => json!({}),
+    };
+    // Range/length constraints (#80) ride into the document as JSON Schema
+    // keywords (JC0552 pins min/max to integer fields, min_len/max_len to
+    // string fields). Absent keys emit nothing, so every unconstrained
+    // design's document stays byte-identical.
+    if let Some(mn) = f.min {
+        schema["minimum"] = json!(mn);
     }
+    if let Some(mx) = f.max {
+        schema["maximum"] = json!(mx);
+    }
+    if let Some(mn) = f.min_len {
+        schema["minLength"] = json!(mn);
+    }
+    if let Some(mx) = f.max_len {
+        schema["maxLength"] = json!(mx);
+    }
+    schema
 }
 
 fn entity_ref(name: &str) -> Value {
@@ -141,7 +158,7 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
         for f in &e.fields {
-            properties.insert(f.name.clone(), field_schema(f.field_type));
+            properties.insert(f.name.clone(), field_schema(f));
             if f.required {
                 required.push(Value::String(f.name.clone()));
             }
@@ -225,7 +242,7 @@ fn request_schema(design: &Design, e: &Entity, for_update: bool) -> Value {
         .iter()
         .filter(|f| for_update || f.default.is_none())
     {
-        properties.insert(f.name.clone(), field_schema(f.field_type));
+        properties.insert(f.name.clone(), field_schema(f));
         if f.required {
             required.push(Value::String(f.name.clone()));
         }
@@ -534,6 +551,49 @@ mod tests {
             json!([{ "cookieAuth": [] }]),
             "a guarded non-public_read GET keeps its stanza"
         );
+    }
+
+    /// Issue #80: declared range/length constraints ride into the document as
+    /// JSON Schema keywords — `minimum`/`maximum` on integer fields,
+    /// `minLength`/`maxLength` on string fields — on BOTH the entity component
+    /// and the request DTO schemas, so a generated client knows the bounds the
+    /// deserialize-validator enforces. An unconstrained design's document stays
+    /// byte-identical (no keyword ever emitted), and `values` is NOT backfilled
+    /// to `enum` (out of scope — it would diff existing enum documents).
+    #[test]
+    fn constraints_ride_into_schemas() {
+        let d = document(
+            &serde_json::from_str::<Design>(crate::platform::genroute::tests::CONSTRAINT_DTO)
+                .unwrap(),
+        );
+        let item = &d["components"]["schemas"]["Item"]["properties"];
+        assert_eq!(item["quantity"]["minimum"], json!(1), "entity minimum");
+        assert_eq!(item["quantity"]["maximum"], json!(600), "entity maximum");
+        assert_eq!(item["code"]["maxLength"], json!(5), "entity maxLength");
+        assert_eq!(item["note"]["minLength"], json!(2), "entity minLength");
+        let req = &d["components"]["schemas"]["ItemRequest"]["properties"];
+        assert_eq!(req["quantity"]["minimum"], json!(1), "request DTO minimum");
+        assert_eq!(
+            req["quantity"]["maximum"],
+            json!(600),
+            "request DTO maximum"
+        );
+        assert_eq!(req["code"]["maxLength"], json!(5), "request DTO maxLength");
+        let upd = &d["components"]["schemas"]["ItemUpdateRequest"]["properties"];
+        assert_eq!(upd["code"]["maxLength"], json!(5), "update DTO maxLength");
+        assert!(
+            item["status"].get("enum").is_none(),
+            "values must NOT backfill to enum (would diff existing documents): {}",
+            item["status"]
+        );
+        // No-drift: the unconstrained golden document gains none of the keywords.
+        let plain = document_json(&serde_json::from_str::<Design>(GOLDEN).unwrap());
+        for kw in ["minimum", "maximum", "minLength", "maxLength"] {
+            assert!(
+                !plain.contains(kw),
+                "unconstrained golden must not gain `{kw}`"
+            );
+        }
     }
 
     /// The `required_roles.is_empty()` conjunct is LOAD-BEARING: a ROLE-GATED GET

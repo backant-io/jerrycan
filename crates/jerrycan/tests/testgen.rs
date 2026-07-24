@@ -2592,3 +2592,312 @@ fn single_role_tenancy_keeps_only_the_roleless_member_tests() {
         "single-role add uses the only declared role:\n{add}"
     );
 }
+
+// ---- #80: constraint-aware fixtures/seeds + the out-of-range 422 probe ----
+
+/// One module, one entity with the given fields, a POST "/" creator and a
+/// PUT "/{id}" updater — the minimal design the #80 testgen changes act on.
+fn constrained_design(fields: serde_json::Value) -> Design {
+    serde_json::from_value(serde_json::json!({
+        "name": "shop-api",
+        "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "items",
+            "entities": [{ "name": "Item", "fields": fields }],
+            "endpoints": [
+                { "operation_id": "create_item", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Item" },
+                  "success": { "status": 201, "entity": "Item" } },
+                { "operation_id": "update_item", "method": "PUT", "path": "/{id}",
+                  "request_body": { "entity": "Item" },
+                  "success": { "status": 200, "entity": "Item" } }
+            ]
+        }]
+    }))
+    .unwrap()
+}
+
+/// #80: a constrained field's happy-path fixture must be IN-RANGE — the design
+/// declares the bound precisely so the generator can derive a fixture that
+/// clears the deserialize validator and the migration CHECK (the whole point
+/// of #80: no more hand-written `Valid` impls rejecting `"test-value"`/`1`).
+#[test]
+fn constrained_fixtures_are_derived_in_range() {
+    let d = constrained_design(serde_json::json!([
+        { "name": "quantity", "type": "integer", "min": 5, "max": 600 },
+        { "name": "code", "type": "string", "max_len": 5 },
+        { "name": "body", "type": "string", "min_len": 12 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    // Integer: the default 1 clamps up to min (5).
+    assert!(
+        generated.contains("\"quantity\": 5"),
+        "int fixture must clamp into [5, 600]: {generated}"
+    );
+    // String over max_len: "test-value" truncates to 5 code points.
+    assert!(
+        generated.contains("\"code\": \"test-\""),
+        "string fixture must truncate to max_len: {generated}"
+    );
+    // String under min_len: a synthesized minimum-length value.
+    assert!(
+        generated.contains("\"body\": \"aaaaaaaaaaaa\""),
+        "string fixture must satisfy min_len (12): {generated}"
+    );
+}
+
+/// #80: a constrained request body gets an out-of-range 422 reject probe on
+/// BOTH the create and update paths (mirroring the #47 enum probes). WHY
+/// (Rule 9): the docs promise a declared bound is enforced at the request
+/// boundary; this pins that an out-of-range value 422s (JC0422), never dies
+/// as a 500 at the DB CHECK.
+#[test]
+fn constrained_body_gets_out_of_range_reject_probe_on_create_and_update() {
+    let d = constrained_design(serde_json::json!([
+        { "name": "quantity", "type": "integer", "min": 1, "max": 600 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        generated.contains("async fn create_item_rejects_out_of_range_quantity"),
+        "create reject probe: {generated}"
+    );
+    assert!(
+        generated.contains("async fn update_item_rejects_out_of_range_quantity"),
+        "update reject probe: {generated}"
+    );
+    // The probe corrupts ONLY the constrained field, to max + 1.
+    assert!(
+        generated.contains("\"quantity\": 601"),
+        "reject body carries max + 1: {generated}"
+    );
+    let probe = test_body(&generated, "create_item_rejects_out_of_range_quantity");
+    assert!(probe.contains("as_u16(), 422"), "asserts 422:\n{probe}");
+    // The happy-path fixture stays in-range (1 is inside [1, 600]).
+    let happy = test_body(&generated, "create_item_returns_201");
+    assert!(
+        happy.contains("\"quantity\": 1"),
+        "in-range fixture:\n{happy}"
+    );
+}
+
+/// #80 (0.6.5 final review, Critical): `serde_json::json!` types a bare
+/// numeric literal as `i32`, so a constrained-integer fixture or reject value
+/// OUTSIDE i32 range must be emitted `i64`-suffixed — a plain `3000000000`
+/// inside a probe body is a HARD compile error in the generated suite
+/// (deny-by-default `overflowing_literals`), failing `cargo test` on a
+/// JC0552-clean design. Values inside i32 range stay unsuffixed, keeping
+/// every existing design's output byte-identical.
+#[test]
+fn out_of_i32_range_bounds_emit_i64_suffixed_literals() {
+    let d = constrained_design(serde_json::json!([
+        { "name": "starts_at", "type": "integer", "min": 0, "max": 4102444800i64 },
+        { "name": "seq", "type": "integer", "min": 3000000000i64 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    // Happy-path fixture: clamp(1) up to min 3000000000 — beyond i32, suffixed.
+    assert!(
+        generated.contains("\"seq\": 3000000000i64"),
+        "out-of-i32-range fixture must be i64-suffixed: {generated}"
+    );
+    // Reject literal: max + 1 = 4102444801 — beyond i32, suffixed.
+    assert!(
+        generated.contains("\"starts_at\": 4102444801i64"),
+        "out-of-i32-range reject literal must be i64-suffixed: {generated}"
+    );
+    // A constrained value INSIDE i32 range stays a plain literal (the
+    // byte-identity guarantee for every existing design).
+    assert!(
+        generated.contains("\"starts_at\": 1,"),
+        "in-i32-range fixture stays unsuffixed: {generated}"
+    );
+
+    // The negative direction: a bound below i32::MIN suffixes too.
+    let d = constrained_design(serde_json::json!([
+        { "name": "depth", "type": "integer", "max": -3000000000i64 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        generated.contains("\"depth\": -3000000000i64"),
+        "below-i32::MIN fixture must be i64-suffixed: {generated}"
+    );
+}
+
+/// #80: the constraint reject probes PASS on stubs (the 422 precedes the
+/// handler), so `expected_failing` must exclude them — exactly like the #47
+/// enum rejects. Otherwise the RED-on-stubs invariant over-counts.
+#[test]
+fn constraint_reject_probes_are_excluded_from_expected_failing() {
+    let d = constrained_design(serde_json::json!([
+        { "name": "quantity", "type": "integer", "min": 1, "max": 600 },
+        { "name": "code", "type": "string", "max_len": 5 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    let total = testgen::test_count(&generated);
+    let rejects = generated
+        .matches("async fn create_item_rejects_out_of_range_")
+        .count()
+        + generated
+            .matches("async fn update_item_rejects_out_of_range_")
+            .count();
+    assert!(rejects >= 2, "create + update reject probes: {generated}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (_rel, expected_failing) =
+        testgen::write_acceptance(tmp.path(), &d, "items").expect("write acceptance");
+    assert_eq!(
+        expected_failing,
+        total - rejects,
+        "expected_failing must exclude exactly the reject probes (total {total}, rejects {rejects})"
+    );
+}
+
+/// #80: a string bound's reject literal is emitted as a `"a".repeat(n)`
+/// EXPRESSION (serde_json::json! accepts expressions), so the generated file
+/// never embeds a giant literal; over-max is preferred, under-min is the
+/// fallback.
+#[test]
+fn string_reject_probe_uses_a_repeat_expression() {
+    let d = constrained_design(serde_json::json!([
+        { "name": "code", "type": "string", "max_len": 5 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        generated.contains("\"code\": \"a\".repeat(6)"),
+        "over-max reject sends max_len + 1 code points: {generated}"
+    );
+
+    // min_len-only: the under-min direction (min_len - 1).
+    let d = constrained_design(serde_json::json!([
+        { "name": "body", "type": "string", "min_len": 3 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        generated.contains("\"body\": \"a\".repeat(2)"),
+        "under-min reject sends min_len - 1 code points: {generated}"
+    );
+}
+
+/// #80 (T1 review, Important-b): a very large `max_len` must NOT materialize a
+/// multi-megabyte over-max string at test run time — above the 4096 fixture
+/// cap the probe falls back to the under-`min_len` direction, or (no usable
+/// min_len) emits no probe at all.
+#[test]
+fn huge_max_len_never_materializes_an_over_max_reject_string() {
+    // No min_len: nothing rejectable below, over-max too large — no probe.
+    let d = constrained_design(serde_json::json!([
+        { "name": "body", "type": "string", "max_len": 100000 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        !generated.contains("_rejects_out_of_range_"),
+        "an over-cap max_len with no min_len emits no probe: {generated}"
+    );
+    // The happy fixture still fits (10 <= 100000) and stays the plain literal.
+    assert!(
+        generated.contains("\"body\": \"test-value\""),
+        "{generated}"
+    );
+
+    // With a usable min_len the probe flips to the under-min direction.
+    let d = constrained_design(serde_json::json!([
+        { "name": "body", "type": "string", "min_len": 3, "max_len": 100000 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        generated.contains("\"body\": \"a\".repeat(2)"),
+        "over-cap max_len falls back to under-min: {generated}"
+    );
+    assert!(
+        !generated.contains("repeat(100001)"),
+        "never materialize an over-cap string: {generated}"
+    );
+}
+
+/// #80: a bound at the i64 extreme is vacuous — the generated validator gates
+/// it out (`bounds_rules`), so the probe must not target it: `max: i64::MAX`
+/// falls back to `min - 1`; with BOTH extremes gated nothing is rejectable and
+/// no probe is emitted.
+#[test]
+fn i64_extreme_bounds_fall_back_or_skip_the_probe() {
+    let d = constrained_design(serde_json::json!([
+        { "name": "views", "type": "integer", "min": 1, "max": i64::MAX }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        generated.contains("\"views\": 0"),
+        "max at i64::MAX falls back to min - 1: {generated}"
+    );
+
+    let d = constrained_design(serde_json::json!([
+        { "name": "views", "type": "integer", "min": i64::MIN, "max": i64::MAX }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        !generated.contains("_rejects_out_of_range_"),
+        "both extremes gated: nothing rejectable, no probe: {generated}"
+    );
+}
+
+/// #80: a defaulted constrained field is omitted from the create request DTO
+/// (issue #53a), so a bad value would be dropped, not 422'd — no reject probe
+/// (the same rule `first_enum_field` applies to defaulted enum fields).
+#[test]
+fn defaulted_constrained_field_gets_no_reject_probe() {
+    let d = constrained_design(serde_json::json!([
+        { "name": "quantity", "type": "integer", "min": 1, "max": 600, "default": 1 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        !generated.contains("_rejects_out_of_range_"),
+        "a defaulted field cannot be rejected at the boundary: {generated}"
+    );
+}
+
+/// #80: the SQL tenant seeds stay IN-RANGE and (for `unique` fields) DISTINCT
+/// from each other and from the HTTP probe fixture — a constrained unique
+/// field must survive the migration CHECK on tenant 1 AND tenant 2 without
+/// colliding with the create probe's body (#85's invariant, now under bounds).
+#[test]
+fn tenant_seeds_for_constrained_unique_fields_stay_in_range_and_distinct() {
+    let d: Design = serde_json::from_value(serde_json::json!({
+        "name": "crm-api",
+        "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "workspaces",
+              "entities": [{ "name": "Workspace", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "slots", "type": "integer", "unique": true, "min": 5, "max": 600 },
+                  { "name": "slug", "type": "string", "unique": true, "max_len": 8 }
+              ]}],
+              "endpoints": [] },
+            { "name": "leads",
+              "entities": [{ "name": "Lead",
+                  "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+                  "fields": [{ "name": "name", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "create_lead", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Lead" },
+                    "success": { "status": 201, "entity": "Lead" } }
+              ] }
+        ]
+    }))
+    .unwrap();
+    let leads = d.modules.iter().find(|m| m.name == "leads").unwrap();
+    let generated = testgen::acceptance_rs(&d, leads);
+    // Tenant 1: slots = the 1st distinct in-range value after the fixture
+    // anchor (5) → 6; slug = 'seed-test-value' fitted to max_len 8.
+    assert!(
+        generated.contains("VALUES (1, 6, 'seed-tes')"),
+        "tenant-1 seed must be in-range and distinct from the fixture: {generated}"
+    );
+    // Tenant 2: slots = the 2nd distinct value (7); slug keeps its
+    // discriminator through the fit (front-loaded '2').
+    assert!(
+        generated.contains("VALUES (2, 7, '2-test-v')"),
+        "tenant-2 seed must be in-range and distinct from tenant 1: {generated}"
+    );
+}

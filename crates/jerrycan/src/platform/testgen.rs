@@ -9,10 +9,21 @@ use super::design::*;
 /// declared `values` set) use their FIRST declared value, so the generated
 /// happy-path body satisfies the migration's `CHECK (... IN (...))` constraint
 /// instead of tripping it with `"test-value"` (an opaque `JC0510` at run time).
+/// A range/length-constrained field (#80) derives an IN-RANGE value the same
+/// way, so the happy-path body clears the deserialize validator AND the CHECK.
 /// Mirrors `seed_sql_value` on the SQL seed side — the two must agree.
 fn fixture_value(f: &Field) -> String {
     if let Some(first) = f.values.as_ref().and_then(|v| v.first()) {
         return format!("\"{first}\"");
+    }
+    // #80: both branches gate on a constraint being PRESENT — an unconstrained
+    // field keeps the exact literals below (byte-identity for every existing
+    // design).
+    if has_int_range(f) {
+        return int_literal(clamp_int(1, f));
+    }
+    if has_len_range(f) {
+        return format!("\"{}\"", constrained_fixture_string(f));
     }
     match f.field_type {
         FieldType::String => "\"test-value\"",
@@ -32,6 +43,124 @@ fn fixture_value(f: &Field) -> String {
         FieldType::Json => "{}",
     }
     .to_string()
+}
+
+/// True when the field declares an integer range constraint (#80) — the gate
+/// every constraint-aware fixture/seed branch keys on, so an unconstrained
+/// field's output stays byte-identical.
+fn has_int_range(f: &Field) -> bool {
+    matches!(f.field_type, FieldType::Integer) && (f.min.is_some() || f.max.is_some())
+}
+
+/// True when the field declares a string length constraint (#80). A `values`
+/// field never carries one (JC0552 refuses the combination) and takes the enum
+/// branch first anyway.
+fn has_len_range(f: &Field) -> bool {
+    matches!(f.field_type, FieldType::String) && (f.min_len.is_some() || f.max_len.is_some())
+}
+
+/// Render a constrained-integer value for embedding inside a
+/// `serde_json::json!` probe body (#80): `json!` types a bare numeric literal
+/// as `i32`, so a value outside i32 range (a bound like `max: 4102444800`)
+/// would be a HARD compile error in the generated suite under rustc's
+/// deny-by-default `overflowing_literals`. Suffix `i64` exactly when the
+/// value is outside i32 range; everything in-range stays an unsuffixed
+/// literal (byte-identity for every existing design). The `id` fixture never
+/// routes through here — JC0552 refuses constraints on the pk — so a suffixed
+/// value can never leak into a URL path.
+fn int_literal(v: i64) -> String {
+    if v < i64::from(i32::MIN) || v > i64::from(i32::MAX) {
+        format!("{v}i64")
+    } else {
+        v.to_string()
+    }
+}
+
+/// Clamp `v` into the field's declared `[min, max]` (#80): below-min snaps to
+/// min, above-max to max — the NEAREST in-range value. Identity for an
+/// unconstrained field.
+fn clamp_int(v: i64, f: &Field) -> i64 {
+    let v = match f.min {
+        Some(mn) if v < mn => mn,
+        _ => v,
+    };
+    match f.max {
+        Some(mx) if v > mx => mx,
+        _ => v,
+    }
+}
+
+/// The k-th distinct in-range value for a `unique` range-constrained integer
+/// field (#80): k = 0 is the fixture anchor (`clamp(1)`), higher k walks up
+/// toward `max` and continues DOWNWARD from the anchor once the top of the
+/// range is exhausted. JC0552 refuses a unique field whose cardinality is
+/// below 3, so k <= 2 (the probe fixture + the tenant-1 and tenant-2 seeds)
+/// always yields three distinct in-range values here; the saturating
+/// arithmetic + final clamp keep even an unvalidated design's output in-range.
+fn kth_in_range(f: &Field, k: i64) -> i64 {
+    let anchor = clamp_int(1, f);
+    let headroom = f.max.unwrap_or(i64::MAX).saturating_sub(anchor);
+    let v = if k <= headroom {
+        anchor.saturating_add(k)
+    } else {
+        anchor.saturating_sub(k - headroom)
+    };
+    clamp_int(v, f)
+}
+
+/// Fit `base` into `[min_len, max_len]` (#80): truncate to `max_len` CODE
+/// POINTS (`.chars()`, the same semantics the generated validator and the
+/// OpenAPI minLength/maxLength use — never `.len()` bytes) when too long, pad
+/// with 'a' up to `min_len` when too short. JC0552's 4096 `min_len` ceiling
+/// bounds the padding.
+fn fit_string(base: &str, min_len: Option<u64>, max_len: Option<u64>) -> String {
+    let len = base.chars().count() as u64;
+    if let Some(mx) = max_len
+        && len > mx
+    {
+        return base.chars().take(mx as usize).collect();
+    }
+    if let Some(mn) = min_len
+        && len < mn
+    {
+        return format!("{base}{}", "a".repeat((mn - len) as usize));
+    }
+    base.to_string()
+}
+
+/// The in-range plain-string value for a length-constrained field (#80):
+/// `test-value` when it fits `[min_len, max_len]`, `"a".repeat(min_len)` when
+/// too short, a truncation to `max_len` code points when too long. Shared by
+/// `fixture_value` and the non-unique seed literals so the HTTP fixture and
+/// the SQL seed stay in agreement (the invariant on `fixture_value`).
+fn constrained_fixture_string(f: &Field) -> String {
+    const BASE: &str = "test-value";
+    if let Some(mn) = f.min_len
+        && (BASE.chars().count() as u64) < mn
+    {
+        return "a".repeat(mn as usize);
+    }
+    fit_string(BASE, f.min_len, f.max_len)
+}
+
+/// The Nth tenant's seed string for a length-constrained field (#80), derived
+/// so the fixture (`test-value`…), the tenant-1 unique seed (`seed-…`) and the
+/// tenant-2 seed stay DISTINCT after fitting: when truncation would cut the
+/// trailing `-{n}` discriminator off the shared "test-value" prefix (colliding
+/// with the fixture), the discriminator is front-loaded instead. The distinct
+/// leading characters ('t' / 's' / a digit) survive any `max_len >= 1`; a
+/// `unique` field with `max_len: 0` is refused at design time (JC0552).
+fn constrained_seed_string_n(f: &Field, n: u32) -> String {
+    let natural = format!("test-value-{n}");
+    let base = if f
+        .max_len
+        .is_some_and(|mx| (natural.chars().count() as u64) > mx)
+    {
+        format!("{n}-test-value")
+    } else {
+        natural
+    };
+    fit_string(&base, f.min_len, f.max_len)
 }
 
 /// The fixture literal for a belongs_to fk column, valued at the SEEDED tenant
@@ -65,7 +194,7 @@ fn fixture_json(
     m: &ModuleDesign,
     entity: &str,
     omit_identity_fk: bool,
-    bad_enum: Option<&str>,
+    bad: Option<(&str, &str)>,
     keep_defaults: bool,
 ) -> String {
     let Some(e) = m.entities.iter().find(|e| e.name == entity) else {
@@ -99,13 +228,13 @@ fn fixture_json(
         .iter()
         .filter(|f| keep_defaults || f.default.is_none())
         .map(|f| {
-            // The reject probe (issue #47) corrupts ONE enum field to an out-of-range
-            // sentinel; every other field keeps its valid fixture value so the ONLY
-            // reason for a 422 is that enum.
-            let value = if bad_enum == Some(f.name.as_str()) {
-                format!("\"{ENUM_REJECT_SENTINEL}\"")
-            } else {
-                fixture_value(f)
+            // The reject probe corrupts ONE field to an out-of-range literal —
+            // the enum sentinel (issue #47) or a #80 constraint violation;
+            // every other field keeps its valid fixture value so the ONLY
+            // reason for a 422 is that field.
+            let value = match bad {
+                Some((name, literal)) if name == f.name => literal.to_string(),
+                _ => fixture_value(f),
             };
             format!("\"{}\": {}", f.name, value)
         });
@@ -341,6 +470,69 @@ fn first_enum_field<'a>(unit: &'a ModuleDesign, entity: &str) -> Option<&'a str>
         .map(|f| f.name.as_str())
 }
 
+/// The largest `max_len` for which the reject probe materializes an over-max
+/// string at test run time (`"a".repeat(max_len + 1)`) — matches JC0552's 4096
+/// `min_len` fixture ceiling, so a generated suite never allocates beyond
+/// ~4KB per probe. Above it the probe falls back to the under-`min_len`
+/// direction, or (min_len absent/0) emits nothing — a bound too large to
+/// violate cheaply goes unprobed (0.6.5 T1 review, Important-b).
+const REJECT_LEN_CAP: u64 = 4096;
+
+/// The out-of-range literal the #80 reject probe sends for a constrained
+/// field, or None when NO rejectable direction exists. Directions mirror
+/// exactly the bounds the generated validator enforces (genroute's
+/// `bounds_rules` gates the vacuous spellings `min: i64::MIN`,
+/// `max: i64::MAX`, `min_len: 0`, `max_len: u64::MAX` out of the runtime
+/// check — and here the checked arithmetic fails on precisely those, so the
+/// probe never asserts a 422 the validator won't produce):
+/// - integer: `max + 1` (checked), falling back to `min - 1` (checked),
+///   rendered via [`int_literal`] so an out-of-i32-range value compiles
+///   inside `serde_json::json!`;
+/// - string: `"a".repeat(max_len + 1)` — an EXPRESSION, valid inside
+///   `serde_json::json!`, so the generated file never embeds a giant literal —
+///   capped by [`REJECT_LEN_CAP`], falling back to `"a".repeat(min_len - 1)`.
+fn constraint_reject_literal(f: &Field) -> Option<String> {
+    match f.field_type {
+        FieldType::Integer => f
+            .max
+            .and_then(|mx| mx.checked_add(1))
+            .or_else(|| f.min.and_then(|mn| mn.checked_sub(1)))
+            .map(int_literal),
+        // A `values` field rides the enum reject probe instead (and a
+        // values+length combination is refused at design time, JC0552).
+        FieldType::String if f.values.is_none() => {
+            if let Some(mx) = f.max_len
+                && mx <= REJECT_LEN_CAP
+            {
+                return Some(format!("\"a\".repeat({})", mx + 1));
+            }
+            f.min_len
+                .filter(|&mn| mn >= 1)
+                .map(|mn| format!("\"a\".repeat({})", mn - 1))
+        }
+        _ => None,
+    }
+}
+
+/// The first request-body field carrying a #80 range/length constraint with a
+/// derivable out-of-range literal — the field the constraint reject probe
+/// corrupts. A defaulted field is skipped for the same reason as
+/// [`first_enum_field`]: it is omitted from the create request DTO, so a bad
+/// value would be dropped, not 422'd. A constrained field with no rejectable
+/// direction (both extremes vacuous) is passed over — nothing violates its
+/// bound, so there is nothing to probe.
+fn first_constraint_reject<'a>(unit: &'a ModuleDesign, entity: &str) -> Option<(&'a str, String)> {
+    unit.entities
+        .iter()
+        .find(|e| e.name == entity)
+        .and_then(|e| {
+            e.fields
+                .iter()
+                .filter(|f| f.default.is_none() && (has_int_range(f) || has_len_range(f)))
+                .find_map(|f| constraint_reject_literal(f).map(|lit| (f.name.as_str(), lit)))
+        })
+}
+
 /// A request expression `t.<verb>(...)`. In auth mode a guarded endpoint threads
 /// the test cookie via the `_with` helper variants; otherwise the plain verb.
 fn request_expr(
@@ -349,7 +541,7 @@ fn request_expr(
     ep: &Endpoint,
     path: &str,
     guarded_and_auth: bool,
-    bad_enum: Option<&str>,
+    bad: Option<(&str, &str)>,
 ) -> String {
     let body = || {
         ep.request_body
@@ -363,7 +555,7 @@ fn request_expr(
                     unit,
                     &rb.entity,
                     omits_identity_fk(design, unit, ep),
-                    bad_enum,
+                    bad,
                     // An UPDATE (PUT/PATCH) probe keeps `default` fields so the body
                     // matches `{Entity}UpdateRequest` (issue #85 D1); a create omits them.
                     ep.method.is_update(),
@@ -546,6 +738,16 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             {
                 push_enum_reject_test(design, out, unit, ep, &full_path, guarded, field);
             }
+            // #80: a range/length-constrained request body gets one too.
+            if let Some((field, literal)) = ep
+                .request_body
+                .as_ref()
+                .and_then(|rb| first_constraint_reject(unit, &rb.entity))
+            {
+                push_constraint_reject_test(
+                    design, out, unit, ep, &full_path, guarded, field, &literal,
+                );
+            }
         } else if param_count(ep) == 1 && seed_creator_is_skipped(unit, ep) {
             // Issue #68: the creator that would seed this `/{id}` probe is marked
             // `probe: skip` — a hand-written validator on it rejects the generated
@@ -595,6 +797,23 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                     .and_then(|rb| first_enum_field(unit, &rb.entity))
                 {
                     push_enum_reject_test(design, out, unit, ep, &seeded_path, guarded, field);
+                }
+                // #80: the update path rejects a constraint violation too.
+                if let Some((field, literal)) = ep
+                    .request_body
+                    .as_ref()
+                    .and_then(|rb| first_constraint_reject(unit, &rb.entity))
+                {
+                    push_constraint_reject_test(
+                        design,
+                        out,
+                        unit,
+                        ep,
+                        &seeded_path,
+                        guarded,
+                        field,
+                        &literal,
+                    );
                 }
             } else {
                 out.todos.push(format!(
@@ -700,9 +919,37 @@ fn push_enum_reject_test(
     field: &str,
 ) {
     let fn_base = &ep.operation_id;
-    let request = request_expr(design, unit, ep, path, guarded, Some(field));
+    let sentinel = format!("\"{ENUM_REJECT_SENTINEL}\"");
+    let request = request_expr(design, unit, ep, path, guarded, Some((field, &sentinel)));
     out.code.push_str(&format!(
         "#[tokio::test]\nasync fn {fn_base}_rejects_out_of_range_{field}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 422, \"design: out-of-range `{field}` enum must 422 at the request boundary, not 500 at the DB CHECK; body: {{}}\", res.text());\n}}\n\n"
+    ));
+    out.count += 1;
+    out.reject += 1;
+}
+
+/// The #80 constraint twin of [`push_enum_reject_test`]: sends the endpoint's
+/// fixture body with ONE constrained field set to an out-of-range literal and
+/// asserts the request boundary answers 422 (JC0422) — the generated
+/// `deserialize_with` validator refuses it before the handler and the DB
+/// CHECK. Like the enum probe it PASSES on stubs, so it increments
+/// `out.reject` and is excluded from the RED-on-stubs `expected_failing`
+/// baseline.
+#[allow(clippy::too_many_arguments)]
+fn push_constraint_reject_test(
+    design: &Design,
+    out: &mut TestOut,
+    unit: &ModuleDesign,
+    ep: &Endpoint,
+    path: &str,
+    guarded: bool,
+    field: &str,
+    literal: &str,
+) {
+    let fn_base = &ep.operation_id;
+    let request = request_expr(design, unit, ep, path, guarded, Some((field, literal)));
+    out.code.push_str(&format!(
+        "#[tokio::test]\nasync fn {fn_base}_rejects_out_of_range_{field}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 422, \"design: out-of-range `{field}` must 422 at the request boundary (the declared min/max/min_len/max_len), not 500 at the DB CHECK; body: {{}}\", res.text());\n}}\n\n"
     ));
     out.count += 1;
     out.reject += 1;
@@ -1702,6 +1949,28 @@ fn seed_sql_value(f: &Field) -> String {
     {
         return format!("'{first}'");
     }
+    // #80: a constrained field seeds an IN-RANGE literal (the row must clear
+    // the migration CHECK and any later validated read), a `unique` one a
+    // value DISTINCT from the probe fixture — the next value after the
+    // fixture anchor / the 'seed-…' base fitted to the length bounds — so a
+    // create probe on a pre-seeded row still can't 409 (#85). Both branches
+    // gate on a constraint being present (byte-identity).
+    if has_int_range(f) {
+        return if f.unique {
+            kth_in_range(f, 1)
+        } else {
+            clamp_int(1, f)
+        }
+        .to_string();
+    }
+    if has_len_range(f) {
+        let s = if f.unique {
+            fit_string("seed-test-value", f.min_len, f.max_len)
+        } else {
+            constrained_fixture_string(f)
+        };
+        return format!("'{s}'");
+    }
     match f.field_type {
         // A `unique` String/Integer/Float shares its literal with the create-probe
         // body (`fixture_value`), so a create probe on a pre-seeded tenant row 409s
@@ -1733,6 +2002,21 @@ fn seed_sql_value_n(f: &Field, n: u32) -> String {
         && let Some(first) = values.first()
     {
         return format!("'{first}'");
+    }
+    // #80: the Nth tenant's constrained literals stay in-range; a `unique`
+    // integer takes the Nth distinct in-range value (the fixture anchor is the
+    // 0th, the tenant-1 seed the 1st), a string keeps its `-{n}` discriminator
+    // through the length fit. Gated on a constraint being present.
+    if has_int_range(f) {
+        return if f.unique {
+            kth_in_range(f, i64::from(n))
+        } else {
+            clamp_int(i64::from(n), f)
+        }
+        .to_string();
+    }
+    if has_len_range(f) {
+        return format!("'{}'", constrained_seed_string_n(f, n));
     }
     match f.field_type {
         FieldType::String | FieldType::Datetime | FieldType::Uuid => format!("'test-value-{n}'"),

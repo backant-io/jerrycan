@@ -128,14 +128,49 @@ fn default_type_error(f: &Field, wants_db: bool) -> Option<String> {
         FieldType::Boolean => value.is_boolean(),
         FieldType::Json => true,
     };
-    if ok {
-        None
-    } else {
-        Some(format!(
+    if !ok {
+        return Some(format!(
             "Field `{}` default {value} does not match its type `{:?}` — the server writes it verbatim, so it must be a valid {:?} literal.",
             f.name, f.field_type, f.field_type
-        ))
+        ));
     }
+    // #80 (JC0552): the default must also satisfy the field's OWN range/length
+    // constraints — an out-of-bounds default would plant a value the declared
+    // bound forbids on every defaulted row.
+    let bound = |b: Option<i64>| b.map_or_else(|| "unbounded".into(), |v: i64| v.to_string());
+    if matches!(f.field_type, FieldType::Integer) && (f.min.is_some() || f.max.is_some()) {
+        // A u64 beyond i64::MAX has no as_i64(): it exceeds any i64 `max` and
+        // satisfies any i64 `min`.
+        let out = match value.as_i64() {
+            Some(v) => f.min.is_some_and(|mn| v < mn) || f.max.is_some_and(|mx| v > mx),
+            None => f.max.is_some(),
+        };
+        if out {
+            return Some(format!(
+                "Field `{}` default {value} is outside its own declared range [min {}, max {}] — pick an in-range default, or relax the bound. See `jerrycan explain JC0552`.",
+                f.name,
+                bound(f.min),
+                bound(f.max)
+            ));
+        }
+    }
+    if matches!(f.field_type, FieldType::String)
+        && (f.min_len.is_some() || f.max_len.is_some())
+        && let Some(s) = value.as_str()
+    {
+        let n = s.chars().count() as u64;
+        if f.min_len.is_some_and(|mn| n < mn) || f.max_len.is_some_and(|mx| n > mx) {
+            return Some(format!(
+                "Field `{}` default {value} is {n} code points long, outside its own declared length bounds [min_len {}, max_len {}] — pick a default of a valid length, or relax the bound. See `jerrycan explain JC0552`.",
+                f.name,
+                f.min_len
+                    .map_or_else(|| "unbounded".into(), |v: u64| v.to_string()),
+                f.max_len
+                    .map_or_else(|| "unbounded".into(), |v: u64| v.to_string())
+            ));
+        }
+    }
+    None
 }
 
 /// The entity an endpoint's repo operates on (mirrors genroute's resolution):
@@ -695,6 +730,152 @@ pub fn validate(d: &Design) -> Vec<Question> {
                                 f.name
                             ),
                         ));
+                    }
+                }
+                // #80 (JC0552): field range/length constraints. Refuse
+                // misplacement, empty ranges, contradictions with `values`, an
+                // unfillable required field, an over-ceiling `min_len`, and ANY
+                // constraint on the pk `id` — each pointed at the offending key.
+                // The pk check runs first and swallows the rest: ids are
+                // server-assigned, and the generated id probes and seeds assume
+                // them free.
+                if f.name == "id" {
+                    for (key, present) in [
+                        ("min", f.min.is_some()),
+                        ("max", f.max.is_some()),
+                        ("min_len", f.min_len.is_some()),
+                        ("max_len", f.max_len.is_some()),
+                    ] {
+                        if present {
+                            qs.push(q(
+                                format!("{ptr}/entities/{i}/fields/{j}/{key}"),
+                                format!(
+                                    "Field `id` is the primary key — `{key}` is not allowed on it: ids are server-assigned, and the generated id probes and seeds assume unconstrained ids. Drop `{key}`. See `jerrycan explain JC0552`."
+                                ),
+                            ));
+                        }
+                    }
+                } else {
+                    if f.min.is_some() || f.max.is_some() {
+                        if !matches!(f.field_type, FieldType::Integer) {
+                            for (key, present) in
+                                [("min", f.min.is_some()), ("max", f.max.is_some())]
+                            {
+                                if present {
+                                    qs.push(q(
+                                        format!("{ptr}/entities/{i}/fields/{j}/{key}"),
+                                        format!(
+                                            "Field `{}` declares `{key}` but its type is not integer — `min`/`max` are an inclusive integer range, only allowed on integer fields. Use `min_len`/`max_len` to bound a string's length, or drop `{key}`. See `jerrycan explain JC0552`.",
+                                            f.name
+                                        ),
+                                    ));
+                                }
+                            }
+                        } else if let (Some(mn), Some(mx)) = (f.min, f.max)
+                            && mn > mx
+                        {
+                            qs.push(q(
+                                format!("{ptr}/entities/{i}/fields/{j}/min"),
+                                format!(
+                                    "Field `{}` declares an empty range: min {mn} > max {mx} — no value can satisfy it, so no in-range fixture is derivable. Lower `min` or raise `max`. See `jerrycan explain JC0552`.",
+                                    f.name
+                                ),
+                            ));
+                        } else if f.unique {
+                            // #80 (T3): the generated suite materializes up to
+                            // THREE distinct values per field — the probe
+                            // fixture plus the tenant-1 and tenant-2 seeds —
+                            // so a `unique` range below that collides on the
+                            // UNIQUE index and is un-greenable by construction.
+                            // An ABSENT bound substitutes its i64 extreme (T4):
+                            // a single `min` near i64::MAX (or `max` near
+                            // i64::MIN) leaves the same too-narrow range even
+                            // though only one bound was written.
+                            let mn = f.min.unwrap_or(i64::MIN);
+                            let mx = f.max.unwrap_or(i64::MAX);
+                            if (mx as i128) - (mn as i128) + 1 < 3 {
+                                let key = if f.min.is_some() { "min" } else { "max" };
+                                qs.push(q(
+                                    format!("{ptr}/entities/{i}/fields/{j}/{key}"),
+                                    format!(
+                                        "Field `{}` is `unique` but its range [min {mn}, max {mx}] admits only {} distinct value(s) — the generated seeds and probe fixture need up to 3 distinct in-range values (the request fixture and the two tenant seeds), so uniqueness cannot hold. Widen the range to at least 3 values, or drop `unique`. See `jerrycan explain JC0552`.",
+                                        f.name,
+                                        (mx as i128) - (mn as i128) + 1
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    if f.min_len.is_some() || f.max_len.is_some() {
+                        if !matches!(f.field_type, FieldType::String) {
+                            for (key, present) in [
+                                ("min_len", f.min_len.is_some()),
+                                ("max_len", f.max_len.is_some()),
+                            ] {
+                                if present {
+                                    qs.push(q(
+                                        format!("{ptr}/entities/{i}/fields/{j}/{key}"),
+                                        format!(
+                                            "Field `{}` declares `{key}` but its type is not string — `min_len`/`max_len` bound a string's length in Unicode code points. Use `min`/`max` for an integer range, or drop `{key}`. See `jerrycan explain JC0552`.",
+                                            f.name
+                                        ),
+                                    ));
+                                }
+                            }
+                        } else if f.values.is_some() {
+                            let key = if f.min_len.is_some() {
+                                "min_len"
+                            } else {
+                                "max_len"
+                            };
+                            qs.push(q(
+                                format!("{ptr}/entities/{i}/fields/{j}/{key}"),
+                                format!(
+                                    "Field `{}` combines enum `values` with `{key}` — the enum already fixes the exact allowed strings, so a length bound is contradictory. Drop `{key}` (or drop `values`). See `jerrycan explain JC0552`.",
+                                    f.name
+                                ),
+                            ));
+                        } else if let (Some(mn), Some(mx)) = (f.min_len, f.max_len)
+                            && mn > mx
+                        {
+                            qs.push(q(
+                                format!("{ptr}/entities/{i}/fields/{j}/min_len"),
+                                format!(
+                                    "Field `{}` declares an empty range: min_len {mn} > max_len {mx} — no value can satisfy it, so no in-range fixture is derivable. Lower `min_len` or raise `max_len`. See `jerrycan explain JC0552`.",
+                                    f.name
+                                ),
+                            ));
+                        } else if f.max_len == Some(0) && f.required {
+                            qs.push(q(
+                                format!("{ptr}/entities/{i}/fields/{j}/max_len"),
+                                format!(
+                                    "Field `{}` is required but declares `max_len: 0` — an unfillable field: no value satisfies a zero-length required string. Raise `max_len`, or make the field optional (`required: false`). See `jerrycan explain JC0552`.",
+                                    f.name
+                                ),
+                            ));
+                        } else if f.max_len == Some(0) && f.unique {
+                            // #80 (T3): the string twin of the unique-range
+                            // rule — `max_len: 0` admits ONLY the empty
+                            // string, so the seeds cannot be distinct. Any
+                            // max_len >= 1 is fine: the seed derivations lead
+                            // with distinct characters ('t'/'s'/a digit).
+                            qs.push(q(
+                                format!("{ptr}/entities/{i}/fields/{j}/max_len"),
+                                format!(
+                                    "Field `{}` is `unique` but declares `max_len: 0` — the empty string is the only possible value, so the generated seeds cannot derive distinct values. Raise `max_len`, or drop `unique`. See `jerrycan explain JC0552`.",
+                                    f.name
+                                ),
+                            ));
+                        } else if f.min_len.is_some_and(|n| n > 4096) {
+                            qs.push(q(
+                                format!("{ptr}/entities/{i}/fields/{j}/min_len"),
+                                format!(
+                                    "Field `{}` declares min_len {} above the 4096 ceiling — generated test fixtures materialize a minimum-length value, so a larger bound is refused. Lower `min_len` to at most 4096. See `jerrycan explain JC0552`.",
+                                    f.name,
+                                    f.min_len.unwrap()
+                                ),
+                            ));
+                        }
                     }
                 }
                 // A server-owned `default` (issue #53a) must type-check against the
@@ -2966,6 +3147,307 @@ mod tests {
         );
     }
 
+    // ---- #80 (JC0552): field range/length constraints -------------------------
+
+    /// One entity, one create endpoint, the given field JSON — the minimal
+    /// otherwise-clean design the constraint checks run against.
+    fn constraint_base(field: &str) -> Design {
+        design(&format!(
+            r#"{{ "name": "shop", "contract_version": 0, "dependencies": ["db"],
+                "modules": [{{ "name": "items",
+                    "entities": [{{ "name": "Item", "fields": [{field}] }}],
+                    "endpoints": [{{ "operation_id": "create_item", "method": "POST", "path": "/",
+                        "request_body": {{ "entity": "Item" }},
+                        "success": {{ "status": 201, "entity": "Item" }} }}] }}] }}"#
+        ))
+    }
+
+    /// WHY (#80): a declared, well-placed constraint is the whole point of the
+    /// feature — it must validate CLEAN so the design proceeds to generation
+    /// (min_len exactly at the 4096 ceiling included).
+    #[test]
+    fn valid_field_constraints_are_question_free() {
+        let ok = constraint_base(
+            r#"{ "name": "quantity", "type": "integer", "min": 1, "max": 600 },
+               { "name": "bio", "type": "string", "max_len": 280 },
+               { "name": "body", "type": "string", "min_len": 4096, "required": false }"#,
+        );
+        assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
+    }
+
+    /// `min`/`max` are an integer range — on a string or json field no generated
+    /// comparison exists, so placement is refused per offending key.
+    #[test]
+    fn range_keys_are_refused_on_non_integer_fields() {
+        let qs = validate(&constraint_base(
+            r#"{ "name": "bio", "type": "string", "min": 1 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/min"
+                    && q.question.contains("integer")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+        let qs = validate(&constraint_base(
+            r#"{ "name": "custom", "type": "json", "max": 5 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/max"
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+    }
+
+    /// `min_len`/`max_len` count Unicode code points of a string — on an integer
+    /// field there is no length to bound.
+    #[test]
+    fn length_keys_are_refused_on_non_string_fields() {
+        let qs = validate(&constraint_base(
+            r#"{ "name": "quantity", "type": "integer", "max_len": 10 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/max_len"
+                    && q.question.contains("string")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+    }
+
+    /// min > max (and min_len > max_len) is an empty range: no value satisfies
+    /// it, so no in-range fixture is derivable — un-greenable by construction.
+    #[test]
+    fn empty_ranges_are_refused() {
+        let qs = validate(&constraint_base(
+            r#"{ "name": "quantity", "type": "integer", "min": 10, "max": 1 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/min"
+                    && q.question.contains("empty range")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+        let qs = validate(&constraint_base(
+            r#"{ "name": "bio", "type": "string", "min_len": 10, "max_len": 2 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/min_len"
+                    && q.question.contains("empty range")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+    }
+
+    /// Enum `values` already fix the exact allowed strings — a length bound on
+    /// top is a contradiction (mirrors "values only on string").
+    #[test]
+    fn length_keys_are_refused_alongside_enum_values() {
+        let qs = validate(&constraint_base(
+            r#"{ "name": "status", "type": "string", "values": ["active", "expired"], "max_len": 5 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/max_len"
+                    && q.question.contains("values")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+    }
+
+    /// A required string with `max_len: 0` can never be filled; the same bound
+    /// on an optional field is legal (the client omits it).
+    #[test]
+    fn max_len_zero_on_a_required_field_is_unfillable() {
+        let qs = validate(&constraint_base(
+            r#"{ "name": "bio", "type": "string", "max_len": 0 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/max_len"
+                    && q.question.contains("required")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+        let optional = constraint_base(
+            r#"{ "name": "title", "type": "string" },
+               { "name": "bio", "type": "string", "max_len": 0, "required": false }"#,
+        );
+        assert!(
+            !validate(&optional)
+                .iter()
+                .any(|q| q.question.contains("JC0552")),
+            "{:?}",
+            validate(&optional)
+        );
+    }
+
+    /// The pk `id` is server-assigned — the id-echo probe and the seeds assume
+    /// free ids, so ANY constraint key on `id` is refused (even a well-typed one).
+    #[test]
+    fn constraint_keys_on_the_pk_id_are_refused() {
+        let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
+        d.modules[0].entities[0].fields[0].min = Some(1); // id: integer
+        let qs = validate(&d);
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/min"
+                    && q.question.contains("primary key")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+        let mut d2: Design = serde_json::from_str(V1_FULL).unwrap();
+        d2.modules[0].entities[0].fields[0].max_len = Some(8);
+        let qs = validate(&d2);
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/max_len"
+                    && q.question.contains("primary key")),
+            "{qs:?}"
+        );
+    }
+
+    /// testgen must materialize `"a".repeat(min_len)` — an unbounded `min_len`
+    /// would emit a multi-megabyte fixture, so it is capped at 4096.
+    #[test]
+    fn min_len_above_the_fixture_ceiling_is_refused() {
+        let qs = validate(&constraint_base(
+            r#"{ "name": "body", "type": "string", "min_len": 4097 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/min_len"
+                    && q.question.contains("4096")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+    }
+
+    /// #80 (T3): a `unique` field needs room for the distinct values the
+    /// generated suite materializes — the probe fixture plus the tenant-1 and
+    /// tenant-2 seeds, i.e. up to THREE distinct in-range values per field. A
+    /// range admitting fewer makes the design un-greenable by construction
+    /// (the seeds would collide on the UNIQUE index), so it is refused.
+    #[test]
+    fn unique_with_a_range_below_three_values_is_refused() {
+        for field in [
+            r#"{ "name": "slots", "type": "integer", "unique": true, "min": 5, "max": 5 }"#,
+            r#"{ "name": "slots", "type": "integer", "unique": true, "min": 1, "max": 2 }"#,
+        ] {
+            let qs = validate(&constraint_base(field));
+            assert!(
+                qs.iter()
+                    .any(|q| q.id == "/modules/0/entities/0/fields/0/min"
+                        && q.question.contains("unique")
+                        && q.question.contains("JC0552")),
+                "{field}: {qs:?}"
+            );
+        }
+        // Three or more distinct values: clean (the seeds fit).
+        let ok = constraint_base(
+            r#"{ "name": "slots", "type": "integer", "unique": true, "min": 1, "max": 600 },
+               { "name": "trio", "type": "integer", "unique": true, "min": 1, "max": 3 }"#,
+        );
+        assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
+        // Without `unique` a single-value range is legal (no distinctness need).
+        let ok = constraint_base(r#"{ "name": "slots", "type": "integer", "min": 5, "max": 5 }"#);
+        assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
+    }
+
+    /// #80 (T4): the cardinality rule must hold with a SINGLE declared bound
+    /// too — the absent bound substitutes its i64 extreme. A `unique` field
+    /// with only `min: i64::MAX - 1` admits two representable values, so the
+    /// distinct seed derivation collides exactly as with a written `max`; the
+    /// pre-fix arm required BOTH bounds and let this un-greenable design
+    /// validate clean.
+    #[test]
+    fn unique_with_a_single_bound_near_the_extreme_is_refused() {
+        // min-only at the top extreme: [i64::MAX - 1, i64::MAX] = 2 values.
+        let qs = validate(&constraint_base(
+            r#"{ "name": "slots", "type": "integer", "unique": true, "min": 9223372036854775806 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/min"
+                    && q.question.contains("unique")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+        // max-only at the bottom extreme: [i64::MIN, i64::MIN + 1] = 2 values.
+        let qs = validate(&constraint_base(
+            r#"{ "name": "slots", "type": "integer", "unique": true, "max": -9223372036854775807 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/max"
+                    && q.question.contains("unique")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+        // An open-ended single bound leaves astronomic room: clean.
+        let ok =
+            constraint_base(r#"{ "name": "slots", "type": "integer", "unique": true, "min": 1 }"#);
+        assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
+    }
+
+    /// #80 (T3): the string twin — `max_len: 0` admits ONLY the empty string,
+    /// so a `unique` field can never seed distinct values. Any `max_len >= 1`
+    /// stays clean: the seed derivations lead with distinct characters
+    /// ('t'/'s'/a digit), so even one code point suffices.
+    #[test]
+    fn unique_with_max_len_zero_is_refused() {
+        let qs = validate(&constraint_base(
+            r#"{ "name": "slug", "type": "string", "unique": true, "max_len": 0, "required": false }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/max_len"
+                    && q.question.contains("unique")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+        let ok = constraint_base(
+            r#"{ "name": "slug", "type": "string", "unique": true, "max_len": 1 }"#,
+        );
+        assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
+    }
+
+    /// A server-owned `default` is written verbatim, so it must satisfy the
+    /// field's OWN constraints — an out-of-bounds default would plant a value
+    /// the declared bound forbids on every defaulted row.
+    #[test]
+    fn default_must_satisfy_the_fields_own_constraints() {
+        let qs = validate(&constraint_base(
+            r#"{ "name": "quantity", "type": "integer", "min": 1, "max": 600, "default": 601 }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/default"
+                    && q.question.contains("range")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+        let qs = validate(&constraint_base(
+            r#"{ "name": "bio", "type": "string", "max_len": 3, "default": "toolong" }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/default"
+                    && q.question.contains("length")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+        // In-range defaults stay clean — length counts CODE POINTS, not bytes.
+        let ok = constraint_base(
+            r#"{ "name": "quantity", "type": "integer", "min": 1, "max": 600, "default": 42 },
+               { "name": "bio", "type": "string", "max_len": 5, "default": "héllo" }"#,
+        );
+        assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
+    }
+
     #[test]
     fn explicit_fk_named_field_conflicts_with_belongs_to() {
         let mut d: Design = serde_json::from_str(V1_FULL).unwrap();
@@ -2977,6 +3459,10 @@ mod tests {
             index: false,
             values: None,
             default: None,
+            min: None,
+            max: None,
+            min_len: None,
+            max_len: None,
         });
         assert!(
             validate(&d)

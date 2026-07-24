@@ -155,6 +155,12 @@ fn build_one(
                     // Migration import derives no server-owned default from a
                     // Postgres column default (that stays a run-time concern).
                     default: None,
+                    // Migration import derives no range/length constraints (#80);
+                    // a CHECK on the source column stays a run-time concern.
+                    min: None,
+                    max: None,
+                    min_len: None,
+                    max_len: None,
                 });
             }
             MappedType::Unmappable { pg_type, reason } => {

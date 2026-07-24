@@ -370,7 +370,25 @@
                 "description": "String enums: only valid on type \"string\"; becomes a CHECK constraint in db mode and Valid<T> validation."
               },
               "default": {
-                "description": "A server-owned default value. A field with a default is dropped from the generated request DTO / OpenAPI request schema and the happy-path probe body: the client never sends it and the server applies this value. The field stays required NOT-NULL in the entity/table. Must type-check against \"type\" (and be a member of \"values\" when present). Lets a design express e.g. confirmed (boolean, default false) or status (enum, default \"active\")."
+                "description": "A server-owned default value. A field with a default is dropped from the generated request DTO / OpenAPI request schema and the happy-path probe body: the client never sends it and the server applies this value. The field stays required NOT-NULL in the entity/table. Must type-check against \"type\" (and be a member of \"values\" when present). Lets a design express e.g. confirmed (boolean, default false) or status (enum, default \"active\"). When the field also declares range/length constraints, the default must satisfy them (JC0552)."
+              },
+              "min": {
+                "type": "integer",
+                "description": "Inclusive integer lower bound (issue #80). Only valid on type \"integer\"; must not exceed \"max\"; not allowed on the pk \"id\" field. Violations are refused at design time with JC0552."
+              },
+              "max": {
+                "type": "integer",
+                "description": "Inclusive integer upper bound (issue #80). Only valid on type \"integer\"; not allowed on the pk \"id\" field. Violations are refused at design time with JC0552."
+              },
+              "min_len": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Inclusive minimum string length in Unicode code points (issue #80). Only valid on type \"string\" without \"values\"; must not exceed \"max_len\"; capped at 4096 (generated fixtures materialize a minimum-length value); not allowed on the pk \"id\" field. Violations are refused at design time with JC0552."
+              },
+              "max_len": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Inclusive maximum string length in Unicode code points (issue #80). Only valid on type \"string\" without \"values\"; 0 on a required field is refused as unfillable; not allowed on the pk \"id\" field. Violations are refused at design time with JC0552."
               }
             }
           }

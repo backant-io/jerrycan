@@ -183,6 +183,31 @@ Every entity has an `id` primary key; you usually do NOT declare it:
   database — on every write path (create AND update), and the same 422 in memory mode
   (which has no DB). There is NO separate `enum` field type — enums are always `string`
   + `values`.
+- `min?` / `max?` — integers; an INCLUSIVE integer range; `integer` fields ONLY (use
+  `min_len`/`max_len` to bound a string). Either bound may stand alone. Declaring one
+  generates the full stack: request validation at deserialization (an out-of-range
+  value is answered `422 JC0422` before the handler and the database, on create AND
+  update, and the same 422 in memory mode), OpenAPI `minimum`/`maximum`, a db-mode
+  `CHECK` constraint, an IN-RANGE happy-path fixture in the generated tests, and a
+  `{op}_rejects_out_of_range_{field}` 422 probe. An empty range (`min > max`) is
+  rejected (`JC0552`).
+- `min_len?` / `max_len?` — non-negative integers; an INCLUSIVE string-LENGTH range
+  counted in Unicode CODE POINTS (`chars().count()`, matching JSON Schema
+  `minLength`/`maxLength` — NOT bytes); `string` fields ONLY, and NOT combinable with
+  `values` (the enum already fixes the exact allowed strings — `JC0552`). Generates
+  the same stack as `min`/`max`: the 422 at the boundary, OpenAPI
+  `minLength`/`maxLength`, a db-mode `CHECK` on `length(col)`, the in-range fixture,
+  and the 422 reject probe. `min_len` is capped at 4096 (generated fixtures
+  materialize a minimum-length value); `min_len > max_len` and `max_len: 0` on a
+  required field are rejected (`JC0552`).
+- Constraint rules (each refused with `JC0552` at design time): no constraint key on
+  the pk `id` (ids are server-assigned; the generated probes and seeds assume them
+  free); a `default` must satisfy its own field's constraints; and a `unique` field
+  must leave ROOM — the generated test harness seeds up to 3 DISTINCT in-range values
+  per field (the request fixture plus two seeds), so a `unique` integer whose range
+  admits fewer than 3 values is refused. An ABSENT bound counts as its i64 extreme,
+  so a lone `min: 9223372036854775806` is refused too; a `unique` string with
+  `max_len: 0` is the same case. Widen the range or drop `unique`.
 - `default?` — a SERVER-OWNED default. A field with a `default` is dropped from the
   generated request DTO / OpenAPI request schema / happy-path probe body — the client
   never sends it, the SERVER supplies it — yet it stays **required NOT-NULL** in the
@@ -292,15 +317,24 @@ Every entity has an `id` primary key; you usually do NOT declare it:
 > red, and cover the real behavior (the 200 WITH a valid credential, and the 401/400
 > without) in your own agent-owned test. See `jerrycan docs testing`.
 >
-> **A hand-written format/`Valid` constraint the generator can't see is the same case.**
+> **A length or range rule is NOT this case — declare it, don't skip.** The contract
+> expresses bounds directly: `min`/`max` on an integer field, `min_len`/`max_len` on a
+> string field (see Field above). Declare them and the generator does the rest — it
+> derives an IN-RANGE happy-path fixture (a `string` gets `"test-value"` fitted into
+> the declared length window, an integer is clamped into `[min, max]`) plus a
+> `{op}_rejects_out_of_range_{field}` 422 probe, so the endpoint stays fully greenable
+> with ZERO hand-written validation. Never hand-write a `Valid` impl (or reach for
+> `probe: "skip"`) for a plain length/range bound.
+>
+> **A hand-written FORMAT constraint the generator can't see is still the skip case.**
 > The probe fills each field with a generic fixture — a `string` gets `"test-value"`;
 > declared `uuid`/`datetime` get format-valid fixtures and enum `values` get a declared
 > value. But the design contract has **no field-format declaration** (no email/url/
-> pattern), so a `string` the handler additionally requires to be an **email, URL, or
-> other format** — enforced by a hand-written `Valid` impl the design can't express — is
-> rejected by a CORRECT handler, and that endpoint's 2xx probe is un-greenable too. Mark
-> such an endpoint **`probe: "skip"`** and write its success test with a real value
-> yourself.
+> regex/pattern), so a `string` the handler additionally requires to be an **email,
+> URL, or other format** — enforced by a hand-written `Valid` impl the design can't
+> express — is rejected by a CORRECT handler, and that endpoint's 2xx probe is
+> un-greenable too. Mark such an endpoint **`probe: "skip"`** and write its success
+> test with a real value yourself.
 >
 > **A module with endpoints requiring DIFFERENT roles is a partial case.** The generated
 > credential carries ONE role, drawn from the design's role gate (the first
