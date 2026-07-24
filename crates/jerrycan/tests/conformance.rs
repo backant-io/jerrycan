@@ -1341,6 +1341,207 @@ fn body_omittable_fields_go_green_on_a_correct_scaffold() {
     );
 }
 
+/// The #80 conformance fixture: a db-mode design whose fields declare
+/// range/length constraints. `body` (min_len 2 / max_len 30) is the FIRST
+/// rejectable field of the Note body, so the generated string reject probe
+/// carries the `"a".repeat(31)` over-max EXPRESSION; `priority`/`points`
+/// (integer min/max, both minimums above the default fixture `1`) force the
+/// in-range clamp — a broken derivation would send `1`, trip the migration
+/// CHECK, and turn the 201 probes red.
+const LIMITS: &str = include_str!("../../../conformance/designs/limits-api.design.json");
+
+/// The correct limits-api handlers: plain store + echo. Deliberately ZERO
+/// hand-written validation — the generated `de_*` deserialize-validators own
+/// the declared bounds, which is the whole #80 payoff.
+const LIMITS_HANDLERS: &str = r#"//! Correct #80 handlers: store + echo; the generated de_* validators own the bounds.
+use jerrycan::prelude::*;
+use super::model::*;
+use super::repo::*;
+
+pub(crate) async fn create_note(repo: Dep<NoteRepo>, Json(body): Json<Note>) -> Result<Created<Note>> {
+    let mut note = body;
+    note.id = repo.insert(note.clone()).await?;
+    Ok(Created(note))
+}
+
+pub(crate) async fn update_note(repo: Dep<NoteRepo>, Path(id): Path<i64>, Json(body): Json<Note>) -> Result<Json<Note>> {
+    if repo.update(id, body.clone()).await? { Ok(Json(body)) } else { Err(Error::not_found()) }
+}
+
+pub(crate) async fn create_score(repo: Dep<ScoreRepo>, Json(body): Json<Score>) -> Result<Created<Score>> {
+    let mut score = body;
+    score.id = repo.insert(score.clone()).await?;
+    Ok(Created(score))
+}
+"#;
+
+/// Issue #80 end-to-end: a range/length-constrained design is greenable with
+/// ZERO hand-written `Valid` impls. Scaffold (migration CHECKs emitted) →
+/// gen-tests (the three 422 reject probes are reject-counted OUT of
+/// expected_failing) → RED on stubs (exactly the four success/404 probes) →
+/// trivial store+echo handlers → the SAME suite goes GREEN — the in-range
+/// happy path 201/200s through the de_* validator AND the DB CHECK, and the
+/// `_rejects_out_of_range_{field}` probes (incl. the compiled-and-run
+/// `"a".repeat(31)` over-max string) assert 422 — → full `jerrycan check` ok.
+#[test]
+#[ignore = "heavy: scaffold + gen-tests + red run + implement + green run + check (#80 constraints)"]
+fn constrained_design_goes_green_on_a_correct_scaffold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, LIMITS).unwrap();
+    let app = tmp.path().join("limits-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .args(["new"])
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "the constrained design must scaffold");
+
+    // Defense-in-depth: every constrained column carries its migration CHECK,
+    // so the in-range fixtures below are proven against the DB too.
+    let ddl = std::fs::read_to_string(
+        app.join("crates/routes/notes/migrations/sqlite/0001_create_tables.sql"),
+    )
+    .unwrap();
+    for check in [
+        "CHECK (length(\"body\") BETWEEN 2 AND 30)",
+        "CHECK (\"priority\" BETWEEN 2 AND 5)",
+        "CHECK (\"points\" BETWEEN 10 AND 100)",
+    ] {
+        assert!(
+            ddl.contains(check),
+            "missing `{check}` in migration:\n{ddl}"
+        );
+    }
+
+    // gen-tests: 7 tests, of which the three 422 reject probes pass on stubs
+    // (the boundary rejects before the handler) — expected_failing counts only
+    // the four success/404 probes (the T3 reject math, proven end-to-end).
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "gen-tests", "--module", "notes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "gen-tests notes: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        payload["expected_failing"], 4,
+        "the three reject probes must be excluded from expected_failing: {payload}"
+    );
+
+    let acceptance =
+        std::fs::read_to_string(app.join("crates/routes/notes/tests/acceptance.rs")).unwrap();
+    // Each constrained body gets its out-of-range 422 probe, corrupting the
+    // FIRST rejectable field: the string one carries the `"a".repeat(31)`
+    // over-max EXPRESSION (compiled and executed below, not just pinned as
+    // text), the integer one sends max + 1.
+    for (probe, needle) in [
+        (
+            "async fn create_note_rejects_out_of_range_body()",
+            "\"body\": \"a\".repeat(31)",
+        ),
+        (
+            "async fn update_note_rejects_out_of_range_body()",
+            "\"body\": \"a\".repeat(31)",
+        ),
+        (
+            "async fn create_score_rejects_out_of_range_points()",
+            "\"points\": 101",
+        ),
+    ] {
+        let at = acceptance
+            .find(probe)
+            .unwrap_or_else(|| panic!("{probe} missing:\n{acceptance}"));
+        let fn_body = &acceptance[at..acceptance[at..].find("\n}").unwrap() + at];
+        assert!(
+            fn_body.contains(needle) && fn_body.contains(", 422,"),
+            "{probe} must send {needle} and assert 422:\n{fn_body}"
+        );
+    }
+    // The happy-path fixtures are derived IN-RANGE: the default integer
+    // fixture `1` is clamped up to each declared minimum (2 and 10) — a raw
+    // `1` would violate the CHECKs above and redden the 201 probes on a
+    // CORRECT handler.
+    assert!(
+        acceptance.contains("\"priority\": 2") && acceptance.contains("\"points\": 10"),
+        "integer fixtures must clamp into the declared range:\n{acceptance}"
+    );
+
+    // RED: stubs (500) fail exactly the four success/404 probes — the three
+    // reject probes PASS on stubs (the 422 precedes the handler), proving the
+    // out-of-range bodies are refused by the GENERATED validators alone.
+    let red = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace", "--no-fail-fast"])
+        .output()
+        .unwrap();
+    assert!(!red.status.success(), "stub handlers must fail the suite");
+    let red_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&red.stdout),
+        String::from_utf8_lossy(&red.stderr)
+    );
+    let failed: usize = red_out
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("test result: FAILED. ")?
+                .split("; ")
+                .nth(1)?
+                .strip_suffix(" failed")
+                .map(|n| n.parse::<usize>().unwrap_or(0))
+        })
+        .sum();
+    assert_eq!(
+        failed, 4,
+        "the 422 reject probes must already pass on stubs:\n{red_out}"
+    );
+
+    // Implement the correct handlers: store + echo, ZERO hand-written
+    // validation — the #80 contract is enforced entirely by generated code.
+    install_handler(&app, "crates/routes/notes/src/handlers.rs", LIMITS_HANDLERS);
+
+    // GREEN: the same suite passes — in-range bodies clear the de_* validator
+    // AND the migration CHECK (201/200), out-of-range bodies 422 at the
+    // boundary, on the create AND update paths.
+    let green = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace"])
+        .status()
+        .unwrap();
+    assert!(
+        green.success(),
+        "a constrained design must be greenable with zero hand-written Valid impls"
+    );
+
+    // And the full gate holds on the implemented app.
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON doc");
+    assert_eq!(
+        payload["ok"], true,
+        "diagnostics: {}",
+        payload["diagnostics"]
+    );
+}
+
 /// The Phase 2 TDD loop: gen-tests makes the design executable and FAILING,
 /// the agent implements, the same tests go green, the gate stays green.
 #[test]

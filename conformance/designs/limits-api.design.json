@@ -1,0 +1,33 @@
+{
+  "name": "limits-api",
+  "contract_version": 1,
+  "description": "Conformance app (#80): field range/length constraints in db mode",
+  "auth": { "model": "none" },
+  "dependencies": ["db"],
+  "modules": [
+    {
+      "name": "notes",
+      "entities": [
+        { "name": "Note", "fields": [
+          { "name": "body", "type": "string", "min_len": 2, "max_len": 30 },
+          { "name": "priority", "type": "integer", "min": 2, "max": 5 }
+        ]},
+        { "name": "Score", "fields": [
+          { "name": "points", "type": "integer", "min": 10, "max": 100 }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "create_note", "method": "POST", "path": "/",
+          "request_body": { "entity": "Note" },
+          "success": { "status": 201, "entity": "Note" } },
+        { "operation_id": "update_note", "method": "PUT", "path": "/{id}",
+          "request_body": { "entity": "Note" },
+          "success": { "status": 200, "entity": "Note" },
+          "errors": [{ "status": 404, "when": "unknown id" }] },
+        { "operation_id": "create_score", "method": "POST", "path": "/scores",
+          "request_body": { "entity": "Score" },
+          "success": { "status": 201, "entity": "Score" } }
+      ]
+    }
+  ]
+}
