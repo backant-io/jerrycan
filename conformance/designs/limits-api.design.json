@@ -13,7 +13,8 @@
           { "name": "priority", "type": "integer", "min": 2, "max": 5 }
         ]},
         { "name": "Score", "fields": [
-          { "name": "points", "type": "integer", "min": 10, "max": 100 }
+          { "name": "points", "type": "integer", "min": 10, "max": 100 },
+          { "name": "seq", "type": "integer", "min": 3000000000, "max": 4102444800 }
         ]}
       ],
       "endpoints": [

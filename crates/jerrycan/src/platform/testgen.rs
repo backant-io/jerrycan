@@ -20,7 +20,7 @@ fn fixture_value(f: &Field) -> String {
     // field keeps the exact literals below (byte-identity for every existing
     // design).
     if has_int_range(f) {
-        return clamp_int(1, f).to_string();
+        return int_literal(clamp_int(1, f));
     }
     if has_len_range(f) {
         return format!("\"{}\"", constrained_fixture_string(f));
@@ -57,6 +57,23 @@ fn has_int_range(f: &Field) -> bool {
 /// branch first anyway.
 fn has_len_range(f: &Field) -> bool {
     matches!(f.field_type, FieldType::String) && (f.min_len.is_some() || f.max_len.is_some())
+}
+
+/// Render a constrained-integer value for embedding inside a
+/// `serde_json::json!` probe body (#80): `json!` types a bare numeric literal
+/// as `i32`, so a value outside i32 range (a bound like `max: 4102444800`)
+/// would be a HARD compile error in the generated suite under rustc's
+/// deny-by-default `overflowing_literals`. Suffix `i64` exactly when the
+/// value is outside i32 range; everything in-range stays an unsuffixed
+/// literal (byte-identity for every existing design). The `id` fixture never
+/// routes through here — JC0552 refuses constraints on the pk — so a suffixed
+/// value can never leak into a URL path.
+fn int_literal(v: i64) -> String {
+    if v < i64::from(i32::MIN) || v > i64::from(i32::MAX) {
+        format!("{v}i64")
+    } else {
+        v.to_string()
+    }
 }
 
 /// Clamp `v` into the field's declared `[min, max]` (#80): below-min snaps to
@@ -468,7 +485,9 @@ const REJECT_LEN_CAP: u64 = 4096;
 /// `max: i64::MAX`, `min_len: 0`, `max_len: u64::MAX` out of the runtime
 /// check — and here the checked arithmetic fails on precisely those, so the
 /// probe never asserts a 422 the validator won't produce):
-/// - integer: `max + 1` (checked), falling back to `min - 1` (checked);
+/// - integer: `max + 1` (checked), falling back to `min - 1` (checked),
+///   rendered via [`int_literal`] so an out-of-i32-range value compiles
+///   inside `serde_json::json!`;
 /// - string: `"a".repeat(max_len + 1)` — an EXPRESSION, valid inside
 ///   `serde_json::json!`, so the generated file never embeds a giant literal —
 ///   capped by [`REJECT_LEN_CAP`], falling back to `"a".repeat(min_len - 1)`.
@@ -478,7 +497,7 @@ fn constraint_reject_literal(f: &Field) -> Option<String> {
             .max
             .and_then(|mx| mx.checked_add(1))
             .or_else(|| f.min.and_then(|mn| mn.checked_sub(1)))
-            .map(|bad| bad.to_string()),
+            .map(int_literal),
         // A `values` field rides the enum reject probe instead (and a
         // values+length combination is refused at design time, JC0552).
         FieldType::String if f.values.is_none() => {

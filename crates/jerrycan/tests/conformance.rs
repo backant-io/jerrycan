@@ -1347,7 +1347,12 @@ fn body_omittable_fields_go_green_on_a_correct_scaffold() {
 /// carries the `"a".repeat(31)` over-max EXPRESSION; `priority`/`points`
 /// (integer min/max, both minimums above the default fixture `1`) force the
 /// in-range clamp — a broken derivation would send `1`, trip the migration
-/// CHECK, and turn the 201 probes red.
+/// CHECK, and turn the 201 probes red. `seq` (min 3000000000 / max
+/// 4102444800, both `> i32::MAX`) forces the `i64`-suffixed fixture literal
+/// (0.6.5 final review, Critical): a bare `3000000000` inside
+/// `serde_json::json!` is typed i32 and the whole suite is a HARD compile
+/// error — this test COMPILES AND RUNS the generated probes, so a regression
+/// can't scaffold-and-pass again.
 const LIMITS: &str = include_str!("../../../conformance/designs/limits-api.design.json");
 
 /// The correct limits-api handlers: plain store + echo. Deliberately ZERO
@@ -1414,6 +1419,7 @@ fn constrained_design_goes_green_on_a_correct_scaffold() {
         "CHECK (length(\"body\") BETWEEN 2 AND 30)",
         "CHECK (\"priority\" BETWEEN 2 AND 5)",
         "CHECK (\"points\" BETWEEN 10 AND 100)",
+        "CHECK (\"seq\" BETWEEN 3000000000 AND 4102444800)",
     ] {
         assert!(
             ddl.contains(check),
@@ -1477,6 +1483,14 @@ fn constrained_design_goes_green_on_a_correct_scaffold() {
     assert!(
         acceptance.contains("\"priority\": 2") && acceptance.contains("\"points\": 10"),
         "integer fixtures must clamp into the declared range:\n{acceptance}"
+    );
+    // A `> i32::MAX` bound emits an `i64`-suffixed fixture literal — a bare
+    // `3000000000` inside `serde_json::json!` is typed i32 and the generated
+    // suite would not COMPILE (deny-by-default `overflowing_literals`); the
+    // red/green runs below execute it, so this can't regress silently.
+    assert!(
+        acceptance.contains("\"seq\": 3000000000i64"),
+        "out-of-i32-range fixtures must be i64-suffixed:\n{acceptance}"
     );
 
     // RED: stubs (500) fail exactly the four success/404 probes — the three

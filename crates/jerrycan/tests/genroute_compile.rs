@@ -1209,9 +1209,12 @@ fn guarded_identity_fk_scaffold_accepts_bodies_without_user_id() {
 /// clippy::collapsible_if case), an OPTIONAL TWO-BOUND string (`label`,
 /// min_len + max_len → the consecutive-let-chain shape, T2-fix Minor-2), an
 /// optional min-only int (`rating`), an "unbounded" `max: i64::MAX` int
-/// (`views` → the unused_comparisons case), and an optional enum (`priority` →
-/// the #47 E0308 twin). Shared by the memory and db gates below via
-/// `constrained_design`.
+/// (`views` → the unused_comparisons case), an optional enum (`priority` →
+/// the #47 E0308 twin), and two `> i32::MAX` bounds (`starts_at`/`seq` → the
+/// 0.6.5 final-review overflowing_literals case: large literals must stay
+/// compilable in the validators here and `i64`-suffixed in the gen-tests
+/// probes, covered end-to-end by conformance's limits-api). Shared by the
+/// memory and db gates below via `constrained_design`.
 const CONSTRAINED_MODULES: &str = r#""modules": [{
         "name": "items",
         "entities": [{ "name": "Item", "fields": [
@@ -1220,7 +1223,9 @@ const CONSTRAINED_MODULES: &str = r#""modules": [{
             { "name": "label", "type": "string", "required": false, "min_len": 2, "max_len": 20 },
             { "name": "rating", "type": "integer", "required": false, "min": 1 },
             { "name": "views", "type": "integer", "max": 9223372036854775807 },
-            { "name": "priority", "type": "string", "required": false, "values": ["low", "high"] }
+            { "name": "priority", "type": "string", "required": false, "values": ["low", "high"] },
+            { "name": "starts_at", "type": "integer", "required": false, "min": 0, "max": 4102444800 },
+            { "name": "seq", "type": "integer", "required": false, "min": 3000000000 }
         ]}],
         "endpoints": [
             { "operation_id": "list_items", "method": "GET", "path": "/",
@@ -1334,10 +1339,12 @@ mod constraint_roundtrip {
         assert!(bad.is_err(), "priority outside values must be rejected");
         let bad = serde_json::from_str::<Item>(r#"{"quantity": 601, "views": 1}"#);
         assert!(bad.is_err(), "quantity 601 must violate max 600");
+        let bad = serde_json::from_str::<Item>(r#"{"quantity": 5, "views": 1, "seq": 2999999999}"#);
+        assert!(bad.is_err(), "seq below min 3000000000 must be rejected");
         let ok = serde_json::from_str::<Item>(
-            r#"{"quantity": 5, "views": 1, "note": "ok", "rating": 3, "priority": "low"}"#,
+            r#"{"quantity": 5, "views": 1, "note": "ok", "rating": 3, "priority": "low", "starts_at": 4102444800, "seq": 3000000000}"#,
         );
-        assert!(ok.is_ok(), "in-range values must pass: {ok:?}");
+        assert!(ok.is_ok(), "in-range values (incl. > i32::MAX) must pass: {ok:?}");
     }
 }
 "##,

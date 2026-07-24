@@ -2681,6 +2681,48 @@ fn constrained_body_gets_out_of_range_reject_probe_on_create_and_update() {
     );
 }
 
+/// #80 (0.6.5 final review, Critical): `serde_json::json!` types a bare
+/// numeric literal as `i32`, so a constrained-integer fixture or reject value
+/// OUTSIDE i32 range must be emitted `i64`-suffixed — a plain `3000000000`
+/// inside a probe body is a HARD compile error in the generated suite
+/// (deny-by-default `overflowing_literals`), failing `cargo test` on a
+/// JC0552-clean design. Values inside i32 range stay unsuffixed, keeping
+/// every existing design's output byte-identical.
+#[test]
+fn out_of_i32_range_bounds_emit_i64_suffixed_literals() {
+    let d = constrained_design(serde_json::json!([
+        { "name": "starts_at", "type": "integer", "min": 0, "max": 4102444800i64 },
+        { "name": "seq", "type": "integer", "min": 3000000000i64 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    // Happy-path fixture: clamp(1) up to min 3000000000 — beyond i32, suffixed.
+    assert!(
+        generated.contains("\"seq\": 3000000000i64"),
+        "out-of-i32-range fixture must be i64-suffixed: {generated}"
+    );
+    // Reject literal: max + 1 = 4102444801 — beyond i32, suffixed.
+    assert!(
+        generated.contains("\"starts_at\": 4102444801i64"),
+        "out-of-i32-range reject literal must be i64-suffixed: {generated}"
+    );
+    // A constrained value INSIDE i32 range stays a plain literal (the
+    // byte-identity guarantee for every existing design).
+    assert!(
+        generated.contains("\"starts_at\": 1,"),
+        "in-i32-range fixture stays unsuffixed: {generated}"
+    );
+
+    // The negative direction: a bound below i32::MIN suffixes too.
+    let d = constrained_design(serde_json::json!([
+        { "name": "depth", "type": "integer", "max": -3000000000i64 }
+    ]));
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        generated.contains("\"depth\": -3000000000i64"),
+        "below-i32::MIN fixture must be i64-suffixed: {generated}"
+    );
+}
+
 /// #80: the constraint reject probes PASS on stubs (the 422 precedes the
 /// handler), so `expected_failing` must exclude them — exactly like the #47
 /// enum rejects. Otherwise the RED-on-stubs invariant over-counts.

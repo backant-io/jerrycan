@@ -853,6 +853,10 @@ fn bounds_rules(f: &Field, var: &str) -> Vec<(String, String)> {
     if let Some(mx) = f.max_len
         && mx < u64::MAX
     {
+        // NOTE: `{mx}` lands as a bare literal typed `usize` (against
+        // `chars().count()`), so a `max_len` above u32::MAX would trip
+        // `overflowing_literals` on a 32-bit TARGET. Jerrycan apps are 64-bit
+        // servers, so no cap is enforced; revisit if 32-bit targets ever matter.
         rules.push((
             format!("{var}.chars().count() > {mx}"),
             format!("{} must be at most {mx} characters", f.name),
