@@ -148,6 +148,74 @@ fn db_mode_wires_main_and_aggregated_migrations() {
     assert!(root.join("openapi.json").exists());
 }
 
+/// Pipe a file through the pinned toolchain's rustfmt (the same one `cargo fmt`
+/// runs) with the generated apps' edition. cwd is pinned to the app root so no
+/// stray rustfmt.toml changes the defaults.
+fn rustfmt(root: &std::path::Path, src: &str) -> String {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("rustfmt")
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("rustfmt must be runnable (pinned toolchain component)");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(src.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "rustfmt failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// #128: the tool-owned app/src/main.rs and app/src/migrations.rs must be
+/// rustfmt FIXPOINTS for every app shape. Agents run `cargo fmt` before
+/// `jerrycan check`; if fmt rewraps a GENERATED file the agent never touched
+/// (the OpenApi extend line, a >100-char `workspaces` postgres include_str!,
+/// or the single-migration array rustfmt collapses to `&[Migration { .. }]`),
+/// JL0003 fires on it and blames the agent for drift it didn't cause. WHY a
+/// real rustfmt round-trip: string goldens can't prove fixpoint-ness — only
+/// feeding the emitted bytes back through rustfmt can.
+#[test]
+fn tool_owned_main_and_migrations_are_rustfmt_fixpoints() {
+    for design_src in [
+        // openapi extend line + multi-entry migrations with a >100-char postgres path
+        include_str!("../../../conformance/designs/reference-slice.design.json"),
+        // single-module db app: the collapsed `&[Migration { .. }]` shape
+        include_str!("../../../conformance/designs/limits-api.design.json"),
+        // memory mode: no migrations.rs, main.rs without the openapi line
+        GOLDEN,
+    ] {
+        let design: Design = serde_json::from_str(design_src).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        scaffold::scaffold(&root, &design).unwrap();
+        for rel in ["crates/app/src/main.rs", "crates/app/src/migrations.rs"] {
+            let path = root.join(rel);
+            if !path.exists() {
+                continue;
+            }
+            let emitted = fs::read_to_string(&path).unwrap();
+            let formatted = rustfmt(&root, &emitted);
+            assert_eq!(
+                emitted, formatted,
+                "{} must be a rustfmt fixpoint for design `{}` — otherwise an \
+                 agent's `cargo fmt` rewrites it and JL0003 fires on a file the \
+                 agent never touched",
+                rel, design.name
+            );
+        }
+    }
+}
+
 #[test]
 fn sql_identifiers_are_quoted_so_reserved_words_survive() {
     // A field named `order` is a SQL reserved word; quoting is the only thing that
