@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.6 — 2026-07-24
+
+Security.
+
+### Security
+- **jsonwebtoken 9 → 10.4.0 (#162, GHSA-h395-gr6q-cpjc).** Upgrades the JWT
+  library past a type-confusion advisory that can lead to an authorization
+  bypass. jsonwebtoken 10 removed its built-in `ring` backend, so jerrycan-auth's
+  `idtoken` (OAuth id-token / JWKS) verifier now installs its own **RS256-only
+  crypto provider backed by `ring`** — the crypto backend already in the tree via
+  rustls — which keeps the pure-Rust `rsa` crate (and the RUSTSEC-2023-0071
+  Marvin timing advisory) off the compiled path. RS256 stays pinned in three
+  independent layers (the JWS header `alg`, the `Validation` algorithm allowlist,
+  and the provider itself); non-RS256, `alg:none`, and an HMAC alg keyed with the
+  RSA public key are all rejected.
+- **The id-token `aud` claim is now required to be present** (previously it was
+  only checked when present) — a validly-signed token that omits its audience is
+  rejected (401).
+
+### Note for embedders
+- jerrycan-auth installs jsonwebtoken 10's process-global crypto provider on the
+  first use of the `idtoken` verifier. An application that *also* uses the
+  `jsonwebtoken` 10 crate directly and calls `decode`/`encode` **before** any
+  jerrycan verifier exists — with neither the `aws_lc_rs` nor `rust_crypto`
+  backend feature enabled — will seed jsonwebtoken's provider with a panicking
+  placeholder (a loud crash, never an unsafe accept). Construct a jerrycan
+  verifier, or enable a jsonwebtoken backend feature, before such direct use.
+
 ## 0.6.5 — 2026-07-24
 
 The #1 contract gap by eval demand: **field length/range constraints**.
