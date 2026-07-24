@@ -281,8 +281,8 @@ pub const REGISTRY: &[CodeInfo] = &[
     CodeInfo {
         code: "JC0552",
         title: "invalid field range/length constraint",
-        cause: "a field's `min`/`max`/`min_len`/`max_len` constraint (#80) is unusable: range keys on a non-integer field or length keys on a non-string field, an empty range (min > max, or min_len > max_len), a length bound combined with enum `values` (the enum already fixes the exact allowed strings), `max_len: 0` on a required field (unfillable), any constraint key on the pk `id` (ids are server-assigned; the generated probes and seeds assume them free), a `min_len` above the 4096 fixture ceiling, or a `default` outside the field's own bounds — each would generate an app whose validator or acceptance fixtures could never pass",
-        fix: "put `min`/`max` on integer fields and `min_len`/`max_len` on string fields (inclusive, length in Unicode code points), keep min <= max and min_len <= max_len with min_len at most 4096, drop length bounds from enum `values` fields and every constraint key from `id`, and pick a `default` inside the field's declared bounds",
+        cause: "a field's `min`/`max`/`min_len`/`max_len` constraint (#80) is unusable: range keys on a non-integer field or length keys on a non-string field, an empty range (min > max, or min_len > max_len), a length bound combined with enum `values` (the enum already fixes the exact allowed strings), `max_len: 0` on a required field (unfillable), any constraint key on the pk `id` (ids are server-assigned; the generated probes and seeds assume them free), a `min_len` above the 4096 fixture ceiling, a `default` outside the field's own bounds, or a `unique` field whose constraint admits fewer than 3 distinct values (`max - min + 1 < 3`, or `max_len: 0`) — the generated suite needs up to 3 distinct in-range values per field (the probe fixture and the two tenant seeds), so a narrower unique range collides on its own UNIQUE index; each of these would generate an app whose validator or acceptance fixtures could never pass",
+        fix: "put `min`/`max` on integer fields and `min_len`/`max_len` on string fields (inclusive, length in Unicode code points), keep min <= max and min_len <= max_len with min_len at most 4096, drop length bounds from enum `values` fields and every constraint key from `id`, pick a `default` inside the field's declared bounds, and give a `unique` field's constraint room for at least 3 distinct values",
         doc: "jerrycan docs validation",
     },
     CodeInfo {
@@ -486,9 +486,21 @@ mod tests {
             "cause must name the length keys and the pk-id refusal: {}",
             info.cause
         );
+        // #80 T3: the unique-cardinality arm (a unique field needs room for
+        // the 3 distinct values the generated seeds/fixture materialize).
+        assert!(
+            info.cause.contains("`unique`") && info.cause.contains("3 distinct"),
+            "cause must name the unique-cardinality refusal: {}",
+            info.cause
+        );
         assert!(
             info.fix.contains("integer fields") && info.fix.contains("4096"),
             "fix must name the placement rule and the ceiling: {}",
+            info.fix
+        );
+        assert!(
+            info.fix.contains("at least 3 distinct values"),
+            "fix must name the unique-cardinality remedy: {}",
             info.fix
         );
     }

@@ -1206,15 +1206,18 @@ fn guarded_identity_fk_scaffold_accepts_bodies_without_user_id() {
 /// The 0.6.5 T2 review battery (#80): every constrained-field shape that broke
 /// a freshly scaffolded app, in one module — a required range int (`quantity`),
 /// an OPTIONAL SINGLE-BOUND string (`note`, max_len only → the
-/// clippy::collapsible_if case), an optional min-only int (`rating`), an
-/// "unbounded" `max: i64::MAX` int (`views` → the unused_comparisons case), and
-/// an optional enum (`priority` → the #47 E0308 twin). Shared by the memory and
-/// db gates below via `constrained_design`.
+/// clippy::collapsible_if case), an OPTIONAL TWO-BOUND string (`label`,
+/// min_len + max_len → the consecutive-let-chain shape, T2-fix Minor-2), an
+/// optional min-only int (`rating`), an "unbounded" `max: i64::MAX` int
+/// (`views` → the unused_comparisons case), and an optional enum (`priority` →
+/// the #47 E0308 twin). Shared by the memory and db gates below via
+/// `constrained_design`.
 const CONSTRAINED_MODULES: &str = r#""modules": [{
         "name": "items",
         "entities": [{ "name": "Item", "fields": [
             { "name": "quantity", "type": "integer", "min": 1, "max": 600 },
             { "name": "note", "type": "string", "required": false, "max_len": 20 },
+            { "name": "label", "type": "string", "required": false, "min_len": 2, "max_len": 20 },
             { "name": "rating", "type": "integer", "required": false, "min": 1 },
             { "name": "views", "type": "integer", "max": 9223372036854775807 },
             { "name": "priority", "type": "string", "required": false, "values": ["low", "high"] }

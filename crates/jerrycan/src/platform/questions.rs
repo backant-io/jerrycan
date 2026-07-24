@@ -781,6 +781,23 @@ pub fn validate(d: &Design) -> Vec<Question> {
                                     f.name
                                 ),
                             ));
+                        } else if f.unique
+                            && let (Some(mn), Some(mx)) = (f.min, f.max)
+                            && (mx as i128) - (mn as i128) + 1 < 3
+                        {
+                            // #80 (T3): the generated suite materializes up to
+                            // THREE distinct values per field — the probe
+                            // fixture plus the tenant-1 and tenant-2 seeds —
+                            // so a `unique` range below that collides on the
+                            // UNIQUE index and is un-greenable by construction.
+                            qs.push(q(
+                                format!("{ptr}/entities/{i}/fields/{j}/min"),
+                                format!(
+                                    "Field `{}` is `unique` but its range [min {mn}, max {mx}] admits only {} distinct value(s) — the generated seeds and probe fixture need up to 3 distinct in-range values (the request fixture and the two tenant seeds), so uniqueness cannot hold. Widen the range to at least 3 values, or drop `unique`. See `jerrycan explain JC0552`.",
+                                    f.name,
+                                    (mx as i128) - (mn as i128) + 1
+                                ),
+                            ));
                         }
                     }
                     if f.min_len.is_some() || f.max_len.is_some() {
@@ -827,6 +844,19 @@ pub fn validate(d: &Design) -> Vec<Question> {
                                 format!("{ptr}/entities/{i}/fields/{j}/max_len"),
                                 format!(
                                     "Field `{}` is required but declares `max_len: 0` — an unfillable field: no value satisfies a zero-length required string. Raise `max_len`, or make the field optional (`required: false`). See `jerrycan explain JC0552`.",
+                                    f.name
+                                ),
+                            ));
+                        } else if f.max_len == Some(0) && f.unique {
+                            // #80 (T3): the string twin of the unique-range
+                            // rule — `max_len: 0` admits ONLY the empty
+                            // string, so the seeds cannot be distinct. Any
+                            // max_len >= 1 is fine: the seed derivations lead
+                            // with distinct characters ('t'/'s'/a digit).
+                            qs.push(q(
+                                format!("{ptr}/entities/{i}/fields/{j}/max_len"),
+                                format!(
+                                    "Field `{}` is `unique` but declares `max_len: 0` — the empty string is the only possible value, so the generated seeds cannot derive distinct values. Raise `max_len`, or drop `unique`. See `jerrycan explain JC0552`.",
                                     f.name
                                 ),
                             ));
@@ -3288,6 +3318,59 @@ mod tests {
                     && q.question.contains("JC0552")),
             "{qs:?}"
         );
+    }
+
+    /// #80 (T3): a `unique` field needs room for the distinct values the
+    /// generated suite materializes — the probe fixture plus the tenant-1 and
+    /// tenant-2 seeds, i.e. up to THREE distinct in-range values per field. A
+    /// range admitting fewer makes the design un-greenable by construction
+    /// (the seeds would collide on the UNIQUE index), so it is refused.
+    #[test]
+    fn unique_with_a_range_below_three_values_is_refused() {
+        for field in [
+            r#"{ "name": "slots", "type": "integer", "unique": true, "min": 5, "max": 5 }"#,
+            r#"{ "name": "slots", "type": "integer", "unique": true, "min": 1, "max": 2 }"#,
+        ] {
+            let qs = validate(&constraint_base(field));
+            assert!(
+                qs.iter()
+                    .any(|q| q.id == "/modules/0/entities/0/fields/0/min"
+                        && q.question.contains("unique")
+                        && q.question.contains("JC0552")),
+                "{field}: {qs:?}"
+            );
+        }
+        // Three or more distinct values: clean (the seeds fit).
+        let ok = constraint_base(
+            r#"{ "name": "slots", "type": "integer", "unique": true, "min": 1, "max": 600 },
+               { "name": "trio", "type": "integer", "unique": true, "min": 1, "max": 3 }"#,
+        );
+        assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
+        // Without `unique` a single-value range is legal (no distinctness need).
+        let ok = constraint_base(r#"{ "name": "slots", "type": "integer", "min": 5, "max": 5 }"#);
+        assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
+    }
+
+    /// #80 (T3): the string twin — `max_len: 0` admits ONLY the empty string,
+    /// so a `unique` field can never seed distinct values. Any `max_len >= 1`
+    /// stays clean: the seed derivations lead with distinct characters
+    /// ('t'/'s'/a digit), so even one code point suffices.
+    #[test]
+    fn unique_with_max_len_zero_is_refused() {
+        let qs = validate(&constraint_base(
+            r#"{ "name": "slug", "type": "string", "unique": true, "max_len": 0, "required": false }"#,
+        ));
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/max_len"
+                    && q.question.contains("unique")
+                    && q.question.contains("JC0552")),
+            "{qs:?}"
+        );
+        let ok = constraint_base(
+            r#"{ "name": "slug", "type": "string", "unique": true, "max_len": 1 }"#,
+        );
+        assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
     }
 
     /// A server-owned `default` is written verbatim, so it must satisfy the
