@@ -141,6 +141,23 @@ fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
     for ec in &ep.errors {
         op["responses"][ec.status.to_string()] = json!({ "description": ec.when });
     }
+    // #115: a create (POST with a body) on an entity carrying a composite `unique`
+    // group may 409 on a duplicate `(col, …)` (the CREATE UNIQUE INDEX → JC0409) —
+    // document it so a generated client expects the conflict. Only when the design
+    // hasn't already declared a 409 for this op (keep the author's description).
+    if ep.method == HttpMethod::POST
+        && op["responses"].get("409").is_none()
+        && let Some(rb) = &ep.request_body
+        && let Some(group) = m
+            .entities
+            .iter()
+            .find(|e| e.name == rb.entity)
+            .and_then(|e| e.unique.first())
+    {
+        let cols = group.join(", ");
+        op["responses"]["409"] =
+            json!({ "description": format!("a row with the same ({cols}) already exists") });
+    }
     op
 }
 
@@ -1041,5 +1058,46 @@ mod tests {
                 "shared path `{k}` must be identical with/without tenancy"
             );
         }
+    }
+
+    /// #115: a create (POST) on an entity with a composite `unique` group carries a
+    /// documented 409 whose description names the columns; a plain create does not.
+    #[test]
+    fn composite_unique_create_documents_a_409() {
+        const LIKES: &str = r#"{
+            "name": "likes-api", "contract_version": 1,
+            "dependencies": ["db"],
+            "modules": [{
+                "name": "engagement",
+                "entities": [
+                    { "name": "Post", "fields": [{ "name": "title", "type": "string" }] },
+                    { "name": "Like",
+                      "belongs_to": [{ "entity": "Post" }],
+                      "unique": [["post_id", "reaction"]],
+                      "fields": [{ "name": "reaction", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_post", "method": "POST", "path": "/posts",
+                      "request_body": { "entity": "Post" },
+                      "success": { "status": 201, "entity": "Post" } },
+                    { "operation_id": "create_like", "method": "POST", "path": "/likes",
+                      "request_body": { "entity": "Like" },
+                      "success": { "status": 201, "entity": "Like" } }
+                ]
+            }]
+        }"#;
+        let d = document(&serde_json::from_str::<Design>(LIKES).unwrap());
+        let like = &d["paths"]["/engagement/likes"]["post"];
+        assert_eq!(
+            like["responses"]["409"]["description"],
+            "a row with the same (post_id, reaction) already exists",
+            "the composite-unique create must document a 409 naming the columns: {like}"
+        );
+        // A plain create (no composite unique on Post) gets no 409.
+        let post = &d["paths"]["/engagement/posts"]["post"];
+        assert!(
+            post["responses"].get("409").is_none(),
+            "a plain create carries no composite-unique 409: {post}"
+        );
     }
 }

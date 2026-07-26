@@ -127,6 +127,20 @@ Fix every question before scaffolding.
   rejected as unimplementable (`JC0549`): the owner-scoped repo has no unscoped read
   and the handler no session user. The fork is: set `public_read: true`, or keep the
   GET authenticated.
+- `unique?` — defaults to `[]`. **Table-level composite UNIQUE** (issue #115): each
+  inner array is one `UNIQUE(col, …)` over **2 or more** columns, emitted as a
+  `CREATE UNIQUE INDEX` — a DB-enforced "one row per (a, …)" invariant, so a duplicate
+  `(a, …)` insert surfaces as `409 JC0409` (no racy SELECT-then-INSERT, no TOCTOU
+  window). The primary use is a composite over two `belongs_to` fk columns — a like per
+  `(user, post)`, an enrollment per `(user, course)`: `"unique": [["user_id",
+  "post_id"]]`. Each column is a declared FIELD name OR a `belongs_to` fk column
+  (`snake_case(entity) + "_id"`). Single-column uniqueness stays `field.unique` — a
+  1-column group is refused. `JC0559` refuses a group with fewer than 2 DISTINCT
+  columns (a repeated column like `["a", "a"]` too), an unknown column (neither a
+  field nor a belongs_to fk), or a duplicate group (order-insensitive). The generated
+  acceptance suite includes a `{entity}_composite_unique_{ordinal}_is_409` test whose
+  duplicate row differs only on the composite columns (every other unique key bumped),
+  and the OpenAPI create op documents the 409.
 - `fields` (REQUIRED) — at least one (see Field).
 
 The SQL **table name** defaults to `snake_case(entity)`, pluralized — `Ticket` →

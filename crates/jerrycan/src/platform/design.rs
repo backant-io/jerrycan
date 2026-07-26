@@ -161,6 +161,14 @@ pub struct Entity {
     /// skipped when false, so every existing design round-trips byte-identically.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub public_read: bool,
+    /// Table-level composite UNIQUE constraints (issue #115): each inner vec is one
+    /// `UNIQUE(col, …)` over ≥2 columns, so a "one row per (a,b)" invariant is a DB
+    /// constraint (a duplicate is 409, no TOCTOU) instead of a racy SELECT-then-INSERT.
+    /// Each column is a field name OR a `belongs_to` fk column. Single-column
+    /// uniqueness stays `Field.unique`. Serde-default empty + skipped so every existing
+    /// design round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unique: Vec<Vec<String>>,
     pub fields: Vec<Field>,
 }
 

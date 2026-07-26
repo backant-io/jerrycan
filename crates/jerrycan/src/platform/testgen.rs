@@ -194,7 +194,7 @@ fn fixture_json(
     m: &ModuleDesign,
     entity: &str,
     omit_identity_fk: bool,
-    bad: Option<(&str, &str)>,
+    overrides: &[(&str, &str)],
     keep_defaults: bool,
 ) -> String {
     let Some(e) = m.entities.iter().find(|e| e.name == entity) else {
@@ -230,13 +230,15 @@ fn fixture_json(
         .iter()
         .filter(|f| (keep_defaults || f.default.is_none()) && !Design::field_is_now_default(f))
         .map(|f| {
-            // The reject probe corrupts ONE field to an out-of-range literal —
-            // the enum sentinel (issue #47) or a #80 constraint violation;
-            // every other field keeps its valid fixture value so the ONLY
-            // reason for a 422 is that field.
-            let value = match bad {
-                Some((name, literal)) if name == f.name => literal.to_string(),
-                _ => fixture_value(f),
+            // `overrides` replaces named fields' literals: the reject probe corrupts
+            // ONE field to an out-of-range value — the enum sentinel (issue #47) or a
+            // #80 constraint violation — so the ONLY reason for a 422 is that field;
+            // the composite-unique dup (#115) bumps every competing `unique`/pk field
+            // to a DISTINCT valid value so ONLY the composite index can 409. An
+            // un-named field keeps its valid fixture value.
+            let value = match overrides.iter().find(|(name, _)| *name == f.name) {
+                Some((_, literal)) => (*literal).to_string(),
+                None => fixture_value(f),
             };
             format!("\"{}\": {}", f.name, value)
         });
@@ -315,7 +317,7 @@ fn seed_line(
             .expect("creator has body")
             .entity,
         omits_identity_fk(design, unit, creator),
-        None,
+        &[],
         false, // seed via the creator (POST) — a create body omits defaults
     );
     if auth && creator.is_guarded() {
@@ -543,7 +545,7 @@ fn request_expr(
     ep: &Endpoint,
     path: &str,
     guarded_and_auth: bool,
-    bad: Option<(&str, &str)>,
+    overrides: &[(&str, &str)],
 ) -> String {
     let body = || {
         ep.request_body
@@ -557,7 +559,7 @@ fn request_expr(
                     unit,
                     &rb.entity,
                     omits_identity_fk(design, unit, ep),
-                    bad,
+                    overrides,
                     // An UPDATE (PUT/PATCH) probe keeps `default` fields so the body
                     // matches `{Entity}UpdateRequest` (issue #85 D1); a create omits them.
                     ep.method.is_update(),
@@ -711,7 +713,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 );
             }
         } else if param_count(ep) == 0 {
-            let request = request_expr(design, unit, ep, &full_path, guarded, None);
+            let request = request_expr(design, unit, ep, &full_path, guarded, &[]);
             // A creator that echoes its entity must echo the id it was given —
             // catches inserts that return a backend default (0) instead.
             let id_echo = (ep.method == HttpMethod::POST)
@@ -784,7 +786,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             // module's seed POST + `/{id}` probe both hit the concrete parent URL.
             if let Some((seed, seed_id)) = seed_for_id_probe(design, unit, &cbase, ep, auth) {
                 let seeded_path = full_path.replacen(&regex_free_param(&ep.path), &seed_id, 1);
-                let request = request_expr(design, unit, ep, &seeded_path, guarded, None);
+                let request = request_expr(design, unit, ep, &seeded_path, guarded, &[]);
                 out.code.push_str(&format!(
                     "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n}}\n\n"
                 ));
@@ -865,7 +867,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 // POST-only `/{id}` action would hit 405, not the 404 we assert.
                 // Guarded endpoints run the auth guard before not-found logic, so
                 // `request_expr` threads the cookie when guarded.
-                let request = request_expr(design, unit, ep, &missing_path, guarded, None);
+                let request = request_expr(design, unit, ep, &missing_path, guarded, &[]);
                 out.code.push_str(&format!(
                     "#[tokio::test]\nasync fn {fn_base}_missing_id_is_404() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 404, \"design: {fn_base} lists 404 ({when}); body: {{}}\", res.text());\n}}\n\n",
                     when = ec.when
@@ -880,9 +882,180 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         }
     }
 
+    // #115: composite / multi-column UNIQUE 409 conflict tests for this unit's
+    // entities (appended after the per-endpoint probes, before recursing).
+    push_composite_unique_tests(design, unit, base, out);
+
     for sub in &unit.subroutes {
         let sub_base = format!("{}{}", base, sub.effective_mount());
         unit_tests(design, sub, &sub_base, out);
+    }
+}
+
+/// Composite / multi-column UNIQUE 409 tests (#115). For each entity in this unit
+/// that declares a `unique` group AND has a probeable collection creator (POST),
+/// emit `{entity}_composite_unique_{ordinal}_is_409` per group: seed the belongs_to
+/// parents once, create a first row, then POST a SECOND row that AGREES on the
+/// group's columns but is bumped to a DISTINCT value on every OTHER competing
+/// unique key — each single-column `unique` field and the explicit client-supplied
+/// pk (a synthetic pk auto-increments, already distinct) — so the ONLY constraint a
+/// duplicate can trip is THIS composite `CREATE UNIQUE INDEX`, via `db_error`. That
+/// isolation is what keeps the test honest: without it, an entity carrying a second
+/// unique key (another field, another group, or a constant pk in the body) would
+/// 409 on THAT key and pass GREEN even if the composite index were missing.
+///
+/// RED on stubs (the first create never inserts, or a stub echo makes the second a
+/// 201, not a 409), so it counts toward `expected_failing` like every create probe
+/// — NOT a `reject`. Skipped (creator credential-gated / `probe: skip`), or emitted
+/// as an AGENT TODO when a competing unique constraint shares no isolable column
+/// with the group (e.g. two fk-only groups, or a `unique` field / pk INSIDE the
+/// group): the 409 could then not be attributed to the composite index alone.
+fn push_composite_unique_tests(
+    design: &Design,
+    unit: &ModuleDesign,
+    base: &str,
+    out: &mut TestOut,
+) {
+    let cbase = concrete_mount_base(base);
+    let auth = out.auth;
+    for e in &unit.entities {
+        if e.unique.is_empty() {
+            continue;
+        }
+        let Some(creator) = creator_for_entity(unit, &e.name) else {
+            continue;
+        };
+        if endpoint_is_credential_gated(creator) || creator.probe == ProbePolicy::Skip {
+            continue;
+        }
+        let guarded = auth && creator.is_guarded();
+        let url = collection_url(&cbase, &creator.path);
+        // Seed belongs_to parents so an enforced intra-module fk resolves (the
+        // identity fk is session-injected, the tenancy entity is app()-seeded —
+        // both skipped by `seed_parents`).
+        let mut seed = String::new();
+        let mut seen = vec![e.name.clone()];
+        seed_parents(design, unit, &cbase, e, auth, &mut seed, &mut seen);
+        let first = request_expr(design, unit, creator, &url, guarded, &[]);
+        let snake = Design::to_snake(&e.name);
+        let status = creator.success.status;
+        // A field the create body actually carries: a `default`/`now`-default field
+        // is server-owned and dropped from the create DTO, so it can neither be
+        // bumped nor is it a body-carried competing key (mirrors fixture_json's
+        // create-body cols filter). An explicit `id` field is a required, constant
+        // `{Entity}Request.id` (genroute) → the body carries a fixed pk that a
+        // duplicate would 409 on; a synthetic pk (no `id` field) auto-increments.
+        let in_create_body = |name: &str| {
+            e.fields
+                .iter()
+                .any(|f| f.name == name && f.default.is_none() && !Design::field_is_now_default(f))
+        };
+        let has_body_pk = e.fields.iter().any(|f| f.name == "id");
+        for (ordinal, group) in e.unique.iter().enumerate() {
+            let cols_human = group.join(", ");
+            let group_cols: std::collections::BTreeSet<&str> =
+                group.iter().map(String::as_str).collect();
+            // Bump every competing single-column `unique` field and the explicit pk
+            // to a DISTINCT value — but only when it is OUTSIDE the group (a group
+            // column is held constant), IN the create body, and expressible as a
+            // distinct value.
+            let overrides: Vec<(String, String)> = e
+                .fields
+                .iter()
+                .filter(|f| {
+                    (f.unique || (f.name == "id" && has_body_pk))
+                        && !group_cols.contains(f.name.as_str())
+                        && in_create_body(&f.name)
+                        && can_bump_distinct(f)
+                })
+                .map(|f| (f.name.clone(), distinct_fixture_value(f)))
+                .collect();
+            let bumped: std::collections::BTreeSet<&str> =
+                overrides.iter().map(|(c, _)| c.as_str()).collect();
+            // Isolation: every OTHER competing unique constraint — each single-column
+            // `unique` field, the explicit pk, and each other composite group — must
+            // share a bumped column, else the dup would 409 on IT (a false green for
+            // this index). A constraint held fully constant can't be separated → TODO.
+            let single_uniques = e.fields.iter().filter(|f| f.unique).map(|f| {
+                std::iter::once(f.name.as_str()).collect::<std::collections::BTreeSet<&str>>()
+            });
+            let pk_constraint = has_body_pk
+                .then(|| std::iter::once("id").collect::<std::collections::BTreeSet<&str>>());
+            let other_groups = e
+                .unique
+                .iter()
+                .enumerate()
+                .filter(|(o, _)| *o != ordinal)
+                .map(|(_, g)| {
+                    g.iter()
+                        .map(String::as_str)
+                        .collect::<std::collections::BTreeSet<&str>>()
+                });
+            let masked = single_uniques
+                .chain(pk_constraint)
+                .chain(other_groups)
+                .any(|c| c.is_disjoint(&bumped));
+            if masked {
+                out.code.push_str(&format!(
+                    "// AGENT TODO: {snake} composite UNIQUE({cols_human}) (group #{ordinal}) shares no isolable column with a competing unique constraint on {name} — a duplicate row would 409 on THAT constraint, not this composite index, so an auto-generated probe could pass GREEN even if this index were missing. Encode this 409 in your own test file with a body that differs ONLY on ({cols_human}).\n\n",
+                    name = e.name,
+                ));
+                continue;
+            }
+            let refs: Vec<(&str, &str)> = overrides
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            let dup = request_expr(design, unit, creator, &url, guarded, &refs);
+            out.code.push_str(&format!(
+                "/// #115 composite UNIQUE({cols_human}) on {name}: a second row sharing the\n/// group's column values — every OTHER `unique` column and the pk bumped to a\n/// DISTINCT value — must 409 ONLY through this composite index, proving it enforces\n/// \"one row per ({cols_human})\" (a conflict, not a race).\n#[tokio::test]\nasync fn {snake}_composite_unique_{ordinal}_is_409() {{\n    let t = app().await;\n{seed}    let first = {first};\n    assert_eq!(first.status().as_u16(), {status}, \"setup: the first {snake} creates ({cols_human}); body: {{}}\", first.text());\n    let dup = {dup};\n    assert_eq!(dup.status().as_u16(), 409, \"design: a duplicate ({cols_human}) must 409 (composite UNIQUE index); body: {{}}\", dup.text());\n}}\n\n",
+                name = e.name,
+            ));
+            out.count += 1;
+        }
+    }
+}
+
+/// Whether [`distinct_fixture_value`] can yield a value DIFFERENT from
+/// [`fixture_value`] for `f`: every shape can, except a single-member enum — which
+/// JC0552's cardinality floor already forbids for a `unique` enum. An un-bumpable
+/// competing field is thus excluded from the bump set, forcing an isolation skip
+/// rather than a silent false green.
+fn can_bump_distinct(f: &Field) -> bool {
+    f.values.as_ref().is_none_or(|v| v.len() >= 2)
+}
+
+/// A valid JSON body literal for `f` GUARANTEED DISTINCT from [`fixture_value`] —
+/// used to bump a competing `unique`/pk column in the composite-unique dup body
+/// (#115) so ONLY the composite index can 409. Mirrors `fixture_value`'s constraint
+/// branches so the bumped value still clears the deserialize validator and any CHECK.
+fn distinct_fixture_value(f: &Field) -> String {
+    if let Some(values) = f.values.as_ref() {
+        // The SECOND declared enum member — valid and distinct (a `unique` enum has
+        // >= 3 members per JC0552; a pk is never an enum). `can_bump_distinct` has
+        // already excluded a degenerate single-member enum from the bump set.
+        if let Some(second) = values.get(1) {
+            return format!("\"{second}\"");
+        }
+        if let Some(first) = values.first() {
+            return format!("\"{first}\"");
+        }
+    }
+    if has_int_range(f) {
+        return int_literal(kth_in_range(f, 1));
+    }
+    if has_len_range(f) {
+        return format!("\"{}\"", constrained_seed_string_n(f, 2));
+    }
+    match f.field_type {
+        FieldType::String => "\"test-value-2\"".to_string(),
+        FieldType::Integer => "2".to_string(),
+        FieldType::Float => "2.0".to_string(),
+        FieldType::Boolean => "true".to_string(),
+        FieldType::Datetime => "\"2026-01-02T00:00:00Z\"".to_string(),
+        // A DIFFERENT valid v4 (distinct from fixture_value's f47ac10b-… v4).
+        FieldType::Uuid => "\"3fa85f64-5717-4562-b3fc-2c963f66afa6\"".to_string(),
+        FieldType::Json => "{\"k\": 1}".to_string(),
     }
 }
 
@@ -897,7 +1070,7 @@ fn push_401_test(
     _seeded: bool,
 ) {
     let fn_base = &ep.operation_id;
-    let request = request_expr(design, unit, ep, path, false, None); // no cookie
+    let request = request_expr(design, unit, ep, path, false, &[]); // no cookie
     out.code.push_str(&format!(
         "#[tokio::test]\nasync fn {fn_base}_without_auth_is_401() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 401, \"design: {fn_base} is guarded — no cookie must 401; body: {{}}\", res.text());\n}}\n\n"
     ));
@@ -922,7 +1095,7 @@ fn push_enum_reject_test(
 ) {
     let fn_base = &ep.operation_id;
     let sentinel = format!("\"{ENUM_REJECT_SENTINEL}\"");
-    let request = request_expr(design, unit, ep, path, guarded, Some((field, &sentinel)));
+    let request = request_expr(design, unit, ep, path, guarded, &[(field, &sentinel)]);
     out.code.push_str(&format!(
         "#[tokio::test]\nasync fn {fn_base}_rejects_out_of_range_{field}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 422, \"design: out-of-range `{field}` enum must 422 at the request boundary, not 500 at the DB CHECK; body: {{}}\", res.text());\n}}\n\n"
     ));
@@ -949,7 +1122,7 @@ fn push_constraint_reject_test(
     literal: &str,
 ) {
     let fn_base = &ep.operation_id;
-    let request = request_expr(design, unit, ep, path, guarded, Some((field, literal)));
+    let request = request_expr(design, unit, ep, path, guarded, &[(field, literal)]);
     out.code.push_str(&format!(
         "#[tokio::test]\nasync fn {fn_base}_rejects_out_of_range_{field}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 422, \"design: out-of-range `{field}` must 422 at the request boundary (the declared min/max/min_len/max_len), not 500 at the DB CHECK; body: {{}}\", res.text());\n}}\n\n"
     ));
@@ -1419,7 +1592,7 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
         module,
         &entity.name,
         omits_identity_fk(design, module, create),
-        None,
+        &[],
         false, // isolation seeds a row via create — a create body omits defaults
     );
     let create_path = format!("{cbase}/");
@@ -1547,7 +1720,7 @@ fn per_user_isolation_test(design: &Design, module: &ModuleDesign) -> String {
         module,
         &entity.name,
         omits_identity_fk(design, module, create),
-        None,
+        &[],
         false, // isolation seeds a row via create — a create body omits defaults
     );
     let create_path = format!("{base}/");
@@ -1654,7 +1827,7 @@ fn public_read_isolation_test(design: &Design, module: &ModuleDesign) -> String 
         module,
         &entity.name,
         omits_identity_fk(design, module, create),
-        None,
+        &[],
         false, // isolation seeds a row via create — a create body omits defaults
     );
     let create_path = format!("{base}/");
@@ -1731,7 +1904,7 @@ fn public_read_isolation_test(design: &Design, module: &ModuleDesign) -> String 
             module,
             &entity.name,
             omits_identity_fk(design, module, put),
-            None,
+            &[],
             true, // an UPDATE body keeps `default` fields ({Entity}UpdateRequest)
         );
         t.push_str(&format!(
@@ -1754,7 +1927,7 @@ fn public_read_isolation_test(design: &Design, module: &ModuleDesign) -> String 
             module,
             &entity.name,
             omits_identity_fk(design, module, put),
-            None,
+            &[],
             true,
         );
         t.push_str(&format!(
@@ -1811,7 +1984,7 @@ fn tenant_collection_isolation_test(design: &Design, module: &ModuleDesign) -> S
         module,
         &entity.name,
         omits_identity_fk(design, module, create),
-        None,
+        &[],
         false, // isolation seeds a row via create — a create body omits defaults
     );
     let hk = design.test_auth_header();

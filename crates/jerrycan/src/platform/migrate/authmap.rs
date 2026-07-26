@@ -44,6 +44,7 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
         table: None,
         belongs_to: vec![],
         public_read: false,
+        unique: vec![],
         fields: vec![
             field("id", FieldType::Uuid, true, false, false),
             field("email", FieldType::String, true, true, false),

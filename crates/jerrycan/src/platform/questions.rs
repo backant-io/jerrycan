@@ -1459,6 +1459,76 @@ pub fn validate(d: &Design) -> Vec<Question> {
         check_public_read(d, m, &format!("/modules/{i}"), &mut qs);
     }
 
+    // JC0559 (#115): a table-level composite `unique` group must be BUILDABLE — the
+    // generator emits one `CREATE UNIQUE INDEX (col, …)` per group (genroute), so a
+    // group is refused when it: has fewer than 2 columns (a single-column unique must
+    // use `Field.unique`, not a 1-col group); names a column that is neither a
+    // declared field nor a `belongs_to` fk column of the entity (the index would
+    // reference a non-existent column and fail at migration apply); or duplicates
+    // another group's column set (order-insensitive — redundant). Applies to every
+    // design (no tenancy/auth prerequisite); an entity with an empty `unique` is inert
+    // (byte-identity baseline).
+    fn check_composite_unique(m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+        for (i, e) in m.entities.iter().enumerate() {
+            if e.unique.is_empty() {
+                continue;
+            }
+            // Valid columns: declared fields ∪ belongs_to fk columns.
+            let mut valid: std::collections::HashSet<String> =
+                e.fields.iter().map(|f| f.name.clone()).collect();
+            for b in &e.belongs_to {
+                valid.insert(Design::fk_column(&b.entity));
+            }
+            let mut seen_sets: Vec<std::collections::BTreeSet<String>> = Vec::new();
+            for (g, group) in e.unique.iter().enumerate() {
+                let gptr = format!("{ptr}/entities/{i}/unique/{g}");
+                // Gate on the count of DISTINCT columns, not raw length: a repeated
+                // column like `["a", "a"]` has 2 entries but 1 distinct column, so
+                // `UNIQUE(a, a)` would silently make column `a` globally unique —
+                // caught here alongside the true <2 case.
+                let distinct: std::collections::BTreeSet<&String> = group.iter().collect();
+                if distinct.len() < 2 {
+                    qs.push(q(
+                        gptr.clone(),
+                        format!(
+                            "Entity `{}` composite `unique` group #{g} has fewer than 2 DISTINCT columns ({group:?}) — a table-level composite UNIQUE expresses a `UNIQUE(a, b)` invariant a single field cannot, and a repeated column (`[\"a\", \"a\"]`) would silently make that lone column globally unique. For single-column uniqueness set `unique: true` on the field instead; a composite group needs at least 2 distinct columns. See `jerrycan explain JC0559`.",
+                            e.name
+                        ),
+                    ));
+                }
+                for col in group {
+                    if !valid.contains(col) {
+                        qs.push(q(
+                            gptr.clone(),
+                            format!(
+                                "Entity `{}` composite `unique` group #{g} names column `{col}`, which is neither a declared field nor a `belongs_to` fk column of `{}` — the generated `CREATE UNIQUE INDEX` would reference a column that does not exist and fail at migration apply. Use a declared field name or a belongs_to fk column (`snake_case(entity) + \"_id\"`). See `jerrycan explain JC0559`.",
+                                e.name, e.name
+                            ),
+                        ));
+                    }
+                }
+                let set: std::collections::BTreeSet<String> = group.iter().cloned().collect();
+                if seen_sets.contains(&set) {
+                    qs.push(q(
+                        gptr,
+                        format!(
+                            "Entity `{}` composite `unique` group #{g} ({group:?}) duplicates an earlier group with the same column set (order does not matter) — a redundant index. List each column set once. See `jerrycan explain JC0559`.",
+                            e.name
+                        ),
+                    ));
+                } else {
+                    seen_sets.push(set);
+                }
+            }
+        }
+        for (i, sub) in m.subroutes.iter().enumerate() {
+            check_composite_unique(sub, &format!("{ptr}/subroutes/{i}"), qs);
+        }
+    }
+    for (i, m) in d.modules.iter().enumerate() {
+        check_composite_unique(m, &format!("/modules/{i}"), &mut qs);
+    }
+
     // Jobs require a database: the engine's default store is Postgres and the
     // generated `jobs(db)` wiring + JOBS_MIGRATIONS run over `jerrycan::db::Db`.
     // A jobs-without-db design can't compile, so reject it here (one error for the
@@ -3019,6 +3089,139 @@ mod tests {
                 .any(|q| q.question.contains("JC0553")),
             "no tenancy → no membership table → no collision: {:?}",
             validate(&no_tenancy)
+        );
+    }
+
+    // ---- #115 (JC0559): composite / multi-column UNIQUE ------------------------
+
+    /// A single-module db design whose `Like` entity declares a composite `unique`
+    /// over its two belongs_to fk columns — the primary #115 shape (a like per
+    /// (user, post)). Question-free as written: the group is buildable.
+    const COMPOSITE_UNIQUE: &str = r#"{
+        "name": "likes-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "engagement",
+            "entities": [
+                { "name": "User", "fields": [{ "name": "email", "type": "string" }] },
+                { "name": "Post", "fields": [{ "name": "title", "type": "string" }] },
+                { "name": "Like",
+                  "belongs_to": [{ "entity": "User" }, { "entity": "Post" }],
+                  "unique": [["user_id", "post_id"]],
+                  "fields": [{ "name": "reaction", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_like", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Like" },
+                  "success": { "status": 201, "entity": "Like" } }
+            ]
+        }]
+    }"#;
+
+    /// JC0559 (#115): a valid composite `unique` over two belongs_to fk columns
+    /// passes clean — the buildable baseline the three refusals are measured
+    /// against, and the byte-identity witness (a field column would pass too).
+    #[test]
+    fn valid_composite_unique_group_over_fk_columns_passes() {
+        assert!(
+            !validate(&design(COMPOSITE_UNIQUE))
+                .iter()
+                .any(|q| q.question.contains("JC0559")),
+            "a buildable fk-pair composite unique must not trip JC0559: {:?}",
+            validate(&design(COMPOSITE_UNIQUE))
+        );
+    }
+
+    /// A group with fewer than 2 columns is a footgun that duplicates the field
+    /// flag — refused, steering to `Field.unique`.
+    #[test]
+    fn composite_unique_group_under_two_columns_is_refused_with_jc0559() {
+        let one_col = COMPOSITE_UNIQUE.replace(r#"[["user_id", "post_id"]]"#, r#"[["user_id"]]"#);
+        let qs = validate(&design(&one_col));
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0559"))
+            .unwrap_or_else(|| panic!("a 1-col group must trip JC0559: {qs:?}"));
+        assert!(
+            hit.question.contains("fewer than 2 DISTINCT columns")
+                && hit.question.contains("unique: true"),
+            "message must name the <2-distinct-col rule and the Field.unique remedy: {}",
+            hit.question
+        );
+        assert_eq!(hit.id, "/modules/0/entities/2/unique/0");
+    }
+
+    /// A repeated column (`["a", "a"]`) has 2 entries but 1 DISTINCT column, so
+    /// `UNIQUE(a, a)` would silently make column `a` globally unique — refused by
+    /// the distinct-count gate, not the raw-length one.
+    #[test]
+    fn composite_unique_group_with_a_repeated_column_is_refused_with_jc0559() {
+        let repeated =
+            COMPOSITE_UNIQUE.replace(r#"[["user_id", "post_id"]]"#, r#"[["user_id", "user_id"]]"#);
+        let qs = validate(&design(&repeated));
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0559"))
+            .unwrap_or_else(|| panic!("a repeated-column group must trip JC0559: {qs:?}"));
+        assert!(
+            hit.question.contains("fewer than 2 DISTINCT columns"),
+            "message must name the distinct-count rule for a repeated column: {}",
+            hit.question
+        );
+        assert_eq!(hit.id, "/modules/0/entities/2/unique/0");
+    }
+
+    /// A column that is neither a declared field nor a belongs_to fk column would
+    /// emit a `CREATE UNIQUE INDEX` that fails at apply — refused loud at `check`.
+    #[test]
+    fn composite_unique_group_with_unknown_column_is_refused_with_jc0559() {
+        let bad = COMPOSITE_UNIQUE.replace(
+            r#"[["user_id", "post_id"]]"#,
+            r#"[["user_id", "widget_id"]]"#,
+        );
+        let qs = validate(&design(&bad));
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0559"))
+            .unwrap_or_else(|| panic!("an unknown column must trip JC0559: {qs:?}"));
+        assert!(
+            hit.question.contains("widget_id") && hit.question.contains("does not exist"),
+            "message must name the offending column and the apply-time failure: {}",
+            hit.question
+        );
+    }
+
+    /// A duplicate group (same column set, order-insensitive) is a redundant
+    /// index — refused.
+    #[test]
+    fn composite_unique_duplicate_group_is_refused_with_jc0559() {
+        // Two groups over the same column set, columns reversed — order-insensitive.
+        let dup = COMPOSITE_UNIQUE.replace(
+            r#"[["user_id", "post_id"]]"#,
+            r#"[["user_id", "post_id"], ["post_id", "user_id"]]"#,
+        );
+        let qs = validate(&design(&dup));
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0559") && q.question.contains("duplicates"))
+            .unwrap_or_else(|| panic!("a duplicate group must trip JC0559: {qs:?}"));
+        assert!(
+            hit.question.contains("order does not matter"),
+            "message must state order-insensitivity: {}",
+            hit.question
+        );
+        assert_eq!(hit.id, "/modules/0/entities/2/unique/1");
+    }
+
+    /// Byte-identity floor: an entity with NO composite `unique` raises no JC0559
+    /// (the whole check is inert unless a group is declared).
+    #[test]
+    fn no_composite_unique_raises_no_jc0559() {
+        assert!(
+            !validate(&design(MINIMAL))
+                .iter()
+                .any(|q| q.question.contains("JC0559")),
+            "a design with no composite unique must never mention JC0559"
         );
     }
 

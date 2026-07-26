@@ -2904,3 +2904,216 @@ fn tenant_seeds_for_constrained_unique_fields_stay_in_range_and_distinct() {
         "tenant-2 seed must be in-range and distinct from tenant 1: {generated}"
     );
 }
+
+/// #115 composite / multi-column UNIQUE: an entity with `unique: [["user_id",
+/// "post_id"]]` gets a `{entity}_composite_unique_{ordinal}_is_409` test — seed the
+/// parents, create a row, then POST a body that agrees on the group → assert 409
+/// (the DB unique index makes the duplicate a conflict). Byte-identity twin: an
+/// entity with no composite `unique` emits no such test.
+#[test]
+fn composite_unique_emits_a_409_conflict_test() {
+    const LIKES: &str = r#"{
+        "name": "likes-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "engagement",
+            "entities": [
+                { "name": "User", "fields": [{ "name": "email", "type": "string" }] },
+                { "name": "Post", "fields": [{ "name": "title", "type": "string" }] },
+                { "name": "Like",
+                  "belongs_to": [{ "entity": "User" }, { "entity": "Post" }],
+                  "unique": [["user_id", "post_id"]],
+                  "fields": [{ "name": "reaction", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_user", "method": "POST", "path": "/users",
+                  "request_body": { "entity": "User" },
+                  "success": { "status": 201, "entity": "User" } },
+                { "operation_id": "create_post", "method": "POST", "path": "/posts",
+                  "request_body": { "entity": "Post" },
+                  "success": { "status": 201, "entity": "Post" } },
+                { "operation_id": "create_like", "method": "POST", "path": "/likes",
+                  "request_body": { "entity": "Like" },
+                  "success": { "status": 201, "entity": "Like" } }
+            ]
+        }]
+    }"#;
+    let d: Design = serde_json::from_str(LIKES).unwrap();
+    let module = &d.modules[0];
+    let generated = testgen::acceptance_rs(&d, module);
+    // The named test exists, keyed on the entity snake + the group ordinal.
+    assert!(
+        generated.contains("async fn like_composite_unique_0_is_409()"),
+        "the composite-unique 409 test must be emitted:\n{generated}"
+    );
+    // It seeds both belongs_to parents (an enforced intra-module fk must resolve).
+    assert!(
+        generated.contains("/engagement/users") && generated.contains("/engagement/posts"),
+        "the 409 test must seed the User and Post parents:\n{generated}"
+    );
+    // It posts the create body twice and asserts the second is a 409.
+    let body = generated
+        .split("async fn like_composite_unique_0_is_409()")
+        .nth(1)
+        .unwrap();
+    let body = body.split("\n}\n").next().unwrap();
+    assert_eq!(
+        body.matches("/engagement/likes").count(),
+        2,
+        "two POSTs to the likes collection (first + duplicate):\n{body}"
+    );
+    assert!(
+        body.contains("assert_eq!(dup.status().as_u16(), 409"),
+        "the duplicate insert must assert 409:\n{body}"
+    );
+
+    // Byte-identity twin: drop the composite unique → no such test.
+    let plain = d.clone();
+    let mut v: serde_json::Value = serde_json::to_value(&plain).unwrap();
+    v["modules"][0]["entities"][2]
+        .as_object_mut()
+        .unwrap()
+        .remove("unique");
+    let plain: Design = serde_json::from_value(v).unwrap();
+    let plain_gen = testgen::acceptance_rs(&plain, &plain.modules[0]);
+    assert!(
+        !plain_gen.contains("_composite_unique_"),
+        "an entity with no composite unique emits no 409 conflict test:\n{plain_gen}"
+    );
+}
+
+/// #115 review — isolation: the composite-unique 409 test must trip ONLY on the
+/// composite index, so its two create bodies AGREE on the group columns
+/// (`user_id`, `course_id`) and DIFFER on every OTHER unique key — a `unique`
+/// field `code` and the explicit string pk `id`. Without this the dup would 409 on
+/// `code` (or on the constant pk) and pass GREEN even if the composite index were
+/// missing — a green-means-safe erosion (spec §D).
+#[test]
+fn composite_unique_dup_bumps_competing_unique_columns_and_pk() {
+    const ENROLL: &str = r#"{
+        "name": "enroll-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "enrollments",
+            "entities": [
+                { "name": "User", "fields": [{ "name": "email", "type": "string" }] },
+                { "name": "Course", "fields": [{ "name": "title", "type": "string" }] },
+                { "name": "Enrollment",
+                  "belongs_to": [{ "entity": "User" }, { "entity": "Course" }],
+                  "unique": [["user_id", "course_id"]],
+                  "fields": [
+                      { "name": "id", "type": "string" },
+                      { "name": "code", "type": "string", "unique": true }
+                  ] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_user", "method": "POST", "path": "/users",
+                  "request_body": { "entity": "User" },
+                  "success": { "status": 201, "entity": "User" } },
+                { "operation_id": "create_course", "method": "POST", "path": "/courses",
+                  "request_body": { "entity": "Course" },
+                  "success": { "status": 201, "entity": "Course" } },
+                { "operation_id": "create_enrollment", "method": "POST", "path": "/enrollments",
+                  "request_body": { "entity": "Enrollment" },
+                  "success": { "status": 201, "entity": "Enrollment" } }
+            ]
+        }]
+    }"#;
+    let d: Design = serde_json::from_str(ENROLL).unwrap();
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    // Isolate the 409 test body (first POST + dup POST).
+    let body = generated
+        .split("async fn enrollment_composite_unique_0_is_409()")
+        .nth(1)
+        .expect("the composite-unique 409 test must be emitted");
+    let body = body.split("\n}\n").next().unwrap();
+    // Two POSTs to the enrollments collection: the first + the duplicate.
+    let first = body.split("let dup =").next().unwrap();
+    let dup = &body[body.find("let dup =").unwrap()..];
+
+    // The GROUP columns are held constant: both bodies carry the SAME fk values
+    // (fk_fixture_value → 1 for both user_id and course_id).
+    assert!(
+        first.contains("\"user_id\": 1") && first.contains("\"course_id\": 1"),
+        "the first body must carry the seeded group fks:\n{first}"
+    );
+    assert!(
+        dup.contains("\"user_id\": 1") && dup.contains("\"course_id\": 1"),
+        "the dup must AGREE with the first on the group columns:\n{dup}"
+    );
+    // The competing `unique` field `code` is bumped: the first uses the fixture
+    // value, the dup a DISTINCT one, so the dup can't 409 on the `code` unique.
+    assert!(
+        first.contains("\"code\": \"test-value\""),
+        "the first body uses the `code` fixture value:\n{first}"
+    );
+    assert!(
+        dup.contains("\"code\": \"test-value-2\"") && !dup.contains("\"code\": \"test-value\""),
+        "the dup must bump the competing `code` unique to a DISTINCT value:\n{dup}"
+    );
+    // The explicit string pk `id` is bumped too (else a constant pk would 409).
+    assert!(
+        first.contains("\"id\": \"test-value\""),
+        "the first body carries the constant fixture pk:\n{first}"
+    );
+    assert!(
+        dup.contains("\"id\": \"test-value-2\"") && !dup.contains("\"id\": \"test-value\""),
+        "the dup must bump the explicit pk to a DISTINCT value:\n{dup}"
+    );
+    assert!(
+        dup.contains("assert_eq!(dup.status().as_u16(), 409"),
+        "the duplicate insert must assert 409:\n{dup}"
+    );
+}
+
+/// #115 review — isolation escape hatch: with `>1` composite group and no
+/// single-column `unique`/pk to bump, a second fk-only group is held fully constant
+/// by the dup and would 409 on ITS index — so neither group's 409 can be attributed
+/// to one index. The generator emits an AGENT TODO instead of a false-green probe.
+#[test]
+fn composite_unique_skips_with_agent_todo_when_a_competing_group_masks() {
+    const TWO_GROUPS: &str = r#"{
+        "name": "pairs-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "pairs",
+            "entities": [
+                { "name": "A", "fields": [{ "name": "label", "type": "string" }] },
+                { "name": "B", "fields": [{ "name": "label", "type": "string" }] },
+                { "name": "C", "fields": [{ "name": "label", "type": "string" }] },
+                { "name": "Pair",
+                  "belongs_to": [{ "entity": "A" }, { "entity": "B" }, { "entity": "C" }],
+                  "unique": [["a_id", "b_id"], ["a_id", "c_id"]],
+                  "fields": [{ "name": "note", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_a", "method": "POST", "path": "/as",
+                  "request_body": { "entity": "A" },
+                  "success": { "status": 201, "entity": "A" } },
+                { "operation_id": "create_b", "method": "POST", "path": "/bs",
+                  "request_body": { "entity": "B" },
+                  "success": { "status": 201, "entity": "B" } },
+                { "operation_id": "create_c", "method": "POST", "path": "/cs",
+                  "request_body": { "entity": "C" },
+                  "success": { "status": 201, "entity": "C" } },
+                { "operation_id": "create_pair", "method": "POST", "path": "/pairs",
+                  "request_body": { "entity": "Pair" },
+                  "success": { "status": 201, "entity": "Pair" } }
+            ]
+        }]
+    }"#;
+    // Two DISTINCT fk-only groups (JC0559-valid): the dup for group 0 holds c_id
+    // constant too, so group 1 (a_id, c_id) also trips — un-isolable → both TODO.
+    let d: Design = serde_json::from_str(TWO_GROUPS).unwrap();
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    assert!(
+        !generated.contains("_composite_unique_0_is_409()")
+            && !generated.contains("_composite_unique_1_is_409()"),
+        "a masked composite group must NOT emit a false-green probe:\n{generated}"
+    );
+    assert!(
+        generated.contains("AGENT TODO: pair composite UNIQUE(a_id, b_id) (group #0)")
+            && generated.contains("AGENT TODO: pair composite UNIQUE(a_id, c_id) (group #1)"),
+        "each masked composite group must emit an AGENT TODO:\n{generated}"
+    );
+}

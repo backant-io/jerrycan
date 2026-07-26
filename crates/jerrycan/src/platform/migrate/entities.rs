@@ -211,6 +211,7 @@ fn build_one(
         table,
         belongs_to,
         public_read: false,
+        unique: vec![],
         fields,
     })
 }
