@@ -165,6 +165,115 @@ fn scaffolded_app_builds_with_zero_warnings() {
     );
 }
 
+/// Issue #116 — the compile proof. A transitively-owned grandchild (`Card`
+/// belongs_to `Board` belongs_to the tenant `Org`) whose flat write lives in an
+/// entity-hosting SUBROUTE (`/cards`, no tenant fk in the path → MembershipSet)
+/// has its generated stub STEERED to `CardRepo::create_for_memberships(...)`.
+/// Before the emission-gate fix, `entity_is_flat_tenant_owned` only scanned the
+/// declaring top-level module's own endpoints — never a subroute — so it returned
+/// false, the repo OMITTED the `*_for_memberships` methods, and a handler that
+/// FOLLOWED its own steer failed to compile (`method not found`) behind a green
+/// `check`. This scaffolds the shape, implements the create by following the steer
+/// verbatim, and requires the workspace to build warning-free: the acceptance
+/// criterion for #116 IS that the framework's own guidance compiles.
+#[test]
+#[ignore = "heavy: scaffolds the #116 grandchild-in-subroute shape and builds it"]
+fn flat_grandchild_steer_following_handler_compiles() {
+    const REPRO_116: &str = r#"{
+        "name": "boards-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "orgs",
+              "entities": [{ "name": "Org", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                  "auth_required": true,
+                  "success": { "status": 200, "entity": "Org", "list": true } }] },
+            { "name": "boards",
+              "entities": [{ "name": "Board",
+                  "belongs_to": [{ "entity": "Org" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "name", "type": "string" }] }],
+              "endpoints": [{ "operation_id": "list_boards", "method": "GET", "path": "/",
+                  "auth_required": true,
+                  "success": { "status": 200, "entity": "Board", "list": true } }],
+              "subroutes": [{
+                  "name": "cards", "mount": "/cards",
+                  "entities": [{ "name": "Card",
+                      "belongs_to": [{ "entity": "Board" }],
+                      "fields": [{ "name": "id", "type": "integer" },
+                                 { "name": "title", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_card", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Card" },
+                      "success": { "status": 201, "entity": "Card" } }]
+              }] }
+        ]
+    }"#;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, REPRO_116).unwrap();
+    let app = tmp.path().join("boards-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "jerrycan new must scaffold the #116 shape");
+
+    // The grandchild's flat write lives in the `cards` subroute of `boards`.
+    let handlers_path = app.join("crates/routes/boards/src/subroutes/cards/handlers.rs");
+    let handlers = std::fs::read_to_string(&handlers_path).unwrap();
+    // The steer names the membership-checked create (fires regardless of the gate).
+    assert!(
+        handlers.contains("CardRepo::create_for_memberships(_user.0.id, card)"),
+        "the subroute stub must steer to create_for_memberships:\n{handlers}"
+    );
+    // The gate must now EMIT that method, or following the steer is method-not-found.
+    let repo =
+        std::fs::read_to_string(app.join("crates/routes/boards/src/subroutes/cards/repo.rs"))
+            .unwrap();
+    assert!(
+        repo.contains("pub async fn create_for_memberships("),
+        "the emission gate must emit create_for_memberships for the grandchild-in-subroute (#116):\n{repo}"
+    );
+
+    // Follow the steer verbatim: call the membership-checked create. Keep the stub's
+    // Err return (the create returns the new id; the point is that it type-checks).
+    let stub = "    Err(Error::internal(\"create_card not implemented — replace this stub\"))";
+    assert!(handlers.contains(stub), "unexpected stub body:\n{handlers}");
+    let implemented = handlers.replace(
+        stub,
+        "    let _id = _repo.create_for_memberships(_user.0.id, _body).await?;\n    Err(Error::internal(\"create_card membership-checked create wired\"))",
+    );
+    std::fs::write(&handlers_path, &implemented).unwrap();
+
+    // The proof: the workspace builds warning-free with a steer-following handler.
+    let out = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .env("RUSTFLAGS", "-D warnings")
+        .args(["build", "--workspace"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a handler following its own #116 steer must compile (was method-not-found):\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// #123a: the full pipeline on a freshly-scaffolded, NEVER-gen-tested app must
 /// not read green — the pre-fix `check` folded a zero-test `cargo test` (exit
 /// 0) into ok:true, so a scaffold nobody ever tested shipped a green verdict.
