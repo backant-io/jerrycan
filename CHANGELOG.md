@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.12 — 2026-07-26
+
+### Fixed
+- **Following the framework's own steer no longer produces a compile error (#116).**
+  A tenant-owned handler stub steers the builder to call
+  `create_for_memberships` / `update_for_memberships` / `remove_for_memberships`,
+  but for a **flat tenant grandchild declared in a nested subroute** the repo
+  emitted none of those methods — so following the generated guidance was a
+  `method not found` behind a green `jerrycan check`. The emission gate
+  (`entity_is_flat_tenant_owned`) scanned only the declaring module's top-level
+  endpoints; it now walks all modules and nested subroutes with each endpoint's
+  own module context, matching the steer's domain, so the (already-correct,
+  #102 transitive-JOIN) membership methods are emitted wherever the steer
+  references them. Byte-identical for every design without this shape.
+
+Follow-up: a single entity carrying **both** a flat write and a path-scoped
+route is a documented non-goal and now fails as a hidden method-not-found — a
+loud refusal is tracked in #175 (no such design exists today).
+
 ## 0.6.11 — 2026-07-26
 
 Auth authorization.
