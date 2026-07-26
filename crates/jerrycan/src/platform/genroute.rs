@@ -1368,25 +1368,47 @@ pub(crate) fn entity_is_flat_tenant_owned(e: &Entity, design: &Design) -> bool {
     if design.tenant_path(&e.name).is_none() {
         return false;
     }
-    let Some(m) = design
-        .modules
-        .iter()
-        .find(|m| m.entities.iter().any(|x| x.name == e.name))
-    else {
-        return false;
-    };
-    let mut flat = false;
-    for ep in &m.endpoints {
-        if endpoint_repo_entity(m, ep) != Some(e.name.as_str()) {
-            continue;
+    // Scan EVERY endpoint bound to this entity across ALL modules AND ALL nested
+    // subroutes — not just the top-level module that DECLARES it (issue #116). The
+    // steer (`tenant_scope_comment`) fires per-endpoint using the endpoint's OWN
+    // module, so a flat write hosted in a subroute (or a module other than the
+    // declaring one) still steers to `create_for_memberships`. A gate that only
+    // scanned the declaring module's top-level `endpoints` saw no `MembershipSet`
+    // route for a grandchild declared in a subroute, returned `false`, and withheld
+    // the very methods the steer references — a `method not found` behind a green
+    // `check`. This gate must cover the steer's whole domain. Each endpoint is
+    // classified with ITS OWN module context: the mount path is what makes a nested
+    // `/{fk}/…` route `PathScoped` vs a flat route `MembershipSet`, so the wrong
+    // module would misclassify. Conservative (unchanged): ANY `PathScoped` route on
+    // the entity ⇒ not flat — a path-scoped write is already covered, and no
+    // mixed-shape design exists today.
+    fn scan(
+        design: &Design,
+        m: &ModuleDesign,
+        entity: &str,
+        saw_path_scoped: &mut bool,
+        saw_flat: &mut bool,
+    ) {
+        for ep in &m.endpoints {
+            if endpoint_repo_entity(m, ep) != Some(entity) {
+                continue;
+            }
+            match design.endpoint_tenant_shape(m, ep) {
+                TenantShape::PathScoped { .. } => *saw_path_scoped = true,
+                TenantShape::MembershipSet => *saw_flat = true,
+                _ => {}
+            }
         }
-        match design.endpoint_tenant_shape(m, ep) {
-            TenantShape::PathScoped { .. } => return false,
-            TenantShape::MembershipSet => flat = true,
-            _ => {}
+        for sub in &m.subroutes {
+            scan(design, sub, entity, saw_path_scoped, saw_flat);
         }
     }
-    flat
+    let mut saw_path_scoped = false;
+    let mut saw_flat = false;
+    for m in &design.modules {
+        scan(design, m, &e.name, &mut saw_path_scoped, &mut saw_flat);
+    }
+    !saw_path_scoped && saw_flat
 }
 
 /// Tenant-scoped accessors for an entity that belongs_to the design's tenancy
@@ -1398,8 +1420,10 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
         return String::new();
     };
     // Tenant-owned directly OR transitively (issue #102): a grandchild reached
-    // through a parent chain gets the scoped accessors too. The JOIN SQL for a
-    // grandchild's filter is Tasks 3/4; this only recognizes ownership.
+    // through a parent chain gets the scoped accessors too. Its filter's JOIN SQL
+    // up the belongs_to chain to the tenant anchor IS emitted below (the
+    // `membership_writes` transitive branch and the non-empty-`joins` read variants,
+    // issue #102); this early return only recognizes ownership.
     if design.tenant_path(&e.name).is_none() {
         return String::new();
     }
@@ -7680,6 +7704,147 @@ pub(crate) mod tests {
         assert!(
             h.contains("async fn list_pages(_repo: Dep<PageRepo>, Path(_site_id): Path<String>)"),
             "a non-id path param referencing a string-pk entity must be Path<String>, not Path<i64>: {h}"
+        );
+    }
+
+    /// Issue #116: the flat-membership-method emission gate must scan the SAME
+    /// endpoint domain the steer does. A transitively-owned grandchild (`Card`
+    /// belongs_to `Board` belongs_to the tenant `Org`) whose flat write lives in a
+    /// SUBROUTE — not the top-level module the entity is declared in — steers its
+    /// stub to `CardRepo::create_for_memberships` (`tenant_scope_comment` fires
+    /// per-endpoint with the subroute as context → `MembershipSet`). Before the fix
+    /// `entity_is_flat_tenant_owned` only scanned the declaring top-level module's
+    /// own `endpoints`, never descending into subroutes, so it returned `false`, the
+    /// repo omitted the `*_for_memberships` methods, and a stub FOLLOWING its own
+    /// steer failed to compile (`method not found`) behind a green `check`. The gate
+    /// now covers the whole tree, so gate ⊇ steer: the method the steer names is
+    /// emitted. Regression: a DIRECT flat child stays flat, a PATH-SCOPED nested
+    /// child stays not-flat (byte-identical), a non-tenant entity stays not-flat.
+    #[test]
+    fn flat_grandchild_write_in_subroute_emits_the_methods_its_steer_references() {
+        // Org (tenant) → Board (direct flat child, top-level `boards`) → Card
+        // (grandchild) declared in `boards`'s flat subroute `cards` with a flat POST.
+        // `orgs` also hosts a PATH-SCOPED subroute (`/{org_id}/widgets`) and the design
+        // carries a non-tenant `Tag`, for the regression legs.
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "boards-api", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "orgs",
+                      "entities": [{ "name": "Org", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                          "auth_required": true,
+                          "success": { "status": 200, "entity": "Org", "list": true } }],
+                      "subroutes": [{
+                          "name": "widgets", "mount": "/{org_id}/widgets",
+                          "entities": [{ "name": "Widget",
+                              "belongs_to": [{ "entity": "Org" }],
+                              "fields": [{ "name": "id", "type": "integer" },
+                                         { "name": "label", "type": "string" }] }],
+                          "endpoints": [{ "operation_id": "list_widgets", "method": "GET", "path": "/",
+                              "auth_required": true,
+                              "success": { "status": 200, "entity": "Widget", "list": true } }]
+                      }] },
+                    { "name": "boards",
+                      "entities": [{ "name": "Board",
+                          "belongs_to": [{ "entity": "Org" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "name", "type": "string" }] }],
+                      "endpoints": [{ "operation_id": "list_boards", "method": "GET", "path": "/",
+                          "auth_required": true,
+                          "success": { "status": 200, "entity": "Board", "list": true } }],
+                      "subroutes": [{
+                          "name": "cards", "mount": "/cards",
+                          "entities": [{ "name": "Card",
+                              "belongs_to": [{ "entity": "Board" }],
+                              "fields": [{ "name": "id", "type": "integer" },
+                                         { "name": "title", "type": "string" }] }],
+                          "endpoints": [{ "operation_id": "create_card", "method": "POST", "path": "/",
+                              "auth_required": true,
+                              "request_body": { "entity": "Card" },
+                              "success": { "status": 201, "entity": "Card" } }]
+                      }] },
+                    { "name": "tags",
+                      "entities": [{ "name": "Tag", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "label", "type": "string" } ]}],
+                      "endpoints": [{ "operation_id": "list_tags", "method": "GET", "path": "/",
+                          "auth_required": true,
+                          "success": { "status": 200, "entity": "Tag", "list": true } }] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let card = d.find_entity("Card").expect("Card entity");
+        let board = d.find_entity("Board").expect("Board entity");
+        let widget = d.find_entity("Widget").expect("Widget entity");
+        let tag = d.find_entity("Tag").expect("Tag entity");
+        let cards = &d.modules[1].subroutes[0];
+        let create_card = &cards.endpoints[0];
+
+        // (a) The gate now agrees with the steer: the flat grandchild is flat.
+        assert!(
+            entity_is_flat_tenant_owned(card, &d),
+            "flat grandchild write hosted in a subroute must be recognized as flat (was false before #116)"
+        );
+
+        // (c) The steer, as emitted in the subroute handler stub, references the
+        //     membership-checked create — gate ⊇ steer, verified against the SAME
+        //     endpoint the steer fires on.
+        assert_eq!(
+            d.endpoint_tenant_shape(cards, create_card),
+            TenantShape::MembershipSet,
+            "the subroute flat write is MembershipSet — the shape the steer keys on"
+        );
+        let stub = handlers_rs(cards, mode, &d);
+        assert!(
+            stub.contains("CardRepo::create_for_memberships(_user.0.id, card)"),
+            "the subroute write stub must steer to the membership-checked create:\n{stub}"
+        );
+
+        // (b) The generated Card repo emits every method the steer can name.
+        let repo = repo_rs(cards, mode, &d).expect("cards subroute emits a repo");
+        for method in [
+            "create_for_memberships",
+            "update_for_memberships",
+            "remove_for_memberships",
+        ] {
+            assert!(
+                repo.contains(&format!("pub async fn {method}(")),
+                "repo must emit {method} (the steer references it):\n{repo}"
+            );
+        }
+        // Grandchild = transitive branch: the create resolves the tenant from the
+        // body's immediate parent fk and JOINs up to the anchor (issue #102), NOT a
+        // direct-fk membership check.
+        assert!(
+            repo.contains("let parent_fk = item.board_id"),
+            "the transitive create must key on the immediate parent fk:\n{repo}"
+        );
+
+        // Regression — no false flip:
+        //   DIRECT flat child stays flat,
+        assert!(
+            entity_is_flat_tenant_owned(board, &d),
+            "a direct flat child stays flat"
+        );
+        //   PATH-SCOPED nested child (`/{org_id}/widgets`) stays not-flat,
+        assert!(
+            !entity_is_flat_tenant_owned(widget, &d),
+            "a path-scoped nested child must stay not-flat (conservative rule, byte-identical)"
+        );
+        //   non-tenant entity stays not-flat.
+        assert!(
+            !entity_is_flat_tenant_owned(tag, &d),
+            "a non-tenant entity is never flat-tenant-owned"
         );
     }
 }
