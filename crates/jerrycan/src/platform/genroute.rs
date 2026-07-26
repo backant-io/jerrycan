@@ -702,10 +702,12 @@ fn keyword_field_attrs(name: &str, indent: &str, db: bool) -> String {
 /// field (issue #112), or empty for a normal field so every design without a
 /// hidden field stays byte-identical. Uses `skip_serializing` (output only),
 /// NEVER `skip`: the entity `Model` is ALSO the input body in the no-DTO path
-/// (`Json<{Entity}>`) AND the SeaORM row, both of which must still DESERIALIZE
-/// the field — `skip` would drop it from client input and break the DB
-/// round-trip. SeaORM still SELECTs the column, so the handler keeps the value
-/// (e.g. for password verification); only the response serialization omits it.
+/// (`Json<{Entity}>`), which must still DESERIALIZE the field — `skip` drops a
+/// field from BOTH directions, so it would silently strip the column from every
+/// client create/update body. Storage is unaffected either way (it never goes
+/// through serde): SeaORM maps the column via `DeriveEntityModel` and memory
+/// mode holds the `Model` struct, so the handler still reads the value (e.g. for
+/// password verification); `skip_serializing` omits only the response.
 fn write_only_attr(f: &Field, indent: &str) -> String {
     if Design::field_is_write_only(f) {
         format!("{indent}#[serde(skip_serializing)]\n")

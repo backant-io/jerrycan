@@ -300,6 +300,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs validation",
     },
     CodeInfo {
+        code: "JC0555",
+        title: "write_only column on a realtime changes entity",
+        cause: "an entity is listed in realtime `changes` AND has a write_only column (an explicit `write_only: true`, or a `password_hash` column auto-hidden by name, issue #112) — but the realtime changes broadcast delivers the RAW database row (every column) to subscribers over the WebSocket, so the write_only column would be exposed to every subscriber even though `#[serde(skip_serializing)]` hides it from REST responses; the secure-by-default REST hide does not reach the changes stream",
+        fix: "remove the write_only column from the changes entity, or drop the entity from realtime `changes` (don't broadcast row changes for it) — reads over REST still hide the column. Column projection (#167) will lift this restriction once the changes broadcast can omit hidden columns",
+        doc: "jerrycan docs realtime",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -555,6 +562,30 @@ mod tests {
         assert!(
             info.fix.to_lowercase().contains("remove") && info.fix.contains("write_only"),
             "fix must name the remove-write_only remedy: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0555_names_the_changes_broadcast_leak_and_both_remedies() {
+        // WHY: JC0555 (#112/#167) closes the realtime egress hole write_only
+        // leaves open — `skip_serializing` hides a secret from REST responses
+        // but the changes broadcast ships the RAW row (every column) over the
+        // WebSocket. `jerrycan explain JC0555` must state the cause (the raw-row
+        // broadcast exposes the hidden column to subscribers) and name BOTH
+        // remedies (remove the column, or drop the entity from `changes`), plus
+        // the #167 projection follow-up.
+        let info = lookup("JC0555").unwrap();
+        assert!(
+            info.cause.contains("write_only") && info.cause.contains("RAW database row"),
+            "cause must tie write_only to the raw-row changes broadcast: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("remove")
+                && info.fix.contains("changes")
+                && info.fix.contains("#167"),
+            "fix must name both remedies and the #167 projection follow-up: {}",
             info.fix
         );
     }

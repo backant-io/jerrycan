@@ -115,3 +115,94 @@ fn expected_main_matches_what_regenerate_writes() {
     let on_disk = fs::read_to_string(root.join("crates/app/src/main.rs")).unwrap();
     assert_eq!(on_disk, mounting::expected_main(&design()));
 }
+
+/// #112 (write_only) end-to-end at the scaffold layer: a db-mode design with a
+/// `write_only` `api_token` (and a `password_hash` auto-hidden by name) is run
+/// through the REAL scaffolder, and the generated `model.rs` on disk carries
+/// `#[serde(skip_serializing)]` on exactly those two columns — never on
+/// `id`/`email`. A serde round-trip against a struct carrying the very attribute
+/// the generator emitted proves the load-bearing property the hide rests on: the
+/// field is OMITTED from a serialized response yet still ACCEPTED on input (the
+/// no-DTO create body is `Json<Account>` = the Model, which must deserialize it).
+/// This is the fast conformance proof (no cargo build); the heavy live-HTTP
+/// variants live in `tests/conformance.rs`.
+#[test]
+fn write_only_columns_are_response_hidden_in_the_scaffolded_model() {
+    const HIDDEN: &str = r#"{
+        "name": "secrets-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{ "name": "accounts",
+            "entities": [{ "name": "Account", "fields": [
+                { "name": "id", "type": "integer" },
+                { "name": "email", "type": "string" },
+                { "name": "api_token", "type": "string", "write_only": true },
+                { "name": "password_hash", "type": "string" } ] }],
+            "endpoints": [
+                { "operation_id": "create_account", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Account" },
+                  "success": { "status": 201, "entity": "Account" } },
+                { "operation_id": "get_account", "method": "GET", "path": "/{id}",
+                  "success": { "status": 200, "entity": "Account" } } ] }] }"#;
+    let d: Design = serde_json::from_str(HIDDEN).unwrap();
+    // The design validates clean — write_only is accepted on a non-id field, and
+    // there is no realtime `changes` entity so JC0555 does not fire.
+    let qs = jerrycan::platform::questions::validate(&d);
+    assert!(qs.is_empty(), "write_only db design must validate: {qs:?}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("secrets-api");
+    scaffold::scaffold(&root, &d).unwrap();
+    let model = fs::read_to_string(root.join("crates/routes/accounts/src/model.rs")).unwrap();
+
+    // Exactly the two secret columns are response-hidden — api_token (explicit)
+    // and password_hash (auto-classified) — and no other field is.
+    assert_eq!(
+        model.matches("#[serde(skip_serializing)]").count(),
+        2,
+        "exactly api_token + password_hash are skip_serializing: {model}"
+    );
+    for hidden in ["api_token", "password_hash"] {
+        assert!(
+            model.contains(&format!("#[serde(skip_serializing)]\n        pub {hidden}")),
+            "`{hidden}` must carry skip_serializing: {model}"
+        );
+    }
+    for shown in ["id", "email"] {
+        assert!(
+            !model.contains(&format!("#[serde(skip_serializing)]\n        pub {shown}")),
+            "`{shown}` must NOT be hidden: {model}"
+        );
+    }
+    // The Model still derives Deserialize — the no-DTO create body deserializes
+    // the hidden columns (input is unaffected; only the response omits them).
+    assert!(
+        model.contains("Deserialize"),
+        "the Model must still deserialize (input path intact): {model}"
+    );
+
+    // The load-bearing property, made executable against the emitted attribute:
+    // a response OMITS the write_only column while a create body still populates
+    // it. (Uses the exact `#[serde(skip_serializing)]` the scaffolder wrote.)
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Account {
+        id: i64,
+        email: String,
+        #[serde(skip_serializing)]
+        api_token: String,
+    }
+    let created: Account =
+        serde_json::from_str(r#"{ "id": 1, "email": "a@b.c", "api_token": "sk-secret" }"#).unwrap();
+    assert_eq!(
+        created.api_token, "sk-secret",
+        "input accepts the write_only field"
+    );
+    let body = serde_json::to_string(&created).unwrap();
+    assert!(
+        !body.contains("api_token"),
+        "response hides the write_only field: {body}"
+    );
+    assert!(
+        body.contains("a@b.c"),
+        "non-hidden fields still serialize: {body}"
+    );
+}
