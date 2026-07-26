@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.13 — 2026-07-26
+
+### New
+- **Composite / multi-column `UNIQUE` (#115).** An entity may declare
+  `"unique": [["user_id", "post_id"]]` — a table-level composite unique over ≥2
+  columns (each a field or a `belongs_to` fk column), emitted as a
+  `CREATE UNIQUE INDEX`. A "one row per (a,b)" invariant — a like per (user,
+  post), an enrollment per (user, course) — is now a **DB constraint**: a
+  duplicate is a **409** (via the existing unique-violation mapping), not a racy
+  SELECT-then-INSERT with a TOCTOU window. Single-column uniqueness stays
+  `Field.unique`. The generated acceptance suite gets a composite-conflict 409
+  test (isolated so only the composite index can trip it), and OpenAPI documents
+  the 409.
+- **`JC0559`** refuses an unbuildable composite `unique` group: fewer than 2
+  **distinct** columns (use `Field.unique` for one column), a column that is
+  neither a field nor a `belongs_to` fk column, or a duplicate group.
+
+Byte-identical for any entity that declares no composite `unique`.
+
 ## 0.6.12 — 2026-07-26
 
 ### Fixed
