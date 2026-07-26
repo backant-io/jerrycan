@@ -335,6 +335,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs designing",
     },
     CodeInfo {
+        code: "JC0560",
+        title: "colliding or malformed belongs_to fk alias",
+        cause: "a `belongs_to` fk column (issue #119) is unbuildable: two `belongs_to` on the same entity derive the SAME fk column — two un-aliased refs to one target (both `snake(entity)_id`), or an `as` alias whose `{as}_id` equals another belongs_to's fk column — so the generated Model would carry a DUPLICATE fk field and the migration a duplicate column; OR an `{as}_id` (or the default `snake(entity)_id`) COLLIDES with a declared field name or the pk `id`; OR the `as` alias is MALFORMED (not snake_case `^[a-z][a-z0-9_]*$`, so the derived column and Rust field would be invalid). The alias exists precisely so two references to one entity (a ledger Transfer's from_account/to_account, a self-referential Comment's parent) get DISTINCT fk columns and distinct DDL constraint names",
+        fix: "give each `belongs_to` a distinct fk column: add an `as` alias to at least one of two refs to the same entity (`{ \"entity\": \"Account\", \"as\": \"from_account\" }` → `from_account_id`), so no two fk columns and no fk-vs-field/pk names collide; make every `as` snake_case (`^[a-z][a-z0-9_]*$`). A single un-aliased `belongs_to` per target needs no `as` (byte-identical)",
+        doc: "jerrycan docs designing",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -720,6 +727,30 @@ mod tests {
                 && info.fix.contains("unique: true")
                 && info.fix.contains("[[\"user_id\", \"post_id\"]]"),
             "fix must name the remedies and the fk-pair example: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0560_names_the_fk_alias_rules_and_their_remedies() {
+        // WHY: JC0560 (#119) refuses a colliding or malformed `belongs_to` fk alias
+        // — `jerrycan explain JC0560` must name all three failure modes (two refs
+        // deriving the SAME fk column, an fk column colliding with a field/pk, a
+        // MALFORMED `as`) and the remedy (a distinct snake_case `as`), plus the
+        // two-ref worked example.
+        let info = lookup("JC0560").unwrap();
+        assert!(
+            info.cause.contains("SAME fk column")
+                && info.cause.contains("COLLIDES")
+                && info.cause.contains("MALFORMED"),
+            "cause must name all three failure modes: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("as")
+                && info.fix.contains("from_account")
+                && info.fix.contains("snake_case"),
+            "fix must name the distinct-alias remedy and the two-ref example: {}",
             info.fix
         );
     }

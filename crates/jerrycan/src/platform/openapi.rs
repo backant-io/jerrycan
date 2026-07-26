@@ -247,10 +247,9 @@ fn request_schema(design: &Design, e: &Entity, for_update: bool) -> Value {
     let omit_identity = design.wants_auth();
     let path_fks = design.entity_path_fk_columns(&e.name);
     for b in e.belongs_to.iter().filter(|b| {
-        !(omit_identity && Design::is_identity_fk(b))
-            && !path_fks.contains(&Design::fk_column(&b.entity))
+        !(omit_identity && Design::is_identity_fk(b)) && !path_fks.contains(&b.fk_column())
     }) {
-        let col = Design::fk_column(&b.entity);
+        let col = b.fk_column();
         let schema = match design.target_key_rust_type(&b.entity) {
             "String" => json!({ "type": "string" }),
             _ => json!({ "type": "integer", "format": "int64" }),

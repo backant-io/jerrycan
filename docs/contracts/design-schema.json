@@ -310,7 +310,12 @@
               "entity": {
                 "type": "string",
                 "pattern": "^[A-Z][A-Za-z0-9]*$",
-                "description": "Target entity name; the fk column is derived as snake_case(entity) + \"_id\"."
+                "description": "Target entity name; the fk column is derived as snake_case(entity) + \"_id\" unless `as` overrides it."
+              },
+              "as": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$",
+                "description": "Optional fk-column alias (issue #119): the fk column becomes '{as}_id' instead of snake_case(entity) + \"_id\". Lets two belongs_to the SAME entity coexist (a ledger Transfer's from_account/to_account, a self-referential Comment's parent) with distinct columns and distinct DDL FOREIGN KEY constraint names. Absent → the default snake_case(entity) + \"_id\", byte-identical. JC0560 refuses two belongs_to whose fk columns collide, or an '{as}_id' that collides with a declared field or the pk 'id'."
               },
               "on_delete": {
                 "enum": [
