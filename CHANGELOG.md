@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.14 — 2026-07-26
+
+### New
+- **`belongs_to` fk alias — two references to the same entity (#119).** A
+  `belongs_to` may declare `"as": "from_account"`, making its fk column
+  `from_account_id` instead of the hardcoded `account_id`. Two references to the
+  same target now coexist — a ledger's `Transfer { from_account, to_account }`, a
+  self-referential `Comment { parent }` — each with its own FK, `ON DELETE`, and
+  scoped accessors, instead of falling back to a plain `i64` field that loses the
+  integrity + scoping machinery. Each aliased fk gets a distinct DDL constraint
+  name. `Design::fk_column` (the tenancy/identity fk) is unchanged.
+- **`JC0560`** refuses an unbuildable alias: two `belongs_to` deriving the same fk
+  column, an `{as}_id` colliding with a field or the pk `id`, a malformed `as`, or
+  an `as` that lands on the **reserved** identity (`user_id`) or tenancy fk that
+  the target doesn't own (which would hijack per-user/tenant scoping).
+
+Byte-identical for any `belongs_to` that declares no `as`.
+
 ## 0.6.13 — 2026-07-26
 
 ### New
