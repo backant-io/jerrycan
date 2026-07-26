@@ -484,10 +484,11 @@ fn db_mode_emits_composite_unique_index_both_dialects() {
         )))
         .unwrap();
         // Exactly one composite unique index, over both fk columns in author
-        // order, on the Like table, with the deterministic name.
+        // order, on the Like table, with the ordinal-disambiguated name (#115
+        // review: collision-proof, never a lossy column join).
         assert!(
             sql.contains(
-                "CREATE UNIQUE INDEX \"idx_likes_user_id_post_id\" ON \"likes\" (\"user_id\", \"post_id\")"
+                "CREATE UNIQUE INDEX \"idx_likes_uc0\" ON \"likes\" (\"user_id\", \"post_id\")"
             ),
             "{dialect}: the composite unique index must be emitted verbatim:\n{sql}"
         );

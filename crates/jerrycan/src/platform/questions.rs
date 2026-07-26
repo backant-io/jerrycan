@@ -1482,11 +1482,16 @@ pub fn validate(d: &Design) -> Vec<Question> {
             let mut seen_sets: Vec<std::collections::BTreeSet<String>> = Vec::new();
             for (g, group) in e.unique.iter().enumerate() {
                 let gptr = format!("{ptr}/entities/{i}/unique/{g}");
-                if group.len() < 2 {
+                // Gate on the count of DISTINCT columns, not raw length: a repeated
+                // column like `["a", "a"]` has 2 entries but 1 distinct column, so
+                // `UNIQUE(a, a)` would silently make column `a` globally unique —
+                // caught here alongside the true <2 case.
+                let distinct: std::collections::BTreeSet<&String> = group.iter().collect();
+                if distinct.len() < 2 {
                     qs.push(q(
                         gptr.clone(),
                         format!(
-                            "Entity `{}` composite `unique` group #{g} has fewer than 2 columns ({group:?}) — a table-level composite UNIQUE expresses a `UNIQUE(a, b)` invariant a single field cannot. For single-column uniqueness set `unique: true` on the field instead; a composite group needs at least 2 columns. See `jerrycan explain JC0559`.",
+                            "Entity `{}` composite `unique` group #{g} has fewer than 2 DISTINCT columns ({group:?}) — a table-level composite UNIQUE expresses a `UNIQUE(a, b)` invariant a single field cannot, and a repeated column (`[\"a\", \"a\"]`) would silently make that lone column globally unique. For single-column uniqueness set `unique: true` on the field instead; a composite group needs at least 2 distinct columns. See `jerrycan explain JC0559`.",
                             e.name
                         ),
                     ));
@@ -3138,8 +3143,29 @@ mod tests {
             .find(|q| q.question.contains("JC0559"))
             .unwrap_or_else(|| panic!("a 1-col group must trip JC0559: {qs:?}"));
         assert!(
-            hit.question.contains("fewer than 2 columns") && hit.question.contains("unique: true"),
-            "message must name the <2-col rule and the Field.unique remedy: {}",
+            hit.question.contains("fewer than 2 DISTINCT columns")
+                && hit.question.contains("unique: true"),
+            "message must name the <2-distinct-col rule and the Field.unique remedy: {}",
+            hit.question
+        );
+        assert_eq!(hit.id, "/modules/0/entities/2/unique/0");
+    }
+
+    /// A repeated column (`["a", "a"]`) has 2 entries but 1 DISTINCT column, so
+    /// `UNIQUE(a, a)` would silently make column `a` globally unique — refused by
+    /// the distinct-count gate, not the raw-length one.
+    #[test]
+    fn composite_unique_group_with_a_repeated_column_is_refused_with_jc0559() {
+        let repeated =
+            COMPOSITE_UNIQUE.replace(r#"[["user_id", "post_id"]]"#, r#"[["user_id", "user_id"]]"#);
+        let qs = validate(&design(&repeated));
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0559"))
+            .unwrap_or_else(|| panic!("a repeated-column group must trip JC0559: {qs:?}"));
+        assert!(
+            hit.question.contains("fewer than 2 DISTINCT columns"),
+            "message must name the distinct-count rule for a repeated column: {}",
             hit.question
         );
         assert_eq!(hit.id, "/modules/0/entities/2/unique/0");

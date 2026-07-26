@@ -2544,6 +2544,28 @@ fn ddl_typed(
     }
 }
 
+/// The collision-proof name for the composite `unique` index of group `ordinal`
+/// on table `tbl` (#115): `idx_{tbl}_uc{ordinal}`. The `uc` prefix + ordinal (the
+/// group's position in `e.unique`) can never collide with a single-column
+/// `idx_{tbl}_{col}` index, the membership index, or another group; the table name
+/// scopes it across the schema-global index namespace. Trimmed to Postgres's 63-byte
+/// identifier limit KEEPING the `_uc{ordinal}` suffix intact, so two groups on the
+/// same (very long) table never truncate into one name. Must stay in sync with
+/// testgen's composite-unique fn name (same ordinal scheme).
+fn composite_unique_index_name(tbl: &str, ordinal: usize) -> String {
+    const MAX_IDENT: usize = 63;
+    let suffix = format!("_uc{ordinal}");
+    let mut prefix = format!("idx_{tbl}");
+    let budget = MAX_IDENT.saturating_sub(suffix.len());
+    if prefix.len() > budget {
+        // Table names are snake_case ASCII, so byte length == char count; a plain
+        // truncate lands on a char boundary. The ordinal suffix always survives.
+        prefix.truncate(budget);
+    }
+    prefix.push_str(&suffix);
+    prefix
+}
+
 /// Dual-dialect `CREATE TABLE` DDL for one module's entities (None if it has
 /// none), rendered by sea-query so dialect differences (autoincrement vs
 /// bigserial, quoting) are library-owned, never hand-rolled strings. `design`
@@ -2705,13 +2727,19 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
         // a "one row per (a,b)" invariant is a DB constraint (a duplicate is 409
         // JC0409 via `db_error`, no TOCTOU). Mirrors the membership
         // `UNIQUE(user_id, fk)` index below (same Index::create().unique() path,
-        // rendered on both SQLite and Postgres). Columns are used in author order;
-        // a deterministic name keeps it collision-free per table+cols. An entity
-        // with no `e.unique` emits nothing — byte-identical.
-        for group in &e.unique {
+        // rendered on both SQLite and Postgres). Columns are used in author order
+        // in the `ON (...)` clause (debuggability preserved); the index NAME is the
+        // ordinal-disambiguated `idx_{tbl}_uc{ordinal}` — collision-proof against
+        // the single-column `idx_{tbl}_{col}` indexes, the membership index, other
+        // groups, and (schema-globally) across tables, and ≤63 chars so Postgres
+        // never truncates two distinct groups into the same identifier (a lossy
+        // `join("_")` collides `["a_b","c"]` with `["a","b_c"]`, and a group
+        // `["post","id"]` with `idx_{tbl}_post_id`). An entity with no `e.unique`
+        // emits nothing — byte-identical.
+        for (ordinal, group) in e.unique.iter().enumerate() {
             let mut uniq = Index::create();
             uniq.unique()
-                .name(format!("idx_{tbl}_{}", group.join("_")))
+                .name(composite_unique_index_name(&tbl, ordinal))
                 .table(Alias::new(tbl.clone()));
             for col in group {
                 uniq.col(Alias::new(col.clone()));

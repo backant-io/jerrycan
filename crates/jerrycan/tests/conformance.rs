@@ -2589,7 +2589,7 @@ fn composite_unique_conflict_goes_409_on_a_correct_scaffold() {
         .unwrap();
         assert!(
             sql.contains(
-                "CREATE UNIQUE INDEX \"idx_likes_user_id_post_id\" ON \"likes\" (\"user_id\", \"post_id\")"
+                "CREATE UNIQUE INDEX \"idx_likes_uc0\" ON \"likes\" (\"user_id\", \"post_id\")"
             ),
             "{dialect}: the composite unique index must be scaffolded:\n{sql}"
         );
@@ -2612,7 +2612,7 @@ fn composite_unique_conflict_goes_409_on_a_correct_scaffold() {
     let acceptance =
         std::fs::read_to_string(app.join("crates/routes/engagement/tests/acceptance.rs")).unwrap();
     assert!(
-        acceptance.contains("async fn like_user_id_post_id_composite_unique_conflict_is_409()"),
+        acceptance.contains("async fn like_composite_unique_0_is_409()"),
         "the composite-unique 409 test must be generated:\n{acceptance}"
     );
 

@@ -135,11 +135,12 @@ Fix every question before scaffolding.
   `(user, post)`, an enrollment per `(user, course)`: `"unique": [["user_id",
   "post_id"]]`. Each column is a declared FIELD name OR a `belongs_to` fk column
   (`snake_case(entity) + "_id"`). Single-column uniqueness stays `field.unique` — a
-  1-column group is refused. `JC0559` refuses a group with fewer than 2 columns, an
-  unknown column (neither a field nor a belongs_to fk), or a duplicate group
-  (order-insensitive). The generated acceptance suite includes a
-  `{entity}_{cols}_composite_unique_conflict_is_409` test, and the OpenAPI create op
-  documents the 409.
+  1-column group is refused. `JC0559` refuses a group with fewer than 2 DISTINCT
+  columns (a repeated column like `["a", "a"]` too), an unknown column (neither a
+  field nor a belongs_to fk), or a duplicate group (order-insensitive). The generated
+  acceptance suite includes a `{entity}_composite_unique_{ordinal}_is_409` test whose
+  duplicate row differs only on the composite columns (every other unique key bumped),
+  and the OpenAPI create op documents the 409.
 - `fields` (REQUIRED) — at least one (see Field).
 
 The SQL **table name** defaults to `snake_case(entity)`, pluralized — `Ticket` →
