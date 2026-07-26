@@ -2904,3 +2904,80 @@ fn tenant_seeds_for_constrained_unique_fields_stay_in_range_and_distinct() {
         "tenant-2 seed must be in-range and distinct from tenant 1: {generated}"
     );
 }
+
+/// #115 composite / multi-column UNIQUE: an entity with `unique: [["user_id",
+/// "post_id"]]` gets a `{entity}_{cols}_composite_unique_conflict_is_409` test —
+/// seed the parents, create a row, then POST an identical body → assert 409 (the
+/// DB unique index makes the duplicate a conflict). Byte-identity twin: an entity
+/// with no composite `unique` emits no such test.
+#[test]
+fn composite_unique_emits_a_409_conflict_test() {
+    const LIKES: &str = r#"{
+        "name": "likes-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "engagement",
+            "entities": [
+                { "name": "User", "fields": [{ "name": "email", "type": "string" }] },
+                { "name": "Post", "fields": [{ "name": "title", "type": "string" }] },
+                { "name": "Like",
+                  "belongs_to": [{ "entity": "User" }, { "entity": "Post" }],
+                  "unique": [["user_id", "post_id"]],
+                  "fields": [{ "name": "reaction", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_user", "method": "POST", "path": "/users",
+                  "request_body": { "entity": "User" },
+                  "success": { "status": 201, "entity": "User" } },
+                { "operation_id": "create_post", "method": "POST", "path": "/posts",
+                  "request_body": { "entity": "Post" },
+                  "success": { "status": 201, "entity": "Post" } },
+                { "operation_id": "create_like", "method": "POST", "path": "/likes",
+                  "request_body": { "entity": "Like" },
+                  "success": { "status": 201, "entity": "Like" } }
+            ]
+        }]
+    }"#;
+    let d: Design = serde_json::from_str(LIKES).unwrap();
+    let module = &d.modules[0];
+    let generated = testgen::acceptance_rs(&d, module);
+    // The named test exists, keyed on the entity snake + the group columns.
+    assert!(
+        generated.contains("async fn like_user_id_post_id_composite_unique_conflict_is_409()"),
+        "the composite-unique 409 test must be emitted:\n{generated}"
+    );
+    // It seeds both belongs_to parents (an enforced intra-module fk must resolve).
+    assert!(
+        generated.contains("/engagement/users") && generated.contains("/engagement/posts"),
+        "the 409 test must seed the User and Post parents:\n{generated}"
+    );
+    // It posts the create body twice and asserts the second is a 409.
+    let body = generated
+        .split("async fn like_user_id_post_id_composite_unique_conflict_is_409()")
+        .nth(1)
+        .unwrap();
+    let body = body.split("\n}\n").next().unwrap();
+    assert_eq!(
+        body.matches("/engagement/likes").count(),
+        2,
+        "two POSTs to the likes collection (first + duplicate):\n{body}"
+    );
+    assert!(
+        body.contains("assert_eq!(dup.status().as_u16(), 409"),
+        "the duplicate insert must assert 409:\n{body}"
+    );
+
+    // Byte-identity twin: drop the composite unique → no such test.
+    let plain = d.clone();
+    let mut v: serde_json::Value = serde_json::to_value(&plain).unwrap();
+    v["modules"][0]["entities"][2]
+        .as_object_mut()
+        .unwrap()
+        .remove("unique");
+    let plain: Design = serde_json::from_value(v).unwrap();
+    let plain_gen = testgen::acceptance_rs(&plain, &plain.modules[0]);
+    assert!(
+        !plain_gen.contains("composite_unique_conflict_is_409"),
+        "an entity with no composite unique emits no 409 conflict test:\n{plain_gen}"
+    );
+}

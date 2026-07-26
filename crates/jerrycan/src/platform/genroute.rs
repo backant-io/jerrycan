@@ -2699,6 +2699,26 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
         comments.clear();
         out.push_str(&indexes);
         indexes.clear();
+        // Composite / multi-column UNIQUE (#115): each `e.unique` group becomes a
+        // standalone `CREATE UNIQUE INDEX` over its columns — a declared field
+        // column or a belongs_to fk column, both already in this table's DDL — so
+        // a "one row per (a,b)" invariant is a DB constraint (a duplicate is 409
+        // JC0409 via `db_error`, no TOCTOU). Mirrors the membership
+        // `UNIQUE(user_id, fk)` index below (same Index::create().unique() path,
+        // rendered on both SQLite and Postgres). Columns are used in author order;
+        // a deterministic name keeps it collision-free per table+cols. An entity
+        // with no `e.unique` emits nothing — byte-identical.
+        for group in &e.unique {
+            let mut uniq = Index::create();
+            uniq.unique()
+                .name(format!("idx_{tbl}_{}", group.join("_")))
+                .table(Alias::new(tbl.clone()));
+            for col in group {
+                uniq.col(Alias::new(col.clone()));
+            }
+            out.push_str(&schema_sql(&uniq, backend_is_pg));
+            out.push_str(";\n\n");
+        }
     }
     // The tenant module also owns the membership table: who belongs to the tenant
     // and in what role. Emitted right after the tenant's own table so the fk

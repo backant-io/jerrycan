@@ -880,9 +880,66 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         }
     }
 
+    // #115: composite / multi-column UNIQUE 409 conflict tests for this unit's
+    // entities (appended after the per-endpoint probes, before recursing).
+    push_composite_unique_tests(design, unit, base, out);
+
     for sub in &unit.subroutes {
         let sub_base = format!("{}{}", base, sub.effective_mount());
         unit_tests(design, sub, &sub_base, out);
+    }
+}
+
+/// Composite / multi-column UNIQUE 409 tests (#115). For each entity in this unit
+/// that declares a `unique` group AND has a probeable collection creator (POST),
+/// emit `{entity}_{cols}_composite_unique_conflict_is_409` per group: seed the
+/// belongs_to parents once, create a first row, then POST a SECOND row with an
+/// identical body — same values on the group columns (the #85 nuance: the create
+/// bodies agree on the group), the auto-increment pk the only difference — so the
+/// `CREATE UNIQUE INDEX (col, …)` 409s the duplicate `(col, …)` via `db_error`.
+/// RED on stubs (the first create never inserts, or a stub echo makes the second a
+/// 201, not a 409), so it counts toward `expected_failing` like every create probe
+/// — NOT a `reject`. Skipped when the creator's success can't be synthesized
+/// (credential-gated / `probe: skip`). Precise for the primary fk-group shape (no
+/// OTHER single-column unique on the entity that could mask the composite 409).
+fn push_composite_unique_tests(
+    design: &Design,
+    unit: &ModuleDesign,
+    base: &str,
+    out: &mut TestOut,
+) {
+    let cbase = concrete_mount_base(base);
+    let auth = out.auth;
+    for e in &unit.entities {
+        if e.unique.is_empty() {
+            continue;
+        }
+        let Some(creator) = creator_for_entity(unit, &e.name) else {
+            continue;
+        };
+        if endpoint_is_credential_gated(creator) || creator.probe == ProbePolicy::Skip {
+            continue;
+        }
+        let guarded = auth && creator.is_guarded();
+        let url = collection_url(&cbase, &creator.path);
+        // Seed belongs_to parents so an enforced intra-module fk resolves (the
+        // identity fk is session-injected, the tenancy entity is app()-seeded —
+        // both skipped by `seed_parents`).
+        let mut seed = String::new();
+        let mut seen = vec![e.name.clone()];
+        seed_parents(design, unit, &cbase, e, auth, &mut seed, &mut seen);
+        let request = request_expr(design, unit, creator, &url, guarded, None);
+        let snake = Design::to_snake(&e.name);
+        let status = creator.success.status;
+        for group in &e.unique {
+            let cols = group.join("_");
+            let cols_human = group.join(", ");
+            out.code.push_str(&format!(
+                "/// #115 composite UNIQUE({cols_human}) on {name}: a second row sharing the\n/// group's column values (distinct pk) must 409 — the DB unique index enforces\n/// \"one row per ({cols_human})\", so the duplicate insert is a conflict, not a race.\n#[tokio::test]\nasync fn {snake}_{cols}_composite_unique_conflict_is_409() {{\n    let t = app().await;\n{seed}    let first = {request};\n    assert_eq!(first.status().as_u16(), {status}, \"setup: the first {snake} creates ({cols_human}); body: {{}}\", first.text());\n    let dup = {request};\n    assert_eq!(dup.status().as_u16(), 409, \"design: a duplicate ({cols_human}) must 409 (composite UNIQUE index); body: {{}}\", dup.text());\n}}\n\n",
+                name = e.name,
+            ));
+            out.count += 1;
+        }
     }
 }
 

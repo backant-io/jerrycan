@@ -447,3 +447,56 @@ fn memory_mode_is_unchanged() {
         "openapi.json is emitted in every mode"
     );
 }
+
+/// #115 composite / multi-column UNIQUE: an entity's `unique: [["user_id",
+/// "post_id"]]` group emits a standalone `CREATE UNIQUE INDEX … (user_id,
+/// post_id)` on the entity's table, in BOTH dialects — the DB constraint that
+/// makes a duplicate `(user_id, post_id)` a 409 (JC0409) instead of a race.
+#[test]
+fn db_mode_emits_composite_unique_index_both_dialects() {
+    const LIKES: &str = r#"{
+        "name": "likes-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "engagement",
+            "entities": [
+                { "name": "User", "fields": [{ "name": "email", "type": "string" }] },
+                { "name": "Post", "fields": [{ "name": "title", "type": "string" }] },
+                { "name": "Like",
+                  "belongs_to": [{ "entity": "User" }, { "entity": "Post" }],
+                  "unique": [["user_id", "post_id"]],
+                  "fields": [{ "name": "reaction", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_like", "method": "POST", "path": "/likes",
+                  "request_body": { "entity": "Like" },
+                  "success": { "status": 201, "entity": "Like" } }
+            ]
+        }]
+    }"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("likes-api");
+    let design: Design = serde_json::from_str(LIKES).unwrap();
+    scaffold::scaffold(&root, &design).unwrap();
+    for dialect in ["sqlite", "postgres"] {
+        let sql = fs::read_to_string(root.join(format!(
+            "crates/routes/engagement/migrations/{dialect}/0001_create_tables.sql"
+        )))
+        .unwrap();
+        // Exactly one composite unique index, over both fk columns in author
+        // order, on the Like table, with the deterministic name.
+        assert!(
+            sql.contains(
+                "CREATE UNIQUE INDEX \"idx_likes_user_id_post_id\" ON \"likes\" (\"user_id\", \"post_id\")"
+            ),
+            "{dialect}: the composite unique index must be emitted verbatim:\n{sql}"
+        );
+        // Byte-identity floor: the plain User/Post tables emit no such index —
+        // the Like group is the ONLY composite unique index in the file.
+        assert_eq!(
+            sql.matches("CREATE UNIQUE INDEX").count(),
+            1,
+            "{dialect}: only the composite-unique entity gets an index:\n{sql}"
+        );
+    }
+}

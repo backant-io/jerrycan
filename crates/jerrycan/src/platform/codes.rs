@@ -328,6 +328,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs auth",
     },
     CodeInfo {
+        code: "JC0559",
+        title: "unbuildable composite unique group",
+        cause: "a table-level composite `unique` group on an entity (issue #115) is unbuildable: it has FEWER THAN 2 columns (a single-column unique must use the field's `unique` flag, not a 1-col group — the group is meant for a `UNIQUE(a, b)` a lone field cannot express), or it names a column that is NEITHER a declared field NOR a `belongs_to` fk column of the entity (`snake_case(entity) + \"_id\"`) — so the generated `CREATE UNIQUE INDEX` would reference a column that does not exist and fail at migration apply — or it DUPLICATES another group on the same entity (the same column set, order-insensitive), which is redundant",
+        fix: "give each `unique` group at least 2 columns, each a declared field name or a belongs_to fk column of THIS entity; for single-column uniqueness set `unique: true` on the field instead; and list each column set once (order does not matter). The primary use is a composite over two belongs_to fk columns — a like per (user, post): `\"unique\": [[\"user_id\", \"post_id\"]]`",
+        doc: "jerrycan docs designing",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -689,6 +696,30 @@ mod tests {
         assert!(
             info.fix.contains("public") && info.fix.contains("#105"),
             "fix must note tenant-owned entities have no public-read in v1 (#105 is per-user-only): {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0559_names_the_composite_unique_rules_and_their_remedies() {
+        // WHY: JC0559 (#115) refuses an unbuildable table-level composite `unique`
+        // group — `jerrycan explain JC0559` must name all three failure modes
+        // (fewer than 2 columns, an unknown column, a duplicate group) and the
+        // remedies (≥2 columns each a field or a belongs_to fk, use `unique: true`
+        // for a single column, list each set once), plus the fk-pair worked example.
+        let info = lookup("JC0559").unwrap();
+        assert!(
+            info.cause.contains("FEWER THAN 2")
+                && info.cause.contains("belongs_to` fk column")
+                && info.cause.contains("DUPLICATES"),
+            "cause must name all three failure modes: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("at least 2 columns")
+                && info.fix.contains("unique: true")
+                && info.fix.contains("[[\"user_id\", \"post_id\"]]"),
+            "fix must name the remedies and the fk-pair example: {}",
             info.fix
         );
     }

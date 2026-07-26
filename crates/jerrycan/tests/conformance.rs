@@ -2490,6 +2490,186 @@ fn reference_slice_scaffold_passes_check() {
     );
 }
 
+/// The #115 composite-unique conformance fixture: a `Like` per `(user, post)`.
+/// User and Post live in their OWN modules, so the fk columns are cross-module
+/// (unenforced — no seeded parent row needed for a flat create probe) while the
+/// `unique: [["user_id","post_id"]]` composite index is emitted on the likes
+/// table regardless. The generated suite carries the composite-unique 409 test.
+const COMPOSITE_UNIQUE_LIKES: &str = r#"{
+  "name": "likes-api",
+  "contract_version": 1,
+  "dependencies": ["db"],
+  "modules": [
+    { "name": "users",
+      "entities": [{ "name": "User", "fields": [{ "name": "email", "type": "string" }] }],
+      "endpoints": [{ "operation_id": "create_user", "method": "POST", "path": "/",
+        "request_body": { "entity": "User" }, "success": { "status": 201, "entity": "User" } }] },
+    { "name": "posts",
+      "entities": [{ "name": "Post", "fields": [{ "name": "title", "type": "string" }] }],
+      "endpoints": [{ "operation_id": "create_post", "method": "POST", "path": "/",
+        "request_body": { "entity": "Post" }, "success": { "status": 201, "entity": "Post" } }] },
+    { "name": "engagement",
+      "entities": [{ "name": "Like",
+        "belongs_to": [{ "entity": "User" }, { "entity": "Post" }],
+        "unique": [["user_id", "post_id"]],
+        "fields": [{ "name": "reaction", "type": "string" }] }],
+      "endpoints": [{ "operation_id": "create_like", "method": "POST", "path": "/",
+        "request_body": { "entity": "Like" }, "success": { "status": 201, "entity": "Like" } }] }
+  ]
+}"#;
+
+const LIKES_USERS_HANDLERS: &str = r#"//! Correct users handler for the #115 fixture.
+use jerrycan::prelude::*;
+use super::model::*;
+use super::repo::*;
+
+pub(crate) async fn create_user(repo: Dep<UserRepo>, Json(body): Json<User>) -> Result<Created<User>> {
+    repo.insert(body.clone()).await?;
+    Ok(Created(body))
+}
+"#;
+
+const LIKES_POSTS_HANDLERS: &str = r#"//! Correct posts handler for the #115 fixture.
+use jerrycan::prelude::*;
+use super::model::*;
+use super::repo::*;
+
+pub(crate) async fn create_post(repo: Dep<PostRepo>, Json(body): Json<Post>) -> Result<Created<Post>> {
+    repo.insert(body.clone()).await?;
+    Ok(Created(body))
+}
+"#;
+
+/// The correct engagement handler: a plain `insert`. The SECOND create with the
+/// same `(user_id, post_id)` hits the `CREATE UNIQUE INDEX` — `db_error` maps the
+/// unique violation to `Error::conflict` → 409, no application-level check.
+const LIKES_ENGAGEMENT_HANDLERS: &str = r#"//! Correct #115 engagement handler: insert; the composite UNIQUE index 409s a dup.
+use jerrycan::prelude::*;
+use super::model::*;
+use super::repo::*;
+
+pub(crate) async fn create_like(repo: Dep<LikeRepo>, Json(body): Json<Like>) -> Result<Created<Like>> {
+    repo.insert(body.clone()).await?;
+    Ok(Created(body))
+}
+"#;
+
+/// Issue #115 end-to-end: the composite / multi-column UNIQUE proves out on a
+/// real scaffold. Scaffold → gen-tests (the suite carries the composite-unique
+/// 409 test) → RED on stubs → implement the plain-insert handlers → the SAME
+/// suite goes GREEN, so a duplicate `(user_id, post_id)` insert is a 409 through
+/// the DB index (no application-level SELECT-then-INSERT). Then the full
+/// `jerrycan check` gate passes on the implemented app.
+#[test]
+#[ignore = "heavy: scaffold + gen-tests + red run + implement + green run + check (#115 composite unique)"]
+fn composite_unique_conflict_goes_409_on_a_correct_scaffold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, COMPOSITE_UNIQUE_LIKES).unwrap();
+    let app = tmp.path().join("likes-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .args(["new"])
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "the composite-unique design must scaffold");
+
+    // The migration carries the composite unique index on the likes table.
+    for dialect in ["sqlite", "postgres"] {
+        let sql = std::fs::read_to_string(app.join(format!(
+            "crates/routes/engagement/migrations/{dialect}/0001_create_tables.sql"
+        )))
+        .unwrap();
+        assert!(
+            sql.contains(
+                "CREATE UNIQUE INDEX \"idx_likes_user_id_post_id\" ON \"likes\" (\"user_id\", \"post_id\")"
+            ),
+            "{dialect}: the composite unique index must be scaffolded:\n{sql}"
+        );
+    }
+
+    // gen-tests every module; the engagement suite carries the 409 conflict test.
+    for module in ["users", "posts", "engagement"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+            .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
+            .args(["--json", "gen-tests", "--module", module])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "gen-tests {module}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let acceptance =
+        std::fs::read_to_string(app.join("crates/routes/engagement/tests/acceptance.rs")).unwrap();
+    assert!(
+        acceptance.contains("async fn like_user_id_post_id_composite_unique_conflict_is_409()"),
+        "the composite-unique 409 test must be generated:\n{acceptance}"
+    );
+
+    // RED: stubs fail the generated suite (the first create never inserts).
+    let red = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace", "--no-fail-fast"])
+        .output()
+        .unwrap();
+    assert!(!red.status.success(), "stub handlers must fail the suite");
+
+    // Implement the correct plain-insert handlers.
+    install_handler(
+        &app,
+        "crates/routes/users/src/handlers.rs",
+        LIKES_USERS_HANDLERS,
+    );
+    install_handler(
+        &app,
+        "crates/routes/posts/src/handlers.rs",
+        LIKES_POSTS_HANDLERS,
+    );
+    install_handler(
+        &app,
+        "crates/routes/engagement/src/handlers.rs",
+        LIKES_ENGAGEMENT_HANDLERS,
+    );
+
+    // GREEN: the composite-unique 409 test passes — a duplicate (user_id,
+    // post_id) is a 409 through the DB index, not a race.
+    let green = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace"])
+        .status()
+        .unwrap();
+    assert!(
+        green.success(),
+        "the plain-insert handlers must satisfy the composite-unique 409 test"
+    );
+
+    // The full gate holds on the implemented app.
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON doc");
+    assert_eq!(
+        payload["ok"], true,
+        "diagnostics: {}",
+        payload["diagnostics"]
+    );
+}
+
 // Small helpers for the deploy-anywhere test (no earlier-phase equivalents exist
 // in this file; the auth_observe test inlines its own closures).
 fn pick_port() -> u16 {
