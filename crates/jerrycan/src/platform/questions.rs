@@ -1053,6 +1053,93 @@ pub fn validate(d: &Design) -> Vec<Question> {
         for (i, m) in d.modules.iter().enumerate() {
             check_ambiguous_tenant_path(d, m, &format!("/modules/{i}"), &mut qs);
         }
+
+        // JC0553 (#141): with tenancy, jerrycan reserves the `{tenant}_members`
+        // membership table and the `pub struct {Tenant}Member` row type (issue
+        // #107) for the generated member surface. An entity (other than the
+        // tenant) whose RESOLVED table name equals `{tenant}_members` — one named
+        // `{Tenant}Member`, whose default table is exactly that, or one with an
+        // explicit `table` override onto it — OR whose NAME equals `{Tenant}Member`
+        // collides with that surface: the generator would emit the same table
+        // twice (a raw `table "..._members" already exists` mid-scaffold, after a
+        // clean `check`) or two `struct {Tenant}Member` definitions. Reserved
+        // names are computed EXACTLY as the generator names them
+        // (`{Design::to_snake(tenant)}_members`, `{tenant}Member`) so the refusal
+        // matches what is reserved. Fail loud here with a rename suggestion.
+        let reserved_members_table = format!("{}_members", Design::to_snake(&tenancy.entity));
+        let reserved_member_struct = format!("{}Member", tenancy.entity);
+        fn check_membership_collision(
+            d: &Design,
+            tenant: &str,
+            reserved_table: &str,
+            reserved_struct: &str,
+            m: &ModuleDesign,
+            ptr: &str,
+            qs: &mut Vec<Question>,
+        ) {
+            for (i, e) in m.entities.iter().enumerate() {
+                if e.name == tenant {
+                    continue;
+                }
+                let name_collides = e.name == reserved_struct;
+                let table_collides = d.table_name(&e.name) == reserved_table;
+                if !name_collides && !table_collides {
+                    continue;
+                }
+                // Point at the most actionable location: the name for a name (or
+                // name+table) collision — renaming fixes both — else the entity.
+                let (id, detail) = if name_collides {
+                    (
+                        format!("{ptr}/entities/{i}/name"),
+                        if table_collides {
+                            format!(
+                                "its name matches the generated membership row type `pub struct {reserved_struct}` (issue #107), and its default table `{reserved_table}` is the membership table jerrycan generates for `{tenant}`"
+                            )
+                        } else {
+                            format!(
+                                "its name matches the generated membership row type `pub struct {reserved_struct}` (issue #107)"
+                            )
+                        },
+                    )
+                } else {
+                    (
+                        format!("{ptr}/entities/{i}"),
+                        format!(
+                            "its table `{reserved_table}` is the membership table jerrycan generates for `{tenant}`"
+                        ),
+                    )
+                };
+                qs.push(q(
+                    id,
+                    format!(
+                        "Entity `{}` collides with the member surface jerrycan generates for tenant `{tenant}`: {detail} — the generator would emit that table/type twice and the scaffold would abort mid-migration with a raw `table \"{reserved_table}\" already exists` (after a clean `check`). Rename the entity (e.g. `{}Record` or a domain-specific name) so it no longer equals the reserved `{reserved_struct}` type or resolves to the reserved `{reserved_table}` table. See `jerrycan explain JC0553`.",
+                        e.name, e.name
+                    ),
+                ));
+            }
+            for (i, sub) in m.subroutes.iter().enumerate() {
+                check_membership_collision(
+                    d,
+                    tenant,
+                    reserved_table,
+                    reserved_struct,
+                    sub,
+                    &format!("{ptr}/subroutes/{i}"),
+                    qs,
+                );
+            }
+        }
+        for (i, m) in d.modules.iter().enumerate() {
+            check_membership_collision(
+                d,
+                &tenancy.entity,
+                &reserved_members_table,
+                &reserved_member_struct,
+                m,
+                &format!("/modules/{i}"),
+                &mut qs,
+            );
+        }
     }
 
     // JC0550 (#88): the tenant entity's OWN detail route must address the tenant
@@ -2527,6 +2614,103 @@ mod tests {
         // No tenancy at all: nothing to conflict.
         let plain: Design = serde_json::from_str(MINIMAL).unwrap();
         assert!(design_conflict(&plain).is_none());
+    }
+
+    /// JC0553 (#141): with tenancy, jerrycan reserves `{tenant}_members` (the
+    /// membership table) and `pub struct {Tenant}Member` (the member row type,
+    /// issue #107). An entity that resolves to that table, or is named
+    /// `{Tenant}Member`, collides with the generated member surface — today a
+    /// clean `check` then a raw `table "..._members" already exists`
+    /// mid-scaffold. `validate` must refuse it up front, naming the entity, the
+    /// tenant, and the reserved name/table.
+    #[test]
+    fn entity_colliding_with_the_membership_surface_is_refused_with_jc0553() {
+        // V1_FULL tenancy is `Workspace` → reserved table `workspace_members`,
+        // reserved struct `WorkspaceMember`.
+        // (a) An entity NAMED `WorkspaceMember` collides on the struct type AND —
+        // via its default table `workspace_members` — the membership table.
+        let mut by_name: Design = serde_json::from_str(V1_FULL).unwrap();
+        by_name.modules[0].entities.push(
+            serde_json::from_str(
+                r#"{ "name": "WorkspaceMember", "fields": [{ "name": "note", "type": "string" }] }"#,
+            )
+            .unwrap(),
+        );
+        let qs = validate(&by_name);
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0553"))
+            .unwrap_or_else(|| panic!("WorkspaceMember must trip JC0553: {qs:?}"));
+        assert!(
+            hit.question.contains("WorkspaceMember")
+                && hit.question.contains("`Workspace`")
+                && hit.question.contains("workspace_members")
+                && hit.question.to_lowercase().contains("rename"),
+            "message names the entity, tenant, reserved table, and the rename fix: {}",
+            hit.question
+        );
+        // Points at the entity NAME — the actionable fix location for a name clash.
+        assert_eq!(hit.id, "/modules/0/entities/1/name");
+
+        // (b) A differently-NAMED entity whose explicit `table` override IS the
+        // membership table collides on the table alone.
+        let mut by_table: Design = serde_json::from_str(V1_FULL).unwrap();
+        by_table.modules[0].entities.push(
+            serde_json::from_str(
+                r#"{ "name": "Seat", "table": "workspace_members", "fields": [{ "name": "note", "type": "string" }] }"#,
+            )
+            .unwrap(),
+        );
+        let qs = validate(&by_table);
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0553"))
+            .unwrap_or_else(|| {
+                panic!("a table override onto workspace_members must trip JC0553: {qs:?}")
+            });
+        assert!(
+            hit.question.contains("`Seat`") && hit.question.contains("workspace_members"),
+            "table-collision message names the entity and the reserved table: {}",
+            hit.question
+        );
+        assert_eq!(hit.id, "/modules/0/entities/1");
+    }
+
+    /// The refusal is precise: a non-colliding entity in a tenancy design is
+    /// clean, and a `{Tenant}Member`-named entity in a design with NO tenancy is
+    /// clean — no membership surface is generated, so nothing is reserved.
+    #[test]
+    fn membership_collision_check_is_scoped_to_tenancy_and_real_collisions() {
+        // (a) A plain, non-colliding entity in the SAME tenancy design: no JC0553.
+        let mut ok: Design = serde_json::from_str(V1_FULL).unwrap();
+        ok.modules[0].entities.push(
+            serde_json::from_str(
+                r#"{ "name": "Post", "fields": [{ "name": "title", "type": "string" }] }"#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            !validate(&ok).iter().any(|q| q.question.contains("JC0553")),
+            "a non-colliding entity must not trip JC0553: {:?}",
+            validate(&ok)
+        );
+        // (b) A `WorkspaceMember` entity with NO tenancy: no membership surface is
+        // generated, so there is nothing to collide with.
+        let mut no_tenancy: Design = serde_json::from_str(V1_FULL).unwrap();
+        no_tenancy.tenancy = None;
+        no_tenancy.modules[0].entities.push(
+            serde_json::from_str(
+                r#"{ "name": "WorkspaceMember", "fields": [{ "name": "note", "type": "string" }] }"#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            !validate(&no_tenancy)
+                .iter()
+                .any(|q| q.question.contains("JC0553")),
+            "no tenancy → no membership table → no collision: {:?}",
+            validate(&no_tenancy)
+        );
     }
 
     // ---- #107 (JC0548): tenancy member_roles content ---------------------------

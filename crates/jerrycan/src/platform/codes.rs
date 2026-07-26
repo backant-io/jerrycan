@@ -286,6 +286,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs validation",
     },
     CodeInfo {
+        code: "JC0553",
+        title: "entity collides with the generated membership table/type",
+        cause: "with `tenancy`, jerrycan generates a `{tenant}_members` membership table and a `pub struct {Tenant}Member` row type (issue #107) for the member-management surface; an entity other than the tenant whose RESOLVED table name equals `{tenant}_members` — one named `{Tenant}Member`, whose default table is exactly that, or one with an explicit `table` override onto it — or whose NAME equals `{Tenant}Member`, collides with that reserved surface: the generator would emit the same table twice (a raw `table \"{tenant}_members\" already exists` mid-scaffold, after a clean `check`) or two `struct {Tenant}Member` definitions",
+        fix: "rename the offending entity (and/or drop its `table` override) so neither its name equals `{Tenant}Member` nor its table resolves to `{tenant}_members` — those are reserved for the generated member surface",
+        doc: "jerrycan docs tenancy",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -501,6 +508,26 @@ mod tests {
         assert!(
             info.fix.contains("at least 3 distinct values"),
             "fix must name the unique-cardinality remedy: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0553_names_the_membership_surface_collision_and_the_rename_remedy() {
+        // WHY: JC0553 (#141) is the agent's stop after `check` refuses an entity
+        // that would collide with the generated `{tenant}_members` membership
+        // table or the `{Tenant}Member` row type (issue #107). The old failure
+        // was an opaque raw "table already exists" mid-scaffold, so the registry
+        // must name BOTH reserved artifacts and the rename remedy.
+        let info = lookup("JC0553").unwrap();
+        assert!(
+            info.cause.contains("_members") && info.cause.contains("{Tenant}Member"),
+            "cause must name the reserved membership table and row type: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.to_lowercase().contains("rename"),
+            "fix must name the rename remedy: {}",
             info.fix
         );
     }
