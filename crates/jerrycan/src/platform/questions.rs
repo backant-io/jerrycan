@@ -1059,6 +1059,85 @@ pub fn validate(d: &Design) -> Vec<Question> {
             check_public_on_tenant_owned(d, m, &format!("/modules/{i}"), &mut qs);
         }
 
+        // JC0558 (#148): the tenant twin of JC0549(c). In an auth design, an
+        // endpoint on the tenant entity OR a tenant-owned entity (directly or
+        // transitively) that is neither guarded nor `public` is ANONYMOUS:
+        // genroute emits the guard only under `mode.auth && ep.is_guarded()`
+        // (genroute.rs:196), so such a handler gets no `Dep<Tenant>` and no
+        // `CurrentUser` and any caller can read (or write) any tenant's rows —
+        // with a green `jerrycan check`. `check_public_on_tenant_owned` above
+        // keys on `ep.public`; the merely unguarded-non-public case was unpoliced
+        // (JL0004 covers mutations only; in a childless tenant module JL0006 never
+        // scans handlers.rs). Refuse it (correct-by-construction), exempting the
+        // signature-authed webhook shape exactly as JL0004 does (it proves itself
+        // by signature, not a session).
+        //
+        // Domain = the tenant ROOT (`name == tenancy.entity`) OR a tenant-owned
+        // entity (`tenant_path(name).is_some()`). `tenant_path` deliberately
+        // returns None for the tenant itself (design.rs:970 — "the tenant is not
+        // tenant-owned"), so the root arm is spelled out explicitly: the issue's
+        // headline case ("read any tenant's row by id") is the tenant's OWN
+        // unguarded detail route, which `tenant_path` alone would miss.
+        //
+        // Entity resolution uses the STRICT resolver (`endpoint_repo_entity_strict`
+        // — explicit signals only), NOT the lenient `endpoint_repo_entity` the
+        // (public-only) mirror uses. WHY (Rule 9): this predicate fires on
+        // NON-public endpoints, so it reaches the entity-less custom endpoints the
+        // public-only check never touched (e.g. `GET /usage` returning custom JSON
+        // in an entity-bearing module, or an entity-less join/leave subroute).
+        // The lenient first-entity fallback would tie those to a tenant-owned
+        // NEIGHBOR they never read and falsely refuse them; strict returns `None`
+        // for an endpoint no explicit signal ties to a repo, so it fires only on a
+        // real tenant-scoped read/write — the same strict narrowing JC0549(c) and
+        // JC0550 use for exactly this security-sensitive reason.
+        if active_auth_model {
+            fn check_anonymous_on_tenant_scoped(
+                d: &Design,
+                tenant: &str,
+                m: &ModuleDesign,
+                ptr: &str,
+                qs: &mut Vec<Question>,
+            ) {
+                for (i, ep) in m.endpoints.iter().enumerate() {
+                    let Some(entity) = endpoint_repo_entity_strict(m, ep) else {
+                        continue;
+                    };
+                    let tenant_scoped = entity == tenant || d.tenant_path(entity).is_some();
+                    if tenant_scoped
+                        && !ep.public
+                        && !ep.is_guarded()
+                        && !ep.declares_signature_auth()
+                    {
+                        qs.push(q(
+                            format!("{ptr}/endpoints/{i}"),
+                            format!(
+                                "Endpoint `{}` ({:?} {}) is on the tenant-scoped entity `{}` but is neither authenticated nor `public` — it emits no `Dep<Tenant>` guard and no `CurrentUser`, so an anonymous caller could read or write any tenant's rows. Set `auth_required: true` so the membership guard scopes it. See `jerrycan explain JC0558`.",
+                                ep.operation_id, ep.method, ep.path, entity,
+                            ),
+                        ));
+                    }
+                }
+                for (i, sub) in m.subroutes.iter().enumerate() {
+                    check_anonymous_on_tenant_scoped(
+                        d,
+                        tenant,
+                        sub,
+                        &format!("{ptr}/subroutes/{i}"),
+                        qs,
+                    );
+                }
+            }
+            for (i, m) in d.modules.iter().enumerate() {
+                check_anonymous_on_tenant_scoped(
+                    d,
+                    &tenancy.entity,
+                    m,
+                    &format!("/modules/{i}"),
+                    &mut qs,
+                );
+            }
+        }
+
         // JC0545 (#102): an entity that reaches the tenant through TWO or more
         // distinct `belongs_to` chains (a diamond) is ambiguous — `tenant_path`
         // resolves it to `None`, which would leave it UNSCOPED and re-open the
@@ -2014,9 +2093,32 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    /// Authenticate every non-public endpoint of a design so no tenant /
+    /// tenant-owned read is anonymous. The shared tenancy fixtures (V1_FULL /
+    /// V2_STORAGE / V2_REALTIME) predate JC0558 (#148) and carry unguarded reads
+    /// on their tenant/tenant-owned entities; tests that only care that the
+    /// fixture is otherwise question-free (realtime, storage, tenancy checks)
+    /// guard the reads first so the JC0558 refusal doesn't mask the assertion.
+    fn guard_reads(mut d: Design) -> Design {
+        fn walk(m: &mut ModuleDesign) {
+            for ep in &mut m.endpoints {
+                if !ep.public {
+                    ep.auth_required = true;
+                }
+            }
+            for sub in &mut m.subroutes {
+                walk(sub);
+            }
+        }
+        for m in &mut d.modules {
+            walk(m);
+        }
+        d
+    }
+
     #[test]
     fn valid_realtime_design_is_question_free() {
-        let d: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        let d = guard_reads(serde_json::from_str(V2_REALTIME).unwrap());
         assert!(validate(&d).is_empty(), "{:?}", validate(&d));
     }
 
@@ -2090,7 +2192,7 @@ mod tests {
 
         // A DIRECT child (Lead) and the tenant entity itself (Workspace) are
         // both scopable from the row image — no JC0547, no other question.
-        let mut ok: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        let mut ok = guard_reads(serde_json::from_str(V2_REALTIME).unwrap());
         ok.realtime
             .as_mut()
             .unwrap()
@@ -2217,7 +2319,7 @@ mod tests {
 
     #[test]
     fn v2_storage_fixture_is_question_free() {
-        let d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        let d = guard_reads(serde_json::from_str(V2_STORAGE).unwrap());
         assert!(validate(&d).is_empty(), "{:?}", validate(&d));
     }
 
@@ -2438,7 +2540,7 @@ mod tests {
         // the default /storage prefix, a bucket named `avatars` no longer
         // collides with a module at `/orgs`; the collision needs a module mounted
         // at the bucket's actual path (`/storage/avatars`).
-        let base: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        let base = guard_reads(serde_json::from_str(V2_STORAGE).unwrap());
         assert!(
             validate(&base).is_empty(),
             "default /storage prefix keeps buckets clear of the /orgs module: {:?}",
@@ -3349,6 +3451,247 @@ mod tests {
         );
     }
 
+    // ---- #148 (JC0558): anonymous read/write on tenant / tenant-owned ----------
+
+    fn jc0558(qs: &[Question]) -> Vec<&Question> {
+        qs.iter()
+            .filter(|q| q.question.contains("JC0558"))
+            .collect()
+    }
+
+    /// A SAFE tenancy design: a tenant root (`Club`) and a tenant-owned child
+    /// (`Event` belongs_to Club), every read authenticated. It must validate
+    /// question-free — that is the byte-identity baseline JC0558 preserves.
+    const JC0558_BASE: &str = r#"{
+        "name": "clubs", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "clubs",
+              "entities": [{ "name": "Club", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "list_clubs", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Club", "list": true } },
+                  { "operation_id": "show_club", "method": "GET", "path": "/{id}",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Club" } }
+              ] },
+            { "name": "events",
+              "entities": [{ "name": "Event",
+                  "belongs_to": [{ "entity": "Club", "on_delete": "cascade" }],
+                  "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "title", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "list_events", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Event", "list": true } }
+              ] }
+        ]
+    }"#;
+
+    /// (c) The blessed shape: every tenant/tenant-owned read is authenticated,
+    /// so no handler is anonymous — JC0558 must stay silent and the whole design
+    /// is question-free (the safe-design byte-identity baseline).
+    #[test]
+    fn jc0558_does_not_fire_when_every_tenant_read_is_authenticated() {
+        let d: Design = serde_json::from_str(JC0558_BASE).unwrap();
+        let qs = validate(&d);
+        assert!(
+            qs.is_empty(),
+            "the safe tenancy design must pass clean: {qs:?}"
+        );
+    }
+
+    /// (a) An unguarded, non-`public` GET on the TENANT ROOT entity is anonymous
+    /// — genroute emits no Dep<Tenant>/CurrentUser, so any caller reads any
+    /// tenant's row by id. JC0558 must refuse it, naming the tenant entity.
+    #[test]
+    fn jc0558_fires_on_an_unguarded_read_of_the_tenant_entity() {
+        let mut d: Design = serde_json::from_str(JC0558_BASE).unwrap();
+        // show_club is the tenant's own detail route (`GET /{id}` on Club).
+        d.modules[0]
+            .endpoints
+            .iter_mut()
+            .find(|ep| ep.operation_id == "show_club")
+            .unwrap()
+            .auth_required = false;
+        let qs = validate(&d);
+        assert!(
+            jc0558(&qs)
+                .iter()
+                .any(|q| q.question.contains("show_club") && q.question.contains("`Club`")),
+            "an unguarded read on the tenant root must trip JC0558 naming Club: {qs:?}"
+        );
+    }
+
+    /// (b) The same anonymous shape on a tenant-OWNED (belongs_to) entity — an
+    /// unguarded read of `Event` exposes every tenant's events. JC0558 fires.
+    #[test]
+    fn jc0558_fires_on_an_unguarded_read_of_a_tenant_owned_entity() {
+        let mut d: Design = serde_json::from_str(JC0558_BASE).unwrap();
+        d.modules[1]
+            .endpoints
+            .iter_mut()
+            .find(|ep| ep.operation_id == "list_events")
+            .unwrap()
+            .auth_required = false;
+        let qs = validate(&d);
+        assert!(
+            jc0558(&qs)
+                .iter()
+                .any(|q| q.question.contains("list_events") && q.question.contains("`Event`")),
+            "an unguarded read on a tenant-owned entity must trip JC0558 naming Event: {qs:?}"
+        );
+    }
+
+    /// (d) The `!ep.public` exemption: a `public` route bypasses JC0558. On a
+    /// tenant-OWNED entity the open-read contradiction is the separate
+    /// public-on-tenant-owned refusal; JC0558 itself must not double-fire.
+    #[test]
+    fn jc0558_does_not_fire_on_a_public_route() {
+        let mut d: Design = serde_json::from_str(JC0558_BASE).unwrap();
+        let read = d.modules[1]
+            .endpoints
+            .iter_mut()
+            .find(|ep| ep.operation_id == "list_events")
+            .unwrap();
+        read.auth_required = false;
+        read.public = true;
+        let qs = validate(&d);
+        assert!(
+            jc0558(&qs).is_empty(),
+            "JC0558 must not fire on a public route (the public-on-tenant-owned refusal owns it): {qs:?}"
+        );
+        // The public read on a tenant-owned entity IS refused — by the
+        // public-on-tenant-owned check, proving JC0558 correctly stood down.
+        assert!(
+            qs.iter()
+                .any(|q| q.question.contains("public") && q.question.contains("tenant-owned")),
+            "a public read on a tenant-owned entity is still refused (just not by JC0558): {qs:?}"
+        );
+    }
+
+    /// (e) An entity-less join/leave subroute (the membership escape hatch) reads
+    /// no repo — the STRICT resolver returns None, so JC0558 must not tie it to a
+    /// tenant-owned neighbor via a first-entity fallback and falsely refuse it.
+    #[test]
+    fn jc0558_does_not_fire_on_an_entityless_subroute() {
+        let mut d: Design = serde_json::from_str(JC0558_BASE).unwrap();
+        // Graft an entity-less subroute under the clubs module with an unguarded,
+        // non-public endpoint. No entities ⇒ strict resolves to None ⇒ no fire.
+        d.modules[0].subroutes.push(
+            serde_json::from_str(
+                r#"{ "name": "membership", "mount": "/{club_id}/membership",
+                     "endpoints": [
+                         { "operation_id": "join_club", "method": "POST", "path": "/join",
+                           "success": { "status": 200 } } ] }"#,
+            )
+            .unwrap(),
+        );
+        let qs = validate(&d);
+        assert!(
+            jc0558(&qs).is_empty(),
+            "an entity-less subroute reads no tenant repo — JC0558 must not fire: {qs:?}"
+        );
+    }
+
+    /// (f) A signature-authenticated webhook (Stripe-style) is intentionally
+    /// unguarded — it proves itself by signature (JL0004 exempts it, so JC0558
+    /// must too). The exemption is load-bearing: without the signature error the
+    /// SAME unguarded endpoint on the tenant-owned entity WOULD trip JC0558.
+    #[test]
+    fn jc0558_does_not_fire_on_a_signature_authed_webhook() {
+        let webhook = |signature: bool| -> Design {
+            let mut d: Design = serde_json::from_str(JC0558_BASE).unwrap();
+            let errors = if signature {
+                r#", "errors": [{ "status": 400, "when": "Stripe signature is missing or invalid" }]"#
+            } else {
+                ""
+            };
+            d.modules[1].endpoints.push(
+                serde_json::from_str(&format!(
+                    r#"{{ "operation_id": "event_webhook", "method": "POST", "path": "/webhook",
+                         "success": {{ "status": 200, "entity": "Event" }}{errors} }}"#
+                ))
+                .unwrap(),
+            );
+            d
+        };
+        // With the signature error case: exempt — no JC0558 for the webhook.
+        let qs = validate(&webhook(true));
+        assert!(
+            !jc0558(&qs)
+                .iter()
+                .any(|q| q.question.contains("event_webhook")),
+            "a signature-authed webhook must be exempt from JC0558: {qs:?}"
+        );
+        // Without it: the exemption is what suppresses the refusal (Rule 9).
+        let qs_bare = validate(&webhook(false));
+        assert!(
+            jc0558(&qs_bare)
+                .iter()
+                .any(|q| q.question.contains("event_webhook")),
+            "an unguarded non-signature webhook on a tenant-owned entity DOES trip JC0558: {qs_bare:?}"
+        );
+    }
+
+    /// (g) A per-user (identity-owned, NON-tenant) entity's unguarded read is
+    /// JC0549's lane, not JC0558's: `tenant_path` is None, so the tenant twin
+    /// must stay out of it (JC0549(c) claims the unguarded per-user read).
+    #[test]
+    fn jc0558_does_not_fire_on_a_per_user_non_tenant_entity() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "mixed", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Club", "member_roles": ["owner"] },
+            "modules": [
+                { "name": "clubs",
+                  "entities": [
+                      { "name": "Club", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string" } ]},
+                      { "name": "User", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "email", "type": "string" } ]}
+                  ],
+                  "endpoints": [
+                      { "operation_id": "show_club", "method": "GET", "path": "/{id}",
+                        "auth_required": true,
+                        "success": { "status": 200, "entity": "Club" } }
+                  ] },
+                { "name": "notes",
+                  "entities": [{ "name": "Note",
+                      "belongs_to": [{ "entity": "User" }],
+                      "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "body", "type": "string" } ]}],
+                  "endpoints": [
+                      { "operation_id": "list_notes", "method": "GET", "path": "/",
+                        "success": { "status": 200, "entity": "Note", "list": true } }
+                  ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        let qs = validate(&d);
+        assert!(
+            jc0558(&qs).is_empty(),
+            "an unguarded per-user (non-tenant) read is JC0549's domain, not JC0558's: {qs:?}"
+        );
+        // The boundary: JC0549(c) owns that unguarded per-user read.
+        assert!(
+            qs.iter().any(|q| q.question.contains("JC0549")),
+            "JC0549(c) claims the unguarded per-user read (the twin's lane): {qs:?}"
+        );
+    }
+
     /// The strict-resolution pin (#105 whole-branch review): an ENTITY-LESS
     /// `public: true` GET (`GET /config`, custom-JSON success, no body, no
     /// `{param}` — the documented hand-written `Json<serde_json::Value>`
@@ -4016,7 +4359,7 @@ mod tests {
 
     #[test]
     fn reference_shaped_v1_design_is_question_free() {
-        let d: Design = serde_json::from_str(V1_FULL).unwrap();
+        let d = guard_reads(serde_json::from_str(V1_FULL).unwrap());
         assert!(validate(&d).is_empty(), "{:?}", validate(&d));
     }
 

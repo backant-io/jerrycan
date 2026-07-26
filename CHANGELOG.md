@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.11 — 2026-07-26
+
+Auth authorization.
+
+### Security
+- **Anonymous reads on a tenant / tenant-owned entity are refused (#148, `JC0558`).**
+  In an auth design, an endpoint on the tenant entity or a tenant-owned entity
+  that is neither `auth_required` nor `public` was generated with **no**
+  `Dep<Tenant>` guard and **no** `CurrentUser` — a fully anonymous handler — yet
+  `jerrycan check` was green, so any caller could read (or, with a `public`
+  mutation, write) **any tenant's rows by id**. Validation now refuses this shape
+  (`JC0558`): set `auth_required: true` so the membership guard scopes it. This is
+  the tenant twin of the per-user `JC0549(c)` check. Signature-authenticated
+  webhooks (the Stripe pattern) and genuinely `public` routes are exempt. The
+  refusal covers the tenant root's own reads and directly/transitively
+  tenant-owned entities.
+
+Follow-ups: an anonymous entity-less custom GET in a tenant-owned module still
+receives a lenient tenant-owned repo binding (read-only, writes already blocked by
+JL0004 — #171); a tenant-root non-member-404 acceptance probe (#172).
+
 ## 0.6.10 — 2026-07-26
 
 ### New

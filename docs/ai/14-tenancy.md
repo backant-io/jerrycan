@@ -41,6 +41,21 @@ endpoint:
   (the Supabase-migrated shape, and any authored flat design). The generated repo
   methods scope to the caller's whole membership set — the RLS model, restored.
 
+### Every tenant read must be authenticated (JC0558)
+In an auth design, **every** endpoint on the tenant entity or a tenant-owned entity
+(directly or transitively) must be authenticated — set `auth_required: true`. An
+endpoint that omits `auth_required` (the serde default is `false`) and is not
+`public` generates a handler with **no `Tenant` guard and no `CurrentUser`**: it is
+fully anonymous, so anyone could read (or write) any tenant's rows by id — the exact
+"green check, wide-open data" hole. `jerrycan check` refuses that shape up front with
+**JC0558** (the tenant twin of the per-user `JC0549`); `jerrycan explain JC0558`
+prints the fix. The only exempt unguarded endpoint is a **signature-authenticated
+webhook** (Stripe-style: it declares a 4xx error whose `when` names a signature
+check, so it proves itself by signature rather than a session). There is **no public
+read for tenant-owned entities** in v1 — a public read would bypass the `Tenant`
+guard and expose one tenant's rows to everyone (`public_read`, below, is
+per-user-only). Authenticate the read instead of marking it `public`.
+
 ## Per-user data without tenancy
 Tenancy is for **org/team** entities with memberships — a `Workspace`, `Org`, or
 `Team` that many users belong to and share rows within. It is the wrong tool for
