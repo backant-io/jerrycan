@@ -206,6 +206,17 @@ pub struct Field {
     /// required field is refused as unfillable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_len: Option<u64>,
+    /// Response-hidden output field (issue #112): the field is emitted with
+    /// `#[serde(skip_serializing)]` on the generated `Model`, so it never
+    /// serializes into an API response, while staying present for DESERIALIZE
+    /// (still accepted on create/update input) and for the SeaORM row
+    /// round-trip. `password_hash` is auto-classified as write-only even without
+    /// this flag (see `Design::field_is_write_only`, the secure-by-default). Serde-
+    /// default false and skipped when false, so every existing design round-trips
+    /// byte-identically. JC0554 refuses an explicit `write_only` on the pk `id`
+    /// (the id must be returned).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub write_only: bool,
 }
 
 fn default_true() -> bool {
@@ -1043,6 +1054,20 @@ impl Design {
         format!("{}_id", Self::to_snake(target))
     }
 
+    /// Whether a field is response-hidden (issue #112): emitted with
+    /// `#[serde(skip_serializing)]` on the Model so it never appears in an API
+    /// response, while staying accepted on input (create/update) and stored.
+    /// True for a field that declares `write_only`, AND — secure-by-default,
+    /// fail-CLOSED — for the one unambiguous secret column name `password_hash`
+    /// (a password hash must never be in a response). The broad
+    /// `*_hash`/`token`/`secret`/`api_key` name heuristic is deliberately NOT
+    /// included: too fragile, since a `share_token`/`oauth_token` may legitimately
+    /// be returned. Consumed by both Model emitters and the OpenAPI `field_schema`,
+    /// so the explicit flag AND a `password_hash` column are hidden identically.
+    pub fn field_is_write_only(f: &Field) -> bool {
+        f.write_only || f.name.eq_ignore_ascii_case("password_hash")
+    }
+
     /// Classify how `ep` (in `module`) binds the tenant, so an ownership guard
     /// knows what to verify (issues #78/#79). Resolves the endpoint's full path
     /// (`module.effective_mount()`, trailing `/` trimmed, + `ep.path`) against the
@@ -1694,6 +1719,37 @@ pub(crate) mod tests {
         let plain: Design = serde_json::from_str(MINIMAL).unwrap();
         assert!(!plain.wants_realtime());
         assert!(!plain.facade_features().contains(&"realtime"));
+    }
+
+    /// #112: the write-only classifier hides a field from responses when it
+    /// declares `write_only` OR is the one unambiguous secret column name
+    /// `password_hash` (secure-by-default, fail-CLOSED). A normal field is never
+    /// hidden — that is what guarantees byte-identity for designs with neither.
+    #[test]
+    fn field_is_write_only_flags_explicit_flag_and_password_hash_by_name() {
+        let f = |json: &str| -> Field { serde_json::from_str(json).unwrap() };
+        assert!(
+            Design::field_is_write_only(&f(
+                r#"{ "name": "api_token", "type": "string", "write_only": true }"#
+            )),
+            "an explicit write_only flag hides the field"
+        );
+        assert!(
+            Design::field_is_write_only(&f(r#"{ "name": "password_hash", "type": "string" }"#)),
+            "password_hash is auto-classified WITHOUT the flag (secure-by-default)"
+        );
+        assert!(
+            Design::field_is_write_only(&f(r#"{ "name": "Password_Hash", "type": "string" }"#)),
+            "the password_hash name match is case-insensitive"
+        );
+        assert!(
+            !Design::field_is_write_only(&f(r#"{ "name": "share_token", "type": "string" }"#)),
+            "the broad *_token/*_hash heuristic is deliberately EXCLUDED (may be public)"
+        );
+        assert!(
+            !Design::field_is_write_only(&f(r#"{ "name": "email", "type": "string" }"#)),
+            "a normal field is never hidden"
+        );
     }
 
     #[test]

@@ -740,6 +740,18 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 // server-assigned, and the generated id probes and seeds assume
                 // them free.
                 if f.name == "id" {
+                    // JC0554 (#112): the pk id must be returned in every response
+                    // (the id-echo probe + every cross-scope test key on
+                    // `body["id"]`), so an EXPLICIT `write_only` on it would
+                    // response-hide the id and break the generated suite by
+                    // construction. The `password_hash` auto-classification never
+                    // applies to `id`, so only the explicit flag is refused here.
+                    if f.write_only {
+                        qs.push(q(
+                            format!("{ptr}/entities/{i}/fields/{j}/write_only"),
+                            "Field `id` is the primary key — `write_only` is not allowed on it: the id must be returned in every response (the generated id-echo probe and every cross-scope test key on `body[\"id\"]`), so hiding it breaks the generated suite by construction. Remove `write_only` from `id`. See `jerrycan explain JC0554`.".to_string(),
+                        ));
+                    }
                     for (key, present) in [
                         ("min", f.min.is_some()),
                         ("max", f.max.is_some()),
@@ -3494,6 +3506,45 @@ mod tests {
         );
     }
 
+    /// #112 (JC0554): an EXPLICIT `write_only: true` on the pk `id` is refused —
+    /// the id must be returned in every response (the id-echo probe + every
+    /// cross-scope test key on `body["id"]`), so response-hiding it breaks the
+    /// generated suite by construction. The same flag on any OTHER field — even
+    /// alongside `unique` — is fine (write_only is orthogonal to DB/input keys).
+    #[test]
+    fn explicit_write_only_on_the_pk_id_is_refused_with_jc0554() {
+        let base = |id_extra: &str, token_extra: &str| -> Design {
+            design(&format!(
+                r#"{{ "name": "secrets-api", "contract_version": 1, "dependencies": ["db"],
+                    "modules": [{{ "name": "accounts",
+                        "entities": [{{ "name": "Account", "fields": [
+                            {{ "name": "id", "type": "integer"{id_extra} }},
+                            {{ "name": "api_token", "type": "string"{token_extra} }} ] }}],
+                        "endpoints": [{{ "operation_id": "list_accounts", "method": "GET",
+                            "path": "/",
+                            "success": {{ "status": 200, "entity": "Account", "list": true }} }}]
+                    }}] }}"#
+            ))
+        };
+        // write_only on a NON-id field, even `unique`, is accepted (no refusal).
+        let ok = base("", r#", "write_only": true, "unique": true"#);
+        assert!(
+            validate(&ok).is_empty(),
+            "write_only on a normal field (even unique) is fine: {:?}",
+            validate(&ok)
+        );
+        // Explicit write_only on the pk id → JC0554.
+        let bad = base(r#", "write_only": true"#, "");
+        let qs = validate(&bad);
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/write_only"
+                    && q.question.contains("primary key")
+                    && q.question.contains("JC0554")),
+            "explicit write_only on id must raise JC0554: {qs:?}"
+        );
+    }
+
     /// testgen must materialize `"a".repeat(min_len)` — an unbounded `min_len`
     /// would emit a multi-megabyte fixture, so it is capped at 4096.
     #[test]
@@ -3647,6 +3698,7 @@ mod tests {
             max: None,
             min_len: None,
             max_len: None,
+            write_only: false,
         });
         assert!(
             validate(&d)

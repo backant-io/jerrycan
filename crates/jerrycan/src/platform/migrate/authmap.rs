@@ -24,7 +24,7 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
     if has_oauth_provider {
         dependencies.push("oauth".to_string());
     }
-    let field = |name: &str, ft: FieldType, required: bool, unique: bool| Field {
+    let field = |name: &str, ft: FieldType, required: bool, unique: bool, write_only: bool| Field {
         name: name.into(),
         field_type: ft,
         required,
@@ -36,6 +36,7 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
         max: None,
         min_len: None,
         max_len: None,
+        write_only,
     };
     let user = Entity {
         name: "User".into(),
@@ -44,9 +45,12 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
         belongs_to: vec![],
         public_read: false,
         fields: vec![
-            field("id", FieldType::Uuid, true, false),
-            field("email", FieldType::String, true, true),
-            field("password_hash", FieldType::String, false, false),
+            field("id", FieldType::Uuid, true, false, false),
+            field("email", FieldType::String, true, true, false),
+            // #112: mark the hash write_only explicitly so the emitted design.json
+            // shows the intent (it is also auto-hidden by name); the migrated app's
+            // register/login responses no longer leak the bcrypt hash.
+            field("password_hash", FieldType::String, false, false, true),
         ],
     };
     let users_module = ModuleDesign {

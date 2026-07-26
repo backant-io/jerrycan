@@ -293,6 +293,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs tenancy",
     },
     CodeInfo {
+        code: "JC0554",
+        title: "write_only on the primary key id",
+        cause: "the pk `id` field declares `write_only: true` — but `write_only` response-hides a field (`#[serde(skip_serializing)]` on the generated Model, issue #112), and the id MUST be returned: the generated id-echo probe and every cross-scope acceptance test key on `body[\"id\"]`, so a hidden id breaks the generated suite by construction",
+        fix: "remove `write_only` from the `id` field; ids are always returned. Put `write_only` on the secret columns that must not appear in responses (a `password_hash` is auto-hidden by name; add it to e.g. an `api_token`/`secret` field)",
+        doc: "jerrycan docs validation",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -528,6 +535,26 @@ mod tests {
         assert!(
             info.fix.to_lowercase().contains("rename"),
             "fix must name the rename remedy: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0554_names_the_id_must_be_returned_rule() {
+        // WHY: JC0554 (#112) refuses an explicit `write_only: true` on the pk
+        // `id`. `write_only` response-hides a field, but the id must be echoed in
+        // every response (the id-echo probe + cross-scope tests key on
+        // body["id"]). `jerrycan explain JC0554` must state the cause (the id must
+        // be returned) and the remove-write_only remedy.
+        let info = lookup("JC0554").unwrap();
+        assert!(
+            info.cause.contains("write_only") && info.cause.contains("body[\"id\"]"),
+            "cause must tie write_only to the id-echo requirement: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.to_lowercase().contains("remove") && info.fix.contains("write_only"),
+            "fix must name the remove-write_only remedy: {}",
             info.fix
         );
     }
