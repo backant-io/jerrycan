@@ -144,7 +144,7 @@ fn overlay_type(index: &DesignIndex, table: &str, column: &str) -> Option<String
     }
     // fk columns: not declared as fields — type follows the target key.
     for b in &entity.belongs_to {
-        if Design::fk_column(&b.entity) == column {
+        if b.fk_column() == column {
             return Some(
                 if entity_owner_key_is_string(index, &b.entity) {
                     "string"
@@ -338,7 +338,7 @@ async fn introspect_table(db: &Db, index: &DesignIndex<'_>, table: &str) -> Resu
     // the relationship the handlers uphold.
     if let Some((_, entity)) = index.entities.get(table) {
         for b in &entity.belongs_to {
-            let col = Design::fk_column(&b.entity);
+            let col = b.fk_column();
             if foreign_keys.iter().any(|f| f.column == col) {
                 continue; // a real FK already covers it (intra-module)
             }

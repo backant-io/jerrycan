@@ -981,7 +981,7 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design, auth: bool) -> Opti
         let mut fields = String::new();
         // fk columns, in belongs_to order, before declared fields.
         for b in &e.belongs_to {
-            let col = Design::fk_column(&b.entity);
+            let col = b.fk_column();
             let ty = design.target_key_rust_type(&b.entity);
             if b.on_delete == OnDelete::SetNull {
                 fields.push_str("        #[serde(default)]\n");
@@ -1018,19 +1018,34 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design, auth: bool) -> Opti
         // targets stay decoupled (fk field only, no relation).
         let mut relation_arms = String::new();
         let mut related_impls = String::new();
+        let mut related_targets: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for b in &e.belongs_to {
             if !local.contains(b.entity.as_str()) {
                 continue;
             }
             let target_snake = Design::to_snake(&b.entity);
-            let fk_pascal = col_pascal(&Design::fk_column(&b.entity));
-            let target_pascal = &b.entity;
+            let fk_pascal = col_pascal(&b.fk_column());
+            // Relation variant name: unique per belongs_to. An un-aliased ref keeps
+            // the target entity name (byte-identical); an ALIASED ref (issue #119 —
+            // two `belongs_to` the same entity, or a self-reference) uses the alias
+            // pascal so the two variants don't collide into a duplicate enum arm.
+            let variant = match &b.r#as {
+                Some(a) => col_pascal(a),
+                None => b.entity.clone(),
+            };
             relation_arms.push_str(&format!(
-                "        #[sea_orm(belongs_to = \"super::{target_snake}::Entity\", from = \"Column::{fk_pascal}\", to = \"super::{target_snake}::Column::Id\")]\n        {target_pascal},\n"
+                "        #[sea_orm(belongs_to = \"super::{target_snake}::Entity\", from = \"Column::{fk_pascal}\", to = \"super::{target_snake}::Column::Id\")]\n        {variant},\n"
             ));
-            related_impls.push_str(&format!(
-                "\n    impl Related<super::{target_snake}::Entity> for Entity {{\n        fn to() -> RelationDef {{\n            Relation::{target_pascal}.def()\n        }}\n    }}\n"
-            ));
+            // `Related` is keyed on the TARGET Entity type — Rust coherence permits
+            // exactly one `impl Related<T>`. Emit it for the FIRST relation to a
+            // given entity only; a second `belongs_to` the same entity (issue #119)
+            // still contributes its Relation variant for explicit joins, but a
+            // duplicate `Related` impl would be a conflicting-implementation error.
+            if related_targets.insert(b.entity.as_str()) {
+                related_impls.push_str(&format!(
+                    "\n    impl Related<super::{target_snake}::Entity> for Entity {{\n        fn to() -> RelationDef {{\n            Relation::{variant}.def()\n        }}\n    }}\n"
+                ));
+            }
         }
         // Empty enum on one line (matches docs/ai/08-database.md); arms get a body.
         let relation = if relation_arms.is_empty() {
@@ -1126,10 +1141,9 @@ fn request_dto_rs(e: &Entity, design: &Design, for_update: bool) -> String {
     let path_fks = design.entity_path_fk_columns(entity);
     let mut fields = String::new();
     for b in e.belongs_to.iter().filter(|b| {
-        !(omit_identity && Design::is_identity_fk(b))
-            && !path_fks.contains(&Design::fk_column(&b.entity))
+        !(omit_identity && Design::is_identity_fk(b)) && !path_fks.contains(&b.fk_column())
     }) {
-        let col = Design::fk_column(&b.entity);
+        let col = b.fk_column();
         let ty = design.target_key_rust_type(&b.entity);
         if b.on_delete == OnDelete::SetNull {
             fields.push_str("    #[serde(default)]\n");
@@ -1179,7 +1193,7 @@ fn request_dto_doc(
 ) -> String {
     let mut reasons = Vec::new();
     for b in &e.belongs_to {
-        let col = Design::fk_column(&b.entity);
+        let col = b.fk_column();
         if omit_identity && Design::is_identity_fk(b) {
             reasons.push(format!("`{col}` (the authenticated session user's id)"));
         } else if path_fks.contains(&col) {
@@ -1288,7 +1302,7 @@ impl Default for {n}Repo {{
 fn model_field_names(e: &Entity) -> Vec<String> {
     let mut names = vec!["id".to_string()];
     for b in &e.belongs_to {
-        names.push(Design::fk_column(&b.entity));
+        names.push(b.fk_column());
     }
     for f in e.fields.iter().filter(|f| f.name != "id") {
         names.push(f.name.clone());
@@ -1592,7 +1606,7 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
         let parent_entity = e
             .belongs_to
             .iter()
-            .find(|b| Design::fk_column(&b.entity) == path.joins[0].child_fk)
+            .find(|b| b.fk_column() == path.joins[0].child_fk)
             .map(|b| b.entity.as_str())
             .expect("the tenant path's first hop is a belongs_to of the entity");
         let parent_fk_clone = if design.target_key_rust_type(parent_entity) == "String" {
@@ -2259,7 +2273,9 @@ fn owner_scoped_methods(e: &Entity, mode: GenMode, design: &Design) -> String {
     };
     let entity = &e.name;
     let snake = Design::to_snake(entity);
-    let fk_col = Design::fk_column(&identity.entity);
+    // #119: derive from the belongs_to itself so it agrees with the Model column
+    // (byte-identical — is_identity_fk pins `fk_column() == user_id`).
+    let fk_col = identity.fk_column();
     let fk_pascal = col_pascal(&fk_col);
     let fk_ty = design.target_key_rust_type(&identity.entity);
     let key = key_rust_type(e);
@@ -2615,7 +2631,7 @@ fn migration_ddl(m: &ModuleDesign, backend_is_pg: bool, design: &Design) -> Opti
         // on_delete policy; a cross-module target stays an unenforced relation:
         // bare column + an index + a documenting comment (no FK constraint).
         for b in &e.belongs_to {
-            let col = Design::fk_column(&b.entity);
+            let col = b.fk_column();
             let target_table = design.table_name(&b.entity);
             let mut fk_col = ColumnDef::new(Alias::new(col.clone()));
             match design.target_key_rust_type(&b.entity) {

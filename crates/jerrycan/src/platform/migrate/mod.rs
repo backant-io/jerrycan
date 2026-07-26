@@ -740,12 +740,7 @@ fn write_seed(
                 .fields
                 .iter()
                 .map(|f| f.name.clone())
-                .chain(
-                    entity
-                        .belongs_to
-                        .iter()
-                        .map(|b| Design::fk_column(&b.entity)),
-                )
+                .chain(entity.belongs_to.iter().map(|b| b.fk_column()))
                 .collect();
             let mut cols = Vec::new();
             let mut idxs = Vec::new();

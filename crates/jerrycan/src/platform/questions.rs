@@ -665,7 +665,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 // The fk column a belongs_to derives is generated; an explicit field
                 // of the same name would collide with the derived column.
                 for b in &e.belongs_to {
-                    let derived = Design::fk_column(&b.entity);
+                    let derived = b.fk_column();
                     if let Some(j) = e.fields.iter().position(|f| f.name == derived) {
                         qs.push(q(
                             format!("{ptr}/entities/{i}/fields/{j}"),
@@ -1477,7 +1477,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
             let mut valid: std::collections::HashSet<String> =
                 e.fields.iter().map(|f| f.name.clone()).collect();
             for b in &e.belongs_to {
-                valid.insert(Design::fk_column(&b.entity));
+                valid.insert(b.fk_column());
             }
             let mut seen_sets: Vec<std::collections::BTreeSet<String>> = Vec::new();
             for (g, group) in e.unique.iter().enumerate() {
@@ -1527,6 +1527,119 @@ pub fn validate(d: &Design) -> Vec<Question> {
     }
     for (i, m) in d.modules.iter().enumerate() {
         check_composite_unique(m, &format!("/modules/{i}"), &mut qs);
+    }
+
+    // JC0560 (#119): a `belongs_to` fk column must be BUILDABLE and DISTINCT. The
+    // fk column a belongs_to derives (`{as}_id` when aliased, else
+    // `snake(entity)_id`) becomes a Model field AND a migration column, so per
+    // entity: (1) every `as` must be snake_case (a malformed alias yields an
+    // invalid column/Rust field); (2) no two belongs_to may derive the SAME fk
+    // column — two un-aliased refs to one target both derive `snake(entity)_id`,
+    // or an `as` collides with another belongs_to's fk — which would emit a
+    // duplicate Model field and a duplicate migration column; (3) an fk column
+    // must not collide with a declared field name or the pk `id`. The alias exists
+    // precisely so two references to one entity (a ledger Transfer's
+    // from_account/to_account, a self-referential Comment's parent) get DISTINCT
+    // columns and distinct DDL constraint names. An entity with 0/1 un-aliased
+    // belongs_to and no `as` is inert (byte-identity baseline).
+    fn check_belongs_to_aliases(d: &Design, m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+        // #119 Finding 1: an `as` alias must not land on a RESERVED fk column that
+        // the target doesn't own — the identity fk `user_id` (in an auth design) or
+        // the tenancy fk — else the alias hijacks identity/tenant scoping and the
+        // generated Rust fails opaquely instead of a clean design-time refusal.
+        let auth_active = d
+            .auth
+            .as_ref()
+            .map(|a| a.model != AuthModel::None)
+            .unwrap_or(false);
+        let tenant_fk = d
+            .tenancy
+            .as_ref()
+            .map(|t| (Design::fk_column(&t.entity), t.entity.clone()));
+        for (i, e) in m.entities.iter().enumerate() {
+            let field_names: std::collections::HashSet<&str> =
+                e.fields.iter().map(|f| f.name.as_str()).collect();
+            let mut seen: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for (bi, b) in e.belongs_to.iter().enumerate() {
+                let bptr = format!("{ptr}/entities/{i}/belongs_to/{bi}");
+                // (1) A malformed alias yields a nonsense `{as}_id` column — refuse
+                // it here and skip the collision checks (they'd be noise on garbage).
+                if let Some(a) = &b.r#as
+                    && !is_snake(a)
+                {
+                    qs.push(q(
+                        bptr,
+                        format!(
+                            "Entity `{}` belongs_to `{}` has a malformed `as` alias `{a}` — an alias must be snake_case (^[a-z][a-z0-9_]*$); the fk column is derived as `{{as}}_id`. See `jerrycan explain JC0560`.",
+                            e.name, b.entity
+                        ),
+                    ));
+                    continue;
+                }
+                let col = b.fk_column();
+                // (4) #119 Finding 1: reject an alias that lands on a reserved fk the
+                // target doesn't own — hijacking identity/tenant scoping.
+                if auth_active
+                    && col == AUTH_IDENTITY_FK_COLUMN
+                    && Design::fk_column(&b.entity) != AUTH_IDENTITY_FK_COLUMN
+                {
+                    qs.push(q(
+                        bptr.clone(),
+                        format!(
+                            "Entity `{}` belongs_to `{}` with `as` deriving fk column `{col}` — that is the reserved identity fk (the authenticated user's column); only `belongs_to` the identity entity may own `{AUTH_IDENTITY_FK_COLUMN}`. Choose a different `as` alias. See `jerrycan explain JC0560`.",
+                            e.name, b.entity
+                        ),
+                    ));
+                }
+                if let Some((tfk, tent)) = &tenant_fk
+                    && col == *tfk
+                    && b.entity != *tent
+                {
+                    qs.push(q(
+                        bptr.clone(),
+                        format!(
+                            "Entity `{}` belongs_to `{}` with `as` deriving fk column `{col}` — that is the reserved tenancy fk for `{tent}`; aliasing the tenant fk breaks tenant scoping. Choose a different `as` alias. See `jerrycan explain JC0560`.",
+                            e.name, b.entity
+                        ),
+                    ));
+                }
+                // (3) The fk column is generated; a same-named declared field or the
+                // pk `id` would be a duplicate column.
+                if col == "id" || field_names.contains(col.as_str()) {
+                    let against = if col == "id" {
+                        "the pk `id`".to_string()
+                    } else {
+                        format!("a declared field `{col}`")
+                    };
+                    qs.push(q(
+                        bptr.clone(),
+                        format!(
+                            "Entity `{}` belongs_to `{}` derives fk column `{col}`, which collides with {against} — the fk column is generated, so it must not duplicate a declared field or the pk `id`. Rename the field or give the belongs_to a distinct `as`. See `jerrycan explain JC0560`.",
+                            e.name, b.entity
+                        ),
+                    ));
+                }
+                // (2) Two belongs_to deriving the same fk column → duplicate column.
+                if let Some(&first) = seen.get(&col) {
+                    qs.push(q(
+                        bptr,
+                        format!(
+                            "Entity `{}` belongs_to `{}` derives fk column `{col}`, the SAME column as belongs_to #{first} — two references to one entity collide into a duplicate column. Add a distinct `as` alias to at least one (e.g. `\"as\": \"from_account\"` → `from_account_id`). See `jerrycan explain JC0560`.",
+                            e.name, b.entity
+                        ),
+                    ));
+                } else {
+                    seen.insert(col, bi);
+                }
+            }
+        }
+        for (i, sub) in m.subroutes.iter().enumerate() {
+            check_belongs_to_aliases(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
+        }
+    }
+    for (i, m) in d.modules.iter().enumerate() {
+        check_belongs_to_aliases(d, m, &format!("/modules/{i}"), &mut qs);
     }
 
     // Jobs require a database: the engine's default store is Postgres and the
@@ -3222,6 +3335,193 @@ mod tests {
                 .iter()
                 .any(|q| q.question.contains("JC0559")),
             "a design with no composite unique must never mention JC0559"
+        );
+    }
+
+    // ---- #119 (JC0560): belongs_to fk alias -----------------------------------
+
+    /// A ledger with two aliased refs to Account (from/to) AND a self-referential
+    /// Comment — the whole point of #119. Fk columns from_account_id/to_account_id/
+    /// parent_id are all distinct, so it validates clean.
+    const FK_ALIAS: &str = r#"{
+        "name": "ledger-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "ledger",
+            "entities": [
+                { "name": "Account", "fields": [{ "name": "name", "type": "string" }] },
+                { "name": "Transfer",
+                  "belongs_to": [
+                      { "entity": "Account", "as": "from_account" },
+                      { "entity": "Account", "as": "to_account" }
+                  ],
+                  "fields": [{ "name": "amount", "type": "integer" }] },
+                { "name": "Comment",
+                  "belongs_to": [{ "entity": "Comment", "as": "parent" }],
+                  "fields": [{ "name": "body", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_transfer", "method": "POST", "path": "/transfers",
+                  "request_body": { "entity": "Transfer" },
+                  "success": { "status": 201, "entity": "Transfer" } }
+            ]
+        }]
+    }"#;
+
+    /// JC0560 (#119): the buildable baseline — two distinct aliases to one entity
+    /// and a self-reference pass clean. This is the acceptance witness the refusals
+    /// are measured against.
+    #[test]
+    fn valid_two_ref_and_self_ref_aliases_pass() {
+        let qs = validate(&design(FK_ALIAS));
+        assert!(
+            !qs.iter().any(|q| q.question.contains("JC0560")),
+            "a two-ref + self-ref alias design must not trip JC0560: {qs:?}"
+        );
+    }
+
+    /// Two UN-aliased belongs_to to the same entity both derive `account_id` — a
+    /// duplicate Model field + migration column. Refused with the add-`as` fork.
+    #[test]
+    fn two_unaliased_refs_to_one_entity_are_refused_with_jc0560() {
+        let dup = FK_ALIAS.replace(
+            r#"{ "entity": "Account", "as": "from_account" },
+                      { "entity": "Account", "as": "to_account" }"#,
+            r#"{ "entity": "Account" },
+                      { "entity": "Account" }"#,
+        );
+        let qs = validate(&design(&dup));
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0560"))
+            .unwrap_or_else(|| panic!("two un-aliased refs must trip JC0560: {qs:?}"));
+        assert!(
+            hit.question.contains("account_id") && hit.question.contains("SAME column"),
+            "message must name the colliding column and the add-`as` remedy: {}",
+            hit.question
+        );
+    }
+
+    /// An `as` whose `{as}_id` collides with a DECLARED field is a duplicate column
+    /// — refused (the field/fk name space is shared).
+    #[test]
+    fn alias_colliding_with_a_declared_field_is_refused_with_jc0560() {
+        // Add a field `from_account_id` alongside `belongs_to Account as from_account`.
+        let clash = FK_ALIAS.replace(
+            r#""fields": [{ "name": "amount", "type": "integer" }] }"#,
+            r#""fields": [{ "name": "amount", "type": "integer" }, { "name": "from_account_id", "type": "integer" }] }"#,
+        );
+        let qs = validate(&design(&clash));
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0560") && q.question.contains("declared field"))
+            .unwrap_or_else(|| panic!("an fk/field collision must trip JC0560: {qs:?}"));
+        assert!(
+            hit.question.contains("from_account_id"),
+            "message must name the colliding column: {}",
+            hit.question
+        );
+    }
+
+    /// A malformed `as` (not snake_case) yields an invalid column/Rust field —
+    /// refused before the collision checks even run.
+    #[test]
+    fn malformed_as_alias_is_refused_with_jc0560() {
+        let bad = FK_ALIAS.replace(r#""as": "from_account""#, r#""as": "FromAccount""#);
+        let qs = validate(&design(&bad));
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0560"))
+            .unwrap_or_else(|| panic!("a malformed `as` must trip JC0560: {qs:?}"));
+        assert!(
+            hit.question.contains("malformed") && hit.question.contains("FromAccount"),
+            "message must name the malformed alias and the snake_case rule: {}",
+            hit.question
+        );
+    }
+
+    /// Byte-identity floor: a design with a single un-aliased belongs_to per target
+    /// and no `as` raises no JC0560 (the check is inert unless an alias or a
+    /// same-entity collision exists).
+    #[test]
+    fn plain_belongs_to_raises_no_jc0560() {
+        assert!(
+            !validate(&design(COMPOSITE_UNIQUE))
+                .iter()
+                .any(|q| q.question.contains("JC0560")),
+            "an unaliased belongs_to design must never mention JC0560"
+        );
+    }
+
+    /// #119 Finding 1: an `as` deriving the reserved identity fk `user_id` on a
+    /// target that isn't the identity entity (here `Account`) would hijack per-user
+    /// scoping and fail as opaque generated Rust — refused at design time.
+    #[test]
+    fn alias_landing_on_the_identity_fk_is_refused_with_jc0560() {
+        const D: &str = r#"{
+            "name": "chat-api", "contract_version": 1,
+            "dependencies": ["db", "auth"],
+            "auth": { "model": "session" },
+            "modules": [{
+                "name": "messages",
+                "entities": [
+                    { "name": "Account", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Message",
+                      "belongs_to": [{ "entity": "Account", "as": "user" }],
+                      "fields": [{ "name": "body", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_message", "method": "POST", "path": "/messages",
+                      "request_body": { "entity": "Message" },
+                      "success": { "status": 201, "entity": "Message" } }
+                ]
+            }]
+        }"#;
+        let qs = validate(&design(D));
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0560") && q.question.contains("identity fk"))
+            .unwrap_or_else(|| {
+                panic!("`as: user` on a non-identity target must trip JC0560: {qs:?}")
+            });
+        assert!(
+            hit.question.contains("user_id"),
+            "message must name the reserved identity fk: {}",
+            hit.question
+        );
+    }
+
+    /// #119 Finding 1: an `as` deriving the reserved tenancy fk on a non-tenant
+    /// target would break tenant scoping — refused at design time.
+    #[test]
+    fn alias_landing_on_the_tenancy_fk_is_refused_with_jc0560() {
+        const D: &str = r#"{
+            "name": "org-api", "contract_version": 1,
+            "dependencies": ["db", "auth"],
+            "auth": { "model": "session", "roles": ["owner"] },
+            "tenancy": { "entity": "Workspace", "member_roles": ["owner"] },
+            "modules": [{
+                "name": "workspaces",
+                "entities": [
+                    { "name": "Workspace", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Vendor", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Note",
+                      "belongs_to": [{ "entity": "Vendor", "as": "workspace" }],
+                      "fields": [{ "name": "body", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_workspace", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Workspace" },
+                      "success": { "status": 201, "entity": "Workspace" } }
+                ]
+            }]
+        }"#;
+        let qs = validate(&design(D));
+        assert!(
+            qs.iter()
+                .any(|q| q.question.contains("JC0560") && q.question.contains("tenancy fk")),
+            "`as: workspace` (the tenancy fk) on a non-tenant target must trip JC0560: {qs:?}"
         );
     }
 

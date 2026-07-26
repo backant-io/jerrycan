@@ -211,11 +211,11 @@ fn fixture_json(
         .belongs_to
         .iter()
         .filter(|b| !(omit_identity_fk && Design::is_identity_fk(b)))
-        .filter(|b| !path_fks.contains(&Design::fk_column(&b.entity)))
+        .filter(|b| !path_fks.contains(&b.fk_column()))
         .map(|b| {
             format!(
                 "\"{}\": {}",
-                Design::fk_column(&b.entity),
+                b.fk_column(),
                 fk_fixture_value(design, &b.entity)
             )
         });

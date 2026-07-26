@@ -263,6 +263,28 @@ pub struct BelongsTo {
     pub entity: String,
     #[serde(default)]
     pub on_delete: OnDelete,
+    /// Optional fk-column alias (issue #119): the fk column becomes `{as}_id`
+    /// instead of `snake(entity)_id`, so two `belongs_to` the same entity (a
+    /// ledger's from/to account, a self-reference) coexist. `as` is a Rust
+    /// keyword — the field is `r#as` with `#[serde(rename = "as")]`. Absent ⇒
+    /// today's `snake(entity)_id`, byte-identical.
+    #[serde(default, rename = "as", skip_serializing_if = "Option::is_none")]
+    pub r#as: Option<String>,
+}
+
+impl BelongsTo {
+    /// The fk column this belongs_to derives: `{as}_id` when aliased, else the
+    /// default `snake(entity)_id` (issue #119). Every fk column derived FROM a
+    /// `belongs_to` MUST come through here; a fk derived from a bare entity name
+    /// (the tenancy/identity fk) keeps [`Design::fk_column`]. Falls through to
+    /// `Design::fk_column(&self.entity)` when unaliased, so a `belongs_to` with
+    /// no `as` is byte-identical to today.
+    pub fn fk_column(&self) -> String {
+        match &self.r#as {
+            Some(a) => format!("{a}_id"),
+            None => Design::fk_column(&self.entity),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1025,7 +1047,7 @@ impl Design {
             for rest in self.tenant_path_chains(&b.entity, tenant, visited) {
                 let mut chain = vec![JoinLink {
                     child_table: self.table_name(entity),
-                    child_fk: Self::fk_column(&b.entity),
+                    child_fk: b.fk_column(),
                     parent_table: self.table_name(&b.entity),
                 }];
                 chain.extend(rest);
@@ -1167,9 +1189,12 @@ impl Design {
     /// fk column is the fixed `user_id` linkage the membership table and the
     /// session guard key on (see `AUTH_IDENTITY_FK_COLUMN`). Identity is a
     /// COLUMN-name fact, not an entity-name one — the same resolution JC0540
-    /// uses.
+    /// uses. Keys on `b.fk_column()`, so an ALIASED `belongs_to` the identity
+    /// entity (issue #119, e.g. `as: "sender"` → `sender_id`) is correctly NOT
+    /// the owner fk — a message's sender/recipient is a plain reference, not the
+    /// authenticated owner; only an un-aliased `belongs_to User` → `user_id` is.
     pub(crate) fn is_identity_fk(b: &BelongsTo) -> bool {
-        Self::fk_column(&b.entity) == AUTH_IDENTITY_FK_COLUMN
+        b.fk_column() == AUTH_IDENTITY_FK_COLUMN
     }
 
     /// True when the entity carries an identity FK (a belongs_to aimed at the
@@ -1292,7 +1317,7 @@ impl Design {
         };
         e.belongs_to
             .iter()
-            .map(|b| Self::fk_column(&b.entity))
+            .map(|b| b.fk_column())
             .filter(|col| self.any_body_endpoint_resolved_path_has(entity_name, col))
             .collect()
     }
@@ -2364,6 +2389,54 @@ pub(crate) mod tests {
         // fk_column derives from the shared to_snake (DRY); both must agree.
         assert_eq!(Design::to_snake("ApiKey"), "api_key");
         assert_eq!(Design::to_snake("Lead"), "lead");
+    }
+
+    #[test]
+    fn belongs_to_fk_column_falls_through_or_aliases() {
+        // WHY (issue #119): the fk-column derivation must be byte-identical to
+        // `Design::fk_column(&entity)` when there is no `as` (every existing design
+        // stays byte-for-byte), and become `{as}_id` when aliased — the SINGLE
+        // mechanic that lets two refs to one entity coexist. If this diverged from
+        // `Design::fk_column` on the unaliased path, determinism.rs would break.
+        let plain = BelongsTo {
+            entity: "Account".to_string(),
+            on_delete: OnDelete::Restrict,
+            r#as: None,
+        };
+        assert_eq!(plain.fk_column(), Design::fk_column("Account"));
+        assert_eq!(plain.fk_column(), "account_id");
+        let aliased = BelongsTo {
+            entity: "Account".to_string(),
+            on_delete: OnDelete::Restrict,
+            r#as: Some("from_account".to_string()),
+        };
+        assert_eq!(aliased.fk_column(), "from_account_id");
+        // A self-reference aliases just the same — the derivation never consults the
+        // target, only the alias.
+        let self_ref = BelongsTo {
+            entity: "Comment".to_string(),
+            on_delete: OnDelete::Cascade,
+            r#as: Some("parent".to_string()),
+        };
+        assert_eq!(self_ref.fk_column(), "parent_id");
+    }
+
+    #[test]
+    fn belongs_to_as_serde_roundtrips_and_omits_when_absent() {
+        // `as` is a Rust keyword → `r#as` with `#[serde(rename = "as")]`; it
+        // deserializes from the wire key `as`, and an absent alias is skipped on
+        // serialize so an unaliased belongs_to stays byte-identical on the wire.
+        let aliased: BelongsTo =
+            serde_json::from_str(r#"{ "entity": "Account", "as": "from_account" }"#).unwrap();
+        assert_eq!(aliased.r#as.as_deref(), Some("from_account"));
+        assert_eq!(aliased.fk_column(), "from_account_id");
+        let plain: BelongsTo = serde_json::from_str(r#"{ "entity": "Account" }"#).unwrap();
+        assert_eq!(plain.r#as, None);
+        let back = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !back.contains("\"as\""),
+            "absent alias must not serialize: {back}"
+        );
     }
 
     #[test]

@@ -2670,6 +2670,180 @@ fn composite_unique_conflict_goes_409_on_a_correct_scaffold() {
     );
 }
 
+/// The #119 fk-alias conformance fixture: a ledger `Transfer` with TWO aliased
+/// references to `Account` (from_account/to_account) and a self-referential
+/// `Comment` (parent), all in ONE module so the fk columns carry REAL DDL FOREIGN
+/// KEY constraints — the case a single un-aliased `belongs_to` cannot express.
+/// GET-only so the generated probes read (no create probe → no FK-seed needed).
+const FK_ALIAS_LEDGER: &str = r#"{
+  "name": "ledger-api",
+  "contract_version": 1,
+  "dependencies": ["db"],
+  "modules": [
+    { "name": "ledger",
+      "entities": [
+        { "name": "Account", "fields": [{ "name": "name", "type": "string" }] },
+        { "name": "Transfer",
+          "belongs_to": [
+            { "entity": "Account", "as": "from_account" },
+            { "entity": "Account", "as": "to_account" }
+          ],
+          "fields": [{ "name": "amount", "type": "integer" }] },
+        { "name": "Comment",
+          "belongs_to": [{ "entity": "Comment", "as": "parent", "on_delete": "cascade" }],
+          "fields": [{ "name": "body", "type": "string" }] }
+      ],
+      "endpoints": [
+        { "operation_id": "list_transfers", "method": "GET", "path": "/transfers",
+          "success": { "status": 200, "entity": "Transfer", "list": true } },
+        { "operation_id": "show_transfer", "method": "GET", "path": "/transfers/{id}",
+          "success": { "status": 200, "entity": "Transfer" } },
+        { "operation_id": "list_comments", "method": "GET", "path": "/comments",
+          "success": { "status": 200, "entity": "Comment", "list": true } }
+      ] }
+  ]
+}"#;
+
+/// The correct GET-only handlers over the aliased-fk entities.
+const FK_ALIAS_HANDLERS: &str = r#"//! Correct #119 handlers: GET-only reads over the aliased-fk entities.
+use jerrycan::prelude::*;
+use super::model::*;
+use super::repo::*;
+
+pub(crate) async fn list_transfers(repo: Dep<TransferRepo>) -> Result<Json<Vec<Transfer>>> {
+    Ok(Json(repo.all().await?))
+}
+
+pub(crate) async fn show_transfer(repo: Dep<TransferRepo>, Path(id): Path<i64>) -> Result<Json<Transfer>> {
+    repo.get(id).await?.map(Json).ok_or_else(Error::not_found)
+}
+
+pub(crate) async fn list_comments(repo: Dep<CommentRepo>) -> Result<Json<Vec<Comment>>> {
+    Ok(Json(repo.all().await?))
+}
+"#;
+
+/// Issue #119 end-to-end: the belongs_to fk alias proves out on a real scaffold.
+/// The two-reference `Transfer` (from_account_id + to_account_id, two distinct
+/// FKs to `accounts` with distinct constraint names) and the self-referential
+/// `Comment` (parent_id → comments) scaffold, the generated SeaORM model
+/// (distinct Relation variants + a single `Related` impl per target) COMPILES,
+/// the generated suite goes GREEN on the correct handlers, and the full
+/// `jerrycan check` gate passes. Un-aliased `belongs_to` stays byte-identical
+/// (covered by determinism.rs); THIS proves the alias path is buildable end to
+/// end — a single un-aliased belongs_to could never express two refs to one table.
+#[test]
+#[ignore = "heavy: scaffold + build + gen-tests + red run + implement + green run + check (#119 fk alias)"]
+fn fk_alias_two_refs_and_self_ref_go_green_on_a_correct_scaffold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, FK_ALIAS_LEDGER).unwrap();
+    let app = tmp.path().join("ledger-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .args(["new"])
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "the fk-alias design must scaffold");
+
+    // The migration carries the two aliased fk columns + the self-ref column, with
+    // two distinct FKs to accounts (distinct constraint names on Postgres, where
+    // two same-named table constraints would be rejected at apply).
+    for dialect in ["sqlite", "postgres"] {
+        let sql = std::fs::read_to_string(app.join(format!(
+            "crates/routes/ledger/migrations/{dialect}/0001_create_tables.sql"
+        )))
+        .unwrap();
+        assert!(
+            sql.contains("\"from_account_id\"")
+                && sql.contains("\"to_account_id\"")
+                && !sql.contains("\"account_id\""),
+            "{dialect}: both aliased fk columns replace the default account_id:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("REFERENCES \"accounts\"").count(),
+            2,
+            "{dialect}: two distinct FKs must reference accounts:\n{sql}"
+        );
+        assert!(
+            sql.contains("\"parent_id\"") && sql.contains("REFERENCES \"comments\""),
+            "{dialect}: the self-reference must emit parent_id → comments:\n{sql}"
+        );
+    }
+    let pg = std::fs::read_to_string(
+        app.join("crates/routes/ledger/migrations/postgres/0001_create_tables.sql"),
+    )
+    .unwrap();
+    assert!(
+        pg.contains("\"fk_transfers_from_account_id\"")
+            && pg.contains("\"fk_transfers_to_account_id\"")
+            && pg.contains("\"fk_comments_parent_id\""),
+        "postgres must name the three FK constraints distinctly:\n{pg}"
+    );
+
+    // gen-tests the module (the ledger suite carries the list/show read probes).
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "gen-tests", "--module", "ledger"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "gen-tests ledger: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // RED: the stub handlers (500) fail the generated read suite.
+    let red = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace", "--no-fail-fast"])
+        .output()
+        .unwrap();
+    assert!(!red.status.success(), "stub handlers must fail the suite");
+
+    // Implement the correct GET-only handlers.
+    install_handler(
+        &app,
+        "crates/routes/ledger/src/handlers.rs",
+        FK_ALIAS_HANDLERS,
+    );
+
+    // GREEN: the aliased-fk model compiles and the read suite passes.
+    let green = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["test", "--workspace"])
+        .status()
+        .unwrap();
+    assert!(
+        green.success(),
+        "the correct handlers must satisfy the generated read suite"
+    );
+
+    // The full gate holds on the implemented app.
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON doc");
+    assert_eq!(
+        payload["ok"], true,
+        "diagnostics: {}",
+        payload["diagnostics"]
+    );
+}
+
 // Small helpers for the deploy-anywhere test (no earlier-phase equivalents exist
 // in this file; the auth_observe test inlines its own closures).
 fn pick_port() -> u16 {

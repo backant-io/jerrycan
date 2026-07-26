@@ -501,3 +501,82 @@ fn db_mode_emits_composite_unique_index_both_dialects() {
         );
     }
 }
+
+/// Issue #119 — the acceptance criterion: a two-reference entity and a
+/// self-reference both scaffold to DISTINCT aliased fk columns with DISTINCT
+/// DDL constraint names, in ONE module (so the FKs are real DB constraints).
+/// `Transfer belongs_to Account as from_account/to_account` → from_account_id +
+/// to_account_id (never a single colliding account_id); `Comment belongs_to
+/// Comment as parent` → parent_id → comments.
+#[test]
+fn db_mode_emits_aliased_fk_columns_with_distinct_constraint_names() {
+    const LEDGER: &str = r#"{
+        "name": "ledger-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "ledger",
+            "entities": [
+                { "name": "Account", "fields": [{ "name": "name", "type": "string" }] },
+                { "name": "Transfer",
+                  "belongs_to": [
+                      { "entity": "Account", "as": "from_account" },
+                      { "entity": "Account", "as": "to_account" }
+                  ],
+                  "fields": [{ "name": "amount", "type": "integer" }] },
+                { "name": "Comment",
+                  "belongs_to": [{ "entity": "Comment", "as": "parent", "on_delete": "cascade" }],
+                  "fields": [{ "name": "body", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_transfer", "method": "POST", "path": "/transfers",
+                  "request_body": { "entity": "Transfer" },
+                  "success": { "status": 201, "entity": "Transfer" } }
+            ]
+        }]
+    }"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ledger-api");
+    let design: Design = serde_json::from_str(LEDGER).unwrap();
+    scaffold::scaffold(&root, &design).unwrap();
+    for dialect in ["sqlite", "postgres"] {
+        let sql = fs::read_to_string(root.join(format!(
+            "crates/routes/ledger/migrations/{dialect}/0001_create_tables.sql"
+        )))
+        .unwrap();
+        // Two DISTINCT fk columns on transfers — the alias replaced the default
+        // account_id, so the two refs to Account no longer collide on one column.
+        assert!(
+            sql.contains("\"from_account_id\"") && sql.contains("\"to_account_id\""),
+            "{dialect}: both aliased fk columns must be emitted:\n{sql}"
+        );
+        assert!(
+            !sql.contains("\"account_id\""),
+            "{dialect}: the default account_id must NOT be emitted (the alias replaced it):\n{sql}"
+        );
+        // Two independent FOREIGN KEYs to accounts (one per aliased column).
+        assert_eq!(
+            sql.matches("REFERENCES \"accounts\"").count(),
+            2,
+            "{dialect}: two distinct FKs must reference accounts:\n{sql}"
+        );
+        // The self-reference: parent_id → comments.
+        assert!(
+            sql.contains("\"parent_id\"") && sql.contains("REFERENCES \"comments\""),
+            "{dialect}: the self-reference must emit parent_id → comments:\n{sql}"
+        );
+    }
+    // Postgres NAMES its table constraints `fk_{table}_{col}` — the alias makes the
+    // two FKs to accounts get DISTINCT names; without it, two constraints named
+    // `fk_transfers_account_id` on one table would be rejected at apply. This is the
+    // #119 acceptance criterion: two distinct constraint names for the two refs.
+    let pg = fs::read_to_string(
+        root.join("crates/routes/ledger/migrations/postgres/0001_create_tables.sql"),
+    )
+    .unwrap();
+    assert!(
+        pg.contains("\"fk_transfers_from_account_id\"")
+            && pg.contains("\"fk_transfers_to_account_id\"")
+            && pg.contains("\"fk_comments_parent_id\""),
+        "postgres must name the three FK constraints distinctly:\n{pg}"
+    );
+}

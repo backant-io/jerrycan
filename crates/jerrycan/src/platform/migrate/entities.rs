@@ -109,30 +109,55 @@ fn build_one(
         let column = &fk.columns[0];
         let target_table = fk.ref_table.rsplit('.').next().unwrap_or(&fk.ref_table);
         let target = entity_name(target_table);
+        let on_delete = match fk.on_delete {
+            FkAction::Cascade => OnDelete::Cascade,
+            FkAction::SetNull => OnDelete::SetNull,
+            FkAction::Restrict => OnDelete::Restrict,
+        };
         if *column == Design::fk_column(&target) {
+            // The default derivation reproduces this column exactly — un-aliased.
             belongs_to.push(BelongsTo {
                 entity: target,
-                on_delete: match fk.on_delete {
-                    FkAction::Cascade => OnDelete::Cascade,
-                    FkAction::SetNull => OnDelete::SetNull,
-                    FkAction::Restrict => OnDelete::Restrict,
-                },
+                on_delete,
+                r#as: None,
+            });
+            suppressed.push(column.clone());
+        } else if let Some(alias) = column.strip_suffix("_id").filter(|a| {
+            // Alias pattern `^[a-z][a-z0-9_]*$` — the same shape a hand-authored
+            // `as` must satisfy (JC0560), so the round-trip is validation-clean.
+            !a.is_empty()
+                && a.starts_with(|c: char| c.is_ascii_lowercase())
+                && a.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        }) {
+            // Aliased fk (issue #119): a `{alias}_id` column referencing a table
+            // whose default fk column would differ (`snake(target)_id != column`).
+            // Round-trip it losslessly as `belongs_to { entity, as: alias }` — this
+            // is exactly how two refs to one table (from_account_id/to_account_id) or
+            // a self-reference (parent_id) are expressed. `belongs_to.fk_column()`
+            // reproduces `column`, so an import → design → migrate loop is a fixpoint.
+            belongs_to.push(BelongsTo {
+                entity: target,
+                on_delete,
+                r#as: Some(alias.to_string()),
             });
             suppressed.push(column.clone());
         } else {
+            // The column can't be expressed as an alias (no `_id` suffix, or a
+            // non-snake stem) — don't guess. Keep it as a plain field and document
+            // the dropped FK relation (never silently drop the reference).
             gaps.push(GapItem {
                 kind: GapKind::ForeignKey,
                 source: format!("{key}.{column}"),
                 location: format!("schema.sql:{}", table.line),
                 reason: format!(
-                    "fk column `{column}` does not match the derived belongs_to column `{}`",
+                    "fk column `{column}` is not `{{alias}}_id`-shaped, so it can't round-trip as a belongs_to alias to `{}`",
                     Design::fk_column(&target)
                 ),
                 original: format!("references {}", fk.ref_table),
-                suggested: format!(
-                    "rename the column to {} in the seed mapping or keep it as a plain field + handler-enforced integrity",
-                    Design::fk_column(&target)
-                ),
+                suggested:
+                    "rename the column to `{snake_target}_id` (or a snake `{alias}_id`) in the seed mapping, or keep it as a plain field + handler-enforced integrity"
+                        .to_string(),
                 severity: Severity::Advisory,
             });
         }
@@ -285,22 +310,35 @@ create table public.order_items (
     }
 
     #[test]
-    fn mismatched_fk_names_and_unmappable_types_gap_instead_of_guessing() {
+    fn aliased_fk_round_trips_as_belongs_to_as_and_unmappable_types_still_gap() {
         let out = build();
-        // author_id references workspaces but snake(Workspace)_id == workspace_id ≠ author_id.
-        assert!(out.gaps.iter().any(|g| g.kind
-            == crate::platform::migrate::gaps::GapKind::ForeignKey
-            && g.source.contains("author_id")));
-        // point column → unmapped_type gap, field dropped.
-        assert!(out.gaps.iter().any(|g| g.kind
-            == crate::platform::migrate::gaps::GapKind::UnmappedType
-            && g.source.contains("location")));
         let item = out
             .entities
             .iter()
             .find(|(_, e)| e.name == "OrderItem")
             .map(|(_, e)| e)
             .unwrap();
+        // author_id references workspaces but snake(Workspace)_id == workspace_id ≠
+        // author_id, so it round-trips (issue #119) as `belongs_to Workspace as
+        // author` — a SECOND, distinct reference to Workspace — NOT a ForeignKey gap.
+        let author = item
+            .belongs_to
+            .iter()
+            .find(|b| b.r#as.as_deref() == Some("author"))
+            .expect("author_id must round-trip as `belongs_to Workspace as author`");
+        assert_eq!(author.entity, "Workspace");
+        assert_eq!(author.fk_column(), "author_id");
+        // The aliased column is suppressed (it IS the belongs_to), not a plain field,
+        // and no ForeignKey gap is raised for it (the reference is expressed, not lost).
+        assert!(!item.fields.iter().any(|f| f.name == "author_id"));
+        assert!(!out.gaps.iter().any(|g| g.kind
+            == crate::platform::migrate::gaps::GapKind::ForeignKey
+            && g.source.contains("author_id")));
+        // A column that cannot become a belongs_to at all (point type) still gaps as
+        // an unmapped type and its field is dropped — the migrator never guesses.
+        assert!(out.gaps.iter().any(|g| g.kind
+            == crate::platform::migrate::gaps::GapKind::UnmappedType
+            && g.source.contains("location")));
         assert!(!item.fields.iter().any(|f| f.name == "location"));
     }
 
