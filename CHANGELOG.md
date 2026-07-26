@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.8 — 2026-07-26
+
+Security: response-hidden fields.
+
+### Security
+- **`write_only` fields (#112) — secrets no longer serialize by default.** A
+  field marked `"write_only": true` — and any field named `password_hash`, which
+  is auto-hidden (secure by default) — is accepted on create/update and stored,
+  but **never appears in an API response**: the generated `Model` gets
+  `#[serde(skip_serializing)]` (input and the DB layer are unaffected), and the
+  OpenAPI schema marks it `writeOnly`. Previously every column serialized, so the
+  docs' own accounts-api example and the Supabase migrator both shipped
+  `password_hash` in responses. **Behavior change:** an existing design with a
+  `password_hash` column (or a newly-`write_only` field) stops returning it on
+  regeneration.
+- **`JC0554`** refuses `write_only` on the primary-key `id` (the id must be
+  returned).
+- **`JC0555`** refuses a `write_only`/`password_hash` column on a realtime
+  `changes` entity — the changes broadcast delivers the whole row, so the column
+  would leak to WebSocket subscribers; the combination is refused until
+  per-column projection lands (#167).
+
+### Docs
+- The accounts-api example marks `password_hash` `write_only` (and notes that
+  responses omit it); the field reference documents `write_only`, the
+  `password_hash` auto-hide, and `JC0554`/`JC0555`.
+
 ## 0.6.7 — 2026-07-26
 
 Papercuts — four small correctness/consistency fixes surfaced by prior
