@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.10 — 2026-07-26
+
+### New
+- **`"default": "now"` for server-set timestamps (#110).** A `datetime` field may
+  declare `"default": "now"` — the server sets it to the current time (RFC3339
+  UTC) on create; the field is omitted from **both** the create and update request
+  bodies (server-owned and immutable after create) and is returned in responses.
+  Previously a server timestamp (`created_at`, `applied_at`, `sent_at`) had no
+  in-contract expression and was forced into a lossy `required: false` workaround.
+- **`jerrycan::now_rfc3339() -> String`** — a dependency-free (no `chrono`)
+  current-UTC RFC3339 helper, prelude-exported; the generated `default: "now"`
+  handler steer points at it.
+- **`JC0557`** refuses `"now"` on a non-`datetime` field (or a mis-cased near-miss
+  like `"NOW"` on a datetime field).
+
+Deferred: relative offsets (`"now+7d"`) and now-on-update (`updated_at`).
+
 ## 0.6.9 — 2026-07-26
 
 Storage authorization.

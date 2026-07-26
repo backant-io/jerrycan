@@ -1074,6 +1074,21 @@ impl Design {
         f.write_only || f.name.eq_ignore_ascii_case("password_hash")
     }
 
+    /// Whether a field is the dynamic server-set timestamp (issue #110): a
+    /// `datetime` field whose `default` is the exact lowercase sentinel `"now"`.
+    /// Such a field is dropped from BOTH request DTOs (server-owned on create,
+    /// immutable on update — a client must not rewrite `created_at`) and the create
+    /// handler sets it to `now_rfc3339()`, distinct from a STATIC default (which is
+    /// kept-settable on update and named as a literal). `"now"` never collides with
+    /// a legitimate static datetime literal — no RFC3339 timestamp is the bare word
+    /// `now` — so the sentinel is unambiguous. A near-miss casing (`"NOW"`) or a
+    /// `"now"` on a non-datetime field is refused at validation (JC0557), never
+    /// silently read here. False for every field without this exact shape, which is
+    /// what keeps designs that don't use it byte-identical.
+    pub fn field_is_now_default(f: &Field) -> bool {
+        f.field_type == FieldType::Datetime && f.default.as_ref() == Some(&serde_json::json!("now"))
+    }
+
     /// Classify how `ep` (in `module`) binds the tenant, so an ownership guard
     /// knows what to verify (issues #78/#79). Resolves the endpoint's full path
     /// (`module.effective_mount()`, trailing `/` trimmed, + `ep.path`) against the
@@ -1755,6 +1770,45 @@ pub(crate) mod tests {
         assert!(
             !Design::field_is_write_only(&f(r#"{ "name": "email", "type": "string" }"#)),
             "a normal field is never hidden"
+        );
+    }
+
+    /// #110: the now-default classifier is TRUE only for a `datetime` field whose
+    /// `default` is the exact lowercase `"now"`. A static datetime default, a
+    /// bad-casing near-miss, `"now"` on another type, and no-default all read FALSE
+    /// — that precision is what makes the immutable-timestamp treatment (drop from
+    /// both DTOs, `now_rfc3339()` steer) fire ONLY on the intended sentinel and
+    /// leaves every other datetime field byte-identical.
+    #[test]
+    fn field_is_now_default_flags_only_datetime_with_exact_lowercase_now() {
+        let f = |json: &str| -> Field { serde_json::from_str(json).unwrap() };
+        assert!(
+            Design::field_is_now_default(&f(
+                r#"{ "name": "created_at", "type": "datetime", "default": "now" }"#
+            )),
+            "datetime + exact \"now\" is the sentinel"
+        );
+        assert!(
+            !Design::field_is_now_default(&f(
+                r#"{ "name": "created_at", "type": "datetime", "default": "2026-01-01T00:00:00Z" }"#
+            )),
+            "a STATIC datetime default is not the now sentinel"
+        );
+        assert!(
+            !Design::field_is_now_default(&f(
+                r#"{ "name": "created_at", "type": "datetime", "default": "NOW" }"#
+            )),
+            "a bad-casing near-miss is not the sentinel (validation refuses it)"
+        );
+        assert!(
+            !Design::field_is_now_default(&f(
+                r#"{ "name": "label", "type": "string", "default": "now" }"#
+            )),
+            "\"now\" on a non-datetime field is not the sentinel (validation refuses it)"
+        );
+        assert!(
+            !Design::field_is_now_default(&f(r#"{ "name": "created_at", "type": "datetime" }"#)),
+            "a datetime field WITHOUT a default is never the sentinel"
         );
     }
 

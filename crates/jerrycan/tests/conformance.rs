@@ -1341,6 +1341,172 @@ fn body_omittable_fields_go_green_on_a_correct_scaffold() {
     );
 }
 
+/// Issue #110 end-to-end: a `datetime` field defaulting to `"now"` is a dynamic
+/// server-set, set-once timestamp. `created_at` is dropped from BOTH request DTOs
+/// (create + update) and their OpenAPI schemas, stays in the response entity
+/// schema, and the create stub steers the handler to `now_rfc3339()`. A correct
+/// app — create sets `created_at = now_rfc3339()`, update PRESERVES it — passes the
+/// full `jerrycan check` gate.
+const NOW_DESIGN: &str = r#"{
+  "name": "notes-now",
+  "contract_version": 0,
+  "auth": { "model": "none" },
+  "dependencies": ["db"],
+  "modules": [
+    {
+      "name": "notes",
+      "entities": [
+        { "name": "Note", "fields": [
+          { "name": "body", "type": "string" },
+          { "name": "created_at", "type": "datetime", "default": "now" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_notes", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Note", "list": true } },
+        { "operation_id": "create_note", "method": "POST", "path": "/",
+          "request_body": { "entity": "Note" },
+          "success": { "status": 201, "entity": "Note" } },
+        { "operation_id": "update_note", "method": "PUT", "path": "/{id}",
+          "request_body": { "entity": "Note" },
+          "success": { "status": 200, "entity": "Note" } }
+      ]
+    }
+  ]
+}"#;
+
+/// Correct notes handlers: `NoteRequest`/`NoteUpdateRequest` have NO `created_at`,
+/// so the create handler MUST set it via `now_rfc3339()` (a compile-time forcing
+/// function) and the update handler PRESERVES the stored value — a client can never
+/// rewrite the timestamp.
+const NOW_HANDLERS: &str = r#"//! Correct notes handlers (#110 now-default).
+use super::model::*;
+use super::repo::*;
+use jerrycan::prelude::*;
+
+pub(crate) async fn list_notes(repo: Dep<NoteRepo>) -> Result<Json<Vec<Note>>> {
+    Ok(Json(repo.all().await?))
+}
+
+pub(crate) async fn create_note(repo: Dep<NoteRepo>, Json(body): Json<NoteRequest>) -> Result<Created<Note>> {
+    let mut note = Note { id: 0, body: body.body, created_at: now_rfc3339() };
+    note.id = repo.insert(note.clone()).await?;
+    Ok(Created(note))
+}
+
+pub(crate) async fn update_note(repo: Dep<NoteRepo>, Path(id): Path<i64>, Json(body): Json<NoteUpdateRequest>) -> Result<Json<Note>> {
+    let existing = repo.get(id).await?.ok_or_else(Error::not_found)?;
+    let updated = Note { id, body: body.body, created_at: existing.created_at };
+    if repo.update(id, updated.clone()).await? {
+        Ok(Json(updated))
+    } else {
+        Err(Error::not_found())
+    }
+}
+"#;
+
+#[test]
+#[ignore = "heavy: scaffold + gen-tests + implement + full check gate (#110 now-default)"]
+fn now_default_timestamp_goes_green_on_a_correct_scaffold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, NOW_DESIGN).unwrap();
+    let app = tmp.path().join("notes-now");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .args(["new"])
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "the now-default design must scaffold");
+
+    // BOTH request DTOs drop `created_at` (server-owned on create, immutable on
+    // update); the entity Model KEEPS it (present in every response).
+    let model = std::fs::read_to_string(app.join("crates/routes/notes/src/model.rs")).unwrap();
+    for dto in ["pub struct NoteRequest {", "pub struct NoteUpdateRequest {"] {
+        let body = model
+            .split(dto)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{dto} must be emitted:\n{model}"))
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            !body.contains("created_at"),
+            "{dto} must omit created_at (the divergence: dropped on both):\n{body}"
+        );
+        assert!(
+            body.contains("body"),
+            "{dto} keeps the client field:\n{body}"
+        );
+    }
+    assert!(
+        model.contains("pub created_at: String,"),
+        "the entity Model KEEPS created_at (present in responses):\n{model}"
+    );
+
+    // The create stub steers the handler at now_rfc3339().
+    let handlers =
+        std::fs::read_to_string(app.join("crates/routes/notes/src/handlers.rs")).unwrap();
+    assert!(
+        handlers.contains("now_rfc3339()") && handlers.contains("server-set timestamp"),
+        "the create stub must steer created_at at now_rfc3339():\n{handlers}"
+    );
+
+    // OpenAPI: the response schema (Note) includes created_at; both request schemas
+    // omit it.
+    let openapi: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(app.join("openapi.json")).unwrap()).unwrap();
+    let schemas = &openapi["components"]["schemas"];
+    assert!(
+        !schemas["Note"]["properties"]["created_at"].is_null(),
+        "the response entity schema must include created_at: {}",
+        schemas["Note"]
+    );
+    for req in ["NoteRequest", "NoteUpdateRequest"] {
+        assert!(
+            schemas[req]["properties"]["created_at"].is_null(),
+            "{req} schema must omit created_at: {}",
+            schemas[req]
+        );
+    }
+
+    // gen-tests the module, implement the correct handlers, then the FULL gate is
+    // green (JC0551 cleared, the generated acceptance suite passes on real handlers).
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "gen-tests", "--module", "notes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "gen-tests notes: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    install_handler(&app, "crates/routes/notes/src/handlers.rs", NOW_HANDLERS);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON doc");
+    assert_eq!(
+        payload["ok"], true,
+        "correct now-default handlers must pass the full gate; diagnostics: {}",
+        payload["diagnostics"]
+    );
+    assert!(out.status.success());
+}
+
 /// The #80 conformance fixture: a db-mode design whose fields declare
 /// range/length constraints. `body` (min_len 2 / max_len 30) is the FIRST
 /// rejectable field of the Note body, so the generated string reject probe

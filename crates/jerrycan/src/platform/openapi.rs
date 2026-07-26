@@ -243,12 +243,15 @@ fn request_schema(design: &Design, e: &Entity, for_update: bool) -> Value {
             required.push(Value::String(col));
         }
     }
-    // A `default` field (#53a) is server-owned on CREATE (dropped); on UPDATE it is
-    // client-settable (kept), so `for_update` includes it (issue #85 D1).
+    // A STATIC `default` field (#53a) is server-owned on CREATE (dropped); on UPDATE
+    // it is client-settable (kept), so `for_update` includes it (issue #85 D1). A
+    // `now`-default timestamp (#110) is server-owned AND set-once, so it is dropped
+    // from BOTH request schemas (immutable on update). The extra clause is inert for
+    // every non-`now` field — designs without the sentinel stay byte-identical.
     for f in e
         .fields
         .iter()
-        .filter(|f| for_update || f.default.is_none())
+        .filter(|f| (for_update || f.default.is_none()) && !Design::field_is_now_default(f))
     {
         properties.insert(f.name.clone(), field_schema(f));
         if f.required {

@@ -219,14 +219,16 @@ fn fixture_json(
                 fk_fixture_value(design, &b.entity)
             )
         });
-    // A `default` field (issue #53a) is server-owned on CREATE: the probe omits it
-    // so the minimal client body proves the server applies the default (not a 422).
-    // On UPDATE the field is client-settable (issue #85 D1), so an update probe KEEPS
-    // it — the body must match `{Entity}UpdateRequest`, which requires it.
+    // A STATIC `default` field (issue #53a) is server-owned on CREATE: the probe
+    // omits it so the minimal client body proves the server applies the default (not
+    // a 422). On UPDATE the field is client-settable (issue #85 D1), so an update
+    // probe KEEPS it — the body must match `{Entity}UpdateRequest`, which requires
+    // it. A `now`-default timestamp (#110) is dropped from BOTH DTOs (server-owned,
+    // immutable), so both probes omit it — inert for designs without the sentinel.
     let cols = e
         .fields
         .iter()
-        .filter(|f| keep_defaults || f.default.is_none())
+        .filter(|f| (keep_defaults || f.default.is_none()) && !Design::field_is_now_default(f))
         .map(|f| {
             // The reject probe corrupts ONE field to an out-of-range literal —
             // the enum sentinel (issue #47) or a #80 constraint violation;

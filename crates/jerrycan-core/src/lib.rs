@@ -19,7 +19,7 @@ mod serve;
 pub mod test_client;
 
 pub use app::{App, BuiltApp, Extension};
-pub use clock::Clock;
+pub use clock::{Clock, now_rfc3339};
 pub use cors::{CorsConfig, CorsOrigins};
 pub use dep::{Dep, TaskContext};
 pub use error::{Error, Result};
@@ -52,7 +52,7 @@ pub mod prelude {
     pub use crate::{
         App, Clock, CorsConfig, CorsOrigins, Created, Dep, Error, Extension, Headers, IntoResponse,
         Json, Middleware, MiddlewareFuture, Module, Multipart, Next, NoContent, Path, Query,
-        RawBody, Redirect, RequestCtx, Result, StreamBody, TestApp, TestPart, delete, get, patch,
-        post, put,
+        RawBody, Redirect, RequestCtx, Result, StreamBody, TestApp, TestPart, delete, get,
+        now_rfc3339, patch, post, put,
     };
 }
