@@ -2273,7 +2273,9 @@ fn owner_scoped_methods(e: &Entity, mode: GenMode, design: &Design) -> String {
     };
     let entity = &e.name;
     let snake = Design::to_snake(entity);
-    let fk_col = Design::fk_column(&identity.entity);
+    // #119: derive from the belongs_to itself so it agrees with the Model column
+    // (byte-identical — is_identity_fk pins `fk_column() == user_id`).
+    let fk_col = identity.fk_column();
     let fk_pascal = col_pascal(&fk_col);
     let fk_ty = design.target_key_rust_type(&identity.entity);
     let key = key_rust_type(e);

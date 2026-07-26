@@ -1542,7 +1542,20 @@ pub fn validate(d: &Design) -> Vec<Question> {
     // from_account/to_account, a self-referential Comment's parent) get DISTINCT
     // columns and distinct DDL constraint names. An entity with 0/1 un-aliased
     // belongs_to and no `as` is inert (byte-identity baseline).
-    fn check_belongs_to_aliases(m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+    fn check_belongs_to_aliases(d: &Design, m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+        // #119 Finding 1: an `as` alias must not land on a RESERVED fk column that
+        // the target doesn't own — the identity fk `user_id` (in an auth design) or
+        // the tenancy fk — else the alias hijacks identity/tenant scoping and the
+        // generated Rust fails opaquely instead of a clean design-time refusal.
+        let auth_active = d
+            .auth
+            .as_ref()
+            .map(|a| a.model != AuthModel::None)
+            .unwrap_or(false);
+        let tenant_fk = d
+            .tenancy
+            .as_ref()
+            .map(|t| (Design::fk_column(&t.entity), t.entity.clone()));
         for (i, e) in m.entities.iter().enumerate() {
             let field_names: std::collections::HashSet<&str> =
                 e.fields.iter().map(|f| f.name.as_str()).collect();
@@ -1565,6 +1578,32 @@ pub fn validate(d: &Design) -> Vec<Question> {
                     continue;
                 }
                 let col = b.fk_column();
+                // (4) #119 Finding 1: reject an alias that lands on a reserved fk the
+                // target doesn't own — hijacking identity/tenant scoping.
+                if auth_active
+                    && col == AUTH_IDENTITY_FK_COLUMN
+                    && Design::fk_column(&b.entity) != AUTH_IDENTITY_FK_COLUMN
+                {
+                    qs.push(q(
+                        bptr.clone(),
+                        format!(
+                            "Entity `{}` belongs_to `{}` with `as` deriving fk column `{col}` — that is the reserved identity fk (the authenticated user's column); only `belongs_to` the identity entity may own `{AUTH_IDENTITY_FK_COLUMN}`. Choose a different `as` alias. See `jerrycan explain JC0560`.",
+                            e.name, b.entity
+                        ),
+                    ));
+                }
+                if let Some((tfk, tent)) = &tenant_fk
+                    && col == *tfk
+                    && b.entity != *tent
+                {
+                    qs.push(q(
+                        bptr.clone(),
+                        format!(
+                            "Entity `{}` belongs_to `{}` with `as` deriving fk column `{col}` — that is the reserved tenancy fk for `{tent}`; aliasing the tenant fk breaks tenant scoping. Choose a different `as` alias. See `jerrycan explain JC0560`.",
+                            e.name, b.entity
+                        ),
+                    ));
+                }
                 // (3) The fk column is generated; a same-named declared field or the
                 // pk `id` would be a duplicate column.
                 if col == "id" || field_names.contains(col.as_str()) {
@@ -1596,11 +1635,11 @@ pub fn validate(d: &Design) -> Vec<Question> {
             }
         }
         for (i, sub) in m.subroutes.iter().enumerate() {
-            check_belongs_to_aliases(sub, &format!("{ptr}/subroutes/{i}"), qs);
+            check_belongs_to_aliases(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
         }
     }
     for (i, m) in d.modules.iter().enumerate() {
-        check_belongs_to_aliases(m, &format!("/modules/{i}"), &mut qs);
+        check_belongs_to_aliases(d, m, &format!("/modules/{i}"), &mut qs);
     }
 
     // Jobs require a database: the engine's default store is Postgres and the
@@ -3411,6 +3450,78 @@ mod tests {
                 .iter()
                 .any(|q| q.question.contains("JC0560")),
             "an unaliased belongs_to design must never mention JC0560"
+        );
+    }
+
+    /// #119 Finding 1: an `as` deriving the reserved identity fk `user_id` on a
+    /// target that isn't the identity entity (here `Account`) would hijack per-user
+    /// scoping and fail as opaque generated Rust — refused at design time.
+    #[test]
+    fn alias_landing_on_the_identity_fk_is_refused_with_jc0560() {
+        const D: &str = r#"{
+            "name": "chat-api", "contract_version": 1,
+            "dependencies": ["db", "auth"],
+            "auth": { "model": "session" },
+            "modules": [{
+                "name": "messages",
+                "entities": [
+                    { "name": "Account", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Message",
+                      "belongs_to": [{ "entity": "Account", "as": "user" }],
+                      "fields": [{ "name": "body", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_message", "method": "POST", "path": "/messages",
+                      "request_body": { "entity": "Message" },
+                      "success": { "status": 201, "entity": "Message" } }
+                ]
+            }]
+        }"#;
+        let qs = validate(&design(D));
+        let hit = qs
+            .iter()
+            .find(|q| q.question.contains("JC0560") && q.question.contains("identity fk"))
+            .unwrap_or_else(|| {
+                panic!("`as: user` on a non-identity target must trip JC0560: {qs:?}")
+            });
+        assert!(
+            hit.question.contains("user_id"),
+            "message must name the reserved identity fk: {}",
+            hit.question
+        );
+    }
+
+    /// #119 Finding 1: an `as` deriving the reserved tenancy fk on a non-tenant
+    /// target would break tenant scoping — refused at design time.
+    #[test]
+    fn alias_landing_on_the_tenancy_fk_is_refused_with_jc0560() {
+        const D: &str = r#"{
+            "name": "org-api", "contract_version": 1,
+            "dependencies": ["db", "auth"],
+            "auth": { "model": "session", "roles": ["owner"] },
+            "tenancy": { "entity": "Workspace", "member_roles": ["owner"] },
+            "modules": [{
+                "name": "workspaces",
+                "entities": [
+                    { "name": "Workspace", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Vendor", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Note",
+                      "belongs_to": [{ "entity": "Vendor", "as": "workspace" }],
+                      "fields": [{ "name": "body", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_workspace", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Workspace" },
+                      "success": { "status": 201, "entity": "Workspace" } }
+                ]
+            }]
+        }"#;
+        let qs = validate(&design(D));
+        assert!(
+            qs.iter()
+                .any(|q| q.question.contains("JC0560") && q.question.contains("tenancy fk")),
+            "`as: workspace` (the tenancy fk) on a non-tenant target must trip JC0560: {qs:?}"
         );
     }
 
