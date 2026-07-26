@@ -314,6 +314,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs storage",
     },
     CodeInfo {
+        code: "JC0557",
+        title: "misplaced or mis-cased `now` default",
+        cause: "the `now` default sentinel (#110) is a DYNAMIC server-set timestamp valid ONLY on a `datetime` field — the server writes the current time (`now_rfc3339()`) on create and omits the field from both request DTOs — but it was declared on a non-datetime field (`string`/`integer`/`boolean`/`float`/`uuid`/`json`, where `\"now\"` would otherwise be read as a literal), or a near-miss casing (`\"NOW\"`/`\"Now\"`) was written on a datetime field where it can neither be a static RFC3339 literal nor the exact sentinel",
+        fix: "put `\"default\": \"now\"` (exact lowercase) on a `datetime` field to set it to the current time on create; on any other type use a static literal default, or change the field `type` to `datetime`; never rely on a mis-cased near-miss — the sentinel is exactly `\"now\"`",
+        doc: "jerrycan docs designing",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -620,6 +627,31 @@ mod tests {
         assert!(
             info.fix.contains("never role-gated"),
             "fix must state reads are never role-gated: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0557_names_the_datetime_only_rule_and_both_misuses() {
+        // WHY: JC0557 (#110) refuses a misplaced/mis-cased `now` default. The old
+        // failure was a `"now"` silently stored as a literal (or a mis-cased
+        // near-miss). `jerrycan explain JC0557` must name the datetime-only rule,
+        // BOTH misuses (wrong type, wrong casing), and the `now_rfc3339()` server
+        // set — so the agent knows the sentinel is exactly `"now"` on a `datetime`.
+        let info = lookup("JC0557").unwrap();
+        assert!(
+            info.cause.contains("datetime") && info.cause.contains("now_rfc3339"),
+            "cause must tie the sentinel to a datetime field set via now_rfc3339: {}",
+            info.cause
+        );
+        assert!(
+            info.cause.contains("non-datetime") && info.cause.contains("casing"),
+            "cause must name both misuses (wrong type, wrong casing): {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("datetime") && info.fix.contains("static literal"),
+            "fix must name both remedies (datetime type, or a static literal): {}",
             info.fix
         );
     }

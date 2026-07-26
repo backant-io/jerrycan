@@ -11,7 +11,58 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The current UTC instant as an RFC3339 string with seconds precision and a `Z`
+/// suffix (e.g. `2026-07-26T12:34:56Z`) — the exact shape jerrycan's `datetime`
+/// fields ride as (`String`) and the OpenAPI/fixture format uses.
+///
+/// This is the runtime companion to the design-contract `"default": "now"`
+/// sentinel (issue #110): a `datetime` field defaulting to `"now"` is omitted from
+/// the request DTO, and the generated create handler sets it to `now_rfc3339()`.
+/// Prelude-exported so a generated handler under `use jerrycan::prelude::*;` calls
+/// it bare, with no ad-hoc `chrono` dependency.
+///
+/// Reads the real system clock directly (NOT the injectable [`Clock`] DI): a
+/// server-set create timestamp is wall-clock provenance, not domain time a test
+/// rewinds. Chrono-free — the conversion is Howard Hinnant's civil-from-days
+/// algorithm — so the leanest crate in the tree stays dependency-light (mirroring
+/// jerrycan-db's deliberately chrono-free timestamp).
+pub fn now_rfc3339() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (year, month, day, hour, min, sec) = civil_from_unix_secs(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Convert Unix seconds (>= 0) to civil `(year, month, day, hour, minute, second)`
+/// in UTC. `days_from_civil`'s exact inverse (Howard Hinnant,
+/// <http://howardhinnant.github.io/date_algorithms.html>) — valid for any date in
+/// the proleptic Gregorian calendar; a jerrycan `now` is always post-1970, so the
+/// non-negative path is all that runs.
+fn civil_from_unix_secs(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hour, min, sec) = (
+        (rem / 3600) as u32,
+        ((rem % 3600) / 60) as u32,
+        (rem % 60) as u32,
+    );
+    // days -> civil date, shifting the era so March is month 0 (leap day last).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // month shifted [0, 11] (0 = March)
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day, hour, min, sec)
+}
 
 /// An injectable source of "now". Cloning is cheap and, for a test clock,
 /// shares the same controllable offset — so a handle handed to a test moves
@@ -176,5 +227,55 @@ mod tests {
     #[should_panic(expected = "test-only")]
     fn advancing_a_system_clock_panics_loudly() {
         Clock::system().advance(Duration::from_secs(1));
+    }
+
+    /// The civil conversion is exact for known epoch anchors — a wrong date here
+    /// would plant a garbage `created_at` on every `default:"now"` row (#110), so
+    /// pin it against timestamps whose UTC calendar date is unambiguous.
+    #[test]
+    fn civil_from_unix_secs_matches_known_anchors() {
+        assert_eq!(super::civil_from_unix_secs(0), (1970, 1, 1, 0, 0, 0));
+        // 2000-01-01T00:00:00Z = 946684800 (crosses the 1900/2000 century rule).
+        assert_eq!(
+            super::civil_from_unix_secs(946_684_800),
+            (2000, 1, 1, 0, 0, 0)
+        );
+        // 2020-02-29T23:59:59Z = 1583020799 (a leap day, last second).
+        assert_eq!(
+            super::civil_from_unix_secs(1_583_020_799),
+            (2020, 2, 29, 23, 59, 59)
+        );
+        // 2026-07-26T12:34:56Z = 1785069296.
+        assert_eq!(
+            super::civil_from_unix_secs(1_785_069_296),
+            (2026, 7, 26, 12, 34, 56)
+        );
+    }
+
+    /// The formatted string is RFC3339 UTC with seconds precision and a `Z` —
+    /// byte-for-byte the shape jerrycan `datetime` fixtures/OpenAPI use, so a
+    /// server-set `now` value round-trips through the same datetime contract.
+    #[test]
+    fn now_rfc3339_is_seconds_precision_utc_with_z() {
+        let s = now_rfc3339();
+        assert_eq!(s.len(), 20, "YYYY-MM-DDTHH:MM:SSZ is 20 chars: {s}");
+        assert!(s.ends_with('Z'), "UTC `Z` suffix, not an offset: {s}");
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[10..11], "T");
+        assert!(!s.contains('.'), "no fractional seconds: {s}");
+        // A plausible current year (four leading digits, >= 2024).
+        let year: i64 = s[..4].parse().expect("leading 4-digit year");
+        assert!(year >= 2024, "reads the real clock: {s}");
+    }
+
+    /// Formatting agrees with the civil conversion for a fixed instant — the
+    /// zero-padding and field order are what makes the value a valid `datetime`.
+    #[test]
+    fn format_zero_pads_every_field() {
+        let (y, mo, d, h, mi, s) = super::civil_from_unix_secs(946_684_800);
+        assert_eq!(
+            format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z"),
+            "2000-01-01T00:00:00Z"
+        );
     }
 }

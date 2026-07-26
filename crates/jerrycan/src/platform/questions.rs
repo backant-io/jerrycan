@@ -78,6 +78,7 @@ const RESERVED_PRELUDE_IDENTS: &[&str] = &[
     "delete",
     "get",
     "main",
+    "now_rfc3339",
     "patch",
     "post",
     "put",
@@ -109,6 +110,28 @@ fn default_type_error(f: &Field, wants_db: bool) -> Option<String> {
             "Field `{}` declares a `default` but the design has no `db` dependency — server-owned defaults are applied through the db-mode request DTO (add `db` to `dependencies`, or drop the default).",
             f.name
         ));
+    }
+    // JC0557 (#110): the `now` sentinel is a DYNAMIC server-set timestamp, valid
+    // ONLY on a `datetime` field. Intercept it before the generic type/enum
+    // acceptance below so a `"now"` elsewhere is refused (on a `string` it is
+    // otherwise a legitimate literal — the refusal is what disambiguates the
+    // timestamp intent) and a near-miss casing on a datetime field is never
+    // silently mis-read as a static literal. The db requirement above already
+    // covers `now`. The EXACT `"now"` on a `datetime` field is left to fall through
+    // — it type-checks clean (datetime rides as a String) and carries no bounds.
+    if let Some(s) = value.as_str() {
+        if s == "now" && f.field_type != FieldType::Datetime {
+            return Some(format!(
+                "Field `{}` default \"now\" is a server-set-timestamp sentinel — valid only on a `datetime` field (issue #110). Use a static default here, or change the field `type` to `datetime`. See `jerrycan explain JC0557`.",
+                f.name
+            ));
+        }
+        if s != "now" && s.eq_ignore_ascii_case("now") && f.field_type == FieldType::Datetime {
+            return Some(format!(
+                "Field `{}` default {value} looks like the server-set-timestamp sentinel but is mis-cased — set `{}` to the current time on create with exactly `\"now\"` (lowercase), or give a full RFC3339 literal for a static default. See `jerrycan explain JC0557`.",
+                f.name, f.name
+            ));
+        }
     }
     // Enum membership: a default on a string field with `values` must be listed.
     if let Some(values) = &f.values {
@@ -3511,6 +3534,81 @@ mod tests {
                 .any(|q| q.id == "/modules/0/entities/0/fields/1/default"
                     && q.question.contains("no `db` dependency")),
             "a default without db must be a question: {:?}",
+            validate(&no_db)
+        );
+    }
+
+    #[test]
+    fn now_default_is_clean_on_datetime_and_jc0557_elsewhere() {
+        // Issue #110: the `"now"` sentinel is a DYNAMIC server-set timestamp valid
+        // ONLY on a `datetime` field. The exact lowercase `"now"` on a datetime is
+        // clean (the server sets it via now_rfc3339); `"now"` on any other type, or a
+        // mis-cased near-miss on a datetime, is JC0557 — never silently stored as a
+        // literal.
+        let base = |field: &str| {
+            design(&format!(
+                r#"{{ "name": "notes", "contract_version": 0, "dependencies": ["db"],
+                    "modules": [{{ "name": "notes",
+                        "entities": [{{ "name": "Note", "fields": [{field}] }}],
+                        "endpoints": [{{ "operation_id": "create_note", "method": "POST", "path": "/",
+                            "request_body": {{ "entity": "Note" }},
+                            "success": {{ "status": 201, "entity": "Note" }} }}] }}] }}"#
+            ))
+        };
+        // Exact `"now"` on a datetime field raises NO question.
+        let ok = base(r#"{ "name": "created_at", "type": "datetime", "default": "now" }"#);
+        assert!(
+            !validate(&ok).iter().any(|q| q.id.ends_with("/default")),
+            "a datetime default:\"now\" is clean: {:?}",
+            validate(&ok)
+        );
+        // `"now"` on a string field → JC0557 (it would otherwise be a valid literal).
+        let bad_string = base(r#"{ "name": "label", "type": "string", "default": "now" }"#);
+        assert!(
+            validate(&bad_string)
+                .iter()
+                .any(|q| q.id.ends_with("/fields/0/default")
+                    && q.question.contains("JC0557")
+                    && q.question.contains("datetime")),
+            "\"now\" on a string field must be JC0557: {:?}",
+            validate(&bad_string)
+        );
+        // `"now"` on an integer field → JC0557 (not the generic type-mismatch).
+        let bad_int = base(r#"{ "name": "count", "type": "integer", "default": "now" }"#);
+        assert!(
+            validate(&bad_int)
+                .iter()
+                .any(|q| q.id.ends_with("/fields/0/default") && q.question.contains("JC0557")),
+            "\"now\" on an integer field must be JC0557: {:?}",
+            validate(&bad_int)
+        );
+        // A mis-cased near-miss (`"NOW"`) on a datetime field → JC0557 (never read
+        // as a static literal).
+        let bad_case = base(r#"{ "name": "created_at", "type": "datetime", "default": "NOW" }"#);
+        assert!(
+            validate(&bad_case)
+                .iter()
+                .any(|q| q.id.ends_with("/fields/0/default")
+                    && q.question.contains("JC0557")
+                    && q.question.contains("mis-cased")),
+            "\"NOW\" on a datetime field must be JC0557: {:?}",
+            validate(&bad_case)
+        );
+        // A `default:"now"` without `db` reuses the existing db-required path.
+        let no_db: Design = serde_json::from_str(
+            r#"{ "name": "notes", "contract_version": 0, "dependencies": [],
+                "modules": [{ "name": "notes",
+                    "entities": [{ "name": "Note", "fields": [
+                        { "name": "created_at", "type": "datetime", "default": "now" } ] }],
+                    "endpoints": [{ "operation_id": "list_notes", "method": "GET", "path": "/",
+                        "success": { "status": 200 } }] }] }"#,
+        )
+        .unwrap();
+        assert!(
+            validate(&no_db)
+                .iter()
+                .any(|q| q.id.ends_with("/default") && q.question.contains("no `db` dependency")),
+            "a now default without db reuses the db-required message: {:?}",
             validate(&no_db)
         );
     }

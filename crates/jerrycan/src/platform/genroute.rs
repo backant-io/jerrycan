@@ -597,10 +597,13 @@ fn server_owned_fk_comment(
     // handler must use the body value — resetting to the default would silently undo
     // an edit to a defaulted lifecycle field.
     if is_update {
+        // Only STATIC defaults are KEPT on update (settable). A `now`-default
+        // timestamp (#110) is dropped from the update DTO (immutable, set-once), so
+        // it is NOT listed here — the handler leaves it untouched.
         let names: Vec<String> = e
             .fields
             .iter()
-            .filter(|f| f.default.is_some())
+            .filter(|f| f.default.is_some() && !Design::field_is_now_default(f))
             .map(|f| format!("`{}`", f.name))
             .collect();
         if !names.is_empty() {
@@ -610,9 +613,11 @@ fn server_owned_fk_comment(
             ));
         }
     } else {
+        // STATIC defaults: the handler writes the declared literal.
         let defaults: Vec<String> = e
             .fields
             .iter()
+            .filter(|f| !Design::field_is_now_default(f))
             .filter_map(|f| {
                 f.default.as_ref().map(|v| {
                     format!(
@@ -627,6 +632,19 @@ fn server_owned_fk_comment(
             out.push_str(&format!(
                 "    // server-owned defaults: `{dto}` omits {} — set each to its\n    // declared default when building the {entity}.\n",
                 defaults.join(", ")
+            ));
+        }
+        // `now`-default timestamps (#110): the handler sets each to the current time.
+        let now_fields: Vec<String> = e
+            .fields
+            .iter()
+            .filter(|f| Design::field_is_now_default(f))
+            .map(|f| format!("`{}`", f.name))
+            .collect();
+        if !now_fields.is_empty() {
+            out.push_str(&format!(
+                "    // server-set timestamp: `{dto}` omits {} — set each to the current\n    // time via `now_rfc3339()` when building the {entity}.\n",
+                now_fields.join(", ")
             ));
         }
     }
@@ -1120,13 +1138,15 @@ fn request_dto_rs(e: &Entity, design: &Design, for_update: bool) -> String {
             fields.push_str(&format!("    pub {col}: {ty},\n"));
         }
     }
-    // A `default` field (#53a) is server-owned on CREATE (dropped); on UPDATE it is
-    // client-settable (kept), so `for_update` includes it (issue #85 D1).
-    for f in e
-        .fields
-        .iter()
-        .filter(|f| f.name != "id" && (for_update || f.default.is_none()))
-    {
+    // A STATIC `default` field (#53a) is server-owned on CREATE (dropped); on UPDATE
+    // it is client-settable (kept), so `for_update` includes it (issue #85 D1). A
+    // `now`-default timestamp (#110) DIVERGES: it is server-owned AND set-once — a
+    // client must never rewrite `created_at` — so it is dropped on BOTH create and
+    // update. The extra `!field_is_now_default` clause is inert for every non-`now`
+    // field, keeping designs that don't use the sentinel byte-identical.
+    for f in e.fields.iter().filter(|f| {
+        f.name != "id" && (for_update || f.default.is_none()) && !Design::field_is_now_default(f)
+    }) {
         let base = f.field_type.rust_type();
         fields.push_str(&keyword_field_attrs(&f.name, "    ", false));
         let ident = rust_ident(&f.name);
@@ -1167,8 +1187,16 @@ fn request_dto_doc(
         }
     }
     if for_update {
-        // The `default` fields are KEPT here (settable on update). Only identity/
-        // path fks stay server-owned; note them when present.
+        // STATIC `default` fields are KEPT here (settable on update). A `now`-default
+        // timestamp (#110) is server-owned AND set-once, so it stays omitted on
+        // update too — note each as server-supplied. Identity/path fks stay
+        // server-owned as well.
+        for f in e.fields.iter().filter(|f| Design::field_is_now_default(f)) {
+            reasons.push(format!(
+                "`{}` (server-set timestamp — immutable on update)",
+                f.name
+            ));
+        }
         let omitted = if reasons.is_empty() {
             "\n/// (none — every declared field is client input on update).".to_string()
         } else {
@@ -6872,6 +6900,180 @@ pub(crate) mod tests {
                 && stub.contains("`confirmed` = false")
                 && stub.contains("`status` = \"active\""),
             "stub must name each default the server applies: {stub}"
+        );
+    }
+
+    /// Issue #110 (dynamic `now` default): a `datetime` field defaulting to `"now"`
+    /// is a server-set, set-once timestamp. It carries a static-default sibling
+    /// (`status`) so the create/update DTO divergence is visible: the create DTO
+    /// drops BOTH, the update DTO KEEPS the static default but STILL drops the `now`
+    /// timestamp (immutable — a client must not rewrite `created_at`), the Model
+    /// keeps every column, and the create steer points the handler at `now_rfc3339()`.
+    pub(crate) const NOW_DEFAULT: &str = r#"{
+        "name": "notes", "contract_version": 0, "dependencies": ["db"],
+        "modules": [{ "name": "notes",
+            "entities": [{ "name": "Note", "fields": [
+                { "name": "body", "type": "string" },
+                { "name": "status", "type": "string", "values": ["draft", "published"], "default": "draft" },
+                { "name": "created_at", "type": "datetime", "default": "now" } ] }],
+            "endpoints": [
+                { "operation_id": "create_note", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Note" },
+                  "success": { "status": 201, "entity": "Note" } },
+                { "operation_id": "update_note", "method": "PUT", "path": "/{id}",
+                  "request_body": { "entity": "Note" },
+                  "success": { "status": 200, "entity": "Note" } }] }]
+    }"#;
+
+    #[test]
+    fn now_default_timestamp_dropped_from_both_dtos_and_create_steers_to_now_rfc3339() {
+        let d: Design = serde_json::from_str(NOW_DEFAULT).unwrap();
+        let m = &d.modules[0];
+        let model = model_rs_db(m, &d, false).unwrap();
+
+        // CREATE DTO: drops the static default (`status`) AND the `now` timestamp.
+        let create_dto = model
+            .split("pub struct NoteRequest {")
+            .nth(1)
+            .expect("NoteRequest emitted")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(create_dto.contains("pub body: String,"), "{create_dto}");
+        assert!(
+            !create_dto.contains("created_at") && !create_dto.contains("status"),
+            "create DTO omits both the now timestamp and the static default: {create_dto}"
+        );
+
+        // UPDATE DTO: KEEPS the static default (`status`, settable) but STILL drops
+        // the `now` timestamp (server-owned, immutable on update — the divergence).
+        let update_dto = model
+            .split("pub struct NoteUpdateRequest {")
+            .nth(1)
+            .expect("NoteUpdateRequest emitted")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            update_dto.contains("pub status: String,"),
+            "update DTO keeps the static default (settable): {update_dto}"
+        );
+        assert!(
+            !update_dto.contains("created_at"),
+            "update DTO STILL omits the now timestamp (immutable, set-once): {update_dto}"
+        );
+
+        // The Model keeps every column (all NOT-NULL, persisted; present in responses).
+        assert!(model.contains("pub created_at: String,"), "{model}");
+        assert!(model.contains("pub status: String,"), "{model}");
+
+        // CREATE steer: the handler sets `created_at` via now_rfc3339(); the static
+        // default keeps its literal steer, distinct from the timestamp steer.
+        let h = handlers_rs(
+            m,
+            GenMode {
+                db: true,
+                auth: false,
+            },
+            &d,
+        );
+        let create_stub = h
+            .split("async fn create_note")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            create_stub.contains("server-set timestamp")
+                && create_stub.contains("`created_at`")
+                && create_stub.contains("now_rfc3339()"),
+            "create steer must point created_at at now_rfc3339(): {create_stub}"
+        );
+        assert!(
+            create_stub.contains("server-owned defaults")
+                && create_stub.contains("`status` = \"draft\""),
+            "the static default keeps its literal steer alongside: {create_stub}"
+        );
+
+        // UPDATE steer: names the settable static default but NOT the immutable
+        // timestamp (it is omitted from the update DTO, so the handler leaves it be).
+        let update_stub = h
+            .split("async fn update_note")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            update_stub.contains("settable defaults") && update_stub.contains("`status`"),
+            "update steer names the settable static default: {update_stub}"
+        );
+        assert!(
+            !update_stub.contains("created_at"),
+            "update steer must NOT mention the immutable now timestamp: {update_stub}"
+        );
+    }
+
+    /// #110 byte-identity guard: a `datetime` field with a STATIC default (an ISO
+    /// literal, not `"now"`) is NOT the sentinel — it stays KEPT-settable on update
+    /// exactly like the #85 D1 behavior, and appears in the create steer as a named
+    /// literal. This is what proves the `now` treatment fires ONLY on the sentinel.
+    #[test]
+    fn static_datetime_default_is_kept_on_update_unchanged() {
+        const STATIC_DT: &str = r#"{
+            "name": "notes", "contract_version": 0, "dependencies": ["db"],
+            "modules": [{ "name": "notes",
+                "entities": [{ "name": "Note", "fields": [
+                    { "name": "body", "type": "string" },
+                    { "name": "seen_at", "type": "datetime", "default": "2026-01-01T00:00:00Z" } ] }],
+                "endpoints": [
+                    { "operation_id": "create_note", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Note" },
+                      "success": { "status": 201, "entity": "Note" } },
+                    { "operation_id": "update_note", "method": "PUT", "path": "/{id}",
+                      "request_body": { "entity": "Note" },
+                      "success": { "status": 200, "entity": "Note" } }] }]
+        }"#;
+        let d: Design = serde_json::from_str(STATIC_DT).unwrap();
+        let m = &d.modules[0];
+        let model = model_rs_db(m, &d, false).unwrap();
+        // Create DTO drops it (server-owned on create, #53a).
+        let create_dto = model
+            .split("pub struct NoteRequest {")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            !create_dto.contains("seen_at"),
+            "create drops it: {create_dto}"
+        );
+        // Update DTO KEEPS it (settable, #85 D1) — the divergence is now-ONLY.
+        let update_dto = model
+            .split("pub struct NoteUpdateRequest {")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            update_dto.contains("pub seen_at: String,"),
+            "a STATIC datetime default stays settable on update: {update_dto}"
+        );
+        // The create steer names it as a literal, never now_rfc3339().
+        let h = handlers_rs(
+            m,
+            GenMode {
+                db: true,
+                auth: false,
+            },
+            &d,
+        );
+        assert!(
+            !h.contains("now_rfc3339()"),
+            "a static datetime default never steers to now_rfc3339(): {h}"
         );
     }
 

@@ -221,6 +221,18 @@ Every entity has an `id` primary key; you usually do NOT declare it:
   `required: false`, which would make the column nullable (`Option<T>`) with value
   `null`, not the default; `default` keeps a solid NOT-NULL column with a server-chosen
   fallback.
+  - **`"default": "now"` (dynamic server-set timestamp, `datetime` only).** The exact
+    lowercase string `"now"` on a `datetime` field is a SENTINEL, not a literal: the
+    server stamps the current time (RFC3339 UTC, via `now_rfc3339()`) on CREATE. Use it
+    for `created_at`/`sent_at`/`applied_at`. Unlike a static default it is **immutable
+    and set-once** — it is dropped from BOTH the create `{Entity}Request` AND the update
+    `{Entity}UpdateRequest` (a client must never rewrite `created_at`), while a static
+    default stays settable on update. It is present in every RESPONSE (the entity Model
+    keeps the column). The generated create stub steers you to set it via
+    `now_rfc3339()` (already in scope through `use jerrycan::prelude::*;`). `"now"` on a
+    non-`datetime` field, or a mis-cased near-miss like `"NOW"`, is refused (`JC0557`).
+    Deferred (not yet supported): a relative form (`"now+7d"`) and now-on-UPDATE
+    (`updated_at`/touch-on-write) — for an update timestamp, set it in the handler.
 - `write_only?` — defaults to `false`. A RESPONSE-HIDDEN field: it is accepted on
   create/update input and stored, but emitted with `#[serde(skip_serializing)]` on the
   generated model so it NEVER appears in an API response (the request DTO and OpenAPI
@@ -299,7 +311,9 @@ Every entity has an `id` primary key; you usually do NOT declare it:
     2. **`default` field:** any field with a `default` is omitted; the server applies
        the declared value. Works on unguarded/public creates too — this is what lets
        `POST /subscribers { "email": … }` succeed while `confirmed` and `status` default
-       server-side.
+       server-side. A STATIC default is dropped on create but KEPT on update (settable);
+       a `"default": "now"` timestamp (datetime, server-set-on-create) is dropped on
+       BOTH (immutable, set-once) — see the `default?` field note.
     3. **Path-redundant parent fk:** if the entity `belongs_to` a parent and the create
        route already carries that parent's id as a path param whose name equals the fk
        column (`Checkin belongs_to Habit` + `POST /{habit_id}/checkins`), `habit_id` is

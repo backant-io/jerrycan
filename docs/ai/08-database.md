@@ -271,4 +271,9 @@ that surface.
   object into a quoted string the next reader can't parse.
 - `datetime` and `uuid` design fields are `String` at the Rust layer (no native
   time/uuid type yet) — the column is TEXT and the model field is `String`. Parse
-  and format them yourself in handlers; there is no built-in `now() → rfc3339`.
+  and format them yourself in handlers. For a server-set create timestamp, prefer
+  the design sentinel `"default": "now"` on the `datetime` field (see 00-designing.md):
+  it drops the field from both request DTOs and the generated create stub sets it via
+  `now_rfc3339()` — the prelude helper returning the current UTC time as RFC3339
+  (`YYYY-MM-DDTHH:MM:SSZ`). Call `now_rfc3339()` directly in a handler for any other
+  timestamp (e.g. an `updated_at` you set on write).
