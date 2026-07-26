@@ -167,6 +167,9 @@ impl BucketOut {
             owner_prefix: self.owner_prefix,
             max_size: self.max_size.clone(),
             allowed_mime: self.allowed_mime.clone(),
+            // Supabase buckets carry no tenant-role write gate; a migrated
+            // bucket keeps today's "any member writes" behavior (#132).
+            write_roles: Vec::new(),
         }
     }
 }

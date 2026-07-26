@@ -307,6 +307,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs realtime",
     },
     CodeInfo {
+        code: "JC0556",
+        title: "storage write_roles is unusable as declared",
+        cause: "a bucket's `write_roles` (#132) — the tenant member roles allowed to upload/delete — is meaningless as written: either an entry is not a declared `tenancy.member_roles` role, or the bucket is not tenant-scoped (its `owner` is not the tenancy entity, or the design has no tenancy). A tenant-scoped bucket stamps `owner_id = tenant.id()`, so every member is 'the owner' and a read-only-role member could write; `write_roles` closes that by 403-ing a non-write role. On a non-tenant bucket no Tenant guard runs, so the declared gate would emit NOTHING and silently leave writes open — a security footgun, not a no-op",
+        fix: "make the bucket tenant-owned (set `owner` to the tenancy entity) and list only declared member_roles in `write_roles`, or drop `write_roles` entirely (empty = any member may write, the backward-compatible default). Reads (download/list/sign) are never role-gated",
+        doc: "jerrycan docs storage",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -586,6 +593,33 @@ mod tests {
                 && info.fix.contains("changes")
                 && info.fix.contains("#167"),
             "fix must name both remedies and the #167 projection follow-up: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0556_names_the_write_roles_footgun_and_both_remedies() {
+        // WHY: JC0556 (#132) refuses a storage `write_roles` that is unusable —
+        // an undeclared role, or a non-tenant bucket where the gate would emit
+        // nothing and silently leave writes open. `jerrycan explain JC0556` must
+        // state the footgun (a tenant bucket lets any member write, so a
+        // non-tenant gate is a silent no-op) and name BOTH remedies (make it
+        // tenant-owned with declared roles, or drop write_roles).
+        let info = lookup("JC0556").unwrap();
+        assert!(
+            info.cause.contains("write_roles") && info.cause.contains("tenant-scoped"),
+            "cause must tie write_roles to the tenant-scope requirement: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("tenant-owned") && info.fix.contains("drop"),
+            "fix must name both remedies: {}",
+            info.fix
+        );
+        // Reads must be documented as never gated (sign is a download grant).
+        assert!(
+            info.fix.contains("never role-gated"),
+            "fix must state reads are never role-gated: {}",
             info.fix
         );
     }

@@ -1575,6 +1575,38 @@ pub fn validate(d: &Design) -> Vec<Question> {
                     ));
                 }
             }
+            // JC0556 (#132): `write_roles` gates blob upload/delete by tenant
+            // role. It is only meaningful on a TENANT-scoped bucket (owner IS
+            // the tenancy entity), and each entry must be a declared member_role.
+            // A write gate declared where it emits NOTHING (a non-tenant/no-tenancy
+            // bucket) would silently leave writes open — a security footgun — so
+            // refuse it loud rather than ignore it.
+            if !b.write_roles.is_empty() {
+                match d.tenancy.as_ref() {
+                    Some(t) if b.owner.as_deref() == Some(t.entity.as_str()) => {
+                        for (k, wr) in b.write_roles.iter().enumerate() {
+                            if !t.member_roles.iter().any(|r| r == wr) {
+                                qs.push(q(
+                                    format!("{bptr}/write_roles/{k}"),
+                                    format!(
+                                        "Bucket `{}` write_roles entry `{wr}` is not a declared tenancy member_role — each write role must be one of {:?}. See `jerrycan explain JC0556`.",
+                                        b.name, t.member_roles
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        qs.push(q(
+                            format!("{bptr}/write_roles"),
+                            format!(
+                                "Bucket `{}` sets write_roles but is not tenant-scoped (its owner is not the tenancy entity, or the design has no tenancy) — write_roles gates writes by TENANT role and emits no gate here, so a declared write restriction would silently do nothing. Drop write_roles, or make the bucket tenant-owned (owner = the tenancy entity). See `jerrycan explain JC0556`.",
+                                b.name
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -2273,6 +2305,57 @@ mod tests {
                 .iter()
                 .any(|q| q.id.starts_with("/storage/buckets/0/allowed_mime")),
             "*/*, type/* and type/subtype are all valid"
+        );
+    }
+
+    /// JC0556 (#132): `write_roles` gates blob upload/delete by tenant role. It
+    /// must name declared member_roles AND sit on a tenant-scoped bucket — a
+    /// write gate that emits nothing (non-tenant / no-tenancy) would silently
+    /// leave writes open, so it is refused loud rather than ignored.
+    #[test]
+    fn write_roles_are_validated_with_jc0556() {
+        // An entry that is not a declared member_role, on the tenant-scoped
+        // invoices bucket (owner Org == tenancy.entity).
+        let mut d: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        d.storage.as_mut().unwrap().buckets[1].write_roles = vec!["ghost".into()];
+        assert!(
+            validate(&d).iter().any(
+                |q| q.id == "/storage/buckets/1/write_roles/0" && q.question.contains("JC0556")
+            ),
+            "undeclared write role → JC0556: {:?}",
+            validate(&d)
+        );
+        // A declared member_role on the tenant bucket is accepted.
+        let mut ok: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        ok.storage.as_mut().unwrap().buckets[1].write_roles = vec!["owner".into()];
+        assert!(
+            !validate(&ok)
+                .iter()
+                .any(|q| q.id.starts_with("/storage/buckets/1/write_roles")),
+            "a declared member_role on a tenant bucket is valid: {:?}",
+            validate(&ok)
+        );
+        // write_roles on a NON-tenant bucket (avatars, owner User) is refused —
+        // the gate would emit nothing there.
+        let mut nt: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        nt.storage.as_mut().unwrap().buckets[0].write_roles = vec!["owner".into()];
+        assert!(
+            validate(&nt)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/0/write_roles" && q.question.contains("JC0556")),
+            "write_roles on a non-tenant bucket → JC0556: {:?}",
+            validate(&nt)
+        );
+        // write_roles with no tenancy at all is refused the same way.
+        let mut no_ten: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        no_ten.tenancy = None;
+        no_ten.storage.as_mut().unwrap().buckets[1].write_roles = vec!["owner".into()];
+        assert!(
+            validate(&no_ten)
+                .iter()
+                .any(|q| q.id == "/storage/buckets/1/write_roles" && q.question.contains("JC0556")),
+            "write_roles without tenancy → JC0556: {:?}",
+            validate(&no_ten)
         );
     }
 

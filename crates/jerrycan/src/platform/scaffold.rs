@@ -80,6 +80,15 @@ impl Tenant {{
     pub fn require_role(&self, role: &str) -> jerrycan::Result<()> {{
         jerrycan::auth::require_role(&self.role, role)
     }}
+    /// 403 unless the caller's tenant role matches one of `roles` (the
+    /// multi-role form of `require_role`; storage `write_roles` gate, #132).
+    pub fn require_any_role(&self, roles: &[&str]) -> jerrycan::Result<()> {{
+        if roles.contains(&self.role.as_str()) {{
+            Ok(())
+        }} else {{
+            Err(jerrycan::Error::forbidden())
+        }}
+    }}
 }}
 
 /// DI guard factory — registered app-wide; path-scoped handlers take `Dep<Tenant>`.
@@ -309,6 +318,14 @@ mod tests {
         assert!(
             guard.contains("jerrycan::auth::require_role(&self.role, role)"),
             "require_role stays the 403 gate:\n{guard}"
+        );
+        // #132: the multi-role helper is available for the storage write_roles
+        // gate — 403 unless the caller's tenant role is in the allowed set.
+        assert!(
+            guard.contains("pub fn require_any_role(&self, roles: &[&str])")
+                && guard.contains("roles.contains(&self.role.as_str())")
+                && guard.contains("Err(jerrycan::Error::forbidden())"),
+            "require_any_role is emitted as the multi-role 403 gate:\n{guard}"
         );
     }
 }
