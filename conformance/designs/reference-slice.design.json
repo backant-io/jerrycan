@@ -51,6 +51,7 @@
       ],
       "endpoints": [
         { "operation_id": "list_workspaces", "method": "GET", "path": "/",
+          "auth_required": true,
           "success": { "status": 200, "entity": "Workspace", "list": true } },
         { "operation_id": "create_workspace", "method": "POST", "path": "/",
           "auth_required": true,
@@ -58,6 +59,7 @@
           "success": { "status": 201, "entity": "Workspace" },
           "errors": [{ "status": 422, "when": "request body fails validation" }] },
         { "operation_id": "show_workspace", "method": "GET", "path": "/{id}",
+          "auth_required": true,
           "success": { "status": 200, "entity": "Workspace" },
           "errors": [{ "status": 404, "when": "unknown id" }] }
       ]

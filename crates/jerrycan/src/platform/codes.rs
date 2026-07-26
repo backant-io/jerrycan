@@ -321,6 +321,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs designing",
     },
     CodeInfo {
+        code: "JC0558",
+        title: "anonymous read/write on the tenant or a tenant-owned entity",
+        cause: "in an auth design with tenancy, an endpoint whose repo entity is the tenant entity OR a tenant-owned entity (directly or transitively) omits `auth_required` (serde default false) and is not `public` — genroute emits the Tenant guard only for a guarded endpoint, so this handler is generated with NO `Dep<Tenant>` and NO `CurrentUser`: it is fully anonymous and any caller could read (or write) any tenant's rows, yet `jerrycan check` was green. This is the tenant twin of JC0549(c)'s per-user unguarded-read refusal; the merely-unguarded-non-public case was previously unpoliced (the public-on-tenant-owned check keys on `public`, JL0004 covers mutations only, and a childless tenant module's handlers are never lint-scanned)",
+        fix: "set `auth_required: true` on the endpoint so the membership guard scopes it to the caller's tenant; a signature-authenticated webhook (it declares a 4xx error whose `when` names a signature check) is exempt. Tenant-owned entities have no public-read in v1 — public reads would bypass the Tenant guard (#105 is per-user-only), so authenticate the read rather than making it `public`",
+        doc: "jerrycan docs auth",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -652,6 +659,36 @@ mod tests {
         assert!(
             info.fix.contains("datetime") && info.fix.contains("static literal"),
             "fix must name both remedies (datetime type, or a static literal): {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0558_names_the_anonymous_tenant_read_cause_and_the_auth_fix() {
+        // WHY: JC0558 (#148) refuses an unguarded, non-`public` endpoint on the
+        // tenant or a tenant-owned entity — genroute emits no Dep<Tenant>/no
+        // CurrentUser, so the handler is anonymous and any caller reads/writes any
+        // tenant's rows behind a green check. `jerrycan explain JC0558` must name
+        // the anonymous-handler cause (no guard, no session param), the tenant /
+        // tenant-owned domain, the `auth_required: true` fix, and the
+        // signature-webhook exemption — and note there is no tenant-owned
+        // public-read in v1.
+        let info = lookup("JC0558").unwrap();
+        assert!(
+            info.cause.contains("tenant-owned")
+                && info.cause.contains("Dep<Tenant>")
+                && info.cause.contains("CurrentUser"),
+            "cause must name the tenant-owned domain and the missing guard/session param: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("auth_required: true") && info.fix.contains("signature"),
+            "fix must name the auth_required remedy and the signature-webhook exemption: {}",
+            info.fix
+        );
+        assert!(
+            info.fix.contains("public") && info.fix.contains("#105"),
+            "fix must note tenant-owned entities have no public-read in v1 (#105 is per-user-only): {}",
             info.fix
         );
     }

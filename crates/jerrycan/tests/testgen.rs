@@ -311,11 +311,13 @@ fn tenancy_module_tests_seed_membership_and_provide_the_guard() {
         "{generated}"
     );
 
-    // The tenant module ITSELF (workspaces) owns no tenant-owned entity, so its
-    // REGULAR app() neither seeds nor provides the guard (no false coupling —
-    // its create tests must see an empty tenant table so the id echo holds).
-    // The #107 member tests bring their own SELF-CONTAINED member_app(); the
-    // membership seeds + guard registration live there, never in app().
+    // The tenant module (workspaces) owns no tenant-owned entity, so its REGULAR
+    // app() must never SEED membership — its create tests need an empty tenant
+    // table so the id echo holds. But because its OWN detail route
+    // (`show_workspace GET /{id}`) is now GUARDED (#148/JC0558), that handler
+    // takes `Dep<Tenant>`, so app() DOES register the guard factory
+    // (`module_provides_tenant_dep`, kept separate from the membership-SEED gate).
+    // The #107 member tests still bring their own SELF-CONTAINED member_app().
     let workspaces = design
         .modules
         .iter()
@@ -330,8 +332,8 @@ fn tenancy_module_tests_seed_membership_and_provide_the_guard() {
         .next()
         .unwrap();
     assert!(
-        !app_fn.contains(".provide_dep(shared::tenant)") && !app_fn.contains("workspace_members"),
-        "the tenant module's regular app() must neither seed membership nor provide the guard: {app_fn}"
+        app_fn.contains(".provide_dep(shared::tenant)") && !app_fn.contains("workspace_members"),
+        "the tenant module's app() registers the guard (its detail route is guarded) but must NOT seed membership (id echo): {app_fn}"
     );
     let member_fn = ws_gen
         .split("async fn member_app()")
@@ -456,9 +458,10 @@ fn tenant_owned_modules_get_isolation_tests() {
         "second tenant membership seeds the owner role: {out}"
     );
 
-    // The non-tenant-owned tenant module (workspaces) gets NO cross-tenant
-    // isolation test — AND, because its list is UNGUARDED, no I1 test either
-    // (an unguarded list can't be membership-scoped).
+    // The tenant module (workspaces) is not tenant-OWNED, so it gets NO
+    // cross-tenant isolation test. But its list (`list_workspaces`) is now
+    // GUARDED (#148/JC0558), so it IS membership-scopable and DOES get the I1
+    // test (creating a workspace seeds only the creator's membership).
     let workspaces = d
         .modules
         .iter()
@@ -467,11 +470,11 @@ fn tenant_owned_modules_get_isolation_tests() {
     let ws_gen = testgen::acceptance_rs(&d, workspaces);
     assert!(
         !ws_gen.contains("cannot_read_tenant_b"),
-        "non-tenant-owned module gets no isolation test: {ws_gen}"
+        "non-tenant-owned module gets no cross-tenant isolation test: {ws_gen}"
     );
     assert!(
-        !ws_gen.contains("seeds_only_the_creators_membership"),
-        "an UNGUARDED tenant list can't be membership-scoped, so no I1 test: {ws_gen}"
+        ws_gen.contains("seeds_only_the_creators_membership"),
+        "a GUARDED tenant list IS membership-scoped, so the I1 test is emitted: {ws_gen}"
     );
 }
 
@@ -2517,17 +2520,19 @@ fn member_surface_tests_are_excluded_from_expected_failing() {
     let generated =
         std::fs::read_to_string(tmp.join("crates/routes/workspaces/tests/acceptance.rs")).unwrap();
     std::fs::remove_dir_all(&tmp).ok();
-    // workspaces emits 15 tests. Counted toward expected_failing: list(1) +
-    // create(1) + create-401(1) + show(1) + show-404(1) = 5 (the long-standing
-    // baseline). Excluded: the create enum-reject probe (1) and the member
-    // surface (9) — both pass on stubs.
+    // workspaces emits 18 tests. Its reads are now GUARDED (#148/JC0558), so it
+    // gains a list/show 401 probe and the I1 membership-scope test. Counted
+    // toward expected_failing (RED on stubs): list-200(1) + list-401(1) +
+    // create-201(1) + create-401(1) + show-200(1) + show-401(1) + show-404(1) +
+    // I1(1) = 8. Excluded (green on stubs): the create enum-reject probe (1) and
+    // the member surface (9).
     assert_eq!(
         testgen::test_count(&generated),
-        15,
-        "5 endpoint probes + 1 enum reject + 9 member tests: {generated}"
+        18,
+        "8 counted endpoint/isolation probes + 1 enum reject + 9 member tests: {generated}"
     );
     assert_eq!(
-        expected_failing, 5,
+        expected_failing, 8,
         "the enum reject probe and the 9 member tests must be excluded: {generated}"
     );
 }
