@@ -740,6 +740,18 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 // server-assigned, and the generated id probes and seeds assume
                 // them free.
                 if f.name == "id" {
+                    // JC0554 (#112): the pk id must be returned in every response
+                    // (the id-echo probe + every cross-scope test key on
+                    // `body["id"]`), so an EXPLICIT `write_only` on it would
+                    // response-hide the id and break the generated suite by
+                    // construction. The `password_hash` auto-classification never
+                    // applies to `id`, so only the explicit flag is refused here.
+                    if f.write_only {
+                        qs.push(q(
+                            format!("{ptr}/entities/{i}/fields/{j}/write_only"),
+                            "Field `id` is the primary key — `write_only` is not allowed on it: the id must be returned in every response (the generated id-echo probe and every cross-scope test key on `body[\"id\"]`), so hiding it breaks the generated suite by construction. Remove `write_only` from `id`. See `jerrycan explain JC0554`.".to_string(),
+                        ));
+                    }
                     for (key, present) in [
                         ("min", f.min.is_some()),
                         ("max", f.max.is_some()),
@@ -1623,6 +1635,23 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 }
             }
         }
+        // JC0555 (#112/#167): the changes broadcast delivers the RAW database
+        // row — every column — to subscribers over the WebSocket, so a
+        // `write_only`/`password_hash` column on a changes entity is exposed to
+        // every subscriber even though `#[serde(skip_serializing)]` hides it
+        // from REST responses. write_only's REST hide does not reach the
+        // realtime stream, so refuse the combination by construction until
+        // column projection (#167) lets the broadcast omit hidden columns.
+        for (i, entity) in rt.changes.iter().enumerate() {
+            if let Some(ent) = d.find_entity(entity)
+                && let Some(secret) = ent.fields.iter().find(|f| Design::field_is_write_only(f))
+            {
+                qs.push(q(
+                    format!("/realtime/changes/{i}"),
+                    format!("Realtime `changes` on `{entity}` is not allowed: its `{col}` column is write_only (response-hidden, `#[serde(skip_serializing)]`), but the changes broadcast delivers the raw database row — every column — to subscribers over the WebSocket, so `{col}` would be exposed to every subscriber even though it is hidden from REST responses. Remove `{col}` from `{entity}`, or drop `{entity}` from realtime `changes` (don't broadcast row changes for it — REST reads still hide the column). Column projection (#167) will lift this once the broadcast can omit hidden columns. See `jerrycan explain JC0555`.", col = secret.name),
+                ));
+            }
+        }
         // Broadcast + presence topics: snake_case, unique within their list,
         // tenant scope needs tenancy, and any non-none scope needs auth.
         let mut check_topics = |topics: &[RealtimeTopic], kind: &str| {
@@ -2013,6 +2042,78 @@ mod tests {
             .changes
             .push("Workspace".into());
         assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
+    }
+
+    /// JC0555 (#112/#167): a `write_only`/`password_hash` column on a realtime
+    /// `changes` entity leaks over the WebSocket — the changes broadcast ships
+    /// the RAW row (every column), bypassing the REST-side skip_serializing that
+    /// hides the column from responses. Refuse the combination; REST-hiding
+    /// alone (no `changes`) stays clean, and a changes entity with no secret
+    /// column stays clean. Closes the egress hole T1's `skip_serializing` leaves
+    /// open until column projection (#167) lands.
+    #[test]
+    fn write_only_column_on_a_changes_entity_is_refused_with_jc0555() {
+        let password_hash = serde_json::json!({ "name": "password_hash", "type": "string" });
+
+        // Lead is broadcast in `changes` (V2_REALTIME) and now carries a
+        // password_hash (auto-hidden by name) → the raw-row broadcast would leak
+        // it → JC0555, naming the offending column.
+        let mut leak: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        leak.modules[1].entities[0]
+            .fields
+            .push(serde_json::from_value(password_hash.clone()).unwrap());
+        assert!(
+            validate(&leak).iter().any(|q| q.id == "/realtime/changes/0"
+                && q.question.contains("JC0555")
+                && q.question.contains("password_hash")),
+            "a password_hash column on a changes entity must trip JC0555: {:?}",
+            validate(&leak)
+        );
+
+        // Same secret column, but the entity is NOT broadcast — the REST-side
+        // skip_serializing already hides it, so there is no realtime leak and no
+        // JC0555 (REST-hidden is enough).
+        let mut rest_only: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        rest_only.modules[1].entities[0]
+            .fields
+            .push(serde_json::from_value(password_hash).unwrap());
+        rest_only.realtime.as_mut().unwrap().changes.clear();
+        assert!(
+            !validate(&rest_only)
+                .iter()
+                .any(|q| q.question.contains("JC0555")),
+            "a write_only column with no realtime changes must not trip JC0555: {:?}",
+            validate(&rest_only)
+        );
+
+        // A changes entity with no secret column (the base fixture) stays clean.
+        let clean: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        assert!(
+            !validate(&clean)
+                .iter()
+                .any(|q| q.question.contains("JC0555")),
+            "a changes entity with no write_only column must not trip JC0555: {:?}",
+            validate(&clean)
+        );
+
+        // The EXPLICIT `write_only: true` flag (not just the password_hash name)
+        // trips it too — the classifier covers both.
+        let mut explicit: Design = serde_json::from_str(V2_REALTIME).unwrap();
+        explicit.modules[1].entities[0].fields.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "api_token", "type": "string", "write_only": true
+            }))
+            .unwrap(),
+        );
+        assert!(
+            validate(&explicit)
+                .iter()
+                .any(|q| q.id == "/realtime/changes/0"
+                    && q.question.contains("JC0555")
+                    && q.question.contains("api_token")),
+            "an explicit write_only column on a changes entity must trip JC0555: {:?}",
+            validate(&explicit)
+        );
     }
 
     #[test]
@@ -3494,6 +3595,45 @@ mod tests {
         );
     }
 
+    /// #112 (JC0554): an EXPLICIT `write_only: true` on the pk `id` is refused —
+    /// the id must be returned in every response (the id-echo probe + every
+    /// cross-scope test key on `body["id"]`), so response-hiding it breaks the
+    /// generated suite by construction. The same flag on any OTHER field — even
+    /// alongside `unique` — is fine (write_only is orthogonal to DB/input keys).
+    #[test]
+    fn explicit_write_only_on_the_pk_id_is_refused_with_jc0554() {
+        let base = |id_extra: &str, token_extra: &str| -> Design {
+            design(&format!(
+                r#"{{ "name": "secrets-api", "contract_version": 1, "dependencies": ["db"],
+                    "modules": [{{ "name": "accounts",
+                        "entities": [{{ "name": "Account", "fields": [
+                            {{ "name": "id", "type": "integer"{id_extra} }},
+                            {{ "name": "api_token", "type": "string"{token_extra} }} ] }}],
+                        "endpoints": [{{ "operation_id": "list_accounts", "method": "GET",
+                            "path": "/",
+                            "success": {{ "status": 200, "entity": "Account", "list": true }} }}]
+                    }}] }}"#
+            ))
+        };
+        // write_only on a NON-id field, even `unique`, is accepted (no refusal).
+        let ok = base("", r#", "write_only": true, "unique": true"#);
+        assert!(
+            validate(&ok).is_empty(),
+            "write_only on a normal field (even unique) is fine: {:?}",
+            validate(&ok)
+        );
+        // Explicit write_only on the pk id → JC0554.
+        let bad = base(r#", "write_only": true"#, "");
+        let qs = validate(&bad);
+        assert!(
+            qs.iter()
+                .any(|q| q.id == "/modules/0/entities/0/fields/0/write_only"
+                    && q.question.contains("primary key")
+                    && q.question.contains("JC0554")),
+            "explicit write_only on id must raise JC0554: {qs:?}"
+        );
+    }
+
     /// testgen must materialize `"a".repeat(min_len)` — an unbounded `min_len`
     /// would emit a multi-megabyte fixture, so it is capped at 4096.
     #[test]
@@ -3647,6 +3787,7 @@ mod tests {
             max: None,
             min_len: None,
             max_len: None,
+            write_only: false,
         });
         assert!(
             validate(&d)

@@ -293,6 +293,20 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs tenancy",
     },
     CodeInfo {
+        code: "JC0554",
+        title: "write_only on the primary key id",
+        cause: "the pk `id` field declares `write_only: true` — but `write_only` response-hides a field (`#[serde(skip_serializing)]` on the generated Model, issue #112), and the id MUST be returned: the generated id-echo probe and every cross-scope acceptance test key on `body[\"id\"]`, so a hidden id breaks the generated suite by construction",
+        fix: "remove `write_only` from the `id` field; ids are always returned. Put `write_only` on the secret columns that must not appear in responses (a `password_hash` is auto-hidden by name; add it to e.g. an `api_token`/`secret` field)",
+        doc: "jerrycan docs validation",
+    },
+    CodeInfo {
+        code: "JC0555",
+        title: "write_only column on a realtime changes entity",
+        cause: "an entity is listed in realtime `changes` AND has a write_only column (an explicit `write_only: true`, or a `password_hash` column auto-hidden by name, issue #112) — but the realtime changes broadcast delivers the RAW database row (every column) to subscribers over the WebSocket, so the write_only column would be exposed to every subscriber even though `#[serde(skip_serializing)]` hides it from REST responses; the secure-by-default REST hide does not reach the changes stream",
+        fix: "remove the write_only column from the changes entity, or drop the entity from realtime `changes` (don't broadcast row changes for it) — reads over REST still hide the column. Column projection (#167) will lift this restriction once the changes broadcast can omit hidden columns",
+        doc: "jerrycan docs realtime",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -528,6 +542,50 @@ mod tests {
         assert!(
             info.fix.to_lowercase().contains("rename"),
             "fix must name the rename remedy: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0554_names_the_id_must_be_returned_rule() {
+        // WHY: JC0554 (#112) refuses an explicit `write_only: true` on the pk
+        // `id`. `write_only` response-hides a field, but the id must be echoed in
+        // every response (the id-echo probe + cross-scope tests key on
+        // body["id"]). `jerrycan explain JC0554` must state the cause (the id must
+        // be returned) and the remove-write_only remedy.
+        let info = lookup("JC0554").unwrap();
+        assert!(
+            info.cause.contains("write_only") && info.cause.contains("body[\"id\"]"),
+            "cause must tie write_only to the id-echo requirement: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.to_lowercase().contains("remove") && info.fix.contains("write_only"),
+            "fix must name the remove-write_only remedy: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0555_names_the_changes_broadcast_leak_and_both_remedies() {
+        // WHY: JC0555 (#112/#167) closes the realtime egress hole write_only
+        // leaves open — `skip_serializing` hides a secret from REST responses
+        // but the changes broadcast ships the RAW row (every column) over the
+        // WebSocket. `jerrycan explain JC0555` must state the cause (the raw-row
+        // broadcast exposes the hidden column to subscribers) and name BOTH
+        // remedies (remove the column, or drop the entity from `changes`), plus
+        // the #167 projection follow-up.
+        let info = lookup("JC0555").unwrap();
+        assert!(
+            info.cause.contains("write_only") && info.cause.contains("RAW database row"),
+            "cause must tie write_only to the raw-row changes broadcast: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("remove")
+                && info.fix.contains("changes")
+                && info.fix.contains("#167"),
+            "fix must name both remedies and the #167 projection follow-up: {}",
             info.fix
         );
     }

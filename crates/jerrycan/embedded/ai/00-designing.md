@@ -221,6 +221,19 @@ Every entity has an `id` primary key; you usually do NOT declare it:
   `required: false`, which would make the column nullable (`Option<T>`) with value
   `null`, not the default; `default` keeps a solid NOT-NULL column with a server-chosen
   fallback.
+- `write_only?` — defaults to `false`. A RESPONSE-HIDDEN field: it is accepted on
+  create/update input and stored, but emitted with `#[serde(skip_serializing)]` on the
+  generated model so it NEVER appears in an API response (the request DTO and OpenAPI
+  request schema KEEP it — input is unaffected; OpenAPI marks the property `writeOnly`).
+  A `password_hash` column is AUTO-hidden even without the flag — secure-by-default,
+  fail-closed, since a password hash must never be in a response; the broad
+  `*_hash`/`token`/`secret` name heuristic is deliberately NOT applied (a `share_token`
+  may legitimately be returned), so mark those `write_only` explicitly. `write_only` on
+  the pk `id` is refused (`JC0554` — the id must be echoed in every response). A
+  `write_only`/`password_hash` column may NOT be on a realtime `changes` entity
+  (`JC0555`): the changes broadcast ships the raw row over the WebSocket, so the column
+  would leak to subscribers despite the response hide — remove it from the entity or
+  drop the entity from `changes` (lifted once column projection lands, #167).
 
 ## Endpoint
 ```json

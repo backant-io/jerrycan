@@ -30,6 +30,14 @@ fn field_schema(f: &Field) -> Value {
     if let Some(mx) = f.max_len {
         schema["maxLength"] = json!(mx);
     }
+    // Response-hidden fields (#112): the entity component is shared between the
+    // no-DTO request body and the response `$ref`, and OpenAPI `writeOnly`
+    // (present in requests, omitted from responses) is correct for both. Only
+    // emitted for a write_only / `password_hash` field, so every other design's
+    // document stays byte-identical.
+    if Design::field_is_write_only(f) {
+        schema["writeOnly"] = json!(true);
+    }
     schema
 }
 
@@ -594,6 +602,45 @@ mod tests {
                 "unconstrained golden must not gain `{kw}`"
             );
         }
+    }
+
+    /// #112: a `write_only` field (and any `password_hash` column) is marked
+    /// `writeOnly: true` on the shared entity component — present in requests,
+    /// omitted from responses, correct for both. A normal field gains no keyword,
+    /// and the request DTO KEEPS the field (input path). The unconstrained golden
+    /// gains no `writeOnly` (byte-identity for designs with no hidden field).
+    #[test]
+    fn write_only_fields_are_marked_writeonly_in_the_document() {
+        let d = document(
+            &serde_json::from_str::<Design>(crate::platform::genroute::tests::WRITE_ONLY).unwrap(),
+        );
+        let account = &d["components"]["schemas"]["Account"]["properties"];
+        assert_eq!(
+            account["api_token"]["writeOnly"],
+            json!(true),
+            "an explicit write_only field is writeOnly"
+        );
+        assert_eq!(
+            account["password_hash"]["writeOnly"],
+            json!(true),
+            "a password_hash column is auto-marked writeOnly"
+        );
+        assert!(
+            account["email"].get("writeOnly").is_none(),
+            "a normal field gains no writeOnly: {}",
+            account["email"]
+        );
+        // The request DTO keeps the field (input path unaffected).
+        assert!(
+            d["components"]["schemas"]["AccountRequest"]["properties"]["api_token"].is_object(),
+            "the write_only field stays in the request schema (input)"
+        );
+        // No-drift: a design with no hidden field gains no writeOnly.
+        let plain = document_json(&serde_json::from_str::<Design>(GOLDEN).unwrap());
+        assert!(
+            !plain.contains("writeOnly"),
+            "a design with no write_only/password_hash gains no writeOnly"
+        );
     }
 
     /// The `required_roles.is_empty()` conjunct is LOAD-BEARING: a ROLE-GATED GET

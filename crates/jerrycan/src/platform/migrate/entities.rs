@@ -161,6 +161,9 @@ fn build_one(
                     max: None,
                     min_len: None,
                     max_len: None,
+                    // Migration import sets no explicit write_only (#112); a
+                    // `password_hash` column is auto-hidden by the classifier.
+                    write_only: false,
                 });
             }
             MappedType::Unmappable { pg_type, reason } => {

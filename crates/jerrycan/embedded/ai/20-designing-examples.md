@@ -217,7 +217,10 @@ cross-tenant ISOLATION tests. Tenancy needs an active auth model
 
 ### Auth + a public route
 A `jwt` model with roles; a guarded `/me`, a role-gated delete, and a `public`
-signup (the only unauthenticated route):
+signup (the only unauthenticated route). `password_hash` carries
+`write_only: true`, so it is accepted on signup but never appears in a response
+— a `password_hash` column is auto-hidden even without the flag
+(secure-by-default):
 ```json
 {
   "name": "accounts-api",
@@ -233,7 +236,7 @@ signup (the only unauthenticated route):
           "name": "Account",
           "fields": [
             { "name": "email", "type": "string", "unique": true },
-            { "name": "password_hash", "type": "string" },
+            { "name": "password_hash", "type": "string", "write_only": true },
             { "name": "role", "type": "string", "values": ["admin", "user"] }
           ]
         }

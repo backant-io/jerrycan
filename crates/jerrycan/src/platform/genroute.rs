@@ -663,6 +663,7 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
         out.push_str(" {\n");
         for f in &e.fields {
             out.push_str(&keyword_field_attrs(&f.name, "    ", false));
+            out.push_str(&write_only_attr(f, "    "));
             if !f.required {
                 out.push_str("    #[serde(default)]\n");
             }
@@ -695,6 +696,24 @@ fn keyword_field_attrs(name: &str, indent: &str, db: bool) -> String {
         s.push_str(&format!("{indent}#[sea_orm(column_name = \"{name}\")]\n"));
     }
     s
+}
+
+/// The `#[serde(skip_serializing)]` line for a response-hidden `write_only`
+/// field (issue #112), or empty for a normal field so every design without a
+/// hidden field stays byte-identical. Uses `skip_serializing` (output only),
+/// NEVER `skip`: the entity `Model` is ALSO the input body in the no-DTO path
+/// (`Json<{Entity}>`), which must still DESERIALIZE the field — `skip` drops a
+/// field from BOTH directions, so it would silently strip the column from every
+/// client create/update body. Storage is unaffected either way (it never goes
+/// through serde): SeaORM maps the column via `DeriveEntityModel` and memory
+/// mode holds the `Model` struct, so the handler still reads the value (e.g. for
+/// password verification); `skip_serializing` omits only the response.
+fn write_only_attr(f: &Field, indent: &str) -> String {
+    if Design::field_is_write_only(f) {
+        format!("{indent}#[serde(skip_serializing)]\n")
+    } else {
+        String::new()
+    }
 }
 
 /// True when a field declares any #80 range/length key that needs a runtime
@@ -963,6 +982,9 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design, auth: bool) -> Opti
             // A keyword field is a raw identifier (`type` → `r#type`); the serde
             // rename + sea_orm column_name keep the wire and SQL names as `type`.
             fields.push_str(&keyword_field_attrs(&f.name, "        ", true));
+            // Response-hidden fields (#112): `#[serde(skip_serializing)]` covers
+            // BOTH the required and optional branches below.
+            fields.push_str(&write_only_attr(f, "        "));
             let ident = rust_ident(&f.name);
             if f.required {
                 fields.push_str(&constraint_validate_attr(e, f, "        ", "super::"));
@@ -3648,6 +3670,7 @@ pub(crate) mod tests {
             max: None,
             min_len: None,
             max_len: None,
+            write_only: false,
         });
         d.modules[1].entities[0].belongs_to[0].on_delete = OnDelete::SetNull;
         let ddl = migration_ddl(&d.modules[1], false, &d)
@@ -3735,6 +3758,102 @@ pub(crate) mod tests {
         assert!(
             src.contains("impl ActiveModelBehavior for ActiveModel {}"),
             "{src}"
+        );
+    }
+
+    /// #112: a `write_only` field (and any `password_hash` column, auto-classified)
+    /// is emitted with `#[serde(skip_serializing)]` on the Model at BOTH sites —
+    /// db (SeaORM) and memory — so it never serializes into a response, while a
+    /// normal field carries no such attr (byte-identity for designs with neither).
+    /// The attr is `skip_serializing` NEVER `skip`: the Model is also the input
+    /// body (no-DTO path) and the SeaORM row, both of which must still deserialize
+    /// the field. The request DTO KEEPS the field (input path unaffected).
+    #[test]
+    fn write_only_fields_are_skip_serializing_on_the_model_both_modes() {
+        let d: Design = serde_json::from_str(WRITE_ONLY).unwrap();
+        // The design validates clean — write_only + unique/default is fine.
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "{:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let m = &d.modules[0];
+        for (label, src) in [
+            ("db", model_rs_db(m, &d, true).unwrap()),
+            ("memory", model_rs(m).unwrap()),
+        ] {
+            // Exactly the two write-only columns (api_token + password_hash) are
+            // hidden — never id/email/role.
+            assert_eq!(
+                src.matches("#[serde(skip_serializing)]").count(),
+                2,
+                "{label}: exactly api_token + password_hash are response-hidden: {src}"
+            );
+            // The load-bearing distinction: NEVER `#[serde(skip)]` (which would
+            // drop the field from client input and the DB round-trip).
+            assert!(
+                !src.contains("#[serde(skip)]"),
+                "{label}: must use skip_serializing, never skip: {src}"
+            );
+            // The Model still derives Deserialize (input/DB round-trip intact).
+            assert!(
+                src.contains("Deserialize"),
+                "{label}: Model must still deserialize: {src}"
+            );
+            // A normal field is untouched.
+            assert!(
+                !src.contains("skip_serializing)]\n    pub email")
+                    && !src.contains("skip_serializing)]\n        pub email"),
+                "{label}: email is not hidden: {src}"
+            );
+        }
+        // db-mode also emits AccountRequest (the `role` default forces a DTO). The
+        // write_only field STAYS in that request DTO, without skip_serializing —
+        // so create/update input still carries it (spec: DO NOT touch the DTO).
+        let db_src = model_rs_db(m, &d, true).unwrap();
+        let dto = db_src
+            .split("pub struct AccountRequest")
+            .nth(1)
+            .expect("a request DTO is emitted for the defaulted entity");
+        assert!(
+            dto.contains("pub api_token: String,"),
+            "the write_only field stays in the request DTO (input path): {dto}"
+        );
+        assert!(
+            !dto.contains("skip_serializing"),
+            "the request DTO does not hide the field — input keeps it: {dto}"
+        );
+    }
+
+    /// The #112 load-bearing property, made executable: a field carrying the
+    /// exact attribute the generator emits — `#[serde(skip_serializing)]` — is
+    /// still DESERIALIZED from an incoming body (so a write_only field stays
+    /// accepted on create/update) while being OMITTED from the serialized
+    /// response. Had the generator used `#[serde(skip)]`, the field would vanish
+    /// from BOTH directions — dropping client input and breaking the SeaORM row.
+    #[test]
+    fn skip_serializing_hides_output_but_still_accepts_input() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Model {
+            id: i64,
+            #[serde(skip_serializing)]
+            api_token: String,
+        }
+        // Input WITH the field deserializes and populates it (the create path).
+        let m: Model = serde_json::from_str(r#"{ "id": 1, "api_token": "secret" }"#).unwrap();
+        assert_eq!(
+            m.api_token, "secret",
+            "write_only field is accepted on input"
+        );
+        // The response OMITS it, keeping the non-hidden fields.
+        let body = serde_json::to_string(&m).unwrap();
+        assert!(
+            !body.contains("api_token"),
+            "response hides the field: {body}"
+        );
+        assert!(
+            body.contains("\"id\":1"),
+            "non-hidden fields remain: {body}"
         );
     }
 
@@ -6391,6 +6510,7 @@ pub(crate) mod tests {
                 max: None,
                 min_len: None,
                 max_len: None,
+                write_only: false,
             },
         );
         let ddl = migration_ddl(&m, false, &demo()).unwrap();
@@ -6431,6 +6551,7 @@ pub(crate) mod tests {
                 max: None,
                 min_len: None,
                 max_len: None,
+                write_only: false,
             },
         );
         let ddl = migration_ddl(&m, false, &demo()).unwrap();
@@ -6986,6 +7107,30 @@ pub(crate) mod tests {
               ] }
         ]
     }"#;
+
+    /// #112: an entity carrying an explicit `write_only` field (`api_token`), a
+    /// `password_hash` column (auto-classified), a normal field (`email`), and a
+    /// `default` field (`role`, forcing a request DTO). Shared by the model
+    /// emission test and the OpenAPI `writeOnly` test.
+    pub(crate) const WRITE_ONLY: &str = r#"{
+        "name": "secrets-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": [] },
+        "dependencies": ["db", "auth"],
+        "modules": [{ "name": "accounts",
+            "entities": [{ "name": "Account", "fields": [
+                { "name": "id", "type": "integer" },
+                { "name": "email", "type": "string" },
+                { "name": "api_token", "type": "string", "write_only": true },
+                { "name": "password_hash", "type": "string", "required": false },
+                { "name": "role", "type": "string", "default": "user" } ] }],
+            "endpoints": [
+                { "operation_id": "create_account", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "Account" },
+                  "success": { "status": 201, "entity": "Account" } },
+                { "operation_id": "get_account", "method": "GET", "path": "/{id}",
+                  "auth_required": true,
+                  "success": { "status": 200, "entity": "Account" } } ] }] }"#;
 
     /// Issue #80: a `min`/`max` integer field and a `max_len` string field must
     /// reject out-of-range input at the request boundary (422), exactly like the

@@ -389,6 +389,11 @@
                 "type": "integer",
                 "minimum": 0,
                 "description": "Inclusive maximum string length in Unicode code points (issue #80). Only valid on type \"string\" without \"values\"; 0 on a required field is refused as unfillable; not allowed on the pk \"id\" field. Violations are refused at design time with JC0552."
+              },
+              "write_only": {
+                "type": "boolean",
+                "default": false,
+                "description": "Response-hidden output field (issue #112): the field is emitted with #[serde(skip_serializing)] on the generated Model, so it never appears in an API response, while staying accepted on create/update input and stored. OpenAPI marks it writeOnly. A field named \"password_hash\" is auto-hidden even without this flag (secure-by-default). JC0554 refuses write_only on the pk \"id\" (the id must be returned)."
               }
             }
           }
