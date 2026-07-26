@@ -4525,6 +4525,132 @@ mod tests {
         }
     }
 
+    /// #129 drift tripwire: `RESERVED_PRELUDE_IDENTS` is a HAND-MAINTAINED mirror
+    /// of the identifiers `jerrycan::prelude` re-exports (the glob every generated
+    /// route crate writes: `use jerrycan::prelude::*;`). If a future `pub use` is
+    /// added to the prelude but NOT to the set, JC0546 stops firing for it and an
+    /// entity named after it silently reopens #114 — the scaffold emits an
+    /// uncompilable `E0659` crate. This reads the prelude SOURCE (jerrycan-core's
+    /// `pub mod prelude` + the facade's re-exported `main`) and asserts the set is
+    /// a SUPERSET of every re-exported ident, so any drift fails CI. Test-only;
+    /// like `embedded_sync`, it skips in a published tarball where the sibling
+    /// core-crate source is absent.
+    #[test]
+    fn reserved_prelude_idents_is_a_superset_of_the_prelude_reexports() {
+        use std::path::Path;
+
+        // The body of the single `pub mod prelude { ... }` block, by brace match.
+        fn prelude_body(src: &str) -> String {
+            let start = src.find("pub mod prelude").expect("a prelude module");
+            let open = start + src[start..].find('{').expect("prelude has a body");
+            let mut depth = 0usize;
+            for (i, b) in src[open..].bytes().enumerate() {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return src[open + 1..open + i].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced braces in the prelude module");
+        }
+
+        // (idents, globs) re-exported by a prelude body. Handles `pub use a::b::C;`,
+        // `... as D;`, grouped `pub use a::{B, C as D};`, and glob `pub use x::*;`
+        // (reported separately — a glob cannot be enumerated against the set).
+        fn reexports(body: &str) -> (Vec<String>, Vec<String>) {
+            fn push_item(
+                item: &str,
+                prefix: &str,
+                idents: &mut Vec<String>,
+                globs: &mut Vec<String>,
+            ) {
+                let item = item.trim();
+                if item.is_empty() {
+                    return;
+                }
+                if item == "*" {
+                    globs.push(prefix.trim_end_matches("::").to_string());
+                } else if let Some(base) = item.strip_suffix("::*") {
+                    globs.push(format!("{prefix}{base}"));
+                } else if let Some((_, rename)) = item.split_once(" as ") {
+                    idents.push(rename.trim().to_string());
+                } else {
+                    idents.push(item.rsplit("::").next().unwrap().trim().to_string());
+                }
+            }
+            // Strip line comments so a `//` in a doc line can't leak a token.
+            let cleaned: String = body
+                .lines()
+                .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut idents = Vec::new();
+            let mut globs = Vec::new();
+            for stmt in cleaned.split(';') {
+                let Some(rest) = stmt.trim().strip_prefix("pub use ") else {
+                    continue;
+                };
+                let rest = rest.trim();
+                if let Some(brace) = rest.find("::{") {
+                    let prefix = &rest[..brace + 2]; // path up to and incl. the trailing "::"
+                    let group = rest[brace + 3..].trim_end_matches('}');
+                    for item in group.split(',') {
+                        push_item(item, prefix, &mut idents, &mut globs);
+                    }
+                } else {
+                    push_item(rest, "", &mut idents, &mut globs);
+                }
+            }
+            (idents, globs)
+        }
+
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR")); // crates/jerrycan
+        let core_lib = crate_dir.join("../jerrycan-core/src/lib.rs");
+        if !core_lib.exists() {
+            return; // published tarball: the sibling core-crate source is absent
+        }
+        let facade_lib = crate_dir.join("src/lib.rs");
+        let core_src = std::fs::read_to_string(&core_lib).unwrap();
+        let facade_src = std::fs::read_to_string(&facade_lib).unwrap();
+
+        let (core_idents, core_globs) = reexports(&prelude_body(&core_src));
+        let (facade_idents, facade_globs) = reexports(&prelude_body(&facade_src));
+
+        // The core prelude re-exports concrete items only. A glob there could not
+        // be statically enumerated against the set — fail loud, never pass blind.
+        assert!(
+            core_globs.is_empty(),
+            "jerrycan-core prelude gained a glob re-export {core_globs:?}: RESERVED_PRELUDE_IDENTS cannot mirror a glob — enumerate it or update this tripwire (#129)"
+        );
+        // The facade prelude's ONLY permitted glob is the core prelude it re-exports
+        // (enumerated above via `core_idents`); any OTHER glob is un-mirrorable.
+        assert_eq!(
+            facade_globs,
+            vec!["jerrycan_core::prelude".to_string()],
+            "facade prelude globs changed to {facade_globs:?}: only `jerrycan_core::prelude::*` is enumerable — a new glob reopens the #129 drift blind spot"
+        );
+
+        // Every ident the generated `use jerrycan::prelude::*;` pulls into scope
+        // must be reserved, or an entity named after it reopens #114 (JC0546 goes
+        // silent). Superset — extra reserved names are fine, missing ones are not.
+        let reexported: Vec<String> = core_idents.into_iter().chain(facade_idents).collect();
+        assert!(
+            !reexported.is_empty(),
+            "the prelude parser found no re-exports — the parser or the prelude shape changed"
+        );
+        for id in &reexported {
+            assert!(
+                RESERVED_PRELUDE_IDENTS.contains(&id.as_str()),
+                "`jerrycan::prelude` re-exports `{id}` but RESERVED_PRELUDE_IDENTS (questions.rs) omits it — add `\"{id}\"`, or an entity named `{id}` scaffolds an uncompilable E0659 crate (#114/#129). Current set: {RESERVED_PRELUDE_IDENTS:?}"
+            );
+        }
+    }
+
     /// A tenant child created at `POST /` under a module mounted at `/clubs/{club_id}`
     /// — the fk `club_id` is supplied by the MOUNT, not `ep.path`.
     const NESTED_MOUNT_CREATE: &str = r#"{ "name": "clubs-api", "contract_version": 1,
