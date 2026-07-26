@@ -2243,6 +2243,62 @@ pub fn write_acceptance(
     Ok((rel, test_count(&content) - reject))
 }
 
+/// The outcome of generating every module's acceptance suite plus the jobs
+/// suite — the shared core of the "all modules" path used by both the CLI's
+/// bare `gen-tests` and the MCP `jerrycan_gen_tests` with no `module` (#159).
+/// Each caller formats its own `next_step`/human envelope from these pieces.
+pub struct AllAcceptance {
+    /// Written suite paths, in order: one per endpoint-bearing module, then jobs.
+    pub tests_created: Vec<String>,
+    /// Aggregate expected-failing count (the jobs suite counted exactly once).
+    pub expected_failing: usize,
+    /// The cargo packages the suites live in: `route-{module}` …, then `jobs`.
+    pub packages: Vec<String>,
+    /// Whether the design declared jobs (a jobs suite was written).
+    pub has_jobs: bool,
+}
+
+/// Generate one acceptance suite per endpoint-bearing top-level module, plus the
+/// jobs suite once — the all-modules path shared by the CLI's bare `gen-tests`
+/// and the MCP `jerrycan_gen_tests` with no `module`. Module selection mirrors
+/// the JC0551 step (`checkpipe::missing_acceptance_tests`): a subroute's
+/// endpoints count toward its parent (their tests live in the parent's crate),
+/// so this clears every JC0551 the check can raise — including the jobs one on a
+/// jobs-only design, which has no module name to pass. Each file is byte-identical
+/// to what `write_acceptance` produces per module.
+pub fn write_all_acceptance(
+    root: &std::path::Path,
+    design: &Design,
+) -> Result<AllAcceptance, String> {
+    fn endpoint_count(m: &ModuleDesign) -> usize {
+        m.endpoints.len() + m.subroutes.iter().map(endpoint_count).sum::<usize>()
+    }
+    let mut tests_created: Vec<String> = Vec::new();
+    let mut expected_failing = 0usize;
+    let mut packages: Vec<String> = Vec::new();
+    for m in design.modules.iter().filter(|m| endpoint_count(m) > 0) {
+        let (rel, c) = write_acceptance(root, design, &m.name)?;
+        tests_created.push(rel);
+        expected_failing += c;
+        packages.push(format!("route-{}", m.name));
+    }
+    // Jobs are top-level (not per-module): their suite is written ONCE, so its
+    // count is added to the aggregate exactly once.
+    let jobs = super::jobsgen::write_jobs_acceptance(root, design)?;
+    let has_jobs = jobs.is_some();
+    if let Some((jobs_rel, jobs_count)) = jobs {
+        tests_created.push(jobs_rel);
+        expected_failing += jobs_count;
+        packages.push("jobs".to_string());
+    }
+    Ok(AllAcceptance {
+        tests_created,
+        expected_failing,
+        packages,
+        has_jobs,
+    })
+}
+
 /// How many #[tokio::test] functions a generated file contains.
 pub fn test_count(generated: &str) -> usize {
     generated.matches("#[tokio::test]").count()

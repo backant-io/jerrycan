@@ -102,6 +102,7 @@ fn oversized_line_gets_minus_32600_and_server_keeps_serving() {
 }
 
 const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.json");
+const REFERENCE: &str = include_str!("../../../conformance/designs/reference-slice.design.json");
 
 #[test]
 fn design_tool_questions_then_completes() {
@@ -417,5 +418,90 @@ fn gen_tests_writes_tool_owned_acceptance_tests() {
     );
     assert!(err);
     assert!(payload["error"].as_str().unwrap().contains("ghosts"));
+    c.shutdown();
+}
+
+/// #159: the MCP `jerrycan_gen_tests` twin mirrors the 0.6.4 CLI — with NO
+/// `module` it generates every endpoint-bearing module's suite plus the jobs
+/// suite once, exactly like the bare CLI `gen-tests`. WHY: the CLI dropped the
+/// `--module` requirement (#156), but the MCP twin still forced it, so an agent
+/// on the MCP channel could not run the whole-design generation the JC0551 jobs
+/// diagnostic suggests. The single-`module` call stays byte-identical.
+#[test]
+fn gen_tests_without_module_covers_all_modules_and_jobs_via_mcp() {
+    use jerrycan::platform::design::Design;
+    use jerrycan::platform::testgen::{AllAcceptance, write_all_acceptance};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let app = tmp.path().join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("design.json"), REFERENCE).unwrap();
+
+    let mut c = McpClient::start_in(tmp.path());
+    let (err, payload) = c.call_tool(
+        "jerrycan_gen_tests",
+        serde_json::json!({ "directory": app.to_str().unwrap() }),
+    );
+    assert!(!err, "module-less gen_tests must succeed: {payload}");
+
+    // Oracle: the shared all-modules writer, driven directly into a sibling root.
+    let design = Design::from_path(&app.join("design.json")).unwrap();
+    let oracle = tmp.path().join("oracle");
+    std::fs::create_dir_all(&oracle).unwrap();
+    let AllAcceptance {
+        tests_created: expected_files,
+        expected_failing: expected_count,
+        ..
+    } = write_all_acceptance(&oracle, &design).unwrap();
+    // reference-slice bears multiple endpoint modules AND jobs — a real "all" case.
+    assert!(
+        expected_files.len() > 2 && expected_files.iter().any(|f| f.contains("jobs")),
+        "fixture must exercise many modules + jobs: {expected_files:?}"
+    );
+
+    let created: Vec<String> = payload["tests_created"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        created, expected_files,
+        "one suite per endpoint-bearing module, then jobs once"
+    );
+    for rel in &created {
+        let got = std::fs::read(app.join(rel)).unwrap_or_else(|e| panic!("{rel} not written: {e}"));
+        let want = std::fs::read(oracle.join(rel)).unwrap();
+        assert_eq!(
+            got, want,
+            "{rel} must match the per-module writer byte-for-byte"
+        );
+    }
+    assert_eq!(
+        payload["expected_failing"].as_u64().unwrap() as usize,
+        expected_count,
+        "aggregate = sum of module counts + jobs counted exactly once"
+    );
+
+    // The single-`module` call is UNCHANGED: same one-module + jobs payload, and
+    // that module's suite is byte-identical to the one the module-less run wrote.
+    let (err, single) = c.call_tool(
+        "jerrycan_gen_tests",
+        serde_json::json!({ "module": "users", "directory": app.to_str().unwrap() }),
+    );
+    assert!(!err, "{single}");
+    assert_eq!(
+        single["tests_created"],
+        serde_json::json!([
+            "crates/routes/users/tests/acceptance.rs",
+            "crates/jobs/tests/acceptance.rs"
+        ]),
+        "the single-module MCP contract is frozen"
+    );
+    assert_eq!(
+        std::fs::read(app.join("crates/routes/users/tests/acceptance.rs")).unwrap(),
+        std::fs::read(oracle.join("crates/routes/users/tests/acceptance.rs")).unwrap(),
+        "both MCP paths write the identical module suite"
+    );
     c.shutdown();
 }

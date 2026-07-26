@@ -1168,27 +1168,12 @@ fn cmd_gen_tests(module: Option<&str>, json_mode: bool) -> Result<(), Failure> {
 /// bare command clears every JC0551 the check can raise — including the jobs
 /// one on a jobs-only design, which has no module name to pass.
 fn gen_tests_all(root: &Path, design: &Design, json_mode: bool) -> Result<(), Failure> {
-    fn endpoint_count(m: &jerrycan::platform::design::ModuleDesign) -> usize {
-        m.endpoints.len() + m.subroutes.iter().map(endpoint_count).sum::<usize>()
-    }
-    let mut tests_created: Vec<String> = Vec::new();
-    let mut count = 0usize;
-    let mut packages: Vec<String> = Vec::new();
-    for m in design.modules.iter().filter(|m| endpoint_count(m) > 0) {
-        let (rel, c) = jerrycan::platform::testgen::write_acceptance(root, design, &m.name)
-            .map_err(Failure::usage)?;
-        tests_created.push(rel);
-        count += c;
-        packages.push(format!("route-{}", m.name));
-    }
-    let jobs =
-        jerrycan::platform::jobsgen::write_jobs_acceptance(root, design).map_err(Failure::usage)?;
-    let has_jobs = jobs.is_some();
-    if let Some((jobs_rel, jobs_count)) = jobs {
-        tests_created.push(jobs_rel);
-        count += jobs_count;
-        packages.push("jobs".to_string());
-    }
+    let jerrycan::platform::testgen::AllAcceptance {
+        tests_created,
+        expected_failing: count,
+        packages,
+        has_jobs,
+    } = jerrycan::platform::testgen::write_all_acceptance(root, design).map_err(Failure::usage)?;
     let next_step = if packages.is_empty() {
         "nothing to generate — the design declares no endpoints and no jobs".to_string()
     } else {
