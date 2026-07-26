@@ -93,10 +93,9 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "module": { "type": "string" },
+          "module": { "type": "string", "description": "The endpoint module to generate the acceptance suite for. Omit to generate every module's suite plus the jobs suite once (mirrors the CLI's bare `gen-tests`)." },
           "directory": { "type": "string", "description": "App workspace root. Defaults to the MCP server's working directory." }
         },
-        "required": ["module"],
         "additionalProperties": false
       },
       "outputSchema": {

@@ -61,7 +61,13 @@ fn extension_block(design: &Design) -> String {
         block.push_str("        .extend(db)\n");
     }
     if design.wants_validate() {
-        block.push_str("        .extend(jerrycan::validate::OpenApi::new(include_str!(\"../../../openapi.json\")))\n");
+        // Pre-wrapped exactly as rustfmt formats it (issue #128): the one-line
+        // form's `OpenApi::new(..)` argument exceeds rustfmt's fn_call_width, so
+        // `cargo fmt` would rewrap it and trip JL0003 on a file the agent never
+        // touched. Emitting the wrapped form keeps `cargo fmt` a no-op here.
+        block.push_str(
+            "        .extend(jerrycan::validate::OpenApi::new(include_str!(\n            \"../../../openapi.json\"\n        )))\n",
+        );
     }
     block
 }
@@ -79,13 +85,32 @@ fn join_mount(base: &str, mount: &str) -> String {
     }
 }
 
+/// One `.mount("<path>", <callee>)` builder line, pre-wrapped exactly as rustfmt
+/// formats it (issue #128). rustfmt keeps a two-argument method call on one line
+/// only while its arguments fit `fn_call_width` (60); a long module/bucket name
+/// (e.g. `organization_invitations` → `route_organization_invitations::module()`,
+/// or `/storage/<long-bucket>`) pushes the args past 60, so `cargo fmt` would
+/// rewrap the line to the one-arg-per-line block form and trip JL0003 on a file
+/// the agent never touched. Emitting that form up front keeps `cargo fmt` a
+/// no-op. Boundary is empirical against the pinned toolchain's rustfmt: an
+/// argument text of width 60 stays inline, 61 rewraps.
+fn mount_line(path: &str, callee: &str) -> String {
+    let args = format!("\"{path}\", {callee}");
+    if args.chars().count() <= 60 {
+        format!("        .mount({args})\n")
+    } else {
+        format!("        .mount(\n            \"{path}\",\n            {callee},\n        )\n")
+    }
+}
+
 /// The CORS wiring for `expected_main` (issue #21): `(preamble, layer)`. Both are
 /// empty when the design declares no `cors` block. The preamble binds `cors_origins`
 /// from `JERRYCAN_CORS_ORIGINS` (comma-separated; `*` ⇒ any) with the design's
 /// origins as the fallback, so a cross-origin SPA can be re-pointed at deploy time
-/// without editing this tool-owned file. The layer installs `.cors(CorsConfig::new(..))`
-/// with the design's methods/headers/credentials chained on. `.cors` is an
-/// order-independent setter, so it sits right after `.map_error_body(..)`.
+/// without editing this tool-owned file. The preamble then assembles a `cors`
+/// binding — `CorsConfig::new(cors_origins)` plus the design's methods/headers/
+/// credentials, one setter per line — and the layer installs `.cors(cors)`. `.cors`
+/// is an order-independent setter, so it sits right after `.map_error_body(..)`.
 fn cors_wiring(design: &Design) -> (String, String) {
     let Some(cors) = &design.cors else {
         return (String::new(), String::new());
@@ -113,30 +138,55 @@ fn cors_wiring(design: &Design) -> (String, String) {
          \x20       _ => {default_origins},\n\
          \x20   }};\n"
     );
-    let mut config = String::from("CorsConfig::new(cors_origins)");
+    // The config is bound over several statements — ONE setter per line — instead
+    // of a single chained `.cors(CorsConfig::new(..)..)` expression (issue #128): a
+    // realistic methods/headers config makes the chained form exceed rustfmt's wrap
+    // point, and rustfmt's multi-regime reflow of a `.cors(<long chain>)` line is
+    // not something we can byte-match. Split into single-setter statements, the only
+    // thing that can wrap is an array literal — which `cors_setter` pre-wraps itself
+    // — so the whole block stays a `cargo fmt` no-op for every config.
+    let mut builder = String::from("    let cors = CorsConfig::new(cors_origins);\n");
     if !cors.methods.is_empty() {
-        let methods = cors
+        let methods: Vec<String> = cors
             .methods
             .iter()
             .map(|m| format!("jerrycan::http::Method::{}", m.as_http_const()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        config.push_str(&format!(".allow_methods([{methods}])"));
+            .collect();
+        builder.push_str(&cors_setter("allow_methods", &methods));
     }
     if !cors.headers.is_empty() {
-        let headers = cors
-            .headers
-            .iter()
-            .map(|h| format!("{h:?}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        config.push_str(&format!(".allow_headers([{headers}])"));
+        let headers: Vec<String> = cors.headers.iter().map(|h| format!("{h:?}")).collect();
+        builder.push_str(&cors_setter("allow_headers", &headers));
     }
     if cors.allow_credentials {
-        config.push_str(".allow_credentials(true)");
+        builder.push_str("    let cors = cors.allow_credentials(true);\n");
     }
-    let layer = format!("        .cors({config})\n");
-    (preamble, layer)
+    let layer = String::from("        .cors(cors)\n");
+    (format!("{preamble}{builder}"), layer)
+}
+
+/// One `let cors = cors.<setter>([<items>]);` line for the CORS builder,
+/// pre-wrapped exactly as rustfmt formats it (issue #128). rustfmt keeps a
+/// multi-element array literal on one line only while the whole statement fits
+/// its wrap point; a config with several methods/headers pushes it past, and
+/// `cargo fmt` would rewrap the array one-item-per-line — tripping JL0003 on the
+/// tool-owned main.rs the agent never touched. Emitting that form up front keeps
+/// the block a fmt no-op. A single-element array never wraps (rustfmt overflows
+/// the sole element), so it stays inline regardless of length. Boundary is
+/// empirical against the pinned toolchain's rustfmt: a statement of width 98
+/// stays inline, 99 rewraps.
+fn cors_setter(setter: &str, items: &[String]) -> String {
+    let single = format!("    let cors = cors.{setter}([{}]);", items.join(", "));
+    if items.len() <= 1 || single.chars().count() <= 98 {
+        format!("{single}\n")
+    } else {
+        let mut wrapped = format!("    let cors = cors.{setter}([\n");
+        for item in items {
+            wrapped.push_str(&format!("        {item},\n"));
+        }
+        wrapped.push_str("    ]);\n");
+        wrapped
+    }
 }
 
 /// The complete, tool-owned app/src/main.rs for this design.
@@ -160,10 +210,9 @@ pub fn expected_main(design: &Design) -> String {
         ));
     }
     for m in &modules {
-        mounts.push_str(&format!(
-            "        .mount(\"{}\", {}::module())\n",
-            join_mount(base, &m.effective_mount()),
-            crate_ident(&m.name)
+        mounts.push_str(&mount_line(
+            &join_mount(base, &m.effective_mount()),
+            &format!("{}::module()", crate_ident(&m.name)),
         ));
     }
     // Buckets mount under the storage base path (`/storage/<name>` by default),
@@ -178,9 +227,9 @@ pub fn expected_main(design: &Design) -> String {
         for b in buckets {
             // Bucket mount = app base + storage base + bucket name.
             let bucket_mount = join_mount(base, &format!("{storage_base}/{}", b.name));
-            mounts.push_str(&format!(
-                "        .mount(\"{bucket_mount}\", storage::{}::module())\n",
-                b.name.replace('-', "_")
+            mounts.push_str(&mount_line(
+                &bucket_mount,
+                &format!("storage::{}::module()", b.name.replace('-', "_")),
             ));
         }
     }
@@ -356,25 +405,68 @@ pub(crate) fn scan_migrations(app_root: &Path) -> Result<Vec<ScannedMigration>, 
     Ok(out)
 }
 
+/// One `include_str!` struct-field line, pre-wrapped exactly as rustfmt formats
+/// it (issue #128): single-line while the rendered line fits rustfmt's
+/// `max_width` (100), the block-indented macro form beyond it. Long module
+/// names/stems (e.g. `workspaces` postgres paths) otherwise get rewrapped by
+/// `cargo fmt`, tripping JL0003 on a file the agent never touched.
+fn include_str_field(indent: &str, field: &str, path: &str) -> String {
+    let line = format!("{indent}{field}: include_str!(\"{path}\"),");
+    if line.chars().count() <= 100 {
+        format!("{line}\n")
+    } else {
+        format!("{indent}{field}: include_str!(\n{indent}    \"{path}\"\n{indent}),\n")
+    }
+}
+
 /// The tool-owned `app/src/migrations.rs` aggregating module-owned migrations,
-/// or None when the design has no `db` dependency.
+/// or None when the design has no `db` dependency. The emitted text is a
+/// rustfmt fixpoint for every shape (issue #128): zero entries collapse to
+/// `&[];`, a single entry to rustfmt's inlined `&[Migration { .. }]` form, and
+/// over-wide `include_str!` lines are pre-wrapped — so `cargo fmt` never
+/// rewrites this file and JL0003 stays quiet on it.
 pub fn expected_migrations_rs(app_root: &Path, design: &Design) -> Result<Option<String>, String> {
     if !design.wants_db() {
         return Ok(None);
     }
     let scanned = scan_migrations(app_root)?;
-    let mut entries = String::new();
-    for m in &scanned {
+    let header = "//! GENERATED by jerrycan — aggregates module-owned migrations; do not hand-edit.\nuse jerrycan::db::Migration;\n\n";
+    let fields = |indent: &str, m: &ScannedMigration| {
         let module_snake = m.module.replace('-', "_");
-        entries.push_str(&format!(
-            "    Migration {{\n        name: \"{module_snake}_{stem}\",\n        sqlite: include_str!(\"../../routes/{module}/migrations/sqlite/{stem}.sql\"),\n        postgres: include_str!(\"../../routes/{module}/migrations/postgres/{stem}.sql\"),\n    }},\n",
-            stem = m.file_stem,
-            module = m.module,
-        ));
-    }
-    Ok(Some(format!(
-        "//! GENERATED by jerrycan — aggregates module-owned migrations; do not hand-edit.\nuse jerrycan::db::Migration;\n\npub const MIGRATIONS: &[Migration] = &[\n{entries}];\n"
-    )))
+        let stem = &m.file_stem;
+        let module = &m.module;
+        format!(
+            "{indent}name: \"{module_snake}_{stem}\",\n{sqlite}{postgres}",
+            sqlite = include_str_field(
+                indent,
+                "sqlite",
+                &format!("../../routes/{module}/migrations/sqlite/{stem}.sql"),
+            ),
+            postgres = include_str_field(
+                indent,
+                "postgres",
+                &format!("../../routes/{module}/migrations/postgres/{stem}.sql"),
+            ),
+        )
+    };
+    let body = match scanned.as_slice() {
+        [] => "pub const MIGRATIONS: &[Migration] = &[];\n".to_string(),
+        [only] => format!(
+            "pub const MIGRATIONS: &[Migration] = &[Migration {{\n{}}}];\n",
+            fields("    ", only)
+        ),
+        many => {
+            let mut entries = String::new();
+            for m in many {
+                entries.push_str(&format!(
+                    "    Migration {{\n{}    }},\n",
+                    fields("        ", m)
+                ));
+            }
+            format!("pub const MIGRATIONS: &[Migration] = &[\n{entries}];\n")
+        }
+    };
+    Ok(Some(format!("{header}{body}")))
 }
 
 /// Load every module-owned migration's contents (the SAME scan as the
@@ -961,29 +1053,38 @@ mod tests {
 
     /// WHY: a cross-origin SPA (console on one origin, API on another) must work
     /// without hand-editing the tool-owned main.rs (that edit trips JL0003 and is
-    /// wiped by the next `jerrycan generate`). A `cors` block therefore emits a
-    /// `.cors(CorsConfig::new(..))` layer, chaining the design's methods/headers/
-    /// credentials, positioned right after `.map_error_body(..)` and before App::new's
-    /// extensions/mounts (issue #21).
+    /// wiped by the next `jerrycan generate`). A `cors` block therefore assembles a
+    /// `cors` binding — `CorsConfig::new(..)` plus the design's methods/headers/
+    /// credentials, one setter per line (issue #128) — and installs `.cors(cors)`
+    /// right after `.map_error_body(..)`, before App::new's extensions/mounts (#21).
     #[test]
     fn expected_main_emits_the_cors_layer_from_the_design_block() {
         let main = expected_main(&cors_design());
-        // The layer installs the design's origins as the fallback list.
+        // The config is assembled one setter per line so `cargo fmt` never rewraps
+        // a long methods/headers chain on the tool-owned main.rs (issue #128).
+        for stmt in [
+            "    let cors = CorsConfig::new(cors_origins);\n",
+            "    let cors = cors.allow_methods([jerrycan::http::Method::GET, jerrycan::http::Method::POST]);\n",
+            "    let cors = cors.allow_headers([\"content-type\", \"authorization\"]);\n",
+            "    let cors = cors.allow_credentials(true);\n",
+        ] {
+            assert!(main.contains(stmt), "missing cors setter `{stmt}`:\n{main}");
+        }
+        // The layer references the assembled binding.
         assert!(
-            main.contains(
-                ".cors(CorsConfig::new(cors_origins).allow_methods([jerrycan::http::Method::GET, jerrycan::http::Method::POST]).allow_headers([\"content-type\", \"authorization\"]).allow_credentials(true))"
-            ),
-            "cors layer with methods/headers/credentials must be emitted:\n{main}"
+            main.contains("        .cors(cors)\n"),
+            "the layer installs the assembled `cors` binding:\n{main}"
         );
+        // The binding installs the design's origins as the env fallback list.
         assert!(
             main.contains(
                 "CorsOrigins::list([\"https://app.example\", \"https://admin.example\"])"
             ),
             "the design origins are the env fallback:\n{main}"
         );
-        // Order: .cors(..) sits between .map_error_body(..) and the mounts.
+        // Order: .cors(cors) sits between .map_error_body(..) and the mounts.
         let map = main.find(".map_error_body(errors::error_body)").unwrap();
-        let cors = main.find(".cors(CorsConfig::new").unwrap();
+        let cors = main.find(".cors(cors)").unwrap();
         let serve = main.find(".serve()").unwrap();
         assert!(
             map < cors && cors < serve,
@@ -1028,9 +1129,17 @@ mod tests {
             main.contains("_ => CorsOrigins::any(),"),
             "`*` origins fall back to CorsOrigins::any():\n{main}"
         );
+        // A minimal block binds a bare `cors` (no setter statements) and layers it.
         assert!(
-            main.contains(".cors(CorsConfig::new(cors_origins))\n"),
-            "a minimal block emits a bare CorsConfig::new (no chained options):\n{main}"
+            main.contains("    let cors = CorsConfig::new(cors_origins);\n")
+                && main.contains("        .cors(cors)\n"),
+            "a minimal block emits a bare CorsConfig::new binding:\n{main}"
+        );
+        assert!(
+            !main.contains("allow_methods")
+                && !main.contains("allow_headers")
+                && !main.contains("allow_credentials"),
+            "a minimal block chains no setters:\n{main}"
         );
     }
 

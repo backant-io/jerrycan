@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.6.7 — 2026-07-26
+
+Papercuts — four small correctness/consistency fixes surfaced by prior
+whole-branch reviews.
+
+### Fixed
+- **Scaffold output is `cargo fmt`-clean for every app shape (#128).** The
+  tool-owned `main.rs` (the OpenApi builder line, module/bucket mounts, and the
+  CORS layer) and `migrations.rs` (`include_str!` paths) are now emitted as
+  rustfmt fixpoints, so a later `cargo fmt` no longer rewrites a generated file
+  the agent never touched and re-fires `JL0003` on it. (The CORS layer is emitted
+  as a `let cors = …` builder preamble so it stays stable under any config.)
+- **`JC0553` — an entity that collides with the generated membership surface is
+  refused at `check` (#141).** With `tenancy`, an entity named `{Tenant}Member`
+  or whose table resolves to `{tenant}_members` (e.g. `ClubMember` under tenant
+  `Club`) now fails validation with a rename suggestion — previously it passed
+  `check` and aborted mid-scaffold with an opaque `table already exists`.
+- **`jerrycan_gen_tests` (MCP) no longer requires `module` (#159).** The bare MCP
+  call now generates every endpoint module's acceptance suite plus jobs,
+  mirroring the 0.6.4 CLI `gen-tests`; the two now share one code path.
+
+### Internal
+- **Drift tripwire (#129):** a test asserts `RESERVED_PRELUDE_IDENTS` stays a
+  superset of `jerrycan::prelude`'s re-exports, so adding a prelude export without
+  updating the reserved set now fails CI (guards `JC0546` against silent drift).
+
+### Notes
+- Follow-up: #165 (agent-owned route stubs aren't `cargo fmt`-clean on a pristine
+  scaffold — cosmetic; outside `JL0003`'s tool-owned scope).
+
 ## 0.6.6 — 2026-07-24
 
 Security.

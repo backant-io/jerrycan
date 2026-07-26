@@ -343,8 +343,45 @@ pub fn dispatch(name: &str, args: &Value) -> (bool, Value) {
                 Ok(d) => d,
                 Err(e) => return err_payload(e),
             };
+            // No `module`: mirror the CLI's bare `gen-tests` — every
+            // endpoint-bearing module's suite plus the jobs suite once (#159).
+            // The single-module path below stays byte-identical.
             let Some(module) = args["module"].as_str() else {
-                return err_payload("`module` is required");
+                let all = match super::testgen::write_all_acceptance(&root, &design) {
+                    Ok(a) => a,
+                    Err(e) => return err_payload(e),
+                };
+                let super::testgen::AllAcceptance {
+                    tests_created,
+                    expected_failing,
+                    packages,
+                    has_jobs,
+                } = all;
+                let next_step = if packages.is_empty() {
+                    "nothing to generate — the design declares no endpoints and no jobs".to_string()
+                } else {
+                    let run = packages
+                        .iter()
+                        .map(|p| format!("cargo test -p {p}"))
+                        .collect::<Vec<_>>()
+                        .join(" && ");
+                    let implement = match (packages.len() > usize::from(has_jobs), has_jobs) {
+                        (true, true) => "implement handlers + job tasks",
+                        (true, false) => "implement handlers",
+                        (false, _) => "implement job tasks",
+                    };
+                    format!(
+                        "run the tests to see them fail ({run}), {implement}, iterate until green"
+                    )
+                };
+                return (
+                    false,
+                    json!({
+                        "tests_created": tests_created,
+                        "expected_failing": expected_failing,
+                        "next_step": next_step,
+                    }),
+                );
             };
             match super::testgen::write_acceptance(&root, &design, module) {
                 Ok((rel, count)) => {
