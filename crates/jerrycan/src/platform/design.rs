@@ -380,6 +380,12 @@ pub struct BucketDesign {
     /// Content-type allowlist (globs like "image/*"). Empty = allow all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_mime: Vec<String>,
+    /// Tenant member roles allowed to write (upload/delete). Empty = any member
+    /// may write (backward-compatible: without it a read-only-role member could
+    /// upload bytes and delete others' uploads). Only meaningful on a
+    /// tenant-scoped bucket; each entry must be a declared member_role. // #132
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

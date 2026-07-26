@@ -179,7 +179,31 @@ pub(crate) fn bucket_rs(design: &Design, b: &BucketDesign) -> String {
         .map(|m| format!("\"{m}\""))
         .collect::<Vec<_>>()
         .join(", ");
-    let f = fragments(bucket_scope(design, b));
+    let bscope = bucket_scope(design, b);
+    let f = fragments(bscope);
+
+    // #132: gate the WRITE ops (upload/remove) by tenant role. Only a
+    // Tenant-scoped bucket stamps `owner_id = tenant.id()`, so without this any
+    // member — including a read-only role — could write/delete; `write_roles`
+    // names the roles allowed to write. Reads (download/list/sign) are NOT
+    // gated. Empty `write_roles` (or a non-Tenant scope) emits nothing, so a
+    // bucket that has not opted in is byte-identical. A single role uses the
+    // exact-match `require_role`; two or more use the `require_any_role` helper.
+    let write_gate = if bscope == BucketScope::Tenant && !b.write_roles.is_empty() {
+        if b.write_roles.len() == 1 {
+            format!("tenant.require_role(\"{}\")?;\n    ", b.write_roles[0])
+        } else {
+            let list = b
+                .write_roles
+                .iter()
+                .map(|r| format!("\"{r}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("tenant.require_any_role(&[{list}])?;\n    ")
+        }
+    } else {
+        String::new()
+    };
 
     let mut uses = String::from(
         "use jerrycan::Response;\nuse jerrycan::db::Db;\nuse jerrycan::prelude::*;\nuse jerrycan::storage::{Bucket, ObjectMeta, Scope, SignedUrl, Storage};\n",
@@ -286,7 +310,7 @@ fn default_ttl() -> u64 {{
 /// POST /?key=<path> — upload a raw body; the request `Content-Type` is the
 /// stored mime (415 JC0415 outside `allowed_mime`); duplicate key = 409.
 pub(crate) async fn upload(storage: Dep<Storage>, db: Dep<Db>, {guard}headers: Headers, Query(q): Query<UploadQuery>, RawBody(body): RawBody) -> Result<Created<ObjectMeta>> {{
-    let mime = headers.get("content-type").unwrap_or("application/octet-stream").to_string();
+    {write_gate}let mime = headers.get("content-type").unwrap_or("application/octet-stream").to_string();
     let scope = {scope_expr};
     Ok(Created(storage.put_object(&db, &BUCKET, &scope, &q.key, &mime, body).await?))
 }}
@@ -294,7 +318,7 @@ pub(crate) async fn upload(storage: Dep<Storage>, db: Dep<Db>, {guard}headers: H
 {read_handlers}
 /// DELETE /{{id}} — delete row + bytes, scoped (a foreign object is a 404).
 pub(crate) async fn remove(storage: Dep<Storage>, db: Dep<Db>, {guard}Path(id): Path<String>) -> Result<NoContent> {{
-    let scope = {scope_expr};
+    {write_gate}let scope = {scope_expr};
     storage.delete_object(&db, &BUCKET, &scope, &id).await?;
     Ok(NoContent)
 }}
@@ -350,6 +374,13 @@ pub fn acceptance_rs(design: &Design) -> String {
             BucketScope::Tenant | BucketScope::UserInTenant
         )
     });
+    // #132: a bucket with `write_roles` needs members of KNOWN roles in tenant 1
+    // so the generated 403 test can act as a write-role member (succeeds) AND a
+    // non-write-role member (403). Gated on this flag so a design WITHOUT any
+    // write_roles seeds nothing extra — its acceptance output is byte-identical.
+    let needs_write_role_seed = buckets
+        .iter()
+        .any(|b| bucket_scope(design, b) == BucketScope::Tenant && !b.write_roles.is_empty());
 
     // Tenant plumbing (migration include + tenant 1/2 + membership seeds),
     // reusing testgen's column/value derivation so the two seeds can't drift.
@@ -378,8 +409,26 @@ pub fn acceptance_rs(design: &Design) -> String {
             .unwrap_or("member");
         let (cols1, vals1) = super::testgen::tenant_row_cols_vals(entity, "1", 1);
         let (cols2, vals2) = super::testgen::tenant_row_cols_vals(entity, "2", 2);
+        // #132: one member of tenant 1 per declared role (user id 100 + role
+        // index), so a write_roles bucket's 403 test has a member of each role
+        // to act as. Empty unless a bucket opts into write_roles (byte-identity).
+        let role_members: String = if needs_write_role_seed {
+            tenancy
+                .member_roles
+                .iter()
+                .enumerate()
+                .map(|(ri, r)| {
+                    let uid = 100 + ri;
+                    format!(
+                        "    db.conn().execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES ({uid}, 1, '{r}')\").await.expect(\"seed write-role member\");\n"
+                    )
+                })
+                .collect()
+        } else {
+            String::new()
+        };
         let setup = format!(
-            "    db.migrate(&[\n        jerrycan::db::Migration {{\n            name: \"{t_snake}_0001_create_tables\",\n            sqlite: include_str!(\"../../routes/{t_name}/migrations/sqlite/0001_create_tables.sql\"),\n            postgres: include_str!(\"../../routes/{t_name}/migrations/postgres/0001_create_tables.sql\"),\n        }},\n    ])\n    .await\n    .expect(\"tenant migrations\");\n    db.conn().execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols1}) VALUES ({vals1})\").await.expect(\"seed tenant 1\");\n    db.conn().execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols2}) VALUES ({vals2})\").await.expect(\"seed tenant 2\");\n    db.conn().execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (1, 1, '{role}')\").await.expect(\"seed membership 1\");\n    db.conn().execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (2, 2, '{role}')\").await.expect(\"seed membership 2\");\n",
+            "    db.migrate(&[\n        jerrycan::db::Migration {{\n            name: \"{t_snake}_0001_create_tables\",\n            sqlite: include_str!(\"../../routes/{t_name}/migrations/sqlite/0001_create_tables.sql\"),\n            postgres: include_str!(\"../../routes/{t_name}/migrations/postgres/0001_create_tables.sql\"),\n        }},\n    ])\n    .await\n    .expect(\"tenant migrations\");\n    db.conn().execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols1}) VALUES ({vals1})\").await.expect(\"seed tenant 1\");\n    db.conn().execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols2}) VALUES ({vals2})\").await.expect(\"seed tenant 2\");\n    db.conn().execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (1, 1, '{role}')\").await.expect(\"seed membership 1\");\n    db.conn().execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (2, 2, '{role}')\").await.expect(\"seed membership 2\");\n{role_members}",
             t_name = t.name,
         );
         (
@@ -523,6 +572,41 @@ fn bucket_tests(design: &Design, b: &BucketDesign, base: &str, out: &mut String)
         out.push_str(&format!(
             "/// SECURITY (#109): an authenticated NON-MEMBER (a valid credential, no\n/// membership row) gets the tenant guard's 403 — not a misleading 401 that\n/// hides the real authz outcome.\n#[tokio::test]\nasync fn {ident}_download_by_non_member_is_403() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"{mount}?key=member.bin\", b\"x\", &[(\"{hk}\", &test_cookie_for(1)), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(created.status().as_u16(), 201, \"setup; body: {{}}\", created.text());\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\");\n    let res = t.get_with(&format!(\"{mount}/{{id}}\"), &[(\"{hk}\", &test_cookie_for(3))]).await;\n    assert_eq!(res.status().as_u16(), 403, \"a non-member reads the guard's 403, not 401; body: {{}}\", res.text());\n}}\n\n"
         ));
+    }
+
+    // 3c. #132: write_roles gates upload/delete by tenant role. A member whose
+    // seeded role is NOT in write_roles gets 403 on upload/delete (the gate runs
+    // BEFORE the owner scope, so even a would-be owner is stopped); a write-role
+    // member succeeds. Members of every role live in tenant 1 (user id 100 +
+    // role index, seeded by `role_members`), so both actors are real memberships.
+    if matches!(scope, BucketScope::Tenant) && !b.write_roles.is_empty() {
+        let tenancy = design
+            .tenancy
+            .as_ref()
+            .expect("validated: a tenant bucket requires tenancy");
+        let writer_idx = tenancy
+            .member_roles
+            .iter()
+            .position(|r| r == &b.write_roles[0])
+            .expect("validated JC0556: write_roles[0] is a declared member_role");
+        let writer_uid = 100 + writer_idx;
+        // The first declared role NOT in write_roles is the non-writer actor. If
+        // write_roles covers every role there is no non-writer, so the 403 test
+        // would be vacuous — skip it (the gate is still emitted and no member is
+        // read-only, so there is nothing to prove 403).
+        if let Some(nw_idx) = tenancy
+            .member_roles
+            .iter()
+            .position(|r| !b.write_roles.contains(r))
+        {
+            let nw_uid = 100 + nw_idx;
+            out.push_str(&format!(
+                "/// SECURITY (#132): a tenant member whose role is NOT in write_roles\n/// cannot upload — the write gate 403s a read-only-role member (owner_id is\n/// the shared tenant id, so without the gate any member could write); a\n/// write-role member still succeeds.\n#[tokio::test]\nasync fn {ident}_upload_by_non_writer_is_403() {{\n    let t = app().await;\n    let denied = t.post_bytes_with(\"{mount}?key=nonwriter.bin\", b\"x\", &[(\"{hk}\", &test_cookie_for({nw_uid})), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(denied.status().as_u16(), 403, \"a non-write-role member must be 403 on upload; body: {{}}\", denied.text());\n    let ok = t.post_bytes_with(\"{mount}?key=writer.bin\", b\"x\", &[(\"{hk}\", &test_cookie_for({writer_uid})), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(ok.status().as_u16(), 201, \"a write-role member uploads; body: {{}}\", ok.text());\n}}\n\n"
+            ));
+            out.push_str(&format!(
+                "/// SECURITY (#132): the same write gate protects delete — a\n/// non-write-role member cannot remove blobs; a write-role member can.\n#[tokio::test]\nasync fn {ident}_remove_by_non_writer_is_403() {{\n    let t = app().await;\n    let created = t.post_bytes_with(\"{mount}?key=to-del.bin\", b\"x\", &[(\"{hk}\", &test_cookie_for({writer_uid})), (\"content-type\", \"{mime}\")]).await;\n    assert_eq!(created.status().as_u16(), 201, \"setup; body: {{}}\", created.text());\n    let meta: serde_json::Value = serde_json::from_str(&created.text()).expect(\"meta json\");\n    let id = meta[\"id\"].as_str().expect(\"id\");\n    let denied = t.delete_with(&format!(\"{mount}/{{id}}\"), &[(\"{hk}\", &test_cookie_for({nw_uid}))]).await;\n    assert_eq!(denied.status().as_u16(), 403, \"a non-write-role member must be 403 on delete; body: {{}}\", denied.text());\n    let ok = t.delete_with(&format!(\"{mount}/{{id}}\"), &[(\"{hk}\", &test_cookie_for({writer_uid}))]).await;\n    assert_eq!(ok.status().as_u16(), 204, \"a write-role member deletes; body: {{}}\", ok.text());\n}}\n\n"
+            ));
+        }
     }
 
     // 4. allowed_mime → 415 JC0415.
@@ -1027,6 +1111,131 @@ mod tests {
         assert!(
             !s.contains("{hk}") && !j.contains("{hk}"),
             "the header-key placeholder is always interpolated at the emission site"
+        );
+    }
+
+    /// #132: a tenant-scoped bucket with a single `write_roles` role gates
+    /// upload AND remove (the two write ops) with `require_role` as the FIRST
+    /// statement — before the owner scope, so authz precedes existence. Reads
+    /// (download/list/sign) are NEVER gated: sign issues a download URL, a read
+    /// grant. This is the security contract of #132.
+    #[test]
+    fn tenant_bucket_single_write_role_gates_writes_only() {
+        let mut d = design();
+        // invoices is tenant-scoped (owner Org == tenancy.entity).
+        d.storage.as_mut().unwrap().buckets[1].write_roles = vec!["owner".into()];
+        let m = bucket_rs(&d, &d.storage.as_ref().unwrap().buckets[1].clone());
+        // The gate is the first statement of upload and of remove — exactly twice.
+        assert_eq!(
+            m.matches("tenant.require_role(\"owner\")?;").count(),
+            2,
+            "upload + remove each gate on the write role: {m}"
+        );
+        assert!(
+            m.contains(
+                "-> Result<Created<ObjectMeta>> {\n    tenant.require_role(\"owner\")?;\n    let mime"
+            ),
+            "upload gates FIRST: {m}"
+        );
+        assert!(
+            m.contains(
+                "-> Result<NoContent> {\n    tenant.require_role(\"owner\")?;\n    let scope"
+            ),
+            "remove gates FIRST: {m}"
+        );
+        // sign is a DOWNLOAD grant — never role-gated.
+        assert!(
+            m.contains("-> Result<Json<SignedUrl>> {\n    let scope"),
+            "sign is not gated (read grant): {m}"
+        );
+    }
+
+    /// #132: two or more write roles use the `require_any_role` helper (not
+    /// repeated single-role checks), still on both write ops only.
+    #[test]
+    fn tenant_bucket_multi_write_roles_use_require_any_role() {
+        let mut d = design();
+        d.storage.as_mut().unwrap().buckets[1].write_roles = vec!["owner".into(), "member".into()];
+        let m = bucket_rs(&d, &d.storage.as_ref().unwrap().buckets[1].clone());
+        assert_eq!(
+            m.matches("tenant.require_any_role(&[\"owner\", \"member\"])?;")
+                .count(),
+            2,
+            "upload + remove use the multi-role helper: {m}"
+        );
+        assert!(
+            !m.contains("tenant.require_role("),
+            "multi-role does not fall back to single require_role: {m}"
+        );
+    }
+
+    /// Byte-identity (#132): a tenant bucket with NO write_roles emits no gate —
+    /// its output is exactly the pre-0.6.9 shape.
+    #[test]
+    fn tenant_bucket_without_write_roles_emits_no_gate() {
+        let d = design();
+        let m = bucket_rs(&d, bucket(&d, "invoices"));
+        assert!(
+            !m.contains("require_role") && !m.contains("require_any_role"),
+            "no write gate without write_roles: {m}"
+        );
+    }
+
+    /// A non-tenant (User-scoped) bucket never emits a gate — there is no
+    /// `tenant` binding to call it on. JC0556 refuses write_roles here at
+    /// validation, but codegen must be safe by construction too.
+    #[test]
+    fn write_roles_on_a_user_bucket_emit_no_gate() {
+        let mut d = design();
+        // avatars is User-scoped (owner User != tenancy.entity).
+        d.storage.as_mut().unwrap().buckets[0].write_roles = vec!["owner".into()];
+        let m = bucket_rs(&d, &d.storage.as_ref().unwrap().buckets[0].clone());
+        assert!(
+            !m.contains("require_role") && !m.contains("require_any_role"),
+            "a user-scoped bucket never gets a tenant-role gate: {m}"
+        );
+    }
+
+    /// #132: a write_roles bucket makes the acceptance suite prove the 403 — a
+    /// non-write-role member is denied upload/delete, a write-role member
+    /// succeeds — and seeds a member of every role in tenant 1 so both actors
+    /// are real memberships (write role `owner` -> user 100, non-writer
+    /// `member` -> user 101, per role index).
+    #[test]
+    fn acceptance_emits_write_role_403_tests_and_seeds_role_members() {
+        let mut d = design();
+        d.storage.as_mut().unwrap().buckets[1].write_roles = vec!["owner".into()];
+        let a = acceptance_rs(&d);
+        assert!(
+            a.contains("async fn invoices_upload_by_non_writer_is_403()")
+                && a.contains("async fn invoices_remove_by_non_writer_is_403()"),
+            "{a}"
+        );
+        // A member of each role seeded in tenant 1 at user id 100 + role index.
+        assert!(a.contains("VALUES (100, 1, 'owner')"), "writer seeded: {a}");
+        assert!(
+            a.contains("VALUES (101, 1, 'member')"),
+            "non-writer seeded: {a}"
+        );
+        // writer = owner (idx 0 -> 100); non-writer = member (idx 1 -> 101).
+        assert!(
+            a.contains("test_cookie_for(101)") && a.contains("test_cookie_for(100)"),
+            "both actors are exercised: {a}"
+        );
+    }
+
+    /// Byte-identity (#132): a design without any write_roles seeds no extra
+    /// members and emits no 403 test — its acceptance output is unchanged.
+    #[test]
+    fn acceptance_without_write_roles_is_unchanged() {
+        let a = acceptance_rs(&design());
+        assert!(
+            !a.contains("seed write-role member"),
+            "no extra seed without write_roles: {a}"
+        );
+        assert!(
+            !a.contains("_by_non_writer_is_403"),
+            "no 403 test without write_roles: {a}"
         );
     }
 }

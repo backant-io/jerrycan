@@ -192,6 +192,12 @@
                 "minItems": 1,
                 "items": { "type": "string" },
                 "description": "Content-type allowlist; image/* globs supported. Violation is 415 JC0415."
+              },
+              "write_roles": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string" },
+                "description": "Tenant member roles allowed to upload/delete (#132). Empty/absent = any member may write (today's behavior). Only meaningful on a tenant-scoped bucket (owner = the tenancy entity); each entry must be a declared tenancy member_role — otherwise JC0556. A non-write-role member gets 403 on upload/delete; reads (download/list/sign) are unaffected."
               }
             }
           }

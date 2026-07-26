@@ -14,7 +14,8 @@ bytes live in a pluggable blob store.
       { "name": "avatars", "visibility": "public", "owner": "User",
         "max_size": "5MB", "allowed_mime": ["image/*"] },
       { "name": "invoices", "visibility": "private", "owner": "Org",
-        "owner_prefix": true, "max_size": "20MB" }
+        "owner_prefix": true, "max_size": "20MB",
+        "write_roles": ["admin"] }
     ]
   }
 }
@@ -25,7 +26,24 @@ bytes live in a pluggable blob store.
   scoped); any other entity stamps the session user id.
 - `owner_prefix: true` — keys stored as `{owner_id}/…`, prefix-asserted on every
   access (the Supabase folder-per-user pattern).
+- `write_roles` — on a TENANT-scoped bucket, the member roles allowed to write
+  (upload/delete). A tenant bucket stamps `owner_id = tenant.id()`, so every
+  member is "the owner"; without `write_roles` any member — including a
+  read-only role — can upload bytes and delete others' uploads (#132). List the
+  write roles (each a declared `tenancy.member_roles`) and a non-write-role
+  member gets `403` on upload/delete. Reads (download/list/sign) are never
+  role-gated. Empty/absent = any member may write (the backward-compatible
+  default). On a non-tenant bucket `write_roles` is meaningless and refused
+  (`JC0556`).
 - Storage requires the `db` dependency and an active auth model.
+
+> **Per-owner key isolation (`owner_prefix`).** An OWNED bucket (tenant- or
+> user-scoped) shares ONE key namespace across all owners unless
+> `owner_prefix: true` is set: a key like `report.pdf` is a single global path,
+> so one owner can learn of or squat another owner's keys (the #133 cross-owner
+> key oracle). Set `owner_prefix: true` for per-owner key isolation — keys are
+> stored under `{owner_id}/…` and asserted on every access, so owners cannot
+> observe or collide on each other's keys.
 
 ## Generated endpoints (per bucket `<b>`)
 

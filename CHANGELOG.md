@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.9 — 2026-07-26
+
+Storage authorization.
+
+### Security
+- **Blob writes are role-gated (#132).** A tenant-scoped bucket can declare
+  `"write_roles": ["admin", …]` — a member holding a role **not** in the set gets
+  **403** on `upload`/`remove`. Previously the blob write handlers took a bare
+  tenant guard with no role check, and a tenant-scoped bucket stamps every member
+  as the owner, so a **read-only-role member could upload bytes and delete
+  others' uploads**. `sign` (a signed *download* URL) and reads are unaffected.
+  Backward-compatible: a bucket with no `write_roles` keeps today's behavior (any
+  member may write).
+- **`JC0556`** refuses a `write_roles` entry that isn't a declared member role,
+  or `write_roles` on a non-tenant-scoped bucket (where the gate would be silently
+  inert).
+
+### Docs
+- Storage: an **owned** bucket shares one key namespace across owners unless
+  `owner_prefix: true` is set — use `owner_prefix` for per-owner key isolation
+  (the #133 cross-owner key-collision mitigation; a runtime key-namespacing fix
+  is tracked in #133).
+
 ## 0.6.8 — 2026-07-26
 
 Security: response-hidden fields.
