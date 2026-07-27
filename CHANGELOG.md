@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.16 — 2026-07-27
+
+Classification-honesty cleanup — four review-filed residuals where the
+validator/lint/steer classified an endpoint or entity differently from what
+codegen targets, so a broken stub could ship behind a green `check`.
+
+### Fixed
+- **A public/unguarded write on a `public_read` entity is refused even when the
+  entity isn't first in its module (#143).** The `JC0549(b)` write-gate resolved
+  the endpoint's entity leniently (first-entity fallback), so a bodyless
+  `public` `DELETE /{id}` on a non-first `public_read` entity mis-attributed to
+  the first entity and escaped. It now fires when either the lenient or the
+  strict (#56 collection-creator) resolution lands on the `public_read` entity.
+- **An anonymous custom handler on a tenant-owned module no longer emits a
+  broken scope comment (#171).** The membership-set steer referenced
+  `_user`/`_id` params that an unguarded handler doesn't have; it's replaced by
+  an honest TODO (the repo binding is unchanged).
+- **`JC0562`** refuses a tenant entity reachable by **both** a flat (body-fk)
+  write and a path-scoped route (#175) — the generator emits only one scoping
+  shape, so the mixed shape would steer to a `*_for_memberships` method it never
+  emits. Give the entity a single shape.
+
+### Docs
+- Note that in memory mode an absent optional field reads back as its type
+  default (`0`/`""`), which may fall outside a `min`/`max` bound; db mode stores
+  NULL (#161).
+
 ## 0.6.15 — 2026-07-27
 
 ### New
