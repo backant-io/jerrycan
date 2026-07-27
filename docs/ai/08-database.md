@@ -277,3 +277,6 @@ that surface.
   `now_rfc3339()` — the prelude helper returning the current UTC time as RFC3339
   (`YYYY-MM-DDTHH:MM:SSZ`). Call `now_rfc3339()` directly in a handler for any other
   timestamp (e.g. an `updated_at` you set on write).
+- In memory mode, an absent optional field reads back as its type default (`0`/`""`),
+  which may sit outside a `min`/`max` bound; db mode stores NULL (true absence). Set a
+  `default` to control the absent value, or use db mode for NULL semantics.

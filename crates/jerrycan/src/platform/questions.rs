@@ -1285,6 +1285,46 @@ pub fn validate(d: &Design) -> Vec<Question> {
             check_ambiguous_tenant_path(d, m, &format!("/modules/{i}"), &mut qs);
         }
 
+        // JC0562 (#175): a tenant-owned entity reachable by BOTH a flat
+        // (membership-set, body-fk) route AND a path-scoped (`/{fk}/…`) route is
+        // MIXED-shape. The generator emits only ONE scoping shape per entity —
+        // `genroute::entity_is_flat_tenant_owned` is `!saw_path && saw_flat`, so a
+        // mixed entity is classified NON-flat and its `*_for_memberships` accessors
+        // are withheld, yet the flat-write steer still fires: following the generated
+        // comment would call a method that isn't emitted (`method not found` behind a
+        // green `check`, the #116 class). No corpus design is mixed today; refuse it
+        // so the broken shape can't ship. The tenant-owned guard mirrors
+        // `entity_is_flat_tenant_owned`'s domain; `entity_tenant_shapes` is the SAME
+        // whole-design scan, so this refusal and that classifier can't drift.
+        fn check_mixed_tenant_shape(
+            d: &Design,
+            m: &ModuleDesign,
+            ptr: &str,
+            qs: &mut Vec<Question>,
+        ) {
+            for (i, e) in m.entities.iter().enumerate() {
+                if d.tenant_path(&e.name).is_none() {
+                    continue;
+                }
+                let (saw_path, saw_flat) = d.entity_tenant_shapes(e);
+                if saw_path && saw_flat {
+                    qs.push(q(
+                        format!("{ptr}/entities/{i}"),
+                        format!(
+                            "Entity `{}` mixes a flat (body-fk) write and a path-scoped route — the generator can emit only one scoping shape, so following the generated steer would call a `*_for_memberships` method that isn't emitted. Give `{}` a single shape: make every route path-scoped (`/{{fk}}/…`), or every route flat. See `jerrycan explain JC0562`.",
+                            e.name, e.name
+                        ),
+                    ));
+                }
+            }
+            for (i, sub) in m.subroutes.iter().enumerate() {
+                check_mixed_tenant_shape(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
+            }
+        }
+        for (i, m) in d.modules.iter().enumerate() {
+            check_mixed_tenant_shape(d, m, &format!("/modules/{i}"), &mut qs);
+        }
+
         // JC0553 (#141): with tenancy, jerrycan reserves the `{tenant}_members`
         // membership table and the `pub struct {Tenant}Member` row type (issue
         // #107) for the generated member surface. An entity (other than the
@@ -1546,18 +1586,27 @@ pub fn validate(d: &Design) -> Vec<Question> {
                         ),
                     ));
                 }
-            } else {
+            } else if ep.public || !ep.is_guarded() {
                 // (b) A write must stay owner-gated regardless of the flag.
-                // Writes keep the LENIENT resolution (the repo the generated
-                // stub actually binds — first-entity fallback included): the
-                // failure mode here is fail-CLOSED, so over-matching only asks.
-                let Some(name) = endpoint_repo_entity(m, ep) else {
-                    continue;
-                };
-                let Some(e) = m.entities.iter().find(|e| e.name == name) else {
-                    continue;
-                };
-                if e.public_read && (ep.public || !ep.is_guarded()) {
+                // Resolve BOTH the LENIENT repo-binding entity (first-entity
+                // fallback — the repo the generated stub actually binds) AND the
+                // STRICT #56-collection-creator entity (no fallback), and refuse a
+                // public/unguarded write when EITHER lands on a public_read entity.
+                // The lenient leg preserves the existing over-match (fail-CLOSED);
+                // the strict leg catches the UNDER-match — a bodyless `DELETE /{id}`
+                // whose public_read entity is NOT the module's first entity, which
+                // the lenient fallback mis-attributes to the first (non-public_read)
+                // entity so JC0549(b) never fired (#143). Prefer the lenient name
+                // when it is itself public_read so first-entity designs stay
+                // byte-identical; the `find_map` dedupes to one question per endpoint.
+                if let Some(e) = [
+                    endpoint_repo_entity(m, ep),
+                    endpoint_repo_entity_strict(m, ep),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(|name| m.entities.iter().find(|e| e.name == name && e.public_read))
+                {
                     qs.push(q(
                         format!("{ptr}/endpoints/{i}"),
                         format!(
@@ -4290,6 +4339,129 @@ mod tests {
                 .iter()
                 .any(|q| q.question.contains("delete_post")),
             "an unguarded write on a public_read entity must raise JC0549: {qs2:?}"
+        );
+    }
+
+    /// #143: the write-leg under-match. When the public_read entity is NOT the
+    /// module's first entity, a bodyless `DELETE /{id}` (204, no body, no success
+    /// entity) resolves via the LENIENT first-entity fallback to the OTHER entity
+    /// (here `User`, not public_read) — so the old write-leg saw a non-public_read
+    /// entity and shipped GREEN with an unimplementable public-write stub. The
+    /// STRICT #56 collection-creator resolution ties the DELETE to `Post` (the
+    /// `POST /` creator's body entity), which IS public_read, so firing on EITHER
+    /// resolution now raises JC0549(b) naming `Post`. Reordering alone (write still
+    /// guarded) must stay clean — the refusal is caused by the unguarded write.
+    #[test]
+    fn public_unguarded_write_on_a_non_first_public_read_entity_is_rejected() {
+        // Baseline: the public_read entity SECOND, every write guarded — clean.
+        let mut base: Design = serde_json::from_str(PUBLIC_READ_FEED).unwrap();
+        base.modules[0].entities.swap(0, 1); // [User, Post] — Post (public_read) second
+        assert!(
+            validate(&base).is_empty(),
+            "reordering entities alone must stay clean: {:?}",
+            validate(&base)
+        );
+
+        // Unguard the bodyless DELETE: the lenient fallback lands on `User`
+        // (non-public_read, first), the strict #56 resolution on `Post`.
+        let mut d = base.clone();
+        d.modules[0]
+            .endpoints
+            .iter_mut()
+            .find(|ep| ep.operation_id == "delete_post")
+            .unwrap()
+            .auth_required = false;
+        let qs = validate(&d);
+        assert!(
+            jc0549(&qs)
+                .iter()
+                .any(|q| q.question.contains("delete_post") && q.question.contains("`Post`")),
+            "an unguarded write whose STRICT resolution is the non-first public_read entity must raise JC0549(b) naming Post: {qs:?}"
+        );
+    }
+
+    // ---- #175 (JC0562): mixed-shape tenant entity refusal ----------------------
+
+    fn jc0562(qs: &[Question]) -> Vec<&Question> {
+        qs.iter()
+            .filter(|q| q.question.contains("JC0562"))
+            .collect()
+    }
+
+    /// A tenant-owned `Lead` reachable by BOTH a FLAT read (`GET /`, membership-set)
+    /// AND a PATH-SCOPED read (`GET /{workspace_id}/all`, tenant fk in path). Both
+    /// endpoints resolve to `Lead`; the two shapes give `entity_tenant_shapes` →
+    /// `(saw_path, saw_flat)` both true.
+    const MIXED_SHAPE: &str = r#"{
+        "name": "crm", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "workspaces",
+              "entities": [{ "name": "Workspace", "fields": [{ "name": "name", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "list_workspaces", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Workspace", "list": true } } ] },
+            { "name": "leads",
+              "entities": [{ "name": "Lead",
+                  "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+                  "fields": [{ "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "list_leads_flat", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Lead", "list": true } },
+                  { "operation_id": "list_leads_scoped", "method": "GET", "path": "/{workspace_id}/all",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Lead", "list": true } }
+              ] }
+        ]
+    }"#;
+
+    /// #175: a mixed-shape entity. The generator emits only ONE scoping shape —
+    /// `entity_is_flat_tenant_owned` is `!saw_path && saw_flat`, so seeing a
+    /// path-scoped route classifies `Lead` NON-flat and withholds its
+    /// `*_for_memberships` accessors, yet the flat-write steer would still call
+    /// them (method-not-found behind a green `check`, the #116 class). JC0562
+    /// refuses it, naming the entity.
+    #[test]
+    fn mixed_shape_tenant_entity_is_rejected() {
+        let d: Design = serde_json::from_str(MIXED_SHAPE).unwrap();
+        let qs = validate(&d);
+        assert!(
+            jc0562(&qs).iter().any(|q| q.question.contains("`Lead`")),
+            "a flat-AND-path-scoped tenant entity must raise JC0562 naming Lead: {qs:?}"
+        );
+    }
+
+    /// A PURE-FLAT tenant entity (every route membership-set) is the blessed flat
+    /// shape — JC0562 must stay silent (byte-identity baseline).
+    #[test]
+    fn pure_flat_tenant_entity_does_not_trip_jc0562() {
+        let mut d: Design = serde_json::from_str(MIXED_SHAPE).unwrap();
+        d.modules[1]
+            .endpoints
+            .retain(|ep| ep.operation_id != "list_leads_scoped");
+        let qs = validate(&d);
+        assert!(
+            jc0562(&qs).is_empty(),
+            "a pure-flat tenant entity must not trip JC0562: {qs:?}"
+        );
+    }
+
+    /// A PURE-PATH-SCOPED tenant entity (every route carries the tenant fk) is the
+    /// nested shape — JC0562 must stay silent (byte-identity baseline).
+    #[test]
+    fn pure_path_scoped_tenant_entity_does_not_trip_jc0562() {
+        let mut d: Design = serde_json::from_str(MIXED_SHAPE).unwrap();
+        d.modules[1]
+            .endpoints
+            .retain(|ep| ep.operation_id != "list_leads_flat");
+        let qs = validate(&d);
+        assert!(
+            jc0562(&qs).is_empty(),
+            "a pure-path-scoped tenant entity must not trip JC0562: {qs:?}"
         );
     }
 
