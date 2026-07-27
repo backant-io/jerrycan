@@ -1205,6 +1205,46 @@ impl Design {
         TenantShape::None
     }
 
+    /// The tenant-route SHAPES an entity is reachable by across the WHOLE design —
+    /// `(saw_path_scoped, saw_flat)`: whether any endpoint bound to the entity
+    /// resolves to a `PathScoped` (`/{fk}/…`) route, and whether any resolves to a
+    /// `MembershipSet` (flat, body-fk) route. Scans every endpoint in every module
+    /// AND every nested subroute, classifying each with ITS OWN module context (the
+    /// mount path decides path-scoped vs flat — see [`Self::endpoint_tenant_shape`]).
+    /// Shared by [`genroute::entity_is_flat_tenant_owned`] (flat = `!saw_path && saw_flat`)
+    /// and the JC0562 mixed-shape refusal (BOTH true — the generator emits only one
+    /// scoping shape per entity, so a mixed entity would steer to a withheld
+    /// `*_for_memberships` method). A non-tenant entity resolves to `(false, false)`.
+    pub(crate) fn entity_tenant_shapes(&self, e: &Entity) -> (bool, bool) {
+        fn scan(
+            design: &Design,
+            m: &ModuleDesign,
+            entity: &str,
+            saw_path_scoped: &mut bool,
+            saw_flat: &mut bool,
+        ) {
+            for ep in &m.endpoints {
+                if endpoint_repo_entity(m, ep) != Some(entity) {
+                    continue;
+                }
+                match design.endpoint_tenant_shape(m, ep) {
+                    TenantShape::PathScoped { .. } => *saw_path_scoped = true,
+                    TenantShape::MembershipSet => *saw_flat = true,
+                    _ => {}
+                }
+            }
+            for sub in &m.subroutes {
+                scan(design, sub, entity, saw_path_scoped, saw_flat);
+            }
+        }
+        let mut saw_path_scoped = false;
+        let mut saw_flat = false;
+        for m in &self.modules {
+            scan(self, m, &e.name, &mut saw_path_scoped, &mut saw_flat);
+        }
+        (saw_path_scoped, saw_flat)
+    }
+
     /// True when this belongs_to targets the AUTH IDENTITY entity: its derived
     /// fk column is the fixed `user_id` linkage the membership table and the
     /// session guard key on (see `AUTH_IDENTITY_FK_COLUMN`). Identity is a

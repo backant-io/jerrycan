@@ -338,6 +338,19 @@ fn tenant_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: 
     if !endpoint_is_tenant_owned(m, ep, design) {
         return String::new();
     }
+    // An ANONYMOUS custom handler on a tenant-owned entity (auth design, no guard
+    // param — line 205 adds `Dep<Tenant>`/`CurrentUser` only when `ep.is_guarded()`)
+    // has NEITHER `_user` NOR `_tenant` in its signature, so a membership-set /
+    // path scope comment steering to `*_for_memberships(_user.0.id)` or
+    // `get_for(_tenant.id(), _id)` would name params that don't exist (won't compile
+    // if followed; "fixing" toward the unscoped repo method is a cross-tenant read).
+    // The `_repo` binding stays (for the reference-slice `/usage` shape the
+    // ApiKeyRepo binding is the intended repo — the broken part was the comment, not
+    // the binding). Emit an honest TODO instead (#171). `mode.auth` is already
+    // guaranteed by the `mode.db && mode.auth` gate above.
+    if !ep.is_guarded() {
+        return "    // TODO: custom action on a tenant-owned entity with no session — scope this read\n    // yourself; there is no _user/_tenant to scope by.\n".to_string();
+    }
     let Some(entity) = endpoint_repo_entity(m, ep) else {
         return String::new();
     };
@@ -1473,45 +1486,19 @@ pub(crate) fn entity_is_flat_tenant_owned(e: &Entity, design: &Design) -> bool {
         return false;
     }
     // Scan EVERY endpoint bound to this entity across ALL modules AND ALL nested
-    // subroutes — not just the top-level module that DECLARES it (issue #116). The
-    // steer (`tenant_scope_comment`) fires per-endpoint using the endpoint's OWN
-    // module, so a flat write hosted in a subroute (or a module other than the
-    // declaring one) still steers to `create_for_memberships`. A gate that only
-    // scanned the declaring module's top-level `endpoints` saw no `MembershipSet`
-    // route for a grandchild declared in a subroute, returned `false`, and withheld
-    // the very methods the steer references — a `method not found` behind a green
-    // `check`. This gate must cover the steer's whole domain. Each endpoint is
-    // classified with ITS OWN module context: the mount path is what makes a nested
-    // `/{fk}/…` route `PathScoped` vs a flat route `MembershipSet`, so the wrong
-    // module would misclassify. Conservative (unchanged): ANY `PathScoped` route on
-    // the entity ⇒ not flat — a path-scoped write is already covered, and no
-    // mixed-shape design exists today.
-    fn scan(
-        design: &Design,
-        m: &ModuleDesign,
-        entity: &str,
-        saw_path_scoped: &mut bool,
-        saw_flat: &mut bool,
-    ) {
-        for ep in &m.endpoints {
-            if endpoint_repo_entity(m, ep) != Some(entity) {
-                continue;
-            }
-            match design.endpoint_tenant_shape(m, ep) {
-                TenantShape::PathScoped { .. } => *saw_path_scoped = true,
-                TenantShape::MembershipSet => *saw_flat = true,
-                _ => {}
-            }
-        }
-        for sub in &m.subroutes {
-            scan(design, sub, entity, saw_path_scoped, saw_flat);
-        }
-    }
-    let mut saw_path_scoped = false;
-    let mut saw_flat = false;
-    for m in &design.modules {
-        scan(design, m, &e.name, &mut saw_path_scoped, &mut saw_flat);
-    }
+    // subroutes — not just the top-level module that DECLARES it (issue #116) — via
+    // the shared `Design::entity_tenant_shapes`. The steer (`tenant_scope_comment`)
+    // fires per-endpoint using the endpoint's OWN module, so a flat write hosted in a
+    // subroute (or a module other than the declaring one) still steers to
+    // `create_for_memberships`. A gate that only scanned the declaring module's
+    // top-level `endpoints` saw no `MembershipSet` route for a grandchild declared in
+    // a subroute, returned `false`, and withheld the very methods the steer
+    // references — a `method not found` behind a green `check`. This gate must cover
+    // the steer's whole domain. Conservative (unchanged): ANY `PathScoped` route on
+    // the entity ⇒ not flat — a path-scoped write is already covered, and a
+    // mixed-shape entity (both shapes) is refused at design time by JC0562 (#175), so
+    // it never reaches here.
+    let (saw_path_scoped, saw_flat) = design.entity_tenant_shapes(e);
     !saw_path_scoped && saw_flat
 }
 
@@ -4032,6 +4019,77 @@ pub(crate) mod tests {
         assert!(
             ws.contains("on delete cascade"),
             "member rows die with the tenant: {ws}"
+        );
+    }
+
+    /// #171: an ANONYMOUS custom GET on a tenant-owned entity (the reference-slice
+    /// `/usage` shape — `GET /usage` on `ApiKey belongs_to Workspace`, no
+    /// `auth_required`, no body) has NEITHER `_user` NOR `_tenant` in its signature
+    /// (line 205 adds them only when `ep.is_guarded()`). The membership-set scope
+    /// comment steered to `*_for_memberships(_user.0.id)`, naming params that don't
+    /// exist — won't compile if followed, and "fixing" toward the unscoped repo
+    /// method is a cross-tenant read. The fix suppresses that comment and emits an
+    /// honest TODO, so the emitted comment must carry NO `_user.0.id`/`_id`
+    /// reference. A GUARDED tenant-owned read is byte-identical (the param exists).
+    #[test]
+    fn anonymous_tenant_owned_read_emits_an_honest_todo_not_a_user_scope_comment() {
+        let d: Design = serde_json::from_str(
+            r#"{
+                "name": "ref", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["owner"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Workspace", "member_roles": ["owner"] },
+                "modules": [
+                    { "name": "workspaces",
+                      "entities": [{ "name": "Workspace",
+                          "fields": [{ "name": "name", "type": "string" }] }],
+                      "endpoints": [] },
+                    { "name": "api_keys",
+                      "entities": [{ "name": "ApiKey",
+                          "belongs_to": [{ "entity": "Workspace" }],
+                          "fields": [{ "name": "label", "type": "string" }] }],
+                      "endpoints": [
+                          { "operation_id": "usage", "method": "GET", "path": "/usage",
+                            "success": { "status": 200 } } ] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let m = &d.modules[1];
+        let usage = &m.endpoints[0];
+        // The broken shape: anonymous (no guard param) AND tenant-owned.
+        assert!(!usage.is_guarded(), "usage must be anonymous");
+        assert!(
+            endpoint_is_tenant_owned(m, usage, &d),
+            "ApiKey is tenant-owned"
+        );
+        let comment = tenant_scope_comment(m, usage, mode, &d);
+        assert!(
+            !comment.contains("_user.0.id") && !comment.contains("_id"),
+            "the anonymous /usage stub must not steer to a nonexistent _user/_id param: {comment:?}"
+        );
+        assert!(
+            comment.contains("no session") && comment.contains("scope this read"),
+            "it must emit the honest TODO instead: {comment:?}"
+        );
+
+        // A GUARDED tenant-owned read is unchanged — the membership-set comment
+        // stays because `_user` now exists in the signature.
+        let mut guarded = d.clone();
+        guarded.modules[1].endpoints[0].auth_required = true;
+        let g = tenant_scope_comment(
+            &guarded.modules[1],
+            &guarded.modules[1].endpoints[0],
+            mode,
+            &guarded,
+        );
+        assert!(
+            g.contains("_user.0.id"),
+            "a guarded read keeps the membership-set scope comment: {g:?}"
         );
     }
 

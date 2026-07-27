@@ -349,6 +349,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs designing",
     },
     CodeInfo {
+        code: "JC0562",
+        title: "mixed-shape tenant entity (flat and path-scoped)",
+        cause: "a tenant-owned entity (issue #175) is reachable by BOTH a flat (membership-set, body-fk) write AND a path-scoped (`/{fk}/…`) route across the design — but the generator emits only ONE scoping shape per entity. `entity_is_flat_tenant_owned` is `!saw_path_scoped && saw_flat`, so a mixed entity is classified NON-flat: its membership-checked `create_for_memberships`/`update_for_memberships`/`remove_for_memberships` accessors are withheld, yet the flat-write steer still fires — so following the generated comment would call a `*_for_memberships` method that isn't emitted (a `method not found` compile error behind a green `check`, the #116 class). No corpus design is mixed today; the refusal makes the broken shape impossible to ship",
+        fix: "give the entity a SINGLE tenant-route shape. Make every route PATH-SCOPED — carry the tenant fk in the path (`/{fk}/…`), scoped by the verified path tenant via `all_for`/`get_for`/`update_for`/`remove_for` — OR make every route FLAT (no tenant fk in the path; the fk comes from the request body and is verified against the caller's memberships via `*_for_memberships`). Never mix the two shapes on one entity",
+        doc: "jerrycan docs auth",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -779,6 +786,29 @@ mod tests {
         assert!(
             info.fix.contains("entity") && info.fix.contains("fields"),
             "fix must name both request_body shapes: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0562_names_the_mixed_shape_conflict_and_both_remedies() {
+        // WHY: JC0562 (#175) refuses a tenant entity reachable by BOTH a flat
+        // (membership-set) and a path-scoped route — the generator emits only one
+        // scoping shape, so the withheld `*_for_memberships` method the flat steer
+        // references is a method-not-found behind a green `check`. `jerrycan explain
+        // JC0562` must name the mixed-shape cause and BOTH single-shape remedies
+        // (all path-scoped, or all flat).
+        let info = lookup("JC0562").unwrap();
+        assert!(
+            info.cause.contains("BOTH")
+                && info.cause.contains("path-scoped")
+                && info.cause.contains("for_memberships"),
+            "cause must name the mixed-shape conflict: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("PATH-SCOPED") && info.fix.contains("FLAT"),
+            "fix must name both single-shape remedies: {}",
             info.fix
         );
     }
