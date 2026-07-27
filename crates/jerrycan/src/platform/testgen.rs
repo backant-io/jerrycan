@@ -246,13 +246,31 @@ fn fixture_json(
     format!("{{{fields}}}")
 }
 
+/// The happy-path body for an inline-DTO custom action (issue #122): the REQUIRED
+/// inline fields, each at a valid fixture value (respecting #80 constraints via
+/// `fixture_value`). Optional fields are omitted — they carry `#[serde(default)]`
+/// in the generated `{Op}Request`, so a minimal body still deserializes. No fk
+/// columns and no entity lookup — an inline body is not a table row.
+fn inline_fixture_json(fields: &[Field]) -> String {
+    let cols = fields
+        .iter()
+        .filter(|f| f.required)
+        .map(|f| format!("\"{}\": {}", f.name, fixture_value(f)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{cols}}}")
+}
+
 /// The POST creator (with a body) mounted at a bare collection `path` — the route
 /// that seeds a row addressable under `path/{id}`. `creator_at(m, "/")` is the
 /// module-root creator; `creator_at(m, "/tasks")` seeds the second entity (#51).
 fn creator_at<'a>(m: &'a ModuleDesign, path: &str) -> Option<&'a Endpoint> {
-    m.endpoints
-        .iter()
-        .find(|ep| ep.method == HttpMethod::POST && ep.path == path && ep.request_body.is_some())
+    m.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::POST
+            && ep.path == path
+            // An inline-DTO body (issue #122) seeds no row — it is not a creator.
+            && ep.request_body.as_ref().is_some_and(|rb| !rb.is_inline())
+    })
 }
 
 /// The POST creator (with a body) whose request body is `entity`, at a bare
@@ -264,7 +282,7 @@ fn creator_for_entity<'a>(m: &'a ModuleDesign, entity: &str) -> Option<&'a Endpo
             && ep
                 .request_body
                 .as_ref()
-                .is_some_and(|rb| rb.entity == entity)
+                .is_some_and(|rb| rb.entity.as_deref() == Some(entity))
     })
 }
 
@@ -311,11 +329,11 @@ fn seed_line(
     let body = fixture_json(
         design,
         unit,
-        &creator
+        creator
             .request_body
             .as_ref()
-            .expect("creator has body")
-            .entity,
+            .and_then(|rb| rb.entity.as_deref())
+            .expect("creator has an entity body"),
         omits_identity_fk(design, unit, creator),
         &[],
         false, // seed via the creator (POST) — a create body omits defaults
@@ -347,12 +365,12 @@ fn seed_for_id_probe(
 ) -> Option<(String, String)> {
     let coll = collection_path(ep);
     let creator = creator_at(unit, &coll)?;
-    let entity_name = &creator
+    let entity_name = creator
         .request_body
         .as_ref()
-        .expect("creator has body")
-        .entity;
-    let entity = unit.entities.iter().find(|e| &e.name == entity_name)?;
+        .and_then(|rb| rb.entity.as_deref())
+        .expect("creator has an entity body");
+    let entity = unit.entities.iter().find(|e| e.name == entity_name)?;
 
     let mut seed = String::new();
     let mut seen = vec![entity.name.clone()];
@@ -553,17 +571,19 @@ fn request_expr(
             // The omission keys on the ENDPOINT being guarded (the design-level
             // rule), not on whether THIS request threads a cookie — a guarded
             // endpoint's 401 probe still sends the guarded body shape.
-            .map(|rb| {
-                fixture_json(
+            .map(|rb| match rb.entity.as_deref() {
+                Some(entity) => fixture_json(
                     design,
                     unit,
-                    &rb.entity,
+                    entity,
                     omits_identity_fk(design, unit, ep),
                     overrides,
                     // An UPDATE (PUT/PATCH) probe keeps `default` fields so the body
                     // matches `{Entity}UpdateRequest` (issue #85 D1); a create omits them.
                     ep.method.is_update(),
-                )
+                ),
+                // An inline-DTO body (issue #122) builds from its own fields.
+                None => inline_fixture_json(&rb.fields),
             })
             .unwrap_or_else(|| "{}".to_string())
     };
@@ -679,7 +699,21 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
         let gated = endpoint_is_credential_gated(ep) || probe_skip;
 
         if gated {
-            let reason = if probe_skip {
+            // Issue #122 Part B: the TODO is AUTH-AWARE. In a design with an active
+            // auth model the credential/401 wording is accurate (a skipped success
+            // needs a credential; an unguarded gated route also owns its 401/403
+            // rejection test). In a NO-auth design there is no credential and no 401
+            // — an inline custom action (`POST /checkout`) marked `probe: skip` just
+            // needs its own success test — so the wording drops every auth reference.
+            // Byte-identical for auth designs (`wants_auth()` true).
+            let auth_active = design.wants_auth();
+            let reason = if !auth_active {
+                if probe_skip {
+                    "is marked `probe: skip` — the generator can't synthesize its success"
+                } else {
+                    "needs a success the generator can't synthesize"
+                }
+            } else if probe_skip {
                 "is marked `probe: skip` — the generator can't synthesize a credential for its success"
             } else {
                 "authenticates via a credential/signature the generator can't supply"
@@ -691,12 +725,15 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             // security guard. Any `{param}` is pinned to a literal id: a 401
             // rejection happens before the id is ever looked up, so no seed is
             // needed. The TODO then asks for the success test only; an UNGUARDED
-            // gated endpoint (login, signed webhook) keeps the old ask — its
-            // rejection is handler logic, not a generated guard.
+            // gated endpoint (login, signed webhook) keeps the credential ask — its
+            // rejection is handler logic, not a generated guard. In a NO-auth design
+            // (issue #122 Part B) the ask carries no credential/401 wording.
             let ask = if guarded {
                 "write its success test (with a valid credential) in your own test file; its `_without_auth_is_401` guard test is already generated"
-            } else {
+            } else if auth_active {
                 "write its success test (with a valid credential) and its 401/403 rejection test in your own test file"
+            } else {
+                "write your own success test for this custom action"
             };
             out.todos.push(format!(
                 "// AGENT TODO: {fn_base} ({:?} {full_path}) {reason} — {ask}.",
@@ -719,8 +756,9 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             let id_echo = (ep.method == HttpMethod::POST)
                 .then_some(ep.request_body.as_ref())
                 .flatten()
-                .filter(|rb| ep.success.entity.as_deref() == Some(rb.entity.as_str()))
-                .and_then(|rb| unit.entities.iter().find(|e| e.name == rb.entity))
+                .and_then(|rb| rb.entity.as_deref())
+                .filter(|entity| ep.success.entity.as_deref() == Some(entity))
+                .and_then(|entity| unit.entities.iter().find(|e| e.name == entity))
                 .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
                 .map(|f| format!(
                     "    let body: serde_json::Value = serde_json::from_str(&res.text()).expect(\"json body\");\n    assert_eq!(body[\"id\"], serde_json::json!({}), \"design: created {} echoes its id\");\n",
@@ -738,7 +776,8 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             if let Some(field) = ep
                 .request_body
                 .as_ref()
-                .and_then(|rb| first_enum_field(unit, &rb.entity))
+                .and_then(|rb| rb.entity.as_deref())
+                .and_then(|entity| first_enum_field(unit, entity))
             {
                 push_enum_reject_test(design, out, unit, ep, &full_path, guarded, field);
             }
@@ -746,7 +785,8 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             if let Some((field, literal)) = ep
                 .request_body
                 .as_ref()
-                .and_then(|rb| first_constraint_reject(unit, &rb.entity))
+                .and_then(|rb| rb.entity.as_deref())
+                .and_then(|entity| first_constraint_reject(unit, entity))
             {
                 push_constraint_reject_test(
                     design, out, unit, ep, &full_path, guarded, field, &literal,
@@ -798,7 +838,8 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 if let Some(field) = ep
                     .request_body
                     .as_ref()
-                    .and_then(|rb| first_enum_field(unit, &rb.entity))
+                    .and_then(|rb| rb.entity.as_deref())
+                    .and_then(|entity| first_enum_field(unit, entity))
                 {
                     push_enum_reject_test(design, out, unit, ep, &seeded_path, guarded, field);
                 }
@@ -806,7 +847,8 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 if let Some((field, literal)) = ep
                     .request_body
                     .as_ref()
-                    .and_then(|rb| first_constraint_reject(unit, &rb.entity))
+                    .and_then(|rb| rb.entity.as_deref())
+                    .and_then(|entity| first_constraint_reject(unit, entity))
                 {
                     push_constraint_reject_test(
                         design,
@@ -1561,7 +1603,7 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
             && ep
                 .request_body
                 .as_ref()
-                .is_some_and(|rb| rb.entity == entity.name)
+                .is_some_and(|rb| rb.entity.as_deref() == Some(entity.name.as_str()))
     }) else {
         return String::new();
     };
@@ -1708,7 +1750,7 @@ fn per_user_isolation_test(design: &Design, module: &ModuleDesign) -> String {
             && ep
                 .request_body
                 .as_ref()
-                .is_some_and(|rb| rb.entity == entity.name)
+                .is_some_and(|rb| rb.entity.as_deref() == Some(entity.name.as_str()))
     }) else {
         return String::new();
     };
@@ -1815,7 +1857,7 @@ fn public_read_isolation_test(design: &Design, module: &ModuleDesign) -> String 
             && ep
                 .request_body
                 .as_ref()
-                .is_some_and(|rb| rb.entity == entity.name)
+                .is_some_and(|rb| rb.entity.as_deref() == Some(entity.name.as_str()))
     }) else {
         return String::new();
     };
@@ -1965,7 +2007,7 @@ fn tenant_collection_isolation_test(design: &Design, module: &ModuleDesign) -> S
             && ep
                 .request_body
                 .as_ref()
-                .is_some_and(|rb| rb.entity == entity.name)
+                .is_some_and(|rb| rb.entity.as_deref() == Some(entity.name.as_str()))
     }) else {
         return String::new();
     };

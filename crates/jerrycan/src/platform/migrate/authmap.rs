@@ -69,7 +69,8 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
                 public: true,
                 probe: ProbePolicy::Auto,
                 request_body: Some(RequestBody {
-                    entity: "User".into(),
+                    entity: Some("User".into()),
+                    fields: vec![],
                 }),
                 success: Success {
                     status: 201,
@@ -90,7 +91,8 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
                 // design able to reach `jerrycan check` ok:true.
                 probe: ProbePolicy::Skip,
                 request_body: Some(RequestBody {
-                    entity: "User".into(),
+                    entity: Some("User".into()),
+                    fields: vec![],
                 }),
                 success: Success {
                     status: 200,

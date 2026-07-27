@@ -207,9 +207,214 @@ fn endpoint_repo_entity<'a>(m: &'a ModuleDesign, ep: &'a Endpoint) -> Option<&'a
     }
     ep.request_body
         .as_ref()
-        .map(|rb| rb.entity.as_str())
+        .and_then(|rb| rb.entity.as_deref())
         .or(ep.success.entity.as_deref())
         .or_else(|| m.entities.first().map(|e| e.name.as_str()))
+}
+
+/// The per-FIELD shape checks (#47 enum values + #80 range/length JC0552 + the pk
+/// `write_only` JC0554 + `default` type-check) for one field, pointed at `fptr`
+/// (`.../fields/{j}`). Factored out of `check_relations_and_enums` so an inline-DTO
+/// body's fields (issue #122) get the SAME JC0552/JC0543 checks as entity fields —
+/// they must not be silently skipped. Byte-identical questions for entity fields
+/// (same pointers, same messages) since `fptr` reconstructs the old pointer.
+fn check_field_shape(f: &Field, fptr: &str, wants_db: bool, qs: &mut Vec<Question>) {
+    if let Some(ref values) = f.values {
+        if !matches!(f.field_type, FieldType::String) {
+            qs.push(q(
+                format!("{fptr}/values"),
+                format!(
+                    "Field `{}` declares enum `values` but its type is not string — enum values are only allowed on string fields.",
+                    f.name
+                ),
+            ));
+        } else if values.is_empty() {
+            qs.push(q(
+                format!("{fptr}/values"),
+                format!(
+                    "Field `{}` declares an empty `values` list — list at least one allowed value or drop the field.",
+                    f.name
+                ),
+            ));
+        } else if let Some(bad) = values.iter().find(|v| !is_enum_value(v)) {
+            // JC0543 (#54): enum values are interpolated UNESCAPED into
+            // generated Rust (the deserialize allow-list + 422 text in
+            // genroute, the testgen fixture), so a quote or backslash
+            // emits a crate that won't compile far from the design.
+            // Constrain to an identifier-ish shape (which also excludes
+            // spaces etc. under the same interpolation-safety rule).
+            qs.push(q(
+                format!("{fptr}/values"),
+                format!(
+                    "Field `{}` enum value `{bad}` is not an identifier (^[A-Za-z0-9_-]+$) — enum values are interpolated unescaped into generated Rust (the deserialize allow-list, the 422 error text, and the test fixtures), so a quote or backslash emits a crate that fails to compile; other non-identifier characters are rejected under the same rule. Use identifier-shaped values (letters, digits, `_`, `-`). See `jerrycan explain JC0543`.",
+                    f.name
+                ),
+            ));
+        }
+    }
+    // #80 (JC0552): field range/length constraints. Refuse
+    // misplacement, empty ranges, contradictions with `values`, an
+    // unfillable required field, an over-ceiling `min_len`, and ANY
+    // constraint on the pk `id` — each pointed at the offending key.
+    // The pk check runs first and swallows the rest: ids are
+    // server-assigned, and the generated id probes and seeds assume
+    // them free.
+    if f.name == "id" {
+        // JC0554 (#112): the pk id must be returned in every response
+        // (the id-echo probe + every cross-scope test key on
+        // `body["id"]`), so an EXPLICIT `write_only` on it would
+        // response-hide the id and break the generated suite by
+        // construction. The `password_hash` auto-classification never
+        // applies to `id`, so only the explicit flag is refused here.
+        if f.write_only {
+            qs.push(q(
+                format!("{fptr}/write_only"),
+                "Field `id` is the primary key — `write_only` is not allowed on it: the id must be returned in every response (the generated id-echo probe and every cross-scope test key on `body[\"id\"]`), so hiding it breaks the generated suite by construction. Remove `write_only` from `id`. See `jerrycan explain JC0554`.".to_string(),
+            ));
+        }
+        for (key, present) in [
+            ("min", f.min.is_some()),
+            ("max", f.max.is_some()),
+            ("min_len", f.min_len.is_some()),
+            ("max_len", f.max_len.is_some()),
+        ] {
+            if present {
+                qs.push(q(
+                    format!("{fptr}/{key}"),
+                    format!(
+                        "Field `id` is the primary key — `{key}` is not allowed on it: ids are server-assigned, and the generated id probes and seeds assume unconstrained ids. Drop `{key}`. See `jerrycan explain JC0552`."
+                    ),
+                ));
+            }
+        }
+    } else {
+        if f.min.is_some() || f.max.is_some() {
+            if !matches!(f.field_type, FieldType::Integer) {
+                for (key, present) in [("min", f.min.is_some()), ("max", f.max.is_some())] {
+                    if present {
+                        qs.push(q(
+                            format!("{fptr}/{key}"),
+                            format!(
+                                "Field `{}` declares `{key}` but its type is not integer — `min`/`max` are an inclusive integer range, only allowed on integer fields. Use `min_len`/`max_len` to bound a string's length, or drop `{key}`. See `jerrycan explain JC0552`.",
+                                f.name
+                            ),
+                        ));
+                    }
+                }
+            } else if let (Some(mn), Some(mx)) = (f.min, f.max)
+                && mn > mx
+            {
+                qs.push(q(
+                    format!("{fptr}/min"),
+                    format!(
+                        "Field `{}` declares an empty range: min {mn} > max {mx} — no value can satisfy it, so no in-range fixture is derivable. Lower `min` or raise `max`. See `jerrycan explain JC0552`.",
+                        f.name
+                    ),
+                ));
+            } else if f.unique {
+                // #80 (T3): the generated suite materializes up to
+                // THREE distinct values per field — the probe
+                // fixture plus the tenant-1 and tenant-2 seeds —
+                // so a `unique` range below that collides on the
+                // UNIQUE index and is un-greenable by construction.
+                // An ABSENT bound substitutes its i64 extreme (T4):
+                // a single `min` near i64::MAX (or `max` near
+                // i64::MIN) leaves the same too-narrow range even
+                // though only one bound was written.
+                let mn = f.min.unwrap_or(i64::MIN);
+                let mx = f.max.unwrap_or(i64::MAX);
+                if (mx as i128) - (mn as i128) + 1 < 3 {
+                    let key = if f.min.is_some() { "min" } else { "max" };
+                    qs.push(q(
+                        format!("{fptr}/{key}"),
+                        format!(
+                            "Field `{}` is `unique` but its range [min {mn}, max {mx}] admits only {} distinct value(s) — the generated seeds and probe fixture need up to 3 distinct in-range values (the request fixture and the two tenant seeds), so uniqueness cannot hold. Widen the range to at least 3 values, or drop `unique`. See `jerrycan explain JC0552`.",
+                            f.name,
+                            (mx as i128) - (mn as i128) + 1
+                        ),
+                    ));
+                }
+            }
+        }
+        if f.min_len.is_some() || f.max_len.is_some() {
+            if !matches!(f.field_type, FieldType::String) {
+                for (key, present) in [
+                    ("min_len", f.min_len.is_some()),
+                    ("max_len", f.max_len.is_some()),
+                ] {
+                    if present {
+                        qs.push(q(
+                            format!("{fptr}/{key}"),
+                            format!(
+                                "Field `{}` declares `{key}` but its type is not string — `min_len`/`max_len` bound a string's length in Unicode code points. Use `min`/`max` for an integer range, or drop `{key}`. See `jerrycan explain JC0552`.",
+                                f.name
+                            ),
+                        ));
+                    }
+                }
+            } else if f.values.is_some() {
+                let key = if f.min_len.is_some() {
+                    "min_len"
+                } else {
+                    "max_len"
+                };
+                qs.push(q(
+                    format!("{fptr}/{key}"),
+                    format!(
+                        "Field `{}` combines enum `values` with `{key}` — the enum already fixes the exact allowed strings, so a length bound is contradictory. Drop `{key}` (or drop `values`). See `jerrycan explain JC0552`.",
+                        f.name
+                    ),
+                ));
+            } else if let (Some(mn), Some(mx)) = (f.min_len, f.max_len)
+                && mn > mx
+            {
+                qs.push(q(
+                    format!("{fptr}/min_len"),
+                    format!(
+                        "Field `{}` declares an empty range: min_len {mn} > max_len {mx} — no value can satisfy it, so no in-range fixture is derivable. Lower `min_len` or raise `max_len`. See `jerrycan explain JC0552`.",
+                        f.name
+                    ),
+                ));
+            } else if f.max_len == Some(0) && f.required {
+                qs.push(q(
+                    format!("{fptr}/max_len"),
+                    format!(
+                        "Field `{}` is required but declares `max_len: 0` — an unfillable field: no value satisfies a zero-length required string. Raise `max_len`, or make the field optional (`required: false`). See `jerrycan explain JC0552`.",
+                        f.name
+                    ),
+                ));
+            } else if f.max_len == Some(0) && f.unique {
+                // #80 (T3): the string twin of the unique-range
+                // rule — `max_len: 0` admits ONLY the empty
+                // string, so the seeds cannot be distinct. Any
+                // max_len >= 1 is fine: the seed derivations lead
+                // with distinct characters ('t'/'s'/a digit).
+                qs.push(q(
+                    format!("{fptr}/max_len"),
+                    format!(
+                        "Field `{}` is `unique` but declares `max_len: 0` — the empty string is the only possible value, so the generated seeds cannot derive distinct values. Raise `max_len`, or drop `unique`. See `jerrycan explain JC0552`.",
+                        f.name
+                    ),
+                ));
+            } else if f.min_len.is_some_and(|n| n > 4096) {
+                qs.push(q(
+                    format!("{fptr}/min_len"),
+                    format!(
+                        "Field `{}` declares min_len {} above the 4096 ceiling — generated test fixtures materialize a minimum-length value, so a larger bound is refused. Lower `min_len` to at most 4096. See `jerrycan explain JC0552`.",
+                        f.name,
+                        f.min_len.unwrap()
+                    ),
+                ));
+            }
+        }
+    }
+    // A server-owned `default` (issue #53a) must type-check against the
+    // field type (and enum membership) — the server writes it verbatim
+    // into a NOT-NULL column, so a mistyped literal would fail at run
+    // time, not design time.
+    if let Some(msg) = default_type_error(f, wants_db) {
+        qs.push(q(format!("{fptr}/default"), msg));
+    }
 }
 
 // The fixed `user_id` identity linkage (AUTH_IDENTITY_FK_COLUMN) lives in
@@ -609,6 +814,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
             &format!("/modules/{i}"),
             &declared_roles,
             auth_declared,
+            d.wants_db(),
             &mut qs,
         );
     }
@@ -722,204 +928,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 }
             }
             for (j, f) in e.fields.iter().enumerate() {
-                if let Some(ref values) = f.values {
-                    if !matches!(f.field_type, FieldType::String) {
-                        qs.push(q(
-                            format!("{ptr}/entities/{i}/fields/{j}/values"),
-                            format!(
-                                "Field `{}` declares enum `values` but its type is not string — enum values are only allowed on string fields.",
-                                f.name
-                            ),
-                        ));
-                    } else if values.is_empty() {
-                        qs.push(q(
-                            format!("{ptr}/entities/{i}/fields/{j}/values"),
-                            format!(
-                                "Field `{}` declares an empty `values` list — list at least one allowed value or drop the field.",
-                                f.name
-                            ),
-                        ));
-                    } else if let Some(bad) = values.iter().find(|v| !is_enum_value(v)) {
-                        // JC0543 (#54): enum values are interpolated UNESCAPED into
-                        // generated Rust (the deserialize allow-list + 422 text in
-                        // genroute, the testgen fixture), so a quote or backslash
-                        // emits a crate that won't compile far from the design.
-                        // Constrain to an identifier-ish shape (which also excludes
-                        // spaces etc. under the same interpolation-safety rule).
-                        qs.push(q(
-                            format!("{ptr}/entities/{i}/fields/{j}/values"),
-                            format!(
-                                "Field `{}` enum value `{bad}` is not an identifier (^[A-Za-z0-9_-]+$) — enum values are interpolated unescaped into generated Rust (the deserialize allow-list, the 422 error text, and the test fixtures), so a quote or backslash emits a crate that fails to compile; other non-identifier characters are rejected under the same rule. Use identifier-shaped values (letters, digits, `_`, `-`). See `jerrycan explain JC0543`.",
-                                f.name
-                            ),
-                        ));
-                    }
-                }
-                // #80 (JC0552): field range/length constraints. Refuse
-                // misplacement, empty ranges, contradictions with `values`, an
-                // unfillable required field, an over-ceiling `min_len`, and ANY
-                // constraint on the pk `id` — each pointed at the offending key.
-                // The pk check runs first and swallows the rest: ids are
-                // server-assigned, and the generated id probes and seeds assume
-                // them free.
-                if f.name == "id" {
-                    // JC0554 (#112): the pk id must be returned in every response
-                    // (the id-echo probe + every cross-scope test key on
-                    // `body["id"]`), so an EXPLICIT `write_only` on it would
-                    // response-hide the id and break the generated suite by
-                    // construction. The `password_hash` auto-classification never
-                    // applies to `id`, so only the explicit flag is refused here.
-                    if f.write_only {
-                        qs.push(q(
-                            format!("{ptr}/entities/{i}/fields/{j}/write_only"),
-                            "Field `id` is the primary key — `write_only` is not allowed on it: the id must be returned in every response (the generated id-echo probe and every cross-scope test key on `body[\"id\"]`), so hiding it breaks the generated suite by construction. Remove `write_only` from `id`. See `jerrycan explain JC0554`.".to_string(),
-                        ));
-                    }
-                    for (key, present) in [
-                        ("min", f.min.is_some()),
-                        ("max", f.max.is_some()),
-                        ("min_len", f.min_len.is_some()),
-                        ("max_len", f.max_len.is_some()),
-                    ] {
-                        if present {
-                            qs.push(q(
-                                format!("{ptr}/entities/{i}/fields/{j}/{key}"),
-                                format!(
-                                    "Field `id` is the primary key — `{key}` is not allowed on it: ids are server-assigned, and the generated id probes and seeds assume unconstrained ids. Drop `{key}`. See `jerrycan explain JC0552`."
-                                ),
-                            ));
-                        }
-                    }
-                } else {
-                    if f.min.is_some() || f.max.is_some() {
-                        if !matches!(f.field_type, FieldType::Integer) {
-                            for (key, present) in
-                                [("min", f.min.is_some()), ("max", f.max.is_some())]
-                            {
-                                if present {
-                                    qs.push(q(
-                                        format!("{ptr}/entities/{i}/fields/{j}/{key}"),
-                                        format!(
-                                            "Field `{}` declares `{key}` but its type is not integer — `min`/`max` are an inclusive integer range, only allowed on integer fields. Use `min_len`/`max_len` to bound a string's length, or drop `{key}`. See `jerrycan explain JC0552`.",
-                                            f.name
-                                        ),
-                                    ));
-                                }
-                            }
-                        } else if let (Some(mn), Some(mx)) = (f.min, f.max)
-                            && mn > mx
-                        {
-                            qs.push(q(
-                                format!("{ptr}/entities/{i}/fields/{j}/min"),
-                                format!(
-                                    "Field `{}` declares an empty range: min {mn} > max {mx} — no value can satisfy it, so no in-range fixture is derivable. Lower `min` or raise `max`. See `jerrycan explain JC0552`.",
-                                    f.name
-                                ),
-                            ));
-                        } else if f.unique {
-                            // #80 (T3): the generated suite materializes up to
-                            // THREE distinct values per field — the probe
-                            // fixture plus the tenant-1 and tenant-2 seeds —
-                            // so a `unique` range below that collides on the
-                            // UNIQUE index and is un-greenable by construction.
-                            // An ABSENT bound substitutes its i64 extreme (T4):
-                            // a single `min` near i64::MAX (or `max` near
-                            // i64::MIN) leaves the same too-narrow range even
-                            // though only one bound was written.
-                            let mn = f.min.unwrap_or(i64::MIN);
-                            let mx = f.max.unwrap_or(i64::MAX);
-                            if (mx as i128) - (mn as i128) + 1 < 3 {
-                                let key = if f.min.is_some() { "min" } else { "max" };
-                                qs.push(q(
-                                    format!("{ptr}/entities/{i}/fields/{j}/{key}"),
-                                    format!(
-                                        "Field `{}` is `unique` but its range [min {mn}, max {mx}] admits only {} distinct value(s) — the generated seeds and probe fixture need up to 3 distinct in-range values (the request fixture and the two tenant seeds), so uniqueness cannot hold. Widen the range to at least 3 values, or drop `unique`. See `jerrycan explain JC0552`.",
-                                        f.name,
-                                        (mx as i128) - (mn as i128) + 1
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    if f.min_len.is_some() || f.max_len.is_some() {
-                        if !matches!(f.field_type, FieldType::String) {
-                            for (key, present) in [
-                                ("min_len", f.min_len.is_some()),
-                                ("max_len", f.max_len.is_some()),
-                            ] {
-                                if present {
-                                    qs.push(q(
-                                        format!("{ptr}/entities/{i}/fields/{j}/{key}"),
-                                        format!(
-                                            "Field `{}` declares `{key}` but its type is not string — `min_len`/`max_len` bound a string's length in Unicode code points. Use `min`/`max` for an integer range, or drop `{key}`. See `jerrycan explain JC0552`.",
-                                            f.name
-                                        ),
-                                    ));
-                                }
-                            }
-                        } else if f.values.is_some() {
-                            let key = if f.min_len.is_some() {
-                                "min_len"
-                            } else {
-                                "max_len"
-                            };
-                            qs.push(q(
-                                format!("{ptr}/entities/{i}/fields/{j}/{key}"),
-                                format!(
-                                    "Field `{}` combines enum `values` with `{key}` — the enum already fixes the exact allowed strings, so a length bound is contradictory. Drop `{key}` (or drop `values`). See `jerrycan explain JC0552`.",
-                                    f.name
-                                ),
-                            ));
-                        } else if let (Some(mn), Some(mx)) = (f.min_len, f.max_len)
-                            && mn > mx
-                        {
-                            qs.push(q(
-                                format!("{ptr}/entities/{i}/fields/{j}/min_len"),
-                                format!(
-                                    "Field `{}` declares an empty range: min_len {mn} > max_len {mx} — no value can satisfy it, so no in-range fixture is derivable. Lower `min_len` or raise `max_len`. See `jerrycan explain JC0552`.",
-                                    f.name
-                                ),
-                            ));
-                        } else if f.max_len == Some(0) && f.required {
-                            qs.push(q(
-                                format!("{ptr}/entities/{i}/fields/{j}/max_len"),
-                                format!(
-                                    "Field `{}` is required but declares `max_len: 0` — an unfillable field: no value satisfies a zero-length required string. Raise `max_len`, or make the field optional (`required: false`). See `jerrycan explain JC0552`.",
-                                    f.name
-                                ),
-                            ));
-                        } else if f.max_len == Some(0) && f.unique {
-                            // #80 (T3): the string twin of the unique-range
-                            // rule — `max_len: 0` admits ONLY the empty
-                            // string, so the seeds cannot be distinct. Any
-                            // max_len >= 1 is fine: the seed derivations lead
-                            // with distinct characters ('t'/'s'/a digit).
-                            qs.push(q(
-                                format!("{ptr}/entities/{i}/fields/{j}/max_len"),
-                                format!(
-                                    "Field `{}` is `unique` but declares `max_len: 0` — the empty string is the only possible value, so the generated seeds cannot derive distinct values. Raise `max_len`, or drop `unique`. See `jerrycan explain JC0552`.",
-                                    f.name
-                                ),
-                            ));
-                        } else if f.min_len.is_some_and(|n| n > 4096) {
-                            qs.push(q(
-                                format!("{ptr}/entities/{i}/fields/{j}/min_len"),
-                                format!(
-                                    "Field `{}` declares min_len {} above the 4096 ceiling — generated test fixtures materialize a minimum-length value, so a larger bound is refused. Lower `min_len` to at most 4096. See `jerrycan explain JC0552`.",
-                                    f.name,
-                                    f.min_len.unwrap()
-                                ),
-                            ));
-                        }
-                    }
-                }
-                // A server-owned `default` (issue #53a) must type-check against the
-                // field type (and enum membership) — the server writes it verbatim
-                // into a NOT-NULL column, so a mistyped literal would fail at run
-                // time, not design time.
-                if let Some(msg) = default_type_error(f, wants_db) {
-                    qs.push(q(format!("{ptr}/entities/{i}/fields/{j}/default"), msg));
-                }
+                check_field_shape(f, &format!("{ptr}/entities/{i}/fields/{j}"), wants_db, qs);
             }
         }
         for (i, sub) in m.subroutes.iter().enumerate() {
@@ -970,6 +979,11 @@ pub fn validate(d: &Design) -> Vec<Question> {
             let Some(rb) = ep.request_body.as_ref() else {
                 continue;
             };
+            // An inline-DTO body (issue #122) has no entity and thus no parent fk to
+            // relocate — the path-fk create check does not apply.
+            let Some(entity) = rb.entity.as_deref() else {
+                continue;
+            };
             if !matches!(
                 ep.method,
                 HttpMethod::POST | HttpMethod::PUT | HttpMethod::PATCH
@@ -979,7 +993,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
             let resolved = format!("{base}{}", ep.path);
             let token = |col: &str| resolved.contains(&format!("{{{col}}}"));
             if let Some(col) = d
-                .entity_path_fk_columns(&rb.entity)
+                .entity_path_fk_columns(entity)
                 .into_iter()
                 .find(|col| !token(col))
             {
@@ -987,7 +1001,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
                     format!("{ptr}/endpoints/{i}"),
                     format!(
                         "Endpoint `{}` ({:?} {}) creates `{}`, whose parent foreign key `{col}` is supplied by a path parameter on a sibling nested route — so the generated `{}Request` body drops `{col}`, but this route's own path has no `{{{col}}}` to inject it from. The NOT-NULL `{col}` can be set from neither the body nor the path, so the route is un-implementable. Add `{{{col}}}` to this endpoint's path (mount it under the parent), or split `{}` into a separate entity for the standalone create so its request body keeps `{col}`. See `jerrycan explain JC0544`.",
-                        ep.operation_id, ep.method, ep.path, rb.entity, rb.entity, rb.entity
+                        ep.operation_id, ep.method, ep.path, entity, entity, entity
                     ),
                 ));
             }
@@ -2016,6 +2030,7 @@ fn validate_module(
     ptr: &str,
     declared_roles: &[&str],
     auth_declared: bool,
+    wants_db: bool,
     qs: &mut Vec<Question>,
 ) {
     if !is_kebab(&m.name) {
@@ -2191,16 +2206,82 @@ fn validate_module(
                 ),
             ));
         }
-        if let Some(ref rb) = ep.request_body
-            && !entity_names.contains(&rb.entity.as_str())
-        {
-            qs.push(q(
-                format!("{eptr}/request_body/entity"),
-                format!(
-                    "Entity `{}` is not defined in module `{}` — define it or fix the reference.",
-                    rb.entity, m.name
-                ),
-            ));
+        if let Some(ref rb) = ep.request_body {
+            // JC0561 (#122): a `request_body` is EITHER an entity ref (today's
+            // shape) XOR an inline DTO (`fields`). Refuse both-set / neither-set,
+            // an inline body on an operation with no name (the DTO
+            // `{Pascal(operation_id)}Request` would be unnameable), and validate the
+            // inline fields with the SAME per-field checks as entity fields.
+            let has_entity = rb.entity.is_some();
+            let has_fields = !rb.fields.is_empty();
+            if has_entity && has_fields {
+                qs.push(q(
+                    format!("{eptr}/request_body"),
+                    format!(
+                        "Endpoint `{}` request_body declares BOTH an `entity` and inline `fields` — exactly one is allowed: a `request_body` is either a table-entity reference OR an ad-hoc inline DTO, never both. Drop one. See `jerrycan explain JC0561`.",
+                        ep.operation_id
+                    ),
+                ));
+            } else if !has_entity && !has_fields {
+                qs.push(q(
+                    format!("{eptr}/request_body"),
+                    format!(
+                        "Endpoint `{}` request_body declares NEITHER an `entity` nor inline `fields` — a `request_body` must be exactly one: a table-entity reference (`{{\"entity\": \"Todo\"}}`) OR an inline DTO (`{{\"fields\": [...]}}`). See `jerrycan explain JC0561`.",
+                        ep.operation_id
+                    ),
+                ));
+            } else if let Some(ent) = rb.entity.as_deref() {
+                if !entity_names.contains(&ent) {
+                    qs.push(q(
+                        format!("{eptr}/request_body/entity"),
+                        format!(
+                            "Entity `{ent}` is not defined in module `{}` — define it or fix the reference.",
+                            m.name
+                        ),
+                    ));
+                }
+            } else {
+                // Inline DTO body (has_fields, no entity). It needs an operation_id
+                // to be nameable, and every field must pass the same name/charset
+                // and #80 constraint checks as an entity field, plus no duplicates.
+                if ep.operation_id.trim().is_empty() {
+                    qs.push(q(
+                        format!("{eptr}/request_body/fields"),
+                        "An inline `request_body` (`fields`) requires an `operation_id` — the generated request struct is named `{Pascal(operation_id)}Request`, so a nameless operation has no DTO name. Give the endpoint an operation_id. See `jerrycan explain JC0561`.".to_string(),
+                    ));
+                }
+                let mut seen_fields = std::collections::HashSet::new();
+                for (j, f) in rb.fields.iter().enumerate() {
+                    let fptr = format!("{eptr}/request_body/fields/{j}");
+                    if !is_snake(&f.name) {
+                        qs.push(q(
+                            format!("{fptr}/name"),
+                            format!("Field `{}` must be snake_case.", f.name),
+                        ));
+                    }
+                    if !can_be_rust_ident(&f.name) {
+                        qs.push(q(
+                            format!("{fptr}/name"),
+                            format!(
+                                "Field `{name}` is a Rust keyword that no raw identifier can escape — rename (e.g. `{name}_field` or a domain-specific name).",
+                                name = f.name
+                            ),
+                        ));
+                    }
+                    if !seen_fields.insert(f.name.as_str()) {
+                        qs.push(q(
+                            format!("{fptr}/name"),
+                            format!(
+                                "Inline field `{}` is declared twice in this request_body — the generated `{}Request` struct would carry a duplicate field. Give each field a unique name. See `jerrycan explain JC0561`.",
+                                f.name,
+                                to_pascal(&ep.operation_id)
+                            ),
+                        ));
+                    }
+                    // The SAME #47/#80/default per-field checks as an entity field.
+                    check_field_shape(f, &fptr, wants_db, qs);
+                }
+            }
         }
         for (j, ec) in ep.errors.iter().enumerate() {
             if !(400..=599).contains(&ec.status) {
@@ -2262,6 +2343,7 @@ fn validate_module(
             &format!("{ptr}/subroutes/{i}"),
             declared_roles,
             auth_declared,
+            wants_db,
             qs,
         );
     }
@@ -2297,6 +2379,85 @@ mod tests {
             walk(m);
         }
         d
+    }
+
+    /// JC0561 (#122): a well-formed inline-DTO `request_body` validates clean, and
+    /// the four malformed shapes (both entity+fields, neither, an inline field with
+    /// a bad #80 constraint, a duplicate inline field name) are refused with a
+    /// JC0561/JC0552 message.
+    #[test]
+    fn inline_request_body_is_validated_with_jc0561() {
+        let base = |body: &str| {
+            format!(
+                r#"{{
+                "name": "shop-api", "contract_version": 0, "dependencies": [],
+                "modules": [{{
+                    "name": "checkout",
+                    "endpoints": [
+                        {{ "operation_id": "checkout", "method": "POST", "path": "/",
+                          "request_body": {body},
+                          "success": {{ "status": 200 }} }}
+                    ]
+                }}]
+            }}"#
+            )
+        };
+
+        // A clean inline body → no questions.
+        let ok = design(&base(
+            r#"{ "fields": [ { "name": "coupon", "type": "string" }, { "name": "total", "type": "integer" } ] }"#,
+        ));
+        assert!(
+            validate(&ok).is_empty(),
+            "clean inline body: {:?}",
+            validate(&ok)
+        );
+
+        // BOTH entity and fields → JC0561.
+        let both = design(&base(
+            r#"{ "entity": "Order", "fields": [ { "name": "coupon", "type": "string" } ] }"#,
+        ));
+        assert!(
+            validate(&both)
+                .iter()
+                .any(|q| q.question.contains("JC0561") && q.question.contains("BOTH")),
+            "both entity+fields must trip JC0561: {:?}",
+            validate(&both)
+        );
+
+        // NEITHER → JC0561.
+        let neither = design(&base(r#"{ }"#));
+        assert!(
+            validate(&neither)
+                .iter()
+                .any(|q| q.question.contains("JC0561") && q.question.contains("NEITHER")),
+            "empty request_body must trip JC0561: {:?}",
+            validate(&neither)
+        );
+
+        // An inline field with a misplaced #80 constraint reuses JC0552.
+        let bad_constraint = design(&base(
+            r#"{ "fields": [ { "name": "coupon", "type": "string", "min": 1 } ] }"#,
+        ));
+        assert!(
+            validate(&bad_constraint)
+                .iter()
+                .any(|q| q.question.contains("JC0552")),
+            "inline field constraint must be validated (JC0552): {:?}",
+            validate(&bad_constraint)
+        );
+
+        // A duplicate inline field name → JC0561.
+        let dup = design(&base(
+            r#"{ "fields": [ { "name": "coupon", "type": "string" }, { "name": "coupon", "type": "string" } ] }"#,
+        ));
+        assert!(
+            validate(&dup)
+                .iter()
+                .any(|q| q.question.contains("JC0561") && q.question.contains("twice")),
+            "duplicate inline field must trip JC0561: {:?}",
+            validate(&dup)
+        );
     }
 
     #[test]
