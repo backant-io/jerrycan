@@ -1365,6 +1365,50 @@ mod constraint_roundtrip {
     }
 }
 
+/// Issue #122 (Finding 3): a db-mode design whose custom action carries an INLINE
+/// request body — a #80-constrained REQUIRED field (`amount` min 1 → a
+/// `de_checkout_request_amount` validator wired via `#[serde(deserialize_with]`) AND
+/// an OPTIONAL field (`note` → `#[serde(default)] Option<String>`) — must scaffold
+/// and pass its own strict-clippy gate. The inline `CheckoutRequest` DTO lands in the
+/// SAME module `model.rs` as the entity `Order` and its `OrderRequest` DTO, so this
+/// also proves the two DTO kinds coexist (distinct names) under `-D warnings`, and
+/// the `checkout` handler stub takes `Json<CheckoutRequest>` and returns the
+/// entity-less `Result<Json<serde_json::Value>>`. The prior inline coverage was only
+/// string-matching unit tests + a memory-mode/unconstrained fixture — no db-mode
+/// inline body, no constrained inline field, and no optional inline field was ever
+/// actually compiled.
+#[test]
+#[ignore = "scaffolds a db-mode inline-body app and invokes cargo on it; run with --include-ignored"]
+fn db_mode_inline_request_body_app_passes_strict_clippy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    scaffold_and_strict_clippy(
+        tmp.path(),
+        "inline-db",
+        r#"{
+            "name": "inline-db", "contract_version": 0, "dependencies": ["db"],
+            "modules": [{
+                "name": "checkout",
+                "entities": [{ "name": "Order", "fields": [
+                    { "name": "total", "type": "integer" },
+                    { "name": "status", "type": "string", "values": ["open", "paid"], "default": "open" }
+                ]}],
+                "endpoints": [
+                    { "operation_id": "list_orders", "method": "GET", "path": "/",
+                      "success": { "status": 200, "entity": "Order", "list": true } },
+                    { "operation_id": "create_order", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Order" },
+                      "success": { "status": 201, "entity": "Order" } },
+                    { "operation_id": "checkout", "method": "POST", "path": "/checkout",
+                      "request_body": { "fields": [
+                        { "name": "amount", "type": "integer", "min": 1 },
+                        { "name": "note", "type": "string", "required": false } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+    );
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");

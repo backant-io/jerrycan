@@ -469,6 +469,16 @@ pub fn design_conflict(d: &Design) -> Option<DesignConflict> {
     if let Some(conflict) = request_dto_name_collision(d) {
         return Some(conflict);
     }
+    // JC0561 (#122): an inline-DTO `request_body` mints a `{Pascal(operation_id)}Request`
+    // struct + OpenAPI component that shares the DTO namespace with the entity
+    // `{Entity}Request`/`{Entity}UpdateRequest` DTOs and with every OTHER inline body.
+    // Nothing else validates that name, so a collision slips past a green `check` into
+    // an E0428 duplicate struct (same module) or a clobbered OpenAPI schema
+    // (cross-module — `components/schemas` is one global map, and operation_id is
+    // unique only per-module). Caught here so `check`/MCP refuse it up front.
+    if let Some(conflict) = inline_dto_name_collision(d) {
+        return Some(conflict);
+    }
     // JC0542 (#65): sibling routes that name a shared path position's `{param}`
     // differently panic at `App::build` (JC0500), a clean-scaffold-then-mid-test
     // failure. Caught here as a fatal conflict — it needs a rename or a restructure.
@@ -695,6 +705,99 @@ fn request_dto_name_collision(d: &Design) -> Option<DesignConflict> {
                 "rename `{name}` (e.g. `{base}Payload`/`{base}Submission`) — the `{base}Request` name is reserved for the generated request DTO"
             ),
         });
+    }
+    None
+}
+
+/// The JC0561 name-collision guard (issue #122): an inline-DTO `request_body` mints
+/// a `{Pascal(operation_id)}Request` struct in its module's `model` unit AND an
+/// OpenAPI `{Pascal(operation_id)}Request` component (openapi.rs `walk_schemas`).
+/// That name shares ONE namespace with (a) the `{Entity}Request` /
+/// `{Entity}UpdateRequest` DTOs an entity mints when it omits a server-owned field,
+/// (b) an entity literally named `{X}Request` (its own model struct + schema), and
+/// (c) EVERY OTHER inline body in the design. A same-module clash is an E0428
+/// duplicate struct; a cross-module clash silently clobbers one OpenAPI schema with
+/// the other, because `components/schemas` is one GLOBAL map while `operation_id` is
+/// unique only per-module — so this walk is DESIGN-GLOBAL. Reserves exactly the names
+/// genroute/openapi emit (via `to_pascal` + `entity_generates_request_dto` /
+/// `entity_generates_update_request_dto`), so a `*Request` name that shadows nothing
+/// is never rejected.
+fn inline_dto_name_collision(d: &Design) -> Option<DesignConflict> {
+    use std::collections::HashMap;
+    // 1. Names each entity contributes to the shared struct/schema namespace: its own
+    //    model name (always emitted), plus the request DTOs it actually mints.
+    let mut reserved: HashMap<String, String> = HashMap::new();
+    fn collect_entities(d: &Design, m: &ModuleDesign, reserved: &mut HashMap<String, String>) {
+        for e in &m.entities {
+            reserved
+                .entry(e.name.clone())
+                .or_insert_with(|| format!("the model struct for entity `{}`", e.name));
+            if d.entity_generates_request_dto(&e.name) {
+                reserved
+                    .entry(format!("{}Request", e.name))
+                    .or_insert_with(|| {
+                        format!("the request DTO generated for entity `{}`", e.name)
+                    });
+            }
+            if d.entity_generates_update_request_dto(&e.name) {
+                reserved
+                    .entry(format!("{}UpdateRequest", e.name))
+                    .or_insert_with(|| format!("the update DTO generated for entity `{}`", e.name));
+            }
+        }
+        for sub in &m.subroutes {
+            collect_entities(d, sub, reserved);
+        }
+    }
+    for m in &d.modules {
+        collect_entities(d, m, &mut reserved);
+    }
+
+    // 2. Every inline body, design-global (operation_id is unique per-module only).
+    fn collect_inline<'a>(m: &'a ModuleDesign, out: &mut Vec<(&'a str, &'a Endpoint)>) {
+        for ep in &m.endpoints {
+            if ep.request_body.as_ref().is_some_and(RequestBody::is_inline) {
+                out.push((m.name.as_str(), ep));
+            }
+        }
+        for sub in &m.subroutes {
+            collect_inline(sub, out);
+        }
+    }
+    let mut inline = Vec::new();
+    for m in &d.modules {
+        collect_inline(m, &mut inline);
+    }
+
+    // 3. Each inline name must clash with neither an entity DTO/model name nor an
+    //    EARLIER inline body's name.
+    let mut seen_inline: HashMap<String, (&str, &str)> = HashMap::new();
+    for (module, ep) in inline {
+        let name = format!("{}Request", to_pascal(&ep.operation_id));
+        let op = ep.operation_id.as_str();
+        if let Some(origin) = reserved.get(&name) {
+            return Some(DesignConflict {
+                code: "JC0561",
+                message: format!(
+                    "the inline `request_body` on endpoint `{op}` (module `{module}`) generates a `{name}` request struct and OpenAPI component, but that name is already {origin}. genroute would define `struct {name}` twice — an E0428 duplicate-struct compile error when both land in one module — and the OpenAPI document would clobber one `{name}` schema with the other. Rename the endpoint's `operation_id` so `Pascal(operation_id)Request` no longer collides, or rename the entity. See `jerrycan explain JC0561`."
+                ),
+                hint: format!(
+                    "the `{name}` name is already taken by {origin} — rename endpoint `{op}`'s operation_id (or the entity) so the inline DTO name is unique"
+                ),
+            });
+        }
+        if let Some((prev_op, prev_module)) = seen_inline.get(&name) {
+            return Some(DesignConflict {
+                code: "JC0561",
+                message: format!(
+                    "two inline `request_body` DTOs generate the same `{name}` struct and OpenAPI component: endpoint `{prev_op}` (module `{prev_module}`) and endpoint `{op}` (module `{module}`). `operation_id` is unique only within a module, but the OpenAPI `components/schemas` map is global — the second `{name}` clobbers the first, so one endpoint's requestBody points at the wrong shape. Rename one operation_id so each inline DTO `Pascal(operation_id)Request` is design-globally unique. See `jerrycan explain JC0561`."
+                ),
+                hint: format!(
+                    "endpoints `{prev_op}` and `{op}` both mint `{name}` — give one a distinct operation_id"
+                ),
+            });
+        }
+        seen_inline.insert(name, (op, module));
     }
     None
 }
@@ -3884,6 +3987,152 @@ mod tests {
             ]
         }]
     }"#;
+
+    /// Issue #122 (JC0561 name collision, Finding 1): an inline-DTO body reopens the
+    /// JC0541 collision class. An entity `Checkout` with a `default` field mints a
+    /// `CheckoutRequest` DTO (Rust struct + OpenAPI component); an inline body on
+    /// `operation_id: "checkout"` ALSO mints `CheckoutRequest` — a same-module E0428
+    /// duplicate struct AND a clobbered OpenAPI schema, otherwise behind a green
+    /// `check`. `design_conflict` must refuse it up front with JC0561.
+    #[test]
+    fn inline_dto_name_colliding_with_an_entity_dto_is_a_conflict() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{
+                "name": "shop",
+                "entities": [
+                    { "name": "Checkout", "fields": [
+                        { "name": "note", "type": "string" },
+                        { "name": "confirmed", "type": "boolean", "default": false } ] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_checkout", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Checkout" },
+                      "success": { "status": 201, "entity": "Checkout" } },
+                    { "operation_id": "checkout", "method": "POST", "path": "/run",
+                      "request_body": { "fields": [ { "name": "amount", "type": "integer" } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        // Sanity: the entity really does mint the DTO the inline name will clash with.
+        assert!(
+            d.entity_generates_request_dto("Checkout"),
+            "fixture must mint CheckoutRequest for the collision to be real"
+        );
+        let c = design_conflict(&d)
+            .expect("inline `checkout` clashing with CheckoutRequest DTO conflicts");
+        assert_eq!(c.code, "JC0561");
+        assert!(
+            c.message.contains("CheckoutRequest")
+                && c.message.contains("checkout")
+                && c.message.contains("Checkout"),
+            "message names the collision and both sides: {}",
+            c.message
+        );
+    }
+
+    /// Issue #122 (JC0561 name collision, Finding 2): `operation_id` is unique only
+    /// PER-MODULE, but OpenAPI `components/schemas` is one GLOBAL map. Two modules
+    /// each with an inline `operation_id: "checkout"` both register `CheckoutRequest`
+    /// — the second clobbers the first, pointing one endpoint's requestBody at the
+    /// wrong shape, behind a green `check`. `design_conflict` must refuse cross-module.
+    #[test]
+    fn two_inline_dtos_with_the_same_name_cross_module_is_a_conflict() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop", "contract_version": 1, "dependencies": ["db"],
+            "modules": [
+                { "name": "storefront",
+                  "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/pay",
+                      "request_body": { "fields": [ { "name": "amount", "type": "integer" } ] },
+                      "success": { "status": 200 } }
+                  ] },
+                { "name": "kiosk",
+                  "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/buy",
+                      "request_body": { "fields": [ { "name": "total", "type": "integer" } ] },
+                      "success": { "status": 200 } }
+                  ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        let c = design_conflict(&d)
+            .expect("two modules' inline `checkout` DTOs clash on the global schema map");
+        assert_eq!(c.code, "JC0561");
+        assert!(
+            c.message.contains("CheckoutRequest")
+                && c.message.contains("storefront")
+                && c.message.contains("kiosk"),
+            "message names the shared name and both modules: {}",
+            c.message
+        );
+    }
+
+    /// Issue #122 (JC0561 name collision, negative): the guard fires ONLY on a REAL
+    /// clash. (a) A lone valid inline body (constrained + optional field) mints a
+    /// unique `CheckoutRequest` — fine. (b) An entity whose NAME an inline body's
+    /// Pascal shares, but which mints NO DTO (memory mode), collides with nothing —
+    /// the entity is `Checkout` (model), the inline is `CheckoutRequest` (distinct).
+    #[test]
+    fn inline_dto_name_without_a_real_collision_is_not_flagged() {
+        // (a) A single well-formed inline body — no other DTO with that name.
+        let ok: Design = serde_json::from_str(
+            r#"{
+            "name": "shop", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{
+                "name": "checkout",
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/",
+                      "request_body": { "fields": [
+                        { "name": "amount", "type": "integer", "min": 1 },
+                        { "name": "note", "type": "string", "required": false } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            design_conflict(&ok).is_none(),
+            "a lone valid inline body must pass: {:?}",
+            design_conflict(&ok).map(|c| c.message)
+        );
+        // (b) Entity `Checkout` in MEMORY mode mints no `CheckoutRequest` DTO, so the
+        //     inline `CheckoutRequest` shadows nothing (entity model name is `Checkout`).
+        let mem: Design = serde_json::from_str(
+            r#"{
+            "name": "shop", "contract_version": 1, "dependencies": [],
+            "modules": [{
+                "name": "shop",
+                "entities": [
+                    { "name": "Checkout", "fields": [
+                        { "name": "confirmed", "type": "boolean", "default": false } ] }
+                ],
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/run",
+                      "request_body": { "fields": [ { "name": "amount", "type": "integer" } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            !mem.entity_generates_request_dto("Checkout"),
+            "memory mode mints no DTO"
+        );
+        assert!(
+            design_conflict(&mem).is_none(),
+            "memory-mode entity name sharing the inline Pascal but minting no DTO is fine: {:?}",
+            design_conflict(&mem).map(|c| c.message)
+        );
+    }
 
     // ---- #105 (JC0549): public-read/owner-write shape --------------------------
 

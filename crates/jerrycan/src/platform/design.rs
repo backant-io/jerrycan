@@ -1428,6 +1428,37 @@ impl Design {
         self.modules.iter().any(|m| walk(self, m, entity, auth))
     }
 
+    /// True when entity `entity` produces a generated `{entity}UpdateRequest` DTO —
+    /// a db-mode entity with a `default` field that is the body of an UPDATE
+    /// (PUT/PATCH) endpoint which omits a server-owned field, so the update keeps the
+    /// (create-only) defaults settable via a distinct body (issue #85 D1). Mirrors
+    /// the `needs_update_dto`/`needs_update_schema` gate in genroute/openapi exactly,
+    /// so the inline-DTO name-collision guard (JC0561, issue #122) reserves precisely
+    /// the `{entity}UpdateRequest` names those emitters actually mint.
+    pub(crate) fn entity_generates_update_request_dto(&self, entity: &str) -> bool {
+        if !self.wants_db() {
+            return false;
+        }
+        let has_default = self
+            .find_entity(entity)
+            .is_some_and(|e| e.fields.iter().any(|f| f.default.is_some()));
+        if !has_default {
+            return false;
+        }
+        let auth = self.wants_auth();
+        fn walk(design: &Design, m: &ModuleDesign, entity: &str, auth: bool) -> bool {
+            m.endpoints.iter().any(|ep| {
+                ep.method.is_update()
+                    && ep
+                        .request_body
+                        .as_ref()
+                        .is_some_and(|rb| rb.entity.as_deref() == Some(entity))
+                    && design.endpoint_uses_request_dto(m, ep, auth)
+            }) || m.subroutes.iter().any(|s| walk(design, s, entity, auth))
+        }
+        self.modules.iter().any(|m| walk(self, m, entity, auth))
+    }
+
     /// snake_case a validated PascalCase entity name. Entity names are validated
     /// `^[A-Z][A-Za-z0-9]*$`, so each uppercase letter (past the first char)
     /// starts a new word: "ApiKey" -> "api_key".
