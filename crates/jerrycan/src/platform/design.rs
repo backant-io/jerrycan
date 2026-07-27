@@ -520,7 +520,27 @@ impl HttpMethod {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestBody {
-    pub entity: String,
+    /// The table entity this body deserializes into (today's shape). Absent for an
+    /// inline DTO body (issue #122). Exactly one of `entity` / `fields` is set
+    /// (JC0561). Skipped-when-None so every entity `request_body` round-trips
+    /// byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
+    /// Inline DTO body (issue #122): a custom-action body that is NOT a table row
+    /// (`POST /checkout { coupon, total }`). Reuses `Field` (types + #80
+    /// constraints). No pk, no belongs_to — a plain request struct named
+    /// `{Pascal(operation_id)}Request`. Exactly one of `entity` / `fields` (JC0561).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<Field>,
+}
+
+impl RequestBody {
+    /// True for an inline DTO body (issue #122) — no table entity, an ad-hoc
+    /// `fields` struct. `false` for the entity-ref shape (today's default). The ONE
+    /// predicate every `entity`/`fields` branch keys on so the sites stay readable.
+    pub fn is_inline(&self) -> bool {
+        self.entity.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1270,18 +1290,22 @@ impl Design {
         self.wants_auth()
             && ep.is_guarded()
             && ep.request_body.as_ref().is_some_and(|rb| {
-                m.entities
-                    .iter()
-                    .find(|e| e.name == rb.entity)
-                    .is_some_and(Self::has_identity_fk)
+                rb.entity.as_ref().is_some_and(|ent| {
+                    m.entities
+                        .iter()
+                        .find(|e| &e.name == ent)
+                        .is_some_and(Self::has_identity_fk)
+                })
             })
     }
 
     /// The body entity of this endpoint that lives in `m`, if any (the request DTO
     /// is per-entity, so every request-shape decision resolves the entity here).
     fn request_entity<'a>(&self, m: &'a ModuleDesign, ep: &Endpoint) -> Option<&'a Entity> {
-        let rb = ep.request_body.as_ref()?;
-        m.entities.iter().find(|e| e.name == rb.entity)
+        // An inline DTO body (issue #122) resolves to NO entity — none of the
+        // entity machinery (server-owned fk, defaults, path fk) applies to it.
+        let ent = ep.request_body.as_ref()?.entity.as_ref()?;
+        m.entities.iter().find(|e| &e.name == ent)
     }
 
     /// The defaulted-field rule (issue #53a): this endpoint's request-body entity
@@ -1342,7 +1366,7 @@ impl Design {
             m.endpoints.iter().any(|ep| {
                 ep.request_body
                     .as_ref()
-                    .is_some_and(|rb| rb.entity == entity_name)
+                    .is_some_and(|rb| rb.entity.as_deref() == Some(entity_name))
                     && format!("{base}{}", ep.path).contains(token)
             }) || m
                 .subroutes
@@ -1397,7 +1421,38 @@ impl Design {
             m.endpoints.iter().any(|ep| {
                 ep.request_body
                     .as_ref()
-                    .is_some_and(|rb| rb.entity == entity)
+                    .is_some_and(|rb| rb.entity.as_deref() == Some(entity))
+                    && design.endpoint_uses_request_dto(m, ep, auth)
+            }) || m.subroutes.iter().any(|s| walk(design, s, entity, auth))
+        }
+        self.modules.iter().any(|m| walk(self, m, entity, auth))
+    }
+
+    /// True when entity `entity` produces a generated `{entity}UpdateRequest` DTO —
+    /// a db-mode entity with a `default` field that is the body of an UPDATE
+    /// (PUT/PATCH) endpoint which omits a server-owned field, so the update keeps the
+    /// (create-only) defaults settable via a distinct body (issue #85 D1). Mirrors
+    /// the `needs_update_dto`/`needs_update_schema` gate in genroute/openapi exactly,
+    /// so the inline-DTO name-collision guard (JC0561, issue #122) reserves precisely
+    /// the `{entity}UpdateRequest` names those emitters actually mint.
+    pub(crate) fn entity_generates_update_request_dto(&self, entity: &str) -> bool {
+        if !self.wants_db() {
+            return false;
+        }
+        let has_default = self
+            .find_entity(entity)
+            .is_some_and(|e| e.fields.iter().any(|f| f.default.is_some()));
+        if !has_default {
+            return false;
+        }
+        let auth = self.wants_auth();
+        fn walk(design: &Design, m: &ModuleDesign, entity: &str, auth: bool) -> bool {
+            m.endpoints.iter().any(|ep| {
+                ep.method.is_update()
+                    && ep
+                        .request_body
+                        .as_ref()
+                        .is_some_and(|rb| rb.entity.as_deref() == Some(entity))
                     && design.endpoint_uses_request_dto(m, ep, auth)
             }) || m.subroutes.iter().any(|s| walk(design, s, entity, auth))
         }
@@ -1550,6 +1605,24 @@ pub(crate) fn rust_ident(name: &str) -> String {
     }
 }
 
+/// PascalCase a validated snake_case name (`checkout` → `Checkout`,
+/// `bulk_import` → `BulkImport`): each underscore-separated word capitalized. Used
+/// to name the inline-DTO request struct `{Pascal(operation_id)}Request` (issue
+/// #122) — the ONE op_id→Pascal converter shared by genroute/openapi/testgen/
+/// questions so the emitted struct, the advertised schema, the probe body type,
+/// and the validation message all agree on the name.
+pub(crate) fn to_pascal(snake: &str) -> String {
+    let mut out = String::with_capacity(snake.len());
+    for word in snake.split('_') {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
 /// Walk a module and its subroutes in document order, pairing each entity that
 /// resolves to a tenant path (directly OR transitively — issue #102) with the
 /// owning module/subroute name. Delegates ownership to `Design::tenant_path` so
@@ -1612,13 +1685,13 @@ pub(crate) fn endpoint_repo_entity_strict<'a>(
     }
     ep.request_body
         .as_ref()
-        .map(|rb| rb.entity.as_str())
+        .and_then(|rb| rb.entity.as_deref())
         .or(ep.success.entity.as_deref())
         .or_else(|| {
             collection_path(ep)
                 .and_then(|coll| creator_at(m, &coll))
                 .and_then(|c| c.request_body.as_ref())
-                .map(|rb| rb.entity.as_str())
+                .and_then(|rb| rb.entity.as_deref())
         })
 }
 

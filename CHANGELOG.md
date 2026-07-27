@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.15 — 2026-07-27
+
+### New
+- **Non-entity (inline-DTO) request body (#122).** A custom-action endpoint whose
+  body is not a table row can now declare it inline:
+  `"request_body": { "fields": [ {"name":"coupon","type":"string"}, {"name":"total","type":"integer"} ] }`
+  on `POST /checkout` generates a plain `CheckoutRequest` struct (named from the
+  `operation_id`), the handler takes `Json<CheckoutRequest>`, and the shape flows
+  into OpenAPI — instead of forcing a `probe: skip` and a hand-written DTO
+  invisible to the generated contract. Inline fields honor the field constraints
+  (#80). `request_body` now accepts an entity reference **or** inline `fields`
+  (exactly one).
+- **`JC0561`** refuses an unbuildable `request_body`: both an entity and inline
+  `fields` (or neither), an inline body on an endpoint with no `operation_id`, an
+  invalid inline field, or an inline `{Pascal(operation_id)}Request` name that
+  collides with an entity's generated DTO or another inline body's (which would
+  emit a duplicate struct / clobber the OpenAPI schema).
+
+### Fixed
+- **`probe: skip` TODOs are auth-aware.** In a design with no auth model, the
+  skipped-endpoint TODO no longer emits credential/401 wording that doesn't apply.
+
+Byte-identical for any `request_body` that references an entity.
+
 ## 0.6.14 — 2026-07-26
 
 ### New

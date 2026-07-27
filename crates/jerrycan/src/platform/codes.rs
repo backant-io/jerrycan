@@ -342,6 +342,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs designing",
     },
     CodeInfo {
+        code: "JC0561",
+        title: "invalid request_body — entity XOR inline fields",
+        cause: "a `request_body` (issue #122) is malformed: it declares BOTH an `entity` and inline `fields` (a body is a table-entity reference OR an ad-hoc inline DTO, never both), or NEITHER (it must be exactly one); or an inline (`fields`) body sits on an endpoint with no `operation_id`, so its generated request struct `{Pascal(operation_id)}Request` would be unnameable; or an inline field is itself invalid — a name that is not snake_case or is a Rust keyword no raw identifier can escape, a duplicate field name (the struct would carry two same-named fields), or a #80 range/length constraint that is misplaced or empty (validated exactly like an entity field via JC0552/JC0543); or the inline DTO's `{Pascal(operation_id)}Request` NAME collides with another emitted DTO — an entity's generated `{Entity}Request`/`{Entity}UpdateRequest`, an entity literally named `{X}Request`, or ANOTHER inline body's name in a different module (operation_id is unique only per-module, but the OpenAPI schema map is global) — which would define `struct {name}` twice (E0428) or clobber one OpenAPI schema with the other",
+        fix: "give each `request_body` exactly one shape: `{\"entity\": \"Todo\"}` to deserialize a table row, or `{\"fields\": [{\"name\": \"coupon\", \"type\": \"string\"}, ...]}` for a custom-action DTO that is not a row; put the inline body on an endpoint with an `operation_id` (it names the DTO); make every inline field a snake_case non-keyword name, unique within the body, with well-formed #80 constraints; and choose an `operation_id` whose `{Pascal(operation_id)}Request` name is design-globally unique — it must not match an entity's generated DTO, an entity named `{X}Request`, or another inline body's name",
+        doc: "jerrycan docs designing",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -751,6 +758,27 @@ mod tests {
                 && info.fix.contains("from_account")
                 && info.fix.contains("snake_case"),
             "fix must name the distinct-alias remedy and the two-ref example: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0561_names_the_entity_xor_fields_rules_and_their_remedies() {
+        // WHY: JC0561 (#122) refuses a malformed inline-DTO `request_body` —
+        // `jerrycan explain JC0561` must name the entity-XOR-fields rule (both /
+        // neither), the operation_id-needed-to-name-the-DTO leg, and the inline-field
+        // validation, plus the two-shape remedy.
+        let info = lookup("JC0561").unwrap();
+        assert!(
+            info.cause.contains("BOTH")
+                && info.cause.contains("NEITHER")
+                && info.cause.contains("operation_id"),
+            "cause must name both/neither and the unnameable-DTO leg: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("entity") && info.fix.contains("fields"),
+            "fix must name both request_body shapes: {}",
             info.fix
         );
     }

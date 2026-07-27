@@ -153,10 +153,19 @@ fn request_dto_name(
     mode: GenMode,
     design: &Design,
 ) -> Option<String> {
+    // An inline DTO body (issue #122) ALWAYS deserializes into its own struct —
+    // `{Pascal(operation_id)}Request` — there is no plain-entity fallback. This
+    // leg is independent of db/auth mode (an inline body carries no fk/default
+    // machinery), so it runs BEFORE the entity-DTO gate below.
+    if let Some(rb) = ep.request_body.as_ref()
+        && rb.is_inline()
+    {
+        return Some(format!("{}Request", to_pascal(&ep.operation_id)));
+    }
     if !endpoint_takes_request_dto(m, ep, mode, design) {
         return None;
     }
-    let entity = &ep.request_body.as_ref()?.entity;
+    let entity = ep.request_body.as_ref()?.entity.as_deref()?;
     Some(
         if ep.method.is_update() && design.entity_has_default(entity) {
             format!("{entity}UpdateRequest")
@@ -251,7 +260,13 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
         // update (issue #85 D1) — not the entity itself.
         match request_dto_name(m, ep, mode, design) {
             Some(name) => params.push(format!("Json(_body): Json<{name}>")),
-            None => params.push(format!("Json(_body): Json<{}>", rb.entity)),
+            // The None branch is reached only for an ENTITY body that takes the
+            // full row (inline bodies always return a DTO name above), so `entity`
+            // is present.
+            None => params.push(format!(
+                "Json(_body): Json<{}>",
+                rb.entity.as_deref().expect("non-inline body has an entity")
+            )),
         }
     }
     params.join(", ")
@@ -550,8 +565,12 @@ fn server_owned_fk_comment(
     if !endpoint_takes_request_dto(m, ep, mode, design) {
         return String::new();
     }
-    let entity = &ep.request_body.as_ref().expect("dto implies body").entity;
-    let Some(e) = m.entities.iter().find(|e| &e.name == entity) else {
+    // `endpoint_takes_request_dto` is false for an inline body (issue #122 — no
+    // entity machinery), so reaching here implies an entity body.
+    let Some(entity) = ep.request_body.as_ref().and_then(|rb| rb.entity.as_deref()) else {
+        return String::new();
+    };
+    let Some(e) = m.entities.iter().find(|e| e.name == entity) else {
         return String::new();
     };
     // The DTO this endpoint's body deserializes into — `{Entity}Request` on create,
@@ -669,7 +688,11 @@ fn realtime_publish_comment(ep: &Endpoint, design: &Design) -> String {
 }
 
 pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
-    if m.entities.is_empty() {
+    // An inline-DTO body (issue #122) mints a request struct even in a module with
+    // NO entities (a pure custom-action module), so model.rs must still be emitted
+    // for the handler's `use super::model::*;` to resolve `{Op}Request`.
+    let inline = module_inline_bodies(m);
+    if m.entities.is_empty() && inline.is_empty() {
         return None;
     }
     let mut out = String::from(
@@ -697,6 +720,10 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
     // Memory structs type optional fields BARE (`#[serde(default)]`), so the
     // validators must NOT use the Option variant (E0308 otherwise).
     out.push_str(&constraint_deserialize_fns(&m.entities, false));
+    // Inline-DTO bodies (issue #122): a plain request struct + its own validators.
+    for ep in &inline {
+        out.push_str(&inline_request_dto_rs(ep));
+    }
     Some(out)
 }
 
@@ -958,7 +985,10 @@ fn col_pascal(snake: &str) -> String {
 /// an identity-FK entity used as a GUARDED request body also gets a
 /// `{Entity}Request` struct without `user_id`.
 pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design, auth: bool) -> Option<String> {
-    if m.entities.is_empty() {
+    // An inline-DTO body (issue #122) mints a request struct even in an
+    // entity-less module, so model.rs must still be emitted here too.
+    let inline = module_inline_bodies(m);
+    if m.entities.is_empty() && inline.is_empty() {
         return None;
     }
     let local: std::collections::HashSet<&str> =
@@ -1085,7 +1115,7 @@ pub use {snake}::Model as {entity};
                 && ep
                     .request_body
                     .as_ref()
-                    .is_some_and(|rb| rb.entity == e.name)
+                    .is_some_and(|rb| rb.entity.as_deref() == Some(e.name.as_str()))
         });
         if needs_dto {
             out.push_str(&request_dto_rs(e, design, false));
@@ -1100,7 +1130,7 @@ pub use {snake}::Model as {entity};
                     && ep
                         .request_body
                         .as_ref()
-                        .is_some_and(|rb| rb.entity == e.name)
+                        .is_some_and(|rb| rb.entity.as_deref() == Some(e.name.as_str()))
             });
         if needs_update_dto {
             out.push_str(&request_dto_rs(e, design, true));
@@ -1109,6 +1139,10 @@ pub use {snake}::Model as {entity};
     // The db Model and the request DTOs type optional fields `Option<T>`, so
     // their validators use the Option variant.
     out.push_str(&constraint_deserialize_fns(&m.entities, true));
+    // Inline-DTO bodies (issue #122): a plain request struct + its own validators.
+    for ep in &inline {
+        out.push_str(&inline_request_dto_rs(ep));
+    }
     Some(out)
 }
 
@@ -1236,6 +1270,62 @@ fn request_dto_doc(
         "/// Request body for `{}` — the wire input shape. These SERVER-OWNED fields\n/// are omitted (the client never sends them; the server supplies each):\n///   {}.\n",
         e.name,
         reasons.join(", ")
+    )
+}
+
+/// This unit's OWN endpoints (NOT subroutes) whose request body is inline (issue
+/// #122) — each mints a `{Pascal(operation_id)}Request` DTO in this unit's model
+/// file. operation_ids are design-unique, so no dedupe is needed.
+fn module_inline_bodies(m: &ModuleDesign) -> Vec<&Endpoint> {
+    m.endpoints
+        .iter()
+        .filter(|ep| ep.request_body.as_ref().is_some_and(RequestBody::is_inline))
+        .collect()
+}
+
+/// The inline-DTO request struct (issue #122): a PLAIN body struct for a custom
+/// action whose body is NOT a table row (`POST /checkout { coupon, total }`),
+/// named `{Pascal(operation_id)}Request`. No pk `id`, no belongs_to, no
+/// server-owned omission — none of the entity machinery applies. Reuses the field
+/// loop shape of `request_dto_rs` (keyword renames, #80/#47 validators via
+/// `constraint_validate_attr`, required→`T` / optional→`#[serde(default)]
+/// Option<T>`) and emits the field validators beside the struct, keyed on a
+/// synthetic entity named for the struct so a constrained inline field is enforced
+/// at the request boundary exactly like an entity field. Independent of db/auth
+/// mode — an inline body has no fk/default machinery.
+fn inline_request_dto_rs(ep: &Endpoint) -> String {
+    let rb = ep.request_body.as_ref().expect("inline body endpoint");
+    let struct_name = format!("{}Request", to_pascal(&ep.operation_id));
+    // Synthetic entity so `constraint_validate_attr` and `constraint_deserialize_fns`
+    // agree on the `de_{snake(struct_name)}_{field}` validator names.
+    let syn = Entity {
+        name: struct_name.clone(),
+        table: None,
+        belongs_to: Vec::new(),
+        public_read: false,
+        unique: Vec::new(),
+        fields: rb.fields.clone(),
+    };
+    let mut fields = String::new();
+    for f in &rb.fields {
+        let base = f.field_type.rust_type();
+        fields.push_str(&keyword_field_attrs(&f.name, "    ", false));
+        let ident = rust_ident(&f.name);
+        if f.required {
+            fields.push_str(&constraint_validate_attr(&syn, f, "    ", ""));
+            fields.push_str(&format!("    pub {ident}: {base},\n"));
+        } else {
+            fields.push_str("    #[serde(default)]\n");
+            fields.push_str(&constraint_validate_attr(&syn, f, "    ", ""));
+            fields.push_str(&format!("    pub {ident}: Option<{base}>,\n"));
+        }
+    }
+    // Inline DTOs type optional fields `Option<T>` (the request-DTO shape), so the
+    // validators always take the `Option<T>` variant (`optional_is_option = true`).
+    let validators = constraint_deserialize_fns(std::slice::from_ref(&syn), true);
+    format!(
+        "/// Inline request body (issue #122) for the `{op}` custom action — an ad-hoc\n/// DTO, not a table row; the handler deserializes it as `Json<{struct_name}>`.\n#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\npub struct {struct_name} {{\n{fields}}}\n\n{validators}",
+        op = ep.operation_id,
     )
 }
 
@@ -3615,6 +3705,103 @@ pub(crate) mod tests {
 
     fn todos() -> ModuleDesign {
         demo().modules.into_iter().next().unwrap()
+    }
+
+    /// The inline-DTO body fixture (issue #122): a no-auth `POST /checkout` whose
+    /// `request_body` is inline `fields` (not a table row). PROVES: the design
+    /// validates clean; `model.rs` is emitted (even with NO entities) carrying
+    /// `CheckoutRequest { coupon: String, total: i64 }`; the handler takes
+    /// `Json<CheckoutRequest>`; the OpenAPI document registers the `CheckoutRequest`
+    /// schema and the operation's requestBody `$ref`s it; and the generated probe
+    /// TODO (if any) carries NO auth wording in a no-auth design (Part B).
+    #[test]
+    fn inline_dto_body_checkout_no_auth_flows_end_to_end() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "checkout",
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/",
+                      "request_body": { "fields": [
+                          { "name": "coupon", "type": "string" },
+                          { "name": "total", "type": "integer" } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+
+        // The design is clean — `jerrycan check` reaches validation with no questions.
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "inline-DTO design must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+
+        let m = &d.modules[0];
+        let mode = GenMode::default(); // no db, no auth (memory mode)
+
+        // model.rs is emitted from the inline DTO alone (no entities) and carries
+        // the plain request struct — no `id`, no belongs_to, just the fields.
+        let model = model_rs(m).expect("inline body forces a model.rs even with no entities");
+        assert!(
+            model.contains("pub struct CheckoutRequest {"),
+            "model:\n{model}"
+        );
+        assert!(model.contains("pub coupon: String,"), "model:\n{model}");
+        assert!(model.contains("pub total: i64,"), "model:\n{model}");
+        assert!(
+            !model.contains("pub id:"),
+            "inline DTO has no pk id:\n{model}"
+        );
+
+        // The handler deserializes into the inline DTO, not a plain entity.
+        let handlers = handlers_rs(m, mode, &d);
+        assert!(
+            handlers.contains("Json(_body): Json<CheckoutRequest>"),
+            "handlers:\n{handlers}"
+        );
+
+        // OpenAPI documents the custom action: the schema is registered and the
+        // operation's requestBody references it.
+        let doc = crate::platform::openapi::document(&d);
+        assert!(
+            doc["components"]["schemas"]["CheckoutRequest"].is_object(),
+            "CheckoutRequest schema missing: {doc}"
+        );
+        let req = &doc["paths"]["/checkout/"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"];
+        assert_eq!(
+            req.as_str(),
+            Some("#/components/schemas/CheckoutRequest"),
+            "requestBody must $ref the inline DTO: {doc}"
+        );
+        // The schema spells out both fields with the right types + required set.
+        let schema = &doc["components"]["schemas"]["CheckoutRequest"];
+        assert_eq!(
+            schema["properties"]["coupon"]["type"].as_str(),
+            Some("string")
+        );
+        assert_eq!(
+            schema["properties"]["total"]["type"].as_str(),
+            Some("integer")
+        );
+
+        // Part B: a no-auth `probe: skip` on the SAME inline action yields a TODO
+        // with NO credential/401 wording.
+        let mut skip = d.clone();
+        skip.modules[0].endpoints[0].probe = ProbePolicy::Skip;
+        let suite = crate::platform::testgen::acceptance_rs(&skip, &skip.modules[0]);
+        assert!(suite.contains("AGENT TODO: checkout"), "suite:\n{suite}");
+        for banned in ["credential", "401", "403", "auth"] {
+            assert!(
+                !suite.to_lowercase().contains(banned),
+                "no-auth skip TODO must not mention `{banned}`:\n{suite}"
+            );
+        }
     }
 
     /// #107: `implicit_member_routes` is the conflict walker's + route lister's

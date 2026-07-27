@@ -114,20 +114,25 @@ fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
         // only exists in db mode (memory-mode structs carry no fk columns), so a
         // memory-mode contract advertises the plain entity — never over-specifying
         // fk columns the memory struct doesn't have.
-        let schema =
-            if design.wants_db() && design.endpoint_uses_request_dto(m, ep, design.wants_auth()) {
-                // A defaulted-entity UPDATE advertises `{Entity}UpdateRequest` (keeps
-                // the `default` fields — settable on update); every other DTO
-                // endpoint advertises `{Entity}Request` (issue #85 D1).
-                let name = if ep.method.is_update() && design.entity_has_default(&rb.entity) {
-                    format!("{}UpdateRequest", rb.entity)
-                } else {
-                    format!("{}Request", rb.entity)
-                };
-                entity_ref(&name)
+        let schema = if rb.is_inline() {
+            // An inline DTO body (issue #122): advertise the ad-hoc
+            // `{Pascal(operation_id)}Request` schema (registered in `walk_schemas`).
+            entity_ref(&format!("{}Request", to_pascal(&ep.operation_id)))
+        } else if design.wants_db() && design.endpoint_uses_request_dto(m, ep, design.wants_auth())
+        {
+            // A defaulted-entity UPDATE advertises `{Entity}UpdateRequest` (keeps
+            // the `default` fields — settable on update); every other DTO
+            // endpoint advertises `{Entity}Request` (issue #85 D1).
+            let entity = rb.entity.as_deref().expect("entity body");
+            let name = if ep.method.is_update() && design.entity_has_default(entity) {
+                format!("{entity}UpdateRequest")
             } else {
-                entity_ref(&rb.entity)
+                format!("{entity}Request")
             };
+            entity_ref(&name)
+        } else {
+            entity_ref(rb.entity.as_deref().expect("entity body"))
+        };
         op["requestBody"] = json!({
             "required": true,
             "content": { "application/json": { "schema": schema } },
@@ -148,10 +153,11 @@ fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
     if ep.method == HttpMethod::POST
         && op["responses"].get("409").is_none()
         && let Some(rb) = &ep.request_body
+        && let Some(entity) = rb.entity.as_deref()
         && let Some(group) = m
             .entities
             .iter()
-            .find(|e| e.name == rb.entity)
+            .find(|e| e.name == entity)
             .and_then(|e| e.unique.first())
     {
         let cols = group.join(", ");
@@ -202,7 +208,7 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
                     && ep
                         .request_body
                         .as_ref()
-                        .is_some_and(|rb| rb.entity == e.name)
+                        .is_some_and(|rb| rb.entity.as_deref() == Some(e.name.as_str()))
             });
         if needs_request_schema {
             schemas.insert(
@@ -221,7 +227,7 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
                     && ep
                         .request_body
                         .as_ref()
-                        .is_some_and(|rb| rb.entity == e.name)
+                        .is_some_and(|rb| rb.entity.as_deref() == Some(e.name.as_str()))
             });
         if needs_update_schema {
             schemas.insert(
@@ -230,9 +236,39 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
             );
         }
     }
+    // Inline-DTO bodies (issue #122): a custom action whose body is not a table row
+    // advertises `{Pascal(operation_id)}Request` — a plain object schema built from
+    // its `fields` (types + required set + #80 constraints), so the custom action is
+    // fully described in the contract even though no entity backs it.
+    for ep in &m.endpoints {
+        if let Some(rb) = ep.request_body.as_ref()
+            && rb.is_inline()
+        {
+            schemas.insert(
+                format!("{}Request", to_pascal(&ep.operation_id)),
+                inline_request_schema(&rb.fields),
+            );
+        }
+    }
     for sub in &m.subroutes {
         walk_schemas(design, sub, schemas);
     }
+}
+
+/// The inline-DTO request schema (issue #122): a plain object over the declared
+/// `fields` — each field's type schema (with #80 min/max/minLength/maxLength via
+/// `field_schema`) plus the required set. No fk columns, no server-owned omission
+/// (unlike `request_schema` — an inline body is not an entity).
+fn inline_request_schema(fields: &[Field]) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for f in fields {
+        properties.insert(f.name.clone(), field_schema(f));
+        if f.required {
+            required.push(Value::String(f.name.clone()));
+        }
+    }
+    json!({ "type": "object", "properties": properties, "required": required })
 }
 
 /// The `{Entity}Request` schema (issues #34 + #53): the entity's request shape

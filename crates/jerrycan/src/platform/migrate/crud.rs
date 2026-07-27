@@ -79,7 +79,8 @@ pub fn endpoints_for(
             // Imported CRUD endpoints take the generator's happy-path probe.
             probe: ProbePolicy::Auto,
             request_body: body.then(|| RequestBody {
-                entity: entity.into(),
+                entity: Some(entity.into()),
+                fields: vec![],
             }),
             success: Success {
                 status,
