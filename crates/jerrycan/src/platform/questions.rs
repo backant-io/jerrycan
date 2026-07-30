@@ -1754,6 +1754,19 @@ pub fn validate(d: &Design) -> Vec<Question> {
                         ),
                     ));
                 }
+                // (8) the counter must be NOT NULL. A nullable (`required: false`)
+                // counter is NULL on insert, so the atomic guard `used + n <= capacity`
+                // evaluates to NULL (never true) and `reserve` returns `Ok(false)`
+                // FOREVER — silently dead. Require it, ideally with `"default": 0`.
+                if !f.required {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against` but is nullable (`required: false`) — a NULL counter makes the atomic guard `{} + n <= {}` NULL, so `reserve` returns `Ok(false)` forever (it can never reserve). Make `{}` `required: true` (add `\"default\": 0` for a server-owned counter starting at 0). See `jerrycan explain JC0564`.",
+                            e.name, f.name, f.name, cap, f.name
+                        ),
+                    ));
+                }
                 // (4a) the counter field must not be the pk `id`.
                 if f.name == "id" {
                     qs.push(q(
@@ -1806,6 +1819,18 @@ pub fn validate(d: &Design) -> Vec<Question> {
                         format!(
                             "Entity `{}` field `{}` reserves against `{}`, which is `{:?}`, not `integer` — the capacity ceiling must be an integer column. Make `{}` integer, or point `reserve_against` at an integer field. See `jerrycan explain JC0564`.",
                             e.name, f.name, cap, capf.field_type, cap
+                        ),
+                    ));
+                }
+                // (9) the capacity field must be NOT NULL. A nullable capacity is NULL
+                // on insert, so the guard `used + n <= capacity` is NULL and `reserve`
+                // returns `Ok(false)` forever — the same silent-dead failure as (8).
+                if !capf.required {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` reserves against `{}`, which is nullable (`required: false`) — a NULL capacity makes the atomic guard `{} + n <= {}` NULL, so `reserve` returns `Ok(false)` forever (it can never reserve). Make `{}` `required: true`. See `jerrycan explain JC0564`.",
+                            e.name, f.name, cap, f.name, cap, cap
                         ),
                     ));
                 }
@@ -4033,6 +4058,38 @@ mod tests {
         assert!(
             hit.question.contains("no database"),
             "message must refuse reserve_against without a database: {}",
+            hit.question
+        );
+    }
+
+    /// (8) a NULLABLE counter (review FIX 2). A `required: false` counter is NULL on
+    /// insert, so the guard `used + n <= capacity` is NULL → `reserve` returns
+    /// `Ok(false)` forever (silently dead). The counter must be NOT NULL.
+    #[test]
+    fn reserve_against_nullable_counter_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "used", "type": "integer", "reserve_against": "capacity" }"#,
+            r#"{ "name": "used", "type": "integer", "required": false, "reserve_against": "capacity" }"#,
+        );
+        assert!(
+            hit.question.contains("nullable") && hit.question.contains("Ok(false)` forever"),
+            "message must refuse a nullable counter and name the silent-dead failure: {}",
+            hit.question
+        );
+    }
+
+    /// (9) a NULLABLE capacity (review FIX 2). A `required: false` capacity is NULL on
+    /// insert, so the guard is NULL → `reserve` returns `Ok(false)` forever. The named
+    /// capacity field must be NOT NULL.
+    #[test]
+    fn reserve_against_nullable_capacity_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "capacity", "type": "integer" }"#,
+            r#"{ "name": "capacity", "type": "integer", "required": false }"#,
+        );
+        assert!(
+            hit.question.contains("nullable") && hit.question.contains("capacity"),
+            "message must refuse a nullable capacity: {}",
             hit.question
         );
     }

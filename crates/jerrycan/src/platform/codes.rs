@@ -364,8 +364,8 @@ pub const REGISTRY: &[CodeInfo] = &[
     CodeInfo {
         code: "JC0564",
         title: "invalid reserve_against field",
-        cause: "a field's `reserve_against` (issue #187) wires the generated atomic `{Entity}Repo::reserve(id, n)` method — the #108-proven conditional UPDATE `SET counter = counter + n WHERE id = ? AND counter + n <= capacity` — but the declaration is unbuildable: it names a capacity field that does not exist on the entity; the counter field (the one carrying `reserve_against`) is not `integer`; the named capacity field is not `integer`; the counter or the capacity is the primary key `id`; `reserve_against` names the field's OWN name (a field cannot reserve against itself); more than one field on the entity carries `reserve_against` (the generated `reserve` method name would be ambiguous); or the design has no database (the atomic UPDATE is emitted on the SQL-backed repo only — a memory repo cannot run it)",
-        fix: "put `reserve_against` on exactly ONE integer counter field per entity, naming a SEPARATE integer capacity field (both ordinary columns, neither the pk `id`) — e.g. `{ \"name\": \"used\", \"type\": \"integer\", \"default\": 0, \"reserve_against\": \"capacity\" }` beside `{ \"name\": \"capacity\", \"type\": \"integer\" }`; and give the design a database (`db` in `dependencies`) so the SQL-backed `reserve` method is generated",
+        cause: "a field's `reserve_against` (issue #187) wires the generated atomic `{Entity}Repo::reserve(id, n)` method — the #108-proven conditional UPDATE `SET counter = counter + n WHERE id = ? AND counter + n <= capacity` — but the declaration is unbuildable: it names a capacity field that does not exist on the entity; the counter field (the one carrying `reserve_against`) is not `integer`; the named capacity field is not `integer`; the counter or the capacity is the primary key `id`; `reserve_against` names the field's OWN name (a field cannot reserve against itself); the counter or the named capacity is nullable (`required: false`) — a NULL counter or capacity makes the guard `counter + n <= capacity` NULL, so `reserve` returns `Ok(false)` forever (silently never reserves); more than one field on the entity carries `reserve_against` (the generated `reserve` method name would be ambiguous); or the design has no database (the atomic UPDATE is emitted on the SQL-backed repo only — a memory repo cannot run it)",
+        fix: "put `reserve_against` on exactly ONE integer counter field per entity, naming a SEPARATE integer capacity field (both ordinary columns, neither the pk `id`, both NOT NULL — `required: true`, the default) — e.g. `{ \"name\": \"used\", \"type\": \"integer\", \"default\": 0, \"reserve_against\": \"capacity\" }` beside `{ \"name\": \"capacity\", \"type\": \"integer\" }`; and give the design a database (`db` in `dependencies`) so the SQL-backed `reserve` method is generated",
         doc: "jerrycan docs designing",
     },
     CodeInfo {
@@ -827,17 +827,19 @@ mod tests {
     fn jc0564_names_the_reserve_against_integer_fields_rule() {
         // WHY: JC0564 (#187) is the agent's stop after `check` rejects a malformed
         // `reserve_against` declaration. `jerrycan explain JC0564` must name the rule
-        // — the counter and its named capacity are DISTINCT integer non-pk fields,
-        // exactly one per entity, on a DB-backed design — so the agent can fix the
-        // shape without reading the generator. The cause enumerates every refusal
-        // (missing/non-integer/self/pk target, >1 per entity, memory-only); the fix
-        // states the well-formed shape and the `db` requirement.
+        // — the counter and its named capacity are DISTINCT integer non-pk NOT-NULL
+        // fields, exactly one per entity, on a DB-backed design — so the agent can fix
+        // the shape without reading the generator. The cause enumerates every refusal
+        // (missing/non-integer/self/pk target, nullable counter/capacity, >1 per
+        // entity, memory-only); the fix states the well-formed shape and the `db`
+        // requirement.
         let info = lookup("JC0564").unwrap();
         assert!(
             info.cause.contains("reserve_against")
                 && info.cause.contains("integer")
                 && info.cause.contains("capacity")
                 && info.cause.contains("primary key")
+                && info.cause.contains("nullable")
                 && info.cause.contains("more than one")
                 && info.cause.contains("no database"),
             "cause must name the reserve/capacity integer-fields rule and every refusal: {}",

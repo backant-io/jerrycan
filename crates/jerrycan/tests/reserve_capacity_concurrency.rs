@@ -19,7 +19,11 @@
 
 /// The atomic reserve the generator emits (module `venue`, entity `Room`, counter
 /// `used`, capacity `capacity`). The concurrency legs fire this IDENTICAL statement.
-const RESERVE_SQL: &str = "UPDATE rooms SET used = used + ? WHERE id = ? AND used + ? <= capacity";
+/// Every identifier is double-quoted (ANSI `"ident"`, honored by SQLite AND Postgres)
+/// so a keyword-named counter/capacity can never emit a syntax error (review FIX 1) —
+/// this is RESERVE_SQL's runtime VALUE (real quotes); the generated repo SOURCE carries
+/// the same string with the quotes ESCAPED, which `test_a` matches separately.
+const RESERVE_SQL: &str = "UPDATE \"rooms\" SET \"used\" = \"used\" + ? WHERE \"id\" = ? AND \"used\" + ? <= \"capacity\"";
 
 /// A minimal integer-pk db design whose `Room` entity declares `reserve_against` on
 /// its `used` counter against the `capacity` ceiling — so its generated repo carries
@@ -59,8 +63,13 @@ fn test_a_generated_reserve_emits_the_atomic_capacity_guard() {
         repo.contains("pub async fn reserve(&self, id: i64, n: i64) -> Result<bool>"),
         "generated repo must emit `reserve(id, n) -> Result<bool>`:\n{repo}"
     );
+    // The generated repo SOURCE carries the atomic UPDATE as a Rust string literal, so
+    // its double-quoted identifiers appear ESCAPED (`\"rooms\"`) in the source text —
+    // distinct from RESERVE_SQL's runtime value (real quotes) the legs actually fire.
     assert!(
-        repo.contains(RESERVE_SQL),
+        repo.contains(
+            r#"UPDATE \"rooms\" SET \"used\" = \"used\" + ? WHERE \"id\" = ? AND \"used\" + ? <= \"capacity\""#
+        ),
         "generated reserve must carry the exact atomic capacity guard the legs fire:\n{repo}"
     );
     assert!(
@@ -169,6 +178,61 @@ async fn test_b_sqlite_concurrent_reserves_never_oversell() {
     assert_no_oversell(&db, 5, 20).await;
     assert_no_oversell(&db, 1, 16).await;
     assert_no_oversell(&db, 10, 40).await;
+}
+
+/// Review FIX 1 (reserved-word identifiers): the generator double-quotes every
+/// interpolated identifier, so a counter/capacity named after a SQL keyword still
+/// EXECUTES. This is the exact shape the generator emits for a `Slot` whose counter is
+/// `order` and capacity is `limit` (table `slots`) — both reserved words. Fired
+/// UNQUOTED it would be `UPDATE slots SET order = order + ? WHERE id = ? AND order + ?
+/// <= limit`, a runtime `syntax error near "order"` behind a green `check`. Quoted, it
+/// runs and enforces the guard. SQLite is always available (no external dependency).
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn test_b_reserved_word_identifiers_execute_without_syntax_error() {
+    // The generator's emission for reserved-word columns (runtime value: real quotes).
+    const RESERVE_KEYWORDS_SQL: &str = "UPDATE \"slots\" SET \"order\" = \"order\" + ? WHERE \"id\" = ? AND \"order\" + ? <= \"limit\"";
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    // The reserved words MUST be quoted in DDL too, or the CREATE itself is a syntax error.
+    db.conn()
+        .execute_unprepared(
+            "CREATE TABLE slots (id INTEGER PRIMARY KEY, \"limit\" INTEGER NOT NULL, \
+             \"order\" INTEGER NOT NULL DEFAULT 0)",
+        )
+        .await
+        .unwrap();
+    db.conn()
+        .execute_unprepared("INSERT INTO slots (id, \"limit\", \"order\") VALUES (1, 2, 0)")
+        .await
+        .unwrap();
+
+    let reserve = |n: i64| {
+        let db = db.clone();
+        async move {
+            db.conn()
+                .execute(Statement::from_sql_and_values(
+                    db.conn().get_database_backend(),
+                    db.sql(RESERVE_KEYWORDS_SQL),
+                    [n.into(), 1i64.into(), n.into()],
+                ))
+                .await
+                // An `.unwrap()` here would surface the `syntax error` the UNQUOTED SQL
+                // throws — the whole point of the regression.
+                .expect("quoted reserved-word reserve must EXECUTE (no syntax error)")
+                .rows_affected()
+                == 1
+        }
+    };
+
+    assert!(reserve(1).await, "first reserve fits (0 -> 1 of limit 2)");
+    assert!(
+        reserve(1).await,
+        "second reserve fits exactly (1 -> 2 of limit 2)"
+    );
+    assert!(
+        !reserve(1).await,
+        "third reserve is refused (2 -> 3 > limit 2) — the quoted guard still enforces capacity"
+    );
 }
 
 /// Postgres — the executable #187 proof on a pool with REAL concurrent writers.

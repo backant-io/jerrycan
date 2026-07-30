@@ -2596,6 +2596,9 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
     /// conditional UPDATE — correct on SQLite AND Postgres (all callers contend on the
     /// SAME pk row, so the row lock + WHERE guard serialize them; no oversell).
     /// `Ok(true)` reserved; `Ok(false)` at capacity, or no such row.
+    /// `n` must be a POSITIVE reservation amount — a negative `n` is treated as a
+    /// release that always fits and can drive `{used}` below 0 (releases/refunds are
+    /// out of scope for this primitive).
     pub async fn reserve(&self, id: {key}, n: i64) -> Result<bool> {{
         let r = self
             .db
@@ -2603,7 +2606,7 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
             .execute(sea_orm::Statement::from_sql_and_values(
                 self.db.conn().get_database_backend(),
                 self.db.sql(
-                    "UPDATE {table} SET {used} = {used} + ? WHERE id = ? AND {used} + ? <= {capacity}",
+                    "UPDATE \"{table}\" SET \"{used}\" = \"{used}\" + ? WHERE \"id\" = ? AND \"{used}\" + ? <= \"{capacity}\"",
                 ),
                 [n.into(), id.into(), n.into()],
             ))
@@ -4536,9 +4539,14 @@ pub(crate) mod tests {
         );
         // The body carries the EXACT #108 atomic guard — this is the whole no-oversell
         // property, byte-for-byte identical to the hand-written pattern the docs prove.
+        // Every interpolated identifier is double-quoted (ANSI `"ident"`, honored by
+        // SQLite AND Postgres) so a counter/capacity named after a SQL keyword can never
+        // emit a syntax error behind a green `check` (`db.sql()` only rewrites `?`).
         assert!(
-            src.contains("UPDATE rooms SET used = used + ? WHERE id = ? AND used + ? <= capacity"),
-            "reserve must carry the exact atomic capacity guard: {src}"
+            src.contains(
+                r#"UPDATE \"rooms\" SET \"used\" = \"used\" + ? WHERE \"id\" = ? AND \"used\" + ? <= \"capacity\""#
+            ),
+            "reserve must carry the exact atomic capacity guard with quoted identifiers: {src}"
         );
         // Values bind [n, id, n] and success is EXACTLY one affected row.
         assert!(
@@ -4551,6 +4559,101 @@ pub(crate) mod tests {
             src.matches("pub async fn reserve(").count(),
             1,
             "exactly one reserve method (Room's); Amenity must emit none: {src}"
+        );
+    }
+
+    /// Issue #187 (review FIX 1) — the reserve UPDATE double-quotes EVERY interpolated
+    /// identifier, so a counter or capacity named after a SQL reserved word (`limit`,
+    /// `order`) still generates a syntactically valid statement. Without quoting,
+    /// `UPDATE t SET order = order + ? WHERE id = ? AND order + ? <= limit` throws a
+    /// runtime `syntax error` behind a green `check` (`db.sql()` only rewrites `?`, it
+    /// does NOT quote identifiers). The emitted SQL must carry `"order"` / `"limit"`.
+    #[test]
+    fn reserve_quotes_reserved_word_identifiers() {
+        const D: &str = r#"{
+            "name": "slots-api", "contract_version": 1,
+            "dependencies": ["db"],
+            "modules": [{
+                "name": "slots",
+                "entities": [
+                    { "name": "Slot", "fields": [
+                        { "name": "limit", "type": "integer" },
+                        { "name": "order", "type": "integer", "reserve_against": "limit" }
+                    ]}
+                ],
+                "endpoints": [
+                    { "operation_id": "create_slot", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Slot" },
+                      "success": { "status": 201, "entity": "Slot" } }
+                ]
+            }]
+        }"#;
+        let d: Design = serde_json::from_str(D).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: false,
+            },
+            &d,
+        )
+        .unwrap();
+        // Every reserved-word identifier is quoted — table, counter, capacity, and the pk
+        // `id` — so the statement parses on both SQLite and Postgres.
+        assert!(
+            src.contains(
+                r#"UPDATE \"slots\" SET \"order\" = \"order\" + ? WHERE \"id\" = ? AND \"order\" + ? <= \"limit\""#
+            ),
+            "reserve on reserved-word columns must quote every identifier: {src}"
+        );
+    }
+
+    /// Issue #187 (review FIX 4) — a UUID/string-pk entity emits a compilable
+    /// `reserve(&self, id: String, ...)`: the `{key}` type is threaded from the same
+    /// `key_rust_type` helper `insert`/`get` use, so a non-integer pk flows through
+    /// correctly. Proves the reserve signature is pk-type-generic, not integer-only.
+    #[test]
+    fn reserve_emits_string_pk_signature() {
+        const D: &str = r#"{
+            "name": "vault-api", "contract_version": 1,
+            "dependencies": ["db"],
+            "modules": [{
+                "name": "vault",
+                "entities": [
+                    { "name": "Quota", "fields": [
+                        { "name": "id", "type": "string" },
+                        { "name": "cap", "type": "integer" },
+                        { "name": "used", "type": "integer", "reserve_against": "cap" }
+                    ]}
+                ],
+                "endpoints": [
+                    { "operation_id": "create_quota", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Quota" },
+                      "success": { "status": 201, "entity": "Quota" } }
+                ]
+            }]
+        }"#;
+        let d: Design = serde_json::from_str(D).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: false,
+            },
+            &d,
+        )
+        .unwrap();
+        // The pk type `{key}` is `String` (a declared string id), and `reserve` carries it.
+        assert!(
+            src.contains("pub async fn reserve(&self, id: String, n: i64) -> Result<bool>"),
+            "reserve must carry the string pk type in its signature: {src}"
+        );
+        // The quoted atomic guard is unchanged — only the pk type differs.
+        assert!(
+            src.contains(
+                r#"UPDATE \"quotas\" SET \"used\" = \"used\" + ? WHERE \"id\" = ? AND \"used\" + ? <= \"cap\""#
+            ),
+            "reserve must still carry the quoted atomic guard for a string-pk entity: {src}"
         );
     }
 
