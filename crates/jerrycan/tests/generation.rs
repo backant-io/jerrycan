@@ -145,7 +145,7 @@ fn write_only_columns_are_response_hidden_in_the_scaffolded_model() {
                   "success": { "status": 200, "entity": "Account" } } ] }] }"#;
     let d: Design = serde_json::from_str(HIDDEN).unwrap();
     // The design validates clean — write_only is accepted on a non-id field, and
-    // there is no realtime `changes` entity so JC0555 does not fire.
+    // there is no realtime `changes` entity to project.
     let qs = jerrycan::platform::questions::validate(&d);
     assert!(qs.is_empty(), "write_only db design must validate: {qs:?}");
 

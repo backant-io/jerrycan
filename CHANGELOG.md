@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.18 — 2026-07-30
+
+Realtime security.
+
+### Security
+- **The realtime `changes` broadcast no longer leaks `write_only`/secret columns
+  (#167).** The `changes` channel delivers the raw DB row, so `#[serde(skip_serializing)]`
+  (the #112 REST-response mechanism) never applied — a `write_only`/`password_hash`
+  column on a `changes` entity was broadcast to every WebSocket subscriber. The
+  engine now **projects those columns out** of the broadcast row (at the single
+  `deliver_change` delivery seam, covering both the WAL and trigger paths); the
+  column is still stored and returned by nothing, and never reaches a subscriber.
+- **`JC0555` is lifted.** The 0.6.8 interim refused a `write_only`/`password_hash`
+  column on a `changes` entity by construction; with projection the combination is
+  safe, so the restriction is removed — a `changes` entity may carry a `write_only`
+  column again (it is simply never broadcast).
+
+Byte-identical broadcast for any entity with no `write_only` column.
+
 ## 0.6.17 — 2026-07-30
 
 ### Fixed

@@ -35,6 +35,7 @@ fn wire(db: jerrycan::db::Db) -> Realtime {
             table: "lead".into(),
             pk_column: "id".into(),
             tenant_column: Some("workspace_id".into()),
+            hidden_columns: vec![],
         })
         .broadcast("deal_room", TopicScope::Tenant)
         .presence("editors", TopicScope::Tenant)

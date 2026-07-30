@@ -37,7 +37,7 @@ pub enum TopicScope {
 
 /// One subscribable entity: the generated wiring supplies table/pk/tenant
 /// column so the adapters can build DDL and extract scope keys.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ChangeChannelSpec {
     pub entity: String,
     pub table: String,
@@ -45,6 +45,14 @@ pub struct ChangeChannelSpec {
     /// The tenant fk column when the entity is tenant-owned; None ⇒ delivery
     /// to every authenticated subscriber.
     pub tenant_column: Option<String>,
+    /// Column names stripped from the broadcast row before it reaches any
+    /// subscriber — the entity's `write_only`/`password_hash` columns (#167).
+    /// Empty ⇒ the full row is broadcast (byte-identical to pre-0.6.18). The
+    /// value still transits the engine's own process memory (decoded from the
+    /// WAL tuple or SELECTed by the trigger) but is NEVER sent to a subscriber,
+    /// which is the security guarantee that lets a `write_only` column coexist
+    /// with a `changes` channel.
+    pub hidden_columns: Vec<String>,
 }
 
 /// The hub's static channel configuration (from the design, via realtimegen).
@@ -513,6 +521,15 @@ impl Hub {
             ChangeOp::Update => "update",
             ChangeOp::Delete => "delete",
         };
+        // Strip the entity's hidden (write_only/password_hash) columns from the
+        // row ONCE, before the per-subscriber fan-out (#167): the changes
+        // broadcast ships the RAW DB row, so a hidden column would otherwise
+        // reach every subscriber. Empty `hidden_columns` ⇒ the row is cloned
+        // unchanged ⇒ byte-identical broadcast.
+        let projected_row = ev
+            .row
+            .as_ref()
+            .map(|r| project_row(r, &spec.hidden_columns));
         let mut drop_list = Vec::new();
         {
             let conns = self.conns.lock().expect("hub mutex");
@@ -522,7 +539,7 @@ impl Hub {
                 }
                 let p = sub.principal.as_ref();
                 let payload = if change_visible(spec, &view, p) {
-                    Some(serde_json::json!({ "type": op_str, "pk": ev.pk, "row": ev.row }))
+                    Some(serde_json::json!({ "type": op_str, "pk": ev.pk, "row": projected_row }))
                 } else if delete_view_for_old_tenant(spec, &view, p) {
                     Some(serde_json::json!({ "type": "delete", "pk": ev.pk }))
                 } else {
@@ -544,6 +561,22 @@ impl Hub {
         for cid in drop_list {
             self.conns.lock().expect("hub mutex").remove(&cid);
         }
+    }
+}
+
+/// Remove the `hidden` keys from `row` when it is a JSON object; any other JSON
+/// shape is returned unchanged. An empty `hidden` set clones `row` verbatim, so
+/// an entity with no write_only column broadcasts a byte-identical row (#167).
+fn project_row(row: &serde_json::Value, hidden: &[String]) -> serde_json::Value {
+    match row {
+        serde_json::Value::Object(map) if !hidden.is_empty() => {
+            let mut map = map.clone();
+            for key in hidden {
+                map.remove(key);
+            }
+            serde_json::Value::Object(map)
+        }
+        other => other.clone(),
     }
 }
 
@@ -631,6 +664,7 @@ mod tests {
                 table: "lead".into(),
                 pk_column: "id".into(),
                 tenant_column: Some("workspace_id".into()),
+                hidden_columns: Vec::new(),
             })
             .broadcast("room", TopicScope::Tenant)
             .presence("editors", TopicScope::Tenant)
@@ -669,12 +703,20 @@ mod delivery_tests {
     use crate::protocol::ServerMsg;
 
     fn hub_with_lead() -> Arc<Hub> {
+        hub_with_lead_hiding(Vec::new())
+    }
+
+    /// A single-`Lead`-channel hub whose broadcast row strips `hidden` columns —
+    /// `hub_with_lead()` passes an empty set (full-row broadcast), the #167
+    /// projection test passes `["secret"]`.
+    fn hub_with_lead_hiding(hidden: Vec<String>) -> Arc<Hub> {
         let config = RealtimeConfig {
             changes: vec![ChangeChannelSpec {
                 entity: "Lead".into(),
                 table: "lead".into(),
                 pk_column: "id".into(),
                 tenant_column: Some("workspace_id".into()),
+                hidden_columns: hidden,
             }],
             ..Default::default()
         };
@@ -777,6 +819,49 @@ mod delivery_tests {
                 assert_eq!(payload["row"]["secret"], "s");
             }
             other => panic!("new tenant gets the update with the body: {other:?}"),
+        }
+    }
+
+    /// #167 (SECURITY): a hidden (write_only/password_hash) column is projected
+    /// OUT of the broadcast row before delivery — the subscriber receives every
+    /// OTHER column but NEVER the hidden one, on BOTH insert and update. This is
+    /// the realtime twin of the REST `skip_serializing` hide: the changes
+    /// channel ships the raw DB row, so without this projection the column
+    /// (present in `ev.row` from the WAL decode / trigger SELECT) would leak to
+    /// every subscriber. A regression that drops the projection turns this red.
+    #[test]
+    fn deliver_change_projects_hidden_columns_out_of_the_broadcast() {
+        let hub = hub_with_lead_hiding(vec!["secret".into()]);
+        let (c2, mut rx2) = hub.connect(tenant("t2"));
+        join_changes(&hub, c2);
+
+        let full_row = serde_json::json!({
+            "id": "42", "workspace_id": "t2", "email": "a@b.c", "secret": "shhh"
+        });
+
+        for op in [ChangeOp::Insert, ChangeOp::Update] {
+            hub.deliver_change(&ChangeEvent {
+                entity: "Lead".into(),
+                op,
+                pk: "42".into(),
+                row: Some(full_row.clone()),
+                tenant_id: Some("t2".into()),
+                old_tenant_id: None,
+            });
+            match rx2.try_recv() {
+                Ok(ServerMsg::Event { channel, payload }) => {
+                    assert_eq!(channel, "changes:Lead");
+                    assert!(
+                        payload["row"].get("secret").is_none(),
+                        "the write_only `secret` must NEVER be broadcast: {payload}"
+                    );
+                    // Every other column still rides along unchanged.
+                    assert_eq!(payload["row"]["id"], "42", "{payload}");
+                    assert_eq!(payload["row"]["workspace_id"], "t2", "{payload}");
+                    assert_eq!(payload["row"]["email"], "a@b.c", "{payload}");
+                }
+                other => panic!("subscriber must receive the projected row: {other:?}"),
+            }
         }
     }
 }
