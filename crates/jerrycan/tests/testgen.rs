@@ -874,6 +874,72 @@ fn nested_path_scoped_module_gets_isolation_test_with_pinned_tenant() {
     );
 }
 
+/// #172: the tenant ROOT module whose own `GET /{id}` detail route is GUARDED gets
+/// a cross-tenant non-member-404 probe (the collection test only covers the root's
+/// LIST, and `tenant_owned_isolation_test` skips the root). A root whose detail
+/// route is PUBLIC (public discovery) gets NO probe — asserting 404 against a route
+/// that returns 200 to everyone would false-fail it.
+#[test]
+fn tenant_root_with_a_guarded_detail_route_gets_the_non_member_404_probe() {
+    // Base shape: a Workspace tenant root with a guarded create + guarded detail.
+    const GUARDED: &str = r#"{
+        "name": "ws-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "workspaces",
+              "entities": [{ "name": "Workspace", "fields": [
+                  { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_workspace", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Workspace" }, "success": { "status": 201, "entity": "Workspace" } },
+                  { "operation_id": "list_workspaces", "method": "GET", "path": "/", "auth_required": true,
+                    "success": { "status": 200, "entity": "Workspace", "list": true } },
+                  { "operation_id": "show_workspace", "method": "GET", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Workspace" } } ] }
+        ]
+    }"#;
+    let d: Design = serde_json::from_str(GUARDED).unwrap();
+    let ws = d.modules.iter().find(|m| m.name == "workspaces").unwrap();
+    let out = testgen::acceptance_rs(&d, ws);
+    assert!(
+        out.contains("async fn a_non_member_cannot_read_the_workspace_detail()"),
+        "guarded root detail route must get the non-member-404 probe: {out}"
+    );
+    let probe = out
+        .split("async fn a_non_member_cannot_read_the_workspace_detail()")
+        .nth(1)
+        .expect("root-detail probe fn present");
+    // The probe seeds a tenant-1 row as user 1, then asserts user 2 (a member of
+    // tenant 2 only) gets 404 on the root's own detail route.
+    assert!(
+        probe.contains("&test_cookie_for(1))]).await;") && probe.contains("\"/workspaces/\""),
+        "user 1 seeds the tenant-1 root row via the create: {probe}"
+    );
+    assert!(
+        probe.contains("&format!(\"/workspaces/{id}\"), &[(\"cookie\", &test_cookie_for(2))])")
+            && probe.contains("cross-tenant get on the tenant root must 404"),
+        "the probe asserts a non-member (test_cookie_for(2)) 404s on the root detail route: {probe}"
+    );
+
+    // A root whose detail route is PUBLIC (discovery) emits NO probe — a 404
+    // assertion would false-fail a route that returns 200 to everyone.
+    let public_detail = GUARDED.replace(
+        r#"{ "operation_id": "show_workspace", "method": "GET", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Workspace" } }"#,
+        r#"{ "operation_id": "show_workspace", "method": "GET", "path": "/{id}", "public": true,
+                    "success": { "status": 200, "entity": "Workspace" } }"#,
+    );
+    let dp: Design = serde_json::from_str(&public_detail).unwrap();
+    let wsp = dp.modules.iter().find(|m| m.name == "workspaces").unwrap();
+    let outp = testgen::acceptance_rs(&dp, wsp);
+    assert!(
+        !outp.contains("a_non_member_cannot_read_the_workspace_detail"),
+        "a PUBLIC root detail route must emit NO non-member-404 probe: {outp}"
+    );
+}
+
 /// A GRANDCHILD entity — transitively tenant-owned (`Contact belongs_to Account
 /// belongs_to Org`, mount `/accounts/{account_id}`) — gets a cross-tenant
 /// isolation test (issue #102). Before the transitive fix the generator BAILED on
