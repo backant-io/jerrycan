@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.27 — 2026-07-30
+
+### Fixed
+- **The tenant root's own detail route now gets a cross-tenant isolation probe (#172).**
+  Child and grandchild tenant entities already got a generated acceptance probe proving
+  a non-member gets `404` on another tenant's row by id. The tenant ROOT entity itself
+  (e.g. `Workspace`) was skipped — the finder keys on `tenant_path`, which is `None` for
+  the root — and the collection isolation test covers only the root's list, not its
+  detail route. So a regression that dropped the membership guard on a **guarded**
+  `GET /{root}/{id}` — leaking any tenant's root row to a non-member — passed every
+  generated test. testgen now emits `a_non_member_cannot_read_the_{root}_detail` for a
+  db+auth+tenancy design whose root module exposes a guarded `GET /{id}`: user 2 (a
+  member of a different tenant) must get `404`. It is RED on the stub and on an unscoped
+  `get`, green only when the route keeps its membership-checked `Dep<Tenant>` guard
+  (which `404`s a non-member). A public root detail route is correctly skipped (it 200s
+  everyone by design).
+
+Byte-identical for every design without a guarded tenant-root detail route.
+
 ## 0.6.26 — 2026-07-30
 
 ### Added
