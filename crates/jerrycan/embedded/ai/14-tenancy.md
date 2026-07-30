@@ -432,8 +432,8 @@ these generated methods, and its collection handlers are steered to the first tw
 - `all_for_member(user_id)` lists ONLY the tenants the caller belongs to
   (`JOIN {tenant}_members ... WHERE user_id = ?`), never the unscoped `all()`.
 - `members_of(fk)`, `add_member(fk, user_id, role)`, `set_member_role(fk, user_id,
-  role)`, `remove_member(fk, user_id)`, plus the `count_admins(fk)` helper, back
-  the generated member-management routes (next section) — real SQL against
+  role)`, `remove_member(fk, user_id)` back the generated member-management routes
+  (next section) — real SQL against
   `{tenant}_members`, keyed on the path tenant fk the guard verified. You rarely
   call these yourself: the generated member handlers already do.
 
@@ -472,7 +472,10 @@ The rules the generated handlers and repo enforce:
   validator).
 - **Last-admin protection**: removing or demoting the last member holding the
   admin role is `409` — a tenant can never be left admin-less (nobody could manage
-  members again). This applies to self-removal too.
+  members again). This applies to self-removal too. The guard is ATOMIC (#138): each
+  write locks the tenant's admin set (Postgres `FOR UPDATE`) then re-checks the admin
+  count inside the write's own `WHERE`, so two concurrent admin-gated writes can never
+  both pass and leave zero admins.
 
 The routes are first-class: they appear in the generated OpenAPI (with the `role`
 enum pinned to the declared `member_roles`) and in `jerrycan routes`, and the

@@ -2041,10 +2041,13 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
 /// inserted via `Entity::insert(..).exec(..)`).
 ///
 /// Issue #107 adds the member-management surface on the same repo — `members_of`
-/// / `add_member` / `set_member_role` / `remove_member` / `count_admins` — real
-/// SQL keyed on the path tenant fk, with role validation (422), the last-admin
-/// guard (409), and duplicate adds surfacing UNIQUE as 409 via `db_error`. The
-/// `{Tenant}Member` row struct + MEMBER_ROLES const live in `tenant_member_row`.
+/// / `add_member` / `set_member_role` / `remove_member` — real SQL keyed on the
+/// path tenant fk, with role validation (422), the last-admin guard (409), and
+/// duplicate adds surfacing UNIQUE as 409 via `db_error`. The last-admin guard is
+/// ATOMIC (#138): each write locks the tenant's admin set (Postgres `FOR UPDATE`),
+/// then re-checks the admin count inside the write's own `WHERE`, so two concurrent
+/// admin-gated writes can never leave a tenant admin-less. The `{Tenant}Member` row
+/// struct + MEMBER_ROLES const live in `tenant_member_row`.
 fn tenant_own_methods(e: &Entity, design: &Design) -> String {
     let Some(tenancy) = design.tenancy.as_ref() else {
         return String::new();
@@ -2190,83 +2193,115 @@ fn tenant_own_methods(e: &Entity, design: &Design) -> String {
         if !MEMBER_ROLES.contains(&role.as_str()) {{
             return Err(Error::unprocessable("role must be one of: {roles_msg}"));
         }}
-        let target = {entity}Member::find_by_statement(sea_orm::Statement::from_sql_and_values(
-            self.db.conn().get_database_backend(),
-            self.db.sql(
-                "SELECT id, user_id, role FROM {members} WHERE user_id = ? AND {fk_col} = ?",
-            ),
-            [user_id.clone().into(), fk{fkc}.into()],
-        ))
-        .one(self.db.conn())
-        .await
-        .map_err(db_error)?;
-        if target.is_some_and(|m| m.role == "{admin}")
-            && role != "{admin}"
-            && self.count_admins(fk{fkc}).await? == 1
-        {{
-            return Err(Error::conflict("cannot demote the last {admin}"));
-        }}
-        let r = self
-            .db
-            .conn()
-            .execute(sea_orm::Statement::from_sql_and_values(
-                self.db.conn().get_database_backend(),
+        // Atomic last-admin guard (#138): one transaction that FIRST locks this
+        // tenant's admin rows, THEN runs a conditional UPDATE that re-checks the
+        // admin count in its own WHERE. Postgres READ COMMITTED permits write-skew
+        // between demotions of DISTINCT admin rows (each subquery reads the pre-image
+        // count = 2, both pass), so the FOR UPDATE lock serializes concurrent
+        // admin-gated writes on this tenant; SQLite serializes on its single writer
+        // and cannot parse FOR UPDATE, so it locks nothing. `? <> '{admin}'` is the
+        // NEW role, so re-affirming the last admin (new == admin) is a no-op UPDATE
+        // that still succeeds (rows_affected == 1).
+        use sea_orm::TransactionTrait;
+        let txn = self.db.conn().begin().await.map_err(db_error)?;
+        if txn.get_database_backend() == sea_orm::DatabaseBackend::Postgres {{
+            txn.execute(sea_orm::Statement::from_sql_and_values(
+                txn.get_database_backend(),
                 self.db.sql(
-                    "UPDATE {members} SET role = ? WHERE user_id = ? AND {fk_col} = ?",
+                    "SELECT id FROM {members} WHERE {fk_col} = ? AND role = '{admin}' FOR UPDATE",
                 ),
-                [role.into(), user_id.into(), fk.into()],
+                [fk{fkc}.into()],
             ))
             .await
             .map_err(db_error)?;
-        Ok(r.rows_affected() > 0)
+        }}
+        let r = txn
+            .execute(sea_orm::Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                self.db.sql(
+                    "UPDATE {members} SET role = ? WHERE user_id = ? AND {fk_col} = ? AND NOT (role = '{admin}' AND ? <> '{admin}' AND (SELECT COUNT(*) FROM {members} WHERE {fk_col} = ? AND role = '{admin}') <= 1)",
+                ),
+                [role.clone().into(), user_id.clone().into(), fk{fkc}.into(), role.into(), fk{fkc}.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        if r.rows_affected() > 0 {{
+            txn.commit().await.map_err(db_error)?;
+            return Ok(true);
+        }}
+        // rows_affected == 0: the guard blocked the last-admin demote (409) OR the
+        // member does not exist (Ok(false), a 404). One existence read in the same
+        // txn picks the status; the UPDATE already protected the last admin.
+        let still = {entity}Member::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            self.db.sql(
+                "SELECT id, user_id, role FROM {members} WHERE user_id = ? AND {fk_col} = ?",
+            ),
+            [user_id.into(), fk.into()],
+        ))
+        .one(&txn)
+        .await
+        .map_err(db_error)?;
+        txn.commit().await.map_err(db_error)?;
+        if still.is_some() {{
+            return Err(Error::conflict("cannot demote the last {admin}"));
+        }}
+        Ok(false)
     }}
 
     pub async fn remove_member(&self, fk: {key}, user_id: String) -> Result<bool> {{
-        let target = {entity}Member::find_by_statement(sea_orm::Statement::from_sql_and_values(
-            self.db.conn().get_database_backend(),
+        // Atomic last-admin guard (#138): one transaction that FIRST locks this
+        // tenant's admin rows, THEN runs a conditional DELETE that re-checks the
+        // admin count in its own WHERE. Postgres READ COMMITTED permits write-skew
+        // between removals of DISTINCT admin rows (each subquery reads the pre-image
+        // count = 2, both pass), so the FOR UPDATE lock serializes concurrent
+        // admin-gated writes on this tenant; SQLite serializes on its single writer
+        // and cannot parse FOR UPDATE, so it locks nothing.
+        use sea_orm::TransactionTrait;
+        let txn = self.db.conn().begin().await.map_err(db_error)?;
+        if txn.get_database_backend() == sea_orm::DatabaseBackend::Postgres {{
+            txn.execute(sea_orm::Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                self.db.sql(
+                    "SELECT id FROM {members} WHERE {fk_col} = ? AND role = '{admin}' FOR UPDATE",
+                ),
+                [fk{fkc}.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        }}
+        let r = txn
+            .execute(sea_orm::Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                self.db.sql(
+                    "DELETE FROM {members} WHERE user_id = ? AND {fk_col} = ? AND NOT (role = '{admin}' AND (SELECT COUNT(*) FROM {members} WHERE {fk_col} = ? AND role = '{admin}') <= 1)",
+                ),
+                [user_id.clone().into(), fk{fkc}.into(), fk{fkc}.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        if r.rows_affected() > 0 {{
+            txn.commit().await.map_err(db_error)?;
+            return Ok(true);
+        }}
+        // rows_affected == 0: the guard blocked the last-admin removal (409) OR the
+        // member does not exist (Ok(false), a 404). One existence read in the same
+        // txn picks the status; the DELETE already protected the last admin.
+        let still = {entity}Member::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            txn.get_database_backend(),
             self.db.sql(
                 "SELECT id, user_id, role FROM {members} WHERE user_id = ? AND {fk_col} = ?",
             ),
-            [user_id.clone().into(), fk{fkc}.into()],
+            [user_id.into(), fk.into()],
         ))
-        .one(self.db.conn())
+        .one(&txn)
         .await
         .map_err(db_error)?;
-        if target.is_some_and(|m| m.role == "{admin}")
-            && self.count_admins(fk{fkc}).await? == 1
-        {{
+        txn.commit().await.map_err(db_error)?;
+        if still.is_some() {{
             return Err(Error::conflict("cannot remove the last {admin}"));
         }}
-        let r = self
-            .db
-            .conn()
-            .execute(sea_orm::Statement::from_sql_and_values(
-                self.db.conn().get_database_backend(),
-                self.db.sql("DELETE FROM {members} WHERE user_id = ? AND {fk_col} = ?"),
-                [user_id.into(), fk.into()],
-            ))
-            .await
-            .map_err(db_error)?;
-        Ok(r.rows_affected() > 0)
-    }}
-
-    pub async fn count_admins(&self, fk: {key}) -> Result<i64> {{
-        let row = self
-            .db
-            .conn()
-            .query_one(sea_orm::Statement::from_sql_and_values(
-                self.db.conn().get_database_backend(),
-                self.db.sql(
-                    "SELECT COUNT(*) AS n FROM {members} WHERE {fk_col} = ? AND role = ?",
-                ),
-                [fk.into(), "{admin}".into()],
-            ))
-            .await
-            .map_err(db_error)?;
-        match row {{
-            Some(r) => r.try_get::<i64>("", "n").map_err(db_error),
-            None => Ok(0),
-        }}
+        Ok(false)
     }}
 "#
     )
@@ -5893,9 +5928,9 @@ pub(crate) mod tests {
     }
 
     /// Issue #107 / 0.6.0 Task 1: the tenant entity's own repo carries the full
-    /// member-management surface — list/add/re-role/remove plus the
-    /// `count_admins` helper backing the last-admin guard — as REAL SQL keyed on
-    /// the PATH tenant fk the membership guard already verified. Without these,
+    /// member-management surface — list/add/re-role/remove — as REAL SQL keyed on
+    /// the PATH tenant fk the membership guard already verified, with the last-admin
+    /// guard inlined ATOMICALLY into the re-role/remove writes (#138). Without these,
     /// every tenancy app hand-writes `INSERT INTO {tenant}_members …` (the #107
     /// finding), which is exactly the raw-SQL drift a generated surface kills.
     #[test]
@@ -5947,12 +5982,14 @@ pub(crate) mod tests {
             "remove_member deletes scoped to (user, tenant):\n{src}"
         );
         assert!(
-            src.contains("pub async fn count_admins(&self, fk: i64) -> Result<i64>"),
-            "count_admins helper exists:\n{src}"
+            src.contains("SELECT COUNT(*) FROM club_members WHERE club_id = ? AND role = 'owner'"),
+            "the last-admin guard inlines the per-tenant admin count in the write's WHERE:\n{src}"
         );
         assert!(
-            src.contains("SELECT COUNT(*) AS n FROM club_members WHERE club_id = ? AND role = ?"),
-            "count_admins counts one tenant's admins:\n{src}"
+            src.contains(
+                "SELECT id FROM club_members WHERE club_id = ? AND role = 'owner' FOR UPDATE"
+            ) && src.contains("== sea_orm::DatabaseBackend::Postgres"),
+            "each guarded write locks the tenant admin set on Postgres before the write:\n{src}"
         );
     }
 
@@ -6069,19 +6106,25 @@ pub(crate) mod tests {
             src.contains("Error::conflict(\"cannot remove the last owner\")"),
             "removing the last admin is refused:\n{src}"
         );
-        // Both writes consult the per-tenant admin count.
+        // Both writes inline the per-tenant admin count in a single conditional WHERE
+        // (no separate read-then-act — that read-then-act WAS the #138 write-skew race).
         assert_eq!(
-            src.matches("self.count_admins(fk).await? == 1").count(),
+            src.matches(
+                "(SELECT COUNT(*) FROM club_members WHERE club_id = ? AND role = 'owner') <= 1)"
+            )
+            .count(),
             2,
-            "both writes check the per-tenant admin count:\n{src}"
+            "both writes re-check the per-tenant admin count atomically in their WHERE:\n{src}"
         );
-        // The admin role is the FIRST declared member_role, bound in count_admins.
+        // The admin role is the FIRST declared member_role, a literal in the guard.
         assert!(
-            src.contains("[fk.into(), \"owner\".into()]"),
-            "count_admins counts the first declared role:\n{src}"
+            src.contains("AND role = 'owner') <= 1)"),
+            "the guard counts the first declared role:\n{src}"
         );
+        // Re-affirming the SAME admin role is not a demotion: the demote arm fires only
+        // when the NEW role differs (`? <> 'owner'`), evaluated in SQL, not in Rust.
         assert!(
-            src.contains("&& role != \"owner\""),
+            src.contains("? <> 'owner'"),
             "re-setting the same admin role is not a demotion:\n{src}"
         );
     }
@@ -6171,8 +6214,8 @@ pub(crate) mod tests {
             "text tenant pk means a String fk param:\n{src}"
         );
         assert!(
-            src.contains("self.count_admins(fk.clone()).await? == 1"),
-            "a String fk is cloned into the admin-count pre-check:\n{src}"
+            src.contains("[user_id.clone().into(), fk.clone().into(), fk.clone().into()]"),
+            "a String tenant fk is cloned into the guarded conditional DELETE binds:\n{src}"
         );
     }
 
