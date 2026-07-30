@@ -1546,13 +1546,15 @@ fn seed_second_tenant_fn(design: &Design, module: &ModuleDesign) -> String {
 /// is absent from user 2's list. Empty when there's no usable creator.
 /// Every applicable isolation test for a module, concatenated (issue #78/#79,
 /// spec §F). One design shape ⇒ one emitter fires; each returns "" when N/A, so
-/// composing is safe. The four shapes:
+/// composing is safe. The shapes:
 ///   - tenant-owned (flat MembershipSet, and nested path-scoped) — a member of
 ///     tenant A cannot reach tenant B's rows;
 ///   - per-user identity-owned — user B cannot reach user A's rows (#79);
 ///   - tenant-collection-create (I1) — the creator's list-own returns the new
 ///     tenant; a second user's list is empty (the backstop for an agent who calls
-///     the bare `insert` instead of `create_with_membership`).
+///     the bare `insert` instead of `create_with_membership`);
+///   - tenant-root detail (#172) — a non-member gets 404 on the tenant root's own
+///     `GET /{id}` detail route (the collection test covers only the root's list).
 fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
     let mut out = String::new();
     out.push_str(&tenant_owned_isolation_test(design, module));
@@ -1560,6 +1562,7 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
     out.push_str(&per_user_isolation_test(design, module));
     out.push_str(&public_read_isolation_test(design, module));
     out.push_str(&tenant_collection_isolation_test(design, module));
+    out.push_str(&tenant_root_detail_isolation_test(design, module));
     out
 }
 
@@ -2116,6 +2119,81 @@ fn tenant_collection_isolation_test(design: &Design, module: &ModuleDesign) -> S
         "/// SECURITY (#78, I1): creating a {entity} seeds ONLY the creator's membership.\n/// User 1 creates a {entity}; user 1's own list returns it; user 2's list is empty.\n/// Passes only when create uses `create_with_membership` (NOT the bare `insert`,\n/// which leaves the tenant memberless) and list uses `all_for_member`.\n#[tokio::test]\nasync fn creating_a_{plural2}_seeds_only_the_creators_membership() {{\n    let t = app().await;\n    let created = t.post_json_with(\"{base}/\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n    let id_value = row[\"id\"].clone();\n    let own = t.get_with(\"{base}/\", &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(own.status().as_u16(), 200, \"user 1 lists their own {plural}; body: {{}}\", own.text());\n    let own_rows: serde_json::Value = serde_json::from_str(&own.text()).expect(\"own list json\");\n    let present = own_rows.as_array().map(|a| a.iter().any(|r| r[\"id\"] == id_value)).unwrap_or(false);\n    assert!(present, \"the creator's list MUST contain the new {entity} (create_with_membership seeds membership); body: {{}}\", own.text());\n    let other = t.get_with(\"{base}/\", &[(\"{hk}\", &test_cookie_for(2))]).await;\n    assert_eq!(other.status().as_u16(), 200, \"user 2 lists their own {plural}; body: {{}}\", other.text());\n    let other_rows: serde_json::Value = serde_json::from_str(&other.text()).expect(\"other list json\");\n    let absent = other_rows.as_array().map(|a| a.iter().all(|r| r[\"id\"] != id_value)).unwrap_or(true);\n    assert!(absent, \"a non-creator's list must NOT contain the new {entity} (use all_for_member); body: {{}}\", other.text());\n}}\n\n",
         entity = entity.name,
         plural2 = Design::to_snake(&entity.name),
+        status = create.success.status,
+    )
+}
+
+/// The tenant ROOT's own detail-route cross-tenant probe (#172): user 1 creates a
+/// root {entity} (tenant 1); user 2 (a member of tenant 2 only — `app()` seeds it)
+/// must NOT be able to read it by id. WHY (Rule 9): `tenant_owned_isolation_test`
+/// SKIPS the root (its `tenant_path` is `None` — the root does not `belongs_to`
+/// itself) and `tenant_collection_isolation_test` covers only the root's
+/// COLLECTION (user 2's list is empty), so the root's own `GET /{id}` detail route
+/// has NO cross-tenant probe — a regression that reads via the unscoped `get`
+/// leaks ANY tenant's root row behind a fully-green suite. This probe is RED on a
+/// fresh scaffold's stub (the create 500s) AND on an unscoped `get` (200 — the
+/// leak), and GREEN only when the detail handler scopes the read to the caller's
+/// memberships (a non-member ⇒ `None` ⇒ 404).
+///
+/// Emitted ONLY for the module DECLARING `tenancy.entity` that has BOTH a GUARDED
+/// creator at "/" (to seed the tenant-1 row) AND a GUARDED `GET /{id}` detail
+/// route. A PUBLIC root detail route (e.g. the reference-slice's `show_workspace`
+/// "public discovery", which returns 200 to everyone by design) gets NO probe — a
+/// cross-tenant 404 assertion would false-fail it — so every non-tenancy /
+/// public-detail / detail-less design stays byte-identical. Decoupled from the
+/// list-gate of `tenant_collection_isolation_test` (which early-returns without a
+/// guarded LIST): a root with a guarded detail route but no guarded list still
+/// gets the probe.
+fn tenant_root_detail_isolation_test(design: &Design, module: &ModuleDesign) -> String {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return String::new();
+    };
+    // This module must DECLARE the tenant entity (be the tenant/root module).
+    let Some(entity) = module.entities.iter().find(|e| e.name == tenancy.entity) else {
+        return String::new();
+    };
+    // A GUARDED creator at "/" with this entity's body seeds the tenant-1 row to
+    // probe; `create_with_membership` keys on the session `_user`, so it must be
+    // guarded — without one there is nothing to isolate.
+    let Some(create) = module.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::POST
+            && ep.path == "/"
+            && ep.is_guarded()
+            && ep
+                .request_body
+                .as_ref()
+                .is_some_and(|rb| rb.entity.as_deref() == Some(entity.name.as_str()))
+    }) else {
+        return String::new();
+    };
+    // A GUARDED `GET /{id}` detail route — the route this probe protects. A PUBLIC
+    // detail route (200 to everyone by design) is skipped: asserting a cross-tenant
+    // 404 against it would false-fail a deliberately-public discovery route.
+    if !module
+        .endpoints
+        .iter()
+        .any(|ep| ep.method == HttpMethod::GET && param_count(ep) == 1 && ep.is_guarded())
+    {
+        return String::new();
+    }
+    let base = module.effective_mount();
+    let base = base.trim_end_matches('/');
+    let body = fixture_json(
+        design,
+        module,
+        &entity.name,
+        omits_identity_fk(design, module, create),
+        &[],
+        false, // isolation seeds a row via create — a create body omits defaults
+    );
+    let hk = design.test_auth_header();
+    let snake = Design::to_snake(&entity.name);
+    // A by-id URL must carry the RAW id: a string PK's `Value::String` Display
+    // includes JSON quotes (`"uuid"`), so interpolate the unquoted string (a numeric
+    // PK is identical) — mirrors the child `foreign` leg.
+    format!(
+        "/// SECURITY (#172): the tenant ROOT's own detail route must not leak another\n/// tenant's row. User 1 creates a {entity} (tenant 1); user 2 (tenant 2, seeded by\n/// app()) must NOT read it by id. Passes only when the detail handler scopes the\n/// read to the caller's memberships (a non-member ⇒ None ⇒ 404), NOT the unscoped\n/// `get`, which would leak any tenant's {entity}.\n#[tokio::test]\nasync fn a_non_member_cannot_read_the_{snake}_detail() {{\n    let t = app().await;\n    let created = t.post_json_with(\"{base}/\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n    let id = row[\"id\"].as_str().map(str::to_string).unwrap_or_else(|| row[\"id\"].to_string());\n    let foreign = t.get_with(&format!(\"{base}/{{id}}\"), &[(\"{hk}\", &test_cookie_for(2))]).await;\n    assert_eq!(foreign.status().as_u16(), 404, \"cross-tenant get on the tenant root must 404 (scope the detail read to the caller's memberships, not the unscoped get); body: {{}}\", foreign.text());\n}}\n\n",
+        entity = entity.name,
         status = create.success.status,
     )
 }
