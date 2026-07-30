@@ -62,6 +62,79 @@ is the STRINGIFIED user pk, so an integer or a uuid Supabase id round-trips). A
 is always JWT) is served correctly. Pick the model up front — REST routes,
 realtime, and the OpenAPI `securityScheme` all follow it.
 
+Under `"session"`, the agent writes the login that verifies the password and SETS
+the session cookie — there is no token to return, the `Set-Cookie` header IS the
+credential. Verify with `verify_password` against the stored PHC hash (written by
+`hash_password` at signup), then hand `auth.sessions().set_cookie(&SessionUser{…})`
+back as `Set-Cookie` on the response:
+```rust
+# use jerrycan::prelude::*;
+# use jerrycan::{Response, auth::{Auth, Session, hash_password, verify_password}};
+# use serde::{Deserialize, Serialize};
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+// The generated shared::SessionUser; a session design guards on Session<SessionUser>.
+#[derive(Serialize, Deserialize, Clone)]
+struct SessionUser { id: String, role: String }
+async fn me(Session(u): Session<SessionUser>) -> Json<String> { Json(u.id) }
+
+// The stored account row (from the DB in a real app): the pk, and the argon2 PHC hash
+// `hash_password` wrote at signup — never the plaintext.
+#[derive(Clone)]
+struct Account { id: String, email: String, role: String, password_hash: String }
+
+// The login request body the client POSTs.
+#[derive(Serialize, Deserialize)]
+struct Credentials { email: String, password: String }
+
+// The agent-written login: verify the password, then SET the session cookie on the
+// response. There is no token to hand back — the `Set-Cookie` header IS the credential.
+async fn login(
+    auth: Dep<Auth>,
+    account: Dep<Account>,
+    Json(creds): Json<Credentials>,
+) -> Result<Response> {
+    if creds.email != account.email || !verify_password(&creds.password, &account.password_hash)? {
+        return Err(Error::new(jerrycan::http::StatusCode::UNAUTHORIZED, "JC0401", "invalid credentials"));
+    }
+    let cookie = auth
+        .sessions()
+        .set_cookie(&SessionUser { id: account.id.clone(), role: account.role.clone() })?;
+    let mut res = IntoResponse::into_response(Json("ok"));
+    res.headers_mut().insert(
+        jerrycan::http::header::SET_COOKIE,
+        jerrycan::http::HeaderValue::from_str(&cookie).unwrap(),
+    );
+    Ok(res)
+}
+
+let account = Account {
+    id: "42".into(),
+    email: "ada@example.com".into(),
+    role: "user".into(),
+    password_hash: hash_password("correct horse battery staple").unwrap(),
+};
+let auth = Auth::with_secret("a-very-long-development-secret-string!!");
+let t = App::new()
+    .extend(auth)
+    .provide(account)
+    .route("/login", post(login))
+    .route("/me", get(me))
+    .into_test();
+
+use jerrycan::http::StatusCode;
+// Wrong password → 401, and no session cookie is issued.
+let bad = t.post_json("/login", &Credentials { email: "ada@example.com".into(), password: "guess".into() }).await;
+assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+// Right password → the response carries `Set-Cookie: jerrycan_session=...`; replaying
+// that cookie satisfies the `Session` guard (a bare `/me` is still 401).
+let ok = t.post_json("/login", &Credentials { email: "ada@example.com".into(), password: "correct horse battery staple".into() }).await;
+let set_cookie = ok.headers()["set-cookie"].to_str().unwrap();
+let cookie = set_cookie.split(';').next().unwrap().to_string();     // jerrycan_session=...
+assert_eq!(t.get("/me").await.status(), StatusCode::UNAUTHORIZED);
+assert_eq!(t.get_with("/me", &[("cookie", &cookie)]).await.json::<String>(), "42");
+# }); }
+```
+
 Under `"jwt"`, the agent writes the login that mints the token (there is no
 cookie to set). Mint over the same `SessionUser` shape with `Auth::jwt_key()`,
 and ALWAYS include an `exp` claim (unix seconds) — `decode` enforces it when
@@ -104,9 +177,17 @@ column, for an entity whose `belongs_to` targets the `User` entity:
 - **Per-user owner-scoping** — the generated repo is owner-scoped
   (`all_for`/`get_for`/`update_for`/`remove_for`, keyed on the session user), so
   one user can never read, update, or delete another user's rows.
-- **The server-injected fk** — `user_id` is dropped from the request DTO and
-  injected from the session on create, so a client cannot write a row as
-  someone else (see 00-designing.md, "Server-owned fields").
+- **The server-injected fk (the `user_id` convention)** — `user_id` is dropped
+  from the guarded request DTO and injected from the session on create, so a client
+  cannot write a row as someone else (see 00-designing.md, "Server-owned fields").
+  Name the convention when you author: the framework keys this auto-omission on the
+  LITERAL column `user_id` (design.rs `AUTH_IDENTITY_FK_COLUMN = "user_id"`), which
+  only an UN-aliased `belongs_to User` derives (`snake_case("User") + "_id"`). An
+  ALIASED `belongs_to` the identity — `as: "sender"` → `sender_id` (#119) — is
+  deliberately NOT the owner fk: it stays a plain, client-writable reference (a
+  message's sender/recipient), with no owner-scoping and no session injection. (An
+  `as` alias that would itself derive `user_id` on a non-identity target is refused,
+  `JC0560`.)
 - **`public_read`** — the public-read / owner-write split resolves the owner
   through the same `user_id` column.
 

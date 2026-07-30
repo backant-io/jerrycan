@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.23 — 2026-07-30
+
+### Docs
+- **Auth + tenancy doc improvements (#86).** `10-auth.md` gains a worked
+  **session-login** example (matching the existing JWT one) and now states the
+  **identity-fk convention** explicitly — the framework keys owner auto-omission on
+  the literal `user_id` column, and an aliased `belongs_to` the identity entity is
+  not the owner fk. `14-tenancy.md` mirrors the **unique-field-on-a-tenant-entity
+  gotcha** (a `unique` field needs enough distinct values for the generated
+  per-tenant seeds + create probe, or the acceptance suite is un-greenable — JC0552)
+  that previously lived only in the skill docs.
+
 ## 0.6.22 — 2026-07-30
 
 ### Security

@@ -484,6 +484,20 @@ role-independent tests (list, add, last-admin remove 409, out-of-set-role 422) �
 the other five need a seeded non-admin member, which a one-role design cannot
 express.
 
+## A `unique` field with a small domain can't satisfy the per-tenant seeds (JC0552)
+The generated acceptance suite — the cross-tenant isolation test in particular, which
+seeds the SAME entity into tenant A and tenant B and then runs the create probe —
+materializes up to **three distinct values** for each field: the create-probe request
+fixture plus the two per-tenant seeds. A `unique` field whose domain is smaller than
+that cannot produce three distinct values, so the seeds collide on the UNIQUE index and
+no run can go green. `jerrycan check` refuses the statically-detectable cases up front
+with **JC0552**: a `unique` integer whose `min`/`max` range admits fewer than 3 values
+(an ABSENT bound counts as its i64 extreme, so a lone near-`i64::MAX` `min` is refused
+too), or a `unique` string with `max_len: 0`. For a field whose allowed values are
+inherently few — a small enum, a very narrow range, or a `unique` non-PK field on the
+tenant entity itself — widen it, or drop `unique` and use a plain `index` instead. See
+`jerrycan explain JC0552`.
+
 ## Errors you'll hit
 - No session (missing/invalid cookie or bearer) → `401 JC0401`. The `Tenant` factory
   never runs; the session guard already rejected.
