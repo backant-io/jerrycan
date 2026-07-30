@@ -5,26 +5,41 @@
 **Issues:** #138 (the 0.6.0 member surface #107 blocks removing/demoting the sole admin via a `count_admins` READ followed by a SEPARATE DELETE/UPDATE (genroute.rs `set_member_role`:2203-2221, `remove_member`:2235-2249). Two concurrent admin-gated writes on one tenant can BOTH pass the check and leave the tenant with **zero admins** (member-management locked out). A plain transaction is insufficient — two READ-COMMITTED / deferred-SQLite txns both read `count==2` before either writes.)
 **Ships as:** 0.6.24 — a codegen change to the generated membership repo methods (atomic check-and-act). Same 409/404 behavior; the fix is that the guard is now race-free. Byte-identical for any non-tenancy design (no member surface emitted).
 
-## The fix: a single conditional statement, atomic per-statement on both backends
-Replace the read-then-write in the two generated repo methods with ONE conditional write whose WHERE clause carries the last-admin guard, so the DB row-locks the write and no two callers can both pass the check.
+## Root cause of the race — why a single conditional statement is NOT enough (corrected 2026-07-30)
+A first draft proposed a SINGLE autocommit conditional statement (`DELETE … WHERE … AND NOT (role='{admin}' AND (SELECT COUNT(*) …) <= 1)`), citing #108. **That is WRONG for this shape and was proven racy on Postgres (40/40 trials → zero admins).** #108's atomic reserve is safe because every contender hits the SAME counter row (row-lock + READ COMMITTED re-check serialize them). The last-admin guard is different: two concurrent removes/demotes target DIFFERENT admin rows (admin A vs admin B), and the `COUNT(*)` subquery takes NO lock — under Postgres READ COMMITTED (jerrycan-db default, pool 5) both subqueries read the pre-image count = 2, both pass the guard, both write → **zero admins**. This is textbook **write-skew**; only SERIALIZABLE or EXPLICIT locking prevents it. SQLite (single writer, pool = 1) is already safe, so the race is Postgres-only.
+
+## The fix: a transaction that LOCKS the tenant's admin set, then the conditional statement
+Each op runs in ONE transaction that FIRST locks the tenant's admin rows (so concurrent admin-gated writes on the same tenant serialize), THEN runs the conditional write. The loser blocks on the lock; when it proceeds its subquery sees the post-first-write count and affects 0 rows → the 0-path existence-SELECT maps it to a clean **409**. **Proven safe: 0/40 zero-admin trials, min admins observed = 1.**
+
+- **Backend-conditional lock:** emit `FOR UPDATE` ONLY when `self.db.conn().get_database_backend()` is Postgres (SQLite can't parse `FOR UPDATE` and doesn't need it — its single writer already serializes). A per-tenant `pg_advisory_xact_lock(...)` is an equally idiomatic alternative (the migrate path already uses advisory locks) — either is acceptable; `FOR UPDATE` on the admin set is the recommended default.
+- Use the existing `begin()`/transaction idiom (jerrycan-db) and run the lock SELECT + the conditional write + the 0-path existence-SELECT all inside the same `txn`, then commit.
 
 ### A. `remove_member` (genroute.rs:2224-2250)
-```sql
-DELETE FROM {members} WHERE user_id = ? AND {fk_col} = ?
-  AND NOT (role = '{admin}'
-           AND (SELECT COUNT(*) FROM {members} WHERE {fk_col} = ? AND role = '{admin}') <= 1)
+```
+BEGIN
+  -- Postgres only: lock this tenant's admin rows so concurrent admin writes serialize
+  SELECT id FROM {members} WHERE {fk_col} = ? AND role = '{admin}' FOR UPDATE
+  DELETE FROM {members} WHERE user_id = ? AND {fk_col} = ?
+    AND NOT (role = '{admin}'
+             AND (SELECT COUNT(*) FROM {members} WHERE {fk_col} = ? AND role = '{admin}') <= 1)
+COMMIT
 ```
 - `rows_affected == 1` ⇒ removed ⇒ `Ok(true)`.
-- `rows_affected == 0` ⇒ EITHER the target is the last admin (the guard blocked it — **409**) OR the member does not exist (**`Ok(false)` → 404**). These must NOT be conflated (a non-member remove must stay 404, not become a spurious 409). Disambiguate with ONE follow-up existence SELECT on the 0-path only (rare): if the row `(user_id, fk)` still EXISTS ⇒ it was the last admin ⇒ `Err(Error::conflict("cannot remove the last {admin}"))`; else ⇒ `Ok(false)`. The atomicity (the security fix) is entirely in the conditional DELETE; the follow-up read only picks the status code and has no correctness impact (the DELETE already protected the last admin).
+- `rows_affected == 0` ⇒ EITHER the target is the last admin (guard blocked it — **409**) OR the member does not exist (**`Ok(false)` → 404**). Do NOT conflate: disambiguate with ONE existence SELECT (inside the same txn, on the 0-path only): if the `(user_id, fk)` row still EXISTS ⇒ last admin ⇒ `Err(Error::conflict("cannot remove the last {admin}"))`; else ⇒ `Ok(false)`.
 
 ### B. `set_member_role` (demote) (genroute.rs:2183-2222)
-Keep the role-validation 422 (MEMBER_ROLES check) FIRST. Then ONE conditional UPDATE:
-```sql
-UPDATE {members} SET role = ? WHERE user_id = ? AND {fk_col} = ?
-  AND NOT (role = '{admin}' AND ? <> '{admin}'
-           AND (SELECT COUNT(*) FROM {members} WHERE {fk_col} = ? AND role = '{admin}') <= 1)
+Keep the MEMBER_ROLES 422 check FIRST (outside the txn is fine). Then the same txn+lock, with the conditional UPDATE:
 ```
-bind order: `[new_role (SET), user_id, fk, new_role (the `?<>'{admin}'` compare), fk (COUNT)]`. The `role = '{admin}'` reads the row's CURRENT role; `? <> '{admin}'` is the new role, so **re-affirming** the last admin's admin role (new == admin) makes `? <> '{admin}'` false ⇒ `NOT(...)` true ⇒ the UPDATE proceeds (a no-op role write, `rows_affected == 1` ⇒ `Ok(true)` — preserving the #107 "re-affirm the last admin stays" behavior). A genuine demote of the last admin ⇒ blocked ⇒ `rows_affected == 0`. Same 0-path disambiguation as §A: follow-up existence SELECT ⇒ 409 if the row exists (last-admin demote) else `Ok(false)`.
+BEGIN
+  SELECT id FROM {members} WHERE {fk_col} = ? AND role = '{admin}' FOR UPDATE   -- Postgres only
+  UPDATE {members} SET role = ? WHERE user_id = ? AND {fk_col} = ?
+    AND NOT (role = '{admin}' AND ? <> '{admin}'
+             AND (SELECT COUNT(*) FROM {members} WHERE {fk_col} = ? AND role = '{admin}') <= 1)
+COMMIT
+```
+`role = '{admin}'` = the row's CURRENT role; `? <> '{admin}'` = the new role, so **re-affirming** the last admin's admin role (new == admin) proceeds (no-op UPDATE, `rows_affected == 1` ⇒ `Ok(true)` — preserves the #107 "re-affirm the last admin stays" behavior). A genuine demote of the last admin ⇒ blocked ⇒ `rows_affected == 0` ⇒ same 0-path existence-SELECT ⇒ 409/`Ok(false)`.
+
+**The concurrency proof (§D) MUST be genuinely concurrent and green** — the corrected txn+lock mechanism passes it (0/40 zero-admin, proven); the earlier single-statement mechanism does NOT (40/40 zero-admin) and must not be shipped.
 
 ### C. count_admins
 `count_admins` (genroute.rs:5897-region helper) is now used ONLY inside the conditional SQL's subquery (inlined), not as a separate pre-read. If the standalone `count_admins` method becomes unused after this change, remove it (and its test) OR keep it if still referenced elsewhere — verify with a grep. Do not leave a dead method that `-D warnings` flags.
