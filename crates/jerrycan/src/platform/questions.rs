@@ -2163,6 +2163,50 @@ pub fn validate(d: &Design) -> Vec<Question> {
         check_topics(&rt.presence, "presence");
     }
 
+    // Rate limiting (issue #83). The `rate_limit` block is emitted into the
+    // generated main.rs as `.extend(RateLimit::per_window(limit, window)..)` —
+    // like `cors`, a design-declared middleware policy, not a hand-edit of the
+    // tool-owned file. Its three interpolated values are validated up front
+    // (JC0563) so a misconfig is a pointed question, not a generated-code compile
+    // error, a runtime panic, or a silently-broken limiter.
+    if let Some(ref rl) = d.rate_limit {
+        // A 0-per-window limit rejects every request — surely unintended.
+        if rl.limit == 0 {
+            qs.push(q(
+                "/rate_limit/limit",
+                "Rate limit `limit` is 0, which blocks every request (surely unintended) — set a positive request count per window. See `jerrycan explain JC0563`.",
+            ));
+        }
+        // The window must parse to a POSITIVE duration (it becomes
+        // Duration::from_secs(N) in the generated wiring).
+        if !Design::parse_duration(&rl.window).is_some_and(|secs| secs > 0) {
+            qs.push(q(
+                "/rate_limit/window",
+                format!(
+                    "Rate limit `window` `{}` is not a positive duration — use a bare number of seconds or an `<n>s`/`<n>m`/`<n>h`/`<n>d` string (e.g. \"1m\"). See `jerrycan explain JC0563`.",
+                    rl.window
+                ),
+            ));
+        }
+        // The api-key header is interpolated into `RateLimit::api_key_header(..)`
+        // (an HTTP header name), so it must be a valid header token (^[A-Za-z0-9-]+$)
+        // — otherwise the generated code panics at startup.
+        if let Some(ref header) = rl.api_key_header {
+            let valid = !header.is_empty()
+                && header
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-');
+            if !valid {
+                qs.push(q(
+                    "/rate_limit/api_key_header",
+                    format!(
+                        "Rate limit `api_key_header` `{header}` is not a valid HTTP header name — use ^[A-Za-z0-9-]+$ (e.g. \"x-api-key\"). See `jerrycan explain JC0563`.",
+                    ),
+                ));
+            }
+        }
+    }
+
     qs
 }
 

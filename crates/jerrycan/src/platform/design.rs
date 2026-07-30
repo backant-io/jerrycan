@@ -35,6 +35,13 @@ pub struct Design {
     pub storage: Option<StorageDesign>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realtime: Option<RealtimeDesign>,
+    /// App-level rate-limit policy (installed as the `RateLimit` middleware
+    /// extension, issue #83). Present ⇒ the generated main.rs wires
+    /// `.extend(RateLimit::per_window(..))`; absent ⇒ no limiter. Declaring it
+    /// here (rather than hand-editing the tool-owned main.rs) keeps that file
+    /// byte-identical to the generator, so it never trips JL0003.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitDesign>,
     pub modules: Vec<ModuleDesign>,
 }
 
@@ -72,6 +79,33 @@ impl CorsDesign {
     pub fn is_any(&self) -> bool {
         self.origins.iter().any(|o| o == "*")
     }
+}
+
+/// The top-level `rate_limit` block (issue #83): a design-modeled fixed-window
+/// rate limiter the generator installs via `app.extend(RateLimit::per_window(..))`.
+/// Maps 1:1 onto jerrycan-ratelimit's builder. Declaring the limiter here — rather
+/// than hand-editing the tool-owned main.rs (an edit the next `jerrycan generate`
+/// wipes and which trips JL0003) — is the whole point: the wiring becomes
+/// generated, so main.rs stays byte-identical to the tool's output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitDesign {
+    /// Requests allowed per window per partition key.
+    pub limit: u32,
+    /// The fixed window, a duration string: "30s", "1m", "1h", "1d" (a bare
+    /// number is seconds). See [`Design::parse_duration`].
+    pub window: String,
+    /// Opt-in api-key partition tier: the header carrying the api key (e.g.
+    /// "x-api-key"). Absent ⇒ partition by the authenticated user then client IP
+    /// (both unspoofable). NOTE: an UNAUTHENTICATED api-key header is
+    /// client-controlled (spoofable) — only enable this when the key is
+    /// authenticated upstream of the limiter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_header: Option<String>,
+    /// Trust `X-Forwarded-For` for the client IP (only behind a trusted proxy —
+    /// the header is client-spoofable). Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_forwarded_for: bool,
 }
 
 /// The `realtime` block (contract v2): row-change subscriptions (scope-filtered
@@ -855,6 +889,13 @@ impl Design {
         })
     }
 
+    /// A declared `rate_limit` block switches on the `RateLimit` middleware
+    /// extension wiring in main.rs and the facade `rate-limit` feature (issue
+    /// #83). The block itself is the declaration (like `cors`).
+    pub fn wants_rate_limit(&self) -> bool {
+        self.rate_limit.is_some()
+    }
+
     /// The first broadcast topic a SERVER handler may publish to via
     /// `RealtimeHandle::publish` (issue #50): scope `none` or `auth`, i.e.
     /// un-partitioned. A `tenant`-scoped topic is excluded — a server publish has
@@ -887,6 +928,25 @@ impl Design {
         };
         // checked_mul: overflow reads as unparseable (a validation question),
         // never a debug panic or a silently wrapped size.
+        num.parse::<u64>().ok().and_then(|n| n.checked_mul(mult))
+    }
+
+    /// "1m" → seconds. Suffixes `s`/`m`/`h`/`d` (seconds/minutes/hours/days); a
+    /// bare number is seconds. None = unparseable (a validation question).
+    /// Mirrors [`parse_size`](Self::parse_size): `checked_mul` so an overflowing
+    /// window reads as unparseable rather than panicking or silently wrapping.
+    pub fn parse_duration(s: &str) -> Option<u64> {
+        let (num, mult) = if let Some(n) = s.strip_suffix('d') {
+            (n, 86_400)
+        } else if let Some(n) = s.strip_suffix('h') {
+            (n, 3_600)
+        } else if let Some(n) = s.strip_suffix('m') {
+            (n, 60)
+        } else if let Some(n) = s.strip_suffix('s') {
+            (n, 1)
+        } else {
+            (s, 1)
+        };
         num.parse::<u64>().ok().and_then(|n| n.checked_mul(mult))
     }
 
@@ -933,6 +993,13 @@ impl Design {
         // unchanged. Realtime channels over WebSockets; changes imply db.
         if self.wants_realtime() {
             features.push("realtime");
+        }
+        // Appended last (after realtime) so existing designs' feature order is
+        // unchanged. The `rate-limit` facade feature re-exports
+        // `jerrycan::ratelimit::RateLimit`, which the generated `.extend(..)`
+        // wiring references (issue #83). Needs no db.
+        if self.wants_rate_limit() {
+            features.push("rate-limit");
         }
         features
     }
@@ -2210,6 +2277,85 @@ pub(crate) mod tests {
         assert_eq!(Design::parse_size("99999999999999GB"), None, "overflow");
         assert_eq!(Design::parse_size("18446744073709551615B"), Some(u64::MAX));
         assert_eq!(Design::parse_size("18446744073709551616B"), None);
+    }
+
+    #[test]
+    fn parse_duration_handles_the_documented_suffixes() {
+        assert_eq!(Design::parse_duration("30s"), Some(30));
+        assert_eq!(Design::parse_duration("1m"), Some(60));
+        assert_eq!(Design::parse_duration("1h"), Some(3600));
+        assert_eq!(Design::parse_duration("1d"), Some(86_400));
+        assert_eq!(
+            Design::parse_duration("90"),
+            Some(90),
+            "bare number = seconds"
+        );
+        assert_eq!(
+            Design::parse_duration("0"),
+            Some(0),
+            "0 parses (validation refuses it)"
+        );
+        assert_eq!(
+            Design::parse_duration("1m30s"),
+            None,
+            "no compound durations"
+        );
+        assert_eq!(Design::parse_duration("1min"), None);
+        assert_eq!(Design::parse_duration("soon"), None);
+        // checked_mul: an overflowing window reads as unparseable, never wraps.
+        assert_eq!(
+            Design::parse_duration("99999999999999999999d"),
+            None,
+            "overflow"
+        );
+    }
+
+    /// A `rate_limit` block gates `wants_rate_limit` and appends the `rate-limit`
+    /// facade feature LAST (so existing designs' feature order is unchanged), and
+    /// survives a serde round trip. A design without it wants no rate limiting.
+    #[test]
+    fn wants_rate_limit_gates_and_appends_the_facade_feature_last() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "rl-app", "contract_version": 0, "dependencies": ["db"],
+                "rate_limit": { "limit": 100, "window": "1m" },
+                "modules": [{ "name": "m", "endpoints": [
+                    { "operation_id": "list_m", "method": "GET", "path": "/",
+                      "success": { "status": 200 } }] }] }"#,
+        )
+        .unwrap();
+        assert!(d.wants_rate_limit());
+        let feats = d.facade_features();
+        assert_eq!(
+            feats.last(),
+            Some(&"rate-limit"),
+            "rate-limit is appended last: {feats:?}"
+        );
+        // Survives a round trip (the block + its optional fields).
+        let mut d2 = d.clone();
+        d2.rate_limit.as_mut().unwrap().api_key_header = Some("x-api-key".into());
+        d2.rate_limit.as_mut().unwrap().trust_forwarded_for = true;
+        let re: Design = serde_json::from_str(&serde_json::to_string(&d2).unwrap()).unwrap();
+        let rl = re.rate_limit.unwrap();
+        assert_eq!(rl.limit, 100);
+        assert_eq!(rl.window, "1m");
+        assert_eq!(rl.api_key_header.as_deref(), Some("x-api-key"));
+        assert!(rl.trust_forwarded_for);
+
+        // No block ⇒ no rate limiting, no facade feature (byte-identity baseline).
+        let mut plain = d;
+        plain.rate_limit = None;
+        assert!(!plain.wants_rate_limit());
+        assert!(!plain.facade_features().contains(&"rate-limit"));
+    }
+
+    #[test]
+    fn published_schema_accepts_the_rate_limit_block() {
+        let s = include_str!("../../../../docs/contracts/design-schema.json");
+        assert!(
+            s.contains("\"rate_limit\"")
+                && s.contains("\"api_key_header\"")
+                && s.contains("\"trust_forwarded_for\"")
+        );
     }
 
     #[test]

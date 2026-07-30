@@ -506,6 +506,9 @@ fn emit_from_db(
         jobs,
         storage,
         realtime,
+        // A Supabase export carries no app-level rate-limit config; add a
+        // `rate_limit` block post-migration if the app needs one (#83).
+        rate_limit: None,
         modules,
     };
 

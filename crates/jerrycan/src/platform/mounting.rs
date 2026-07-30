@@ -2,7 +2,7 @@
 //! workspace members, app route-deps. Sorted, idempotent, byte-stable —
 //! JL0003 compares against exactly this output.
 
-use super::design::Design;
+use super::design::{Design, RateLimitDesign};
 use super::genroute::crate_ident;
 use super::templates::set_features;
 use std::fs;
@@ -26,15 +26,94 @@ fn sync_facade_features(ws: &str, design: &Design) -> String {
         + if ws.ends_with('\n') { "\n" } else { "" }
 }
 
+/// The `.extend(RateLimit::…)` wiring for the `rate_limit` design block (issue
+/// #83), pre-wrapped exactly as rustfmt formats it (issue #128) so a fresh
+/// scaffold is a `cargo fmt` fixpoint. This is the whole point of #83: the line
+/// is GENERATED (tool-owned), so a later `cargo fmt` must not rewrite it and trip
+/// JL0003 — the drift that a hand-edit of main.rs (the only prior wiring path)
+/// permanently caused. rustfmt has three regimes here, reproduced verbatim:
+///   * no builders → rustfmt ALWAYS breaks `per_window`'s two args onto their own
+///     lines (even the shortest 97-col case wraps);
+///   * ≥1 builder, receiver fits inline at indent 12 (`12 + len <= 99`) → the
+///     `per_window(..)` receiver on one line, one builder per line at indent 16,
+///     a trailing comma on the last;
+///   * ≥1 builder, receiver too wide at indent 12 → `per_window`'s args broken at
+///     indent 16, builders at indent 12.
+/// Boundary is empirical against the pinned toolchain's rustfmt (1.97): a receiver
+/// whose indent-12 line is 99 cols stays inline, 100 wraps.
+fn rate_limit_extend(rl: &RateLimitDesign) -> String {
+    // parse_duration is validated (JC0563) before generation; a malformed window
+    // that reached here degrades to 0 rather than panicking.
+    let secs = Design::parse_duration(&rl.window).unwrap_or(0);
+    let receiver = format!(
+        "jerrycan::ratelimit::RateLimit::per_window({}, std::time::Duration::from_secs({secs}))",
+        rl.limit
+    );
+    // Builder calls in chain order (api_key_header before trust_forwarded_for).
+    // The api-key header is LOWERCASED: `RateLimit::api_key_header` feeds it to
+    // `HeaderName::from_static`, which panics on a non-lowercase name — and HTTP
+    // header names are case-insensitive, so the lowercased literal is equivalent.
+    let mut builders: Vec<String> = Vec::new();
+    if let Some(header) = &rl.api_key_header {
+        builders.push(format!(".api_key_header({:?})", header.to_lowercase()));
+    }
+    if rl.trust_forwarded_for {
+        builders.push(".trust_forwarded_for(true)".to_string());
+    }
+
+    // Regime 1: no builders — rustfmt always breaks per_window's two args.
+    if builders.is_empty() {
+        return format!(
+            "        .extend(jerrycan::ratelimit::RateLimit::per_window(\n            {},\n            std::time::Duration::from_secs({secs}),\n        ))\n",
+            rl.limit
+        );
+    }
+
+    // Regime 2: ≥1 builder — `.extend(` on its own line, the receiver, one builder
+    // per line (the last carrying a trailing comma), then the closing `)`.
+    let receiver_block = if 12 + receiver.chars().count() <= 99 {
+        // Receiver fits inline at indent 12; builders at indent 16.
+        let mut s = format!("            {receiver}\n");
+        for (i, b) in builders.iter().enumerate() {
+            let comma = if i + 1 == builders.len() { "," } else { "" };
+            s.push_str(&format!("                {b}{comma}\n"));
+        }
+        s
+    } else {
+        // Receiver too wide inline: break per_window's args at indent 16, close at
+        // indent 12; builders at indent 12.
+        let mut s = format!(
+            "            jerrycan::ratelimit::RateLimit::per_window(\n                {},\n                std::time::Duration::from_secs({secs}),\n            )\n",
+            rl.limit
+        );
+        for (i, b) in builders.iter().enumerate() {
+            let comma = if i + 1 == builders.len() { "," } else { "" };
+            s.push_str(&format!("            {b}{comma}\n"));
+        }
+        s
+    };
+    format!("        .extend(\n{receiver_block}        )\n")
+}
+
 /// The ordered `.extend(...)` block for `main`. Order is load-bearing: Auth
-/// FIRST so the session/role guards resolve their extension, then Observe, then
-/// jobs (needs the db, registered before `.extend(db)` moves it), then db, then
-/// validate. Memory/db/validate-only modes keep their exact prior bytes
-/// (auth/observe/jobs absent → no extra lines, db before validate as before).
+/// FIRST so the session/role guards resolve their extension; then rate limiting
+/// (issue #83) — it is identity-aware (partitions by the authenticated user when
+/// available), so it sits AFTER Auth so a `CurrentUser` partition can resolve, but
+/// it needs no db so it stays before the db move; then Observe, then jobs (needs
+/// the db, registered before `.extend(db)` moves it), then db, then validate.
+/// Memory/db/validate-only modes keep their exact prior bytes (auth/observe/jobs/
+/// rate_limit absent → no extra lines, db before validate as before).
 fn extension_block(design: &Design) -> String {
     let mut block = String::new();
     if design.wants_auth() {
         block.push_str("        .extend(jerrycan::auth::Auth::from_env()?)\n");
+    }
+    // Rate limiting: emitted right after Auth so the limiter's identity-aware
+    // partition can resolve a `CurrentUser` when auth is active. GENERATED from
+    // the design (issue #83), so main.rs stays byte-identical to the tool output
+    // — no hand-edit, no JL0003 drift.
+    if let Some(rl) = &design.rate_limit {
+        block.push_str(&rate_limit_extend(rl));
     }
     if design.wants_observe() {
         block.push_str("        .extend(jerrycan::observe::Observe::new())\n");

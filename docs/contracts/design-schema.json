@@ -217,6 +217,34 @@
         "broadcast": { "type": "array", "items": { "$ref": "#/$defs/realtime_topic" } },
         "presence": { "type": "array", "items": { "$ref": "#/$defs/realtime_topic" } }
       }
+    },
+    "rate_limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit", "window"],
+      "description": "App-level fixed-window rate limiting (issue #83), installed as the RateLimit middleware extension. Present => the generated main.rs wires .extend(RateLimit::per_window(limit, window)) right after Auth; absent => no limiter. Declaring it here (not by hand-editing the tool-owned main.rs) keeps that file byte-identical to the generator, so it never trips JL0003. Over-limit requests get 429 JC0429 + Retry-After; the default partition is the authenticated user then client IP (both unspoofable). Needs no db.",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Requests allowed per window per partition key. Must be positive (a 0 limit blocks everything — JC0563)."
+        },
+        "window": {
+          "type": "string",
+          "pattern": "^[0-9]+[smhd]?$",
+          "description": "The fixed window as a duration string: a bare number of seconds, or an <n>s/<n>m/<n>h/<n>d suffix (e.g. \"1m\"). Must parse to a positive duration — otherwise JC0563."
+        },
+        "api_key_header": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9-]+$",
+          "description": "Opt-in api-key partition tier: the header carrying the api key (e.g. \"x-api-key\"). Absent => partition by the authenticated user then client IP. CAVEAT: an unauthenticated api-key header is client-controlled (spoofable) — only enable this when the key is authenticated upstream of the limiter."
+        },
+        "trust_forwarded_for": {
+          "type": "boolean",
+          "default": false,
+          "description": "Trust X-Forwarded-For for the client IP (only behind a trusted proxy — the header is client-spoofable). Off by default."
+        }
+      }
     }
   },
   "$defs": {
