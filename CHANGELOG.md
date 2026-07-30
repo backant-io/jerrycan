@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.20 — 2026-07-30
+
+### Fixed
+- **A migrated jwt login can return its bearer token (#106).** The Supabase
+  migrator pinned the login's success to `entity: User` (a `Json<User>` return),
+  leaving nowhere for the token the login must mint. The login success now carries
+  no entity (a bare 200), so the handler returns its own token response — the
+  reference-slice login shape. (Register keeps its `User` success.)
+
+### Notes
+- The other half of #106 — the `workspace_members` write surface — was resolved by
+  the #107 membership surface (0.6.0): a migrated tenancy now auto-generates the
+  add/remove/list/set-role member-management endpoints at `/{tenant}/members`.
+
 ## 0.6.19 — 2026-07-30
 
 ### Docs
