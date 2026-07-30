@@ -219,6 +219,7 @@ mod server_publish_tests {
                 table: "leads".into(),
                 pk_column: "id".into(),
                 tenant_column: Some("workspace_id".into()),
+                hidden_columns: Vec::new(),
             }],
             broadcast: vec![
                 ("events".into(), TopicScope::Auth),

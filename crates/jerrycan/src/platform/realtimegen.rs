@@ -69,6 +69,25 @@ fn changes_spec(design: &Design, entity: &str) -> (String, String, Option<String
     (table, pk, tenant_column)
 }
 
+/// The `hidden_columns` literal for a changes entity: the DB column name (the
+/// field's own `name`) of every write_only/password_hash field, in declaration
+/// order, as a `vec![...]` literal. Emits `vec![]` when the entity has none — a
+/// byte-identical full-row broadcast. This is what lifts the old refusal (#167): the
+/// realtime engine strips these columns from the broadcast row so a response-
+/// hidden secret never reaches a WebSocket subscriber, matching the REST hide.
+fn hidden_columns_lit(design: &Design, entity: &str) -> String {
+    let cols: Vec<String> = find_entity(design, entity)
+        .map(|e| {
+            e.fields
+                .iter()
+                .filter(|f| Design::field_is_write_only(f))
+                .map(|f| format!("\"{}\".to_string()", f.name))
+                .collect()
+        })
+        .unwrap_or_default();
+    format!("vec![{}]", cols.join(", "))
+}
+
 /// The principal resolver closure, per auth model. No active auth model ⇒ no
 /// `.principal(...)` at all (only scope-none topics are joinable — validation
 /// guarantees that shape).
@@ -177,8 +196,9 @@ pub fn wiring_rs(design: &Design) -> String {
                         Some(c) => format!("Some(\"{c}\".to_string())"),
                         None => "None".to_string(),
                     };
+                    let hidden_lit = hidden_columns_lit(design, entity);
                     format!(
-                        "        .changes(jerrycan::realtime::ChangeChannelSpec {{ entity: \"{entity}\".to_string(), table: \"{table}\".to_string(), pk_column: \"{pk}\".to_string(), tenant_column: {tenant_lit} }})\n"
+                        "        .changes(jerrycan::realtime::ChangeChannelSpec {{ entity: \"{entity}\".to_string(), table: \"{table}\".to_string(), pk_column: \"{pk}\".to_string(), tenant_column: {tenant_lit}, hidden_columns: {hidden_lit} }})\n"
                     )
                 })
                 .collect()
@@ -357,6 +377,48 @@ mod tests {
             a.contains(r#".presence("editors", jerrycan::realtime::TopicScope::Tenant)"#),
             "{a}"
         );
+        // #167: an entity with no write_only column emits an empty projection set
+        // — the realtime broadcast stays byte-identical (full row).
+        assert!(
+            a.contains("hidden_columns: vec![] })"),
+            "no write_only column ⇒ hidden_columns: vec![]: {a}"
+        );
+    }
+
+    /// #167 (SECURITY): the changes wiring lists a changes entity's write_only /
+    /// password_hash columns in `ChangeChannelSpec.hidden_columns`, so the
+    /// realtime engine strips them from the broadcast row (the raw-row leak the
+    /// REST `skip_serializing` hide could not reach). This is what lifts the old
+    /// interim refusal: the combination is now SAFE because the column is never
+    /// delivered. An entity with no such column emits `vec![]` (byte-identical).
+    #[test]
+    fn changes_wiring_projects_write_only_columns_via_hidden_columns() {
+        // Add an explicit write_only flag AND an auto-hidden `password_hash` to
+        // the `Lead` changes entity → both DB column names land in
+        // `hidden_columns`, in field-declaration order.
+        let mut leak = rt_design();
+        leak.modules[1].entities[0].fields.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "api_token", "type": "string", "write_only": true
+            }))
+            .unwrap(),
+        );
+        leak.modules[1].entities[0].fields.push(
+            serde_json::from_value(
+                serde_json::json!({ "name": "password_hash", "type": "string" }),
+            )
+            .unwrap(),
+        );
+        let wired = wiring_rs(&leak);
+        assert!(
+            wired.contains(
+                r#"hidden_columns: vec!["api_token".to_string(), "password_hash".to_string()] })"#
+            ),
+            "write_only + password_hash columns must be projected out via hidden_columns, in \
+             declaration order: {wired}"
+        );
+        // Determinism holds with a non-empty projection set (JL0003 contract).
+        assert_eq!(wired, wiring_rs(&leak), "byte-identical across runs");
     }
 
     /// Issue #84: `topic_wiring_inline` emits the design's broadcast + presence

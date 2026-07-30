@@ -199,6 +199,7 @@ async fn changes_channel_on_sqlite_answers_jc0530() {
             table: "lead".into(),
             pk_column: "id".into(),
             tenant_column: Some("workspace_id".into()),
+            hidden_columns: Vec::new(),
         })
         .principal(header_resolver());
     let (port, shutdown, task) = serve(rt).await;

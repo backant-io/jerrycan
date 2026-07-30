@@ -178,6 +178,7 @@ mod tests {
             table: "lead".into(),
             pk_column: "id".into(),
             tenant_column: Some("workspace_id".into()),
+            hidden_columns: Vec::new(),
         }
     }
 
@@ -245,6 +246,7 @@ mod tests {
             table: table.clone(),
             pk_column: "id".into(),
             tenant_column: Some("workspace_id".into()),
+            hidden_columns: Vec::new(),
         };
         let specs = vec![spec];
         // Idempotent: twice.

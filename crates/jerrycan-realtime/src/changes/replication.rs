@@ -441,6 +441,7 @@ mod tests {
             table: table.clone(),
             pk_column: "id".into(),
             tenant_column: Some("workspace_id".into()),
+            hidden_columns: Vec::new(),
         };
         let specs = vec![spec];
         // Idempotent: calling twice must succeed.

@@ -240,6 +240,7 @@ mod tests {
             table: "lead".into(),
             pk_column: "id".into(),
             tenant_column: Some("workspace_id".into()),
+            hidden_columns: Vec::new(),
         }
     }
 

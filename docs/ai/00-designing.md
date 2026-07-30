@@ -256,10 +256,10 @@ Every entity has an `id` primary key; you usually do NOT declare it:
   `*_hash`/`token`/`secret` name heuristic is deliberately NOT applied (a `share_token`
   may legitimately be returned), so mark those `write_only` explicitly. `write_only` on
   the pk `id` is refused (`JC0554` — the id must be echoed in every response). A
-  `write_only`/`password_hash` column may NOT be on a realtime `changes` entity
-  (`JC0555`): the changes broadcast ships the raw row over the WebSocket, so the column
-  would leak to subscribers despite the response hide — remove it from the entity or
-  drop the entity from `changes` (lifted once column projection lands, #167).
+  `write_only`/`password_hash` column on a realtime `changes` entity is safe: the
+  changes broadcast PROJECTS the hidden columns out of the row before delivery (#167),
+  so the column never reaches a WebSocket subscriber — the same secure-by-default hide
+  the REST response gives, now enforced on the realtime stream too.
 
 ## Endpoint
 ```json
