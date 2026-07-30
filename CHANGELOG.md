@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.24 — 2026-07-30
+
+### Fixed
+- **The last-admin guard is now race-free (#138).** Removing or demoting a tenant's
+  sole admin was blocked by a count-then-act sequence (read the admin count, then a
+  separate `DELETE`/`UPDATE`) — so two concurrent admin-gated writes could both pass
+  the check and leave the tenant with **zero admins** (locked out of member
+  management). On Postgres this was a write-skew race (the two writes touch different
+  admin rows and the count read takes no lock); SQLite's single writer hid it. The
+  generated `remove_member`/`set_member_role` now run one transaction that first locks
+  the tenant's admin set (`SELECT … FOR UPDATE`, Postgres only — SQLite serializes on
+  its single writer) and then the guarded write. Concurrent admin-gated writes now
+  serialize; the sole admin can never be removed or demoted (still `409`), and a
+  normal remove/demote/404/re-affirm are unchanged.
+
+Byte-identical for any design without tenancy (no member surface).
+
 ## 0.6.23 — 2026-07-30
 
 ### Docs
