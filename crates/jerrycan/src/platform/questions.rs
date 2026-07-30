@@ -3872,6 +3872,171 @@ mod tests {
         );
     }
 
+    // ---- #187 (JC0564): reserve_against atomic reserve primitive ---------------
+
+    /// A well-formed `reserve_against`: a `used` integer counter bounded by a
+    /// SEPARATE `capacity` integer field on a db-backed design. This is the buildable
+    /// baseline the seven refusals are measured against — the generated `reserve`
+    /// method wires the #108-proven atomic UPDATE from exactly this shape.
+    const RESERVE_OK: &str = r#"{
+        "name": "reserve-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "venue",
+            "entities": [
+                { "name": "Booking", "fields": [
+                    { "name": "capacity", "type": "integer" },
+                    { "name": "used", "type": "integer", "reserve_against": "capacity" }
+                ]}
+            ],
+            "endpoints": [
+                { "operation_id": "create_booking", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Booking" },
+                  "success": { "status": 201, "entity": "Booking" } }
+            ]
+        }]
+    }"#;
+
+    /// The buildable shape passes clean — no JC0564. Also the byte-identity floor:
+    /// an entity with no `reserve_against` at all never trips it (MINIMAL below).
+    #[test]
+    fn well_formed_reserve_against_passes_and_absence_is_inert() {
+        assert!(
+            !validate(&design(RESERVE_OK))
+                .iter()
+                .any(|q| q.question.contains("JC0564")),
+            "a well-formed reserve_against must not trip JC0564: {:?}",
+            validate(&design(RESERVE_OK))
+        );
+        assert!(
+            !validate(&design(MINIMAL))
+                .iter()
+                .any(|q| q.question.contains("JC0564")),
+            "a design with no reserve_against must never mention JC0564"
+        );
+    }
+
+    /// Helper: mutate RESERVE_OK and return the first JC0564 question, panicking with
+    /// the full question list if none fired (the refusal is the whole point).
+    fn reserve_refusal(from: &str, to: &str) -> Question {
+        let json = RESERVE_OK.replace(from, to);
+        let qs = validate(&design(&json));
+        qs.into_iter()
+            .find(|q| q.question.contains("JC0564"))
+            .unwrap_or_else(|| panic!("mutation `{from}` -> `{to}` must trip JC0564"))
+    }
+
+    /// (1) `reserve_against` names a field that does not exist on the entity.
+    #[test]
+    fn reserve_against_nonexistent_capacity_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#""reserve_against": "capacity""#,
+            r#""reserve_against": "ceiling""#,
+        );
+        assert!(
+            hit.question.contains("is not a field of") && hit.question.contains("ceiling"),
+            "message must name the missing capacity field: {}",
+            hit.question
+        );
+    }
+
+    /// (2) the counter field carrying `reserve_against` is not integer.
+    #[test]
+    fn reserve_against_non_integer_counter_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "used", "type": "integer", "reserve_against": "capacity" }"#,
+            r#"{ "name": "used", "type": "string", "reserve_against": "capacity" }"#,
+        );
+        assert!(
+            hit.question.contains("not `integer`") && hit.question.contains("counter"),
+            "message must name the non-integer counter rule: {}",
+            hit.question
+        );
+    }
+
+    /// (3) the named capacity field is not integer.
+    #[test]
+    fn reserve_against_non_integer_capacity_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "capacity", "type": "integer" }"#,
+            r#"{ "name": "capacity", "type": "string" }"#,
+        );
+        assert!(
+            hit.question.contains("capacity ceiling must be an integer"),
+            "message must name the non-integer capacity rule: {}",
+            hit.question
+        );
+    }
+
+    /// (4a) the counter leg is the primary key `id`.
+    #[test]
+    fn reserve_against_on_pk_counter_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "used", "type": "integer", "reserve_against": "capacity" }"#,
+            r#"{ "name": "id", "type": "integer", "reserve_against": "capacity" }"#,
+        );
+        assert!(
+            hit.question.contains("counter cannot be the primary key"),
+            "message must refuse the pk counter: {}",
+            hit.question
+        );
+    }
+
+    /// (4b) the capacity leg is the primary key `id`.
+    #[test]
+    fn reserve_against_pk_capacity_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#""reserve_against": "capacity""#,
+            r#""reserve_against": "id""#,
+        );
+        assert!(
+            hit.question
+                .contains("capacity ceiling cannot be the primary key"),
+            "message must refuse the pk capacity: {}",
+            hit.question
+        );
+    }
+
+    /// (5) a field cannot reserve against itself.
+    #[test]
+    fn reserve_against_self_reference_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#""reserve_against": "capacity""#,
+            r#""reserve_against": "used""#,
+        );
+        assert!(
+            hit.question.contains("cannot reserve against itself"),
+            "message must refuse the self-reference: {}",
+            hit.question
+        );
+    }
+
+    /// (6) more than one `reserve_against` field on one entity — the generated
+    /// `reserve` method name would be ambiguous.
+    #[test]
+    fn reserve_against_more_than_one_per_entity_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "capacity", "type": "integer" }"#,
+            r#"{ "name": "capacity", "type": "integer", "reserve_against": "used" }"#,
+        );
+        assert!(
+            hit.question.contains("at most one"),
+            "message must refuse >1 reserve_against per entity: {}",
+            hit.question
+        );
+    }
+
+    /// (7) a memory-only design — the atomic UPDATE is emitted on the SQL repo only.
+    #[test]
+    fn reserve_against_on_memory_only_design_is_refused_with_jc0564() {
+        let hit = reserve_refusal(r#""dependencies": ["db"],"#, r#""dependencies": [],"#);
+        assert!(
+            hit.question.contains("no database"),
+            "message must refuse reserve_against without a database: {}",
+            hit.question
+        );
+    }
+
     // ---- #119 (JC0560): belongs_to fk alias -----------------------------------
 
     /// A ledger with two aliased refs to Account (from/to) AND a self-referential

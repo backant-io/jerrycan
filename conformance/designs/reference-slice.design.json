@@ -46,7 +46,9 @@
         { "name": "Workspace", "fields": [
           { "name": "id", "type": "integer" },
           { "name": "name", "type": "string" },
-          { "name": "plan", "type": "string", "values": ["trial", "pro"] }
+          { "name": "plan", "type": "string", "values": ["trial", "pro"] },
+          { "name": "seat_limit", "type": "integer", "required": false },
+          { "name": "seats_used", "type": "integer", "required": false, "reserve_against": "seat_limit" }
         ]}
       ],
       "endpoints": [

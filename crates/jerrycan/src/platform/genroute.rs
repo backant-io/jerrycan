@@ -4487,6 +4487,73 @@ pub(crate) mod tests {
         );
     }
 
+    /// Issue #187 — a `reserve_against` field generates the #108-proven ATOMIC
+    /// conditional UPDATE on the SQL repo, so an agent never hand-writes the
+    /// reservation (a hand-written read-then-write silently oversells on Postgres).
+    /// The counter entity emits `reserve(id, n) -> Result<bool>` carrying the EXACT
+    /// capacity guard; the sibling entity WITHOUT `reserve_against` emits NO reserve
+    /// — the byte-identity floor (the feature is inert unless declared).
+    #[test]
+    fn reserve_against_emits_the_atomic_reserve_only_for_the_declaring_entity() {
+        const D: &str = r#"{
+            "name": "venue-api", "contract_version": 1,
+            "dependencies": ["db"],
+            "modules": [{
+                "name": "rooms",
+                "entities": [
+                    { "name": "Room", "fields": [
+                        { "name": "capacity", "type": "integer" },
+                        { "name": "used", "type": "integer", "reserve_against": "capacity" }
+                    ]},
+                    { "name": "Amenity", "fields": [
+                        { "name": "label", "type": "string" }
+                    ]}
+                ],
+                "endpoints": [
+                    { "operation_id": "create_room", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Room" },
+                      "success": { "status": 201, "entity": "Room" } },
+                    { "operation_id": "create_amenity", "method": "POST", "path": "/amenities",
+                      "request_body": { "entity": "Amenity" },
+                      "success": { "status": 201, "entity": "Amenity" } }
+                ]
+            }]
+        }"#;
+        let d: Design = serde_json::from_str(D).unwrap();
+        let src = repo_rs(
+            &d.modules[0],
+            GenMode {
+                db: true,
+                auth: false,
+            },
+            &d,
+        )
+        .unwrap();
+        // Room (the counter carrier) emits the reserve method with the i64 pk signature.
+        assert!(
+            src.contains("pub async fn reserve(&self, id: i64, n: i64) -> Result<bool>"),
+            "Room must emit `reserve(id, n) -> Result<bool>`: {src}"
+        );
+        // The body carries the EXACT #108 atomic guard — this is the whole no-oversell
+        // property, byte-for-byte identical to the hand-written pattern the docs prove.
+        assert!(
+            src.contains("UPDATE rooms SET used = used + ? WHERE id = ? AND used + ? <= capacity"),
+            "reserve must carry the exact atomic capacity guard: {src}"
+        );
+        // Values bind [n, id, n] and success is EXACTLY one affected row.
+        assert!(
+            src.contains("[n.into(), id.into(), n.into()]") && src.contains("rows_affected() == 1"),
+            "reserve must bind [n, id, n] and key success on one affected row: {src}"
+        );
+        // Byte-identity witness: Amenity declares no `reserve_against`, so the ONLY
+        // reserve method in the module is Room's — the feature is inert otherwise.
+        assert_eq!(
+            src.matches("pub async fn reserve(").count(),
+            1,
+            "exactly one reserve method (Room's); Amenity must emit none: {src}"
+        );
+    }
+
     /// Issue #97 — MAKE THE FLAT-TENANT WRITE LEAK IMPOSSIBLE. A FLAT (MembershipSet)
     /// tenant-owned entity (Lead belongs_to the tenancy Workspace, no tenant fk in its
     /// path) emits ONLY the membership-scoped surface: the BARE unscoped

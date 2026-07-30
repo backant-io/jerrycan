@@ -35,6 +35,8 @@ pub(crate) async fn create_workspace(
             id: body.id,
             name: body.name.clone(),
             plan: plan.clone(),
+            seat_limit: body.seat_limit,
+            seats_used: body.seats_used,
         })
         .await?;
     // Seed ownership: the membership row is what `shared::tenant` resolves to
@@ -53,6 +55,8 @@ pub(crate) async fn create_workspace(
         id,
         name: body.name,
         plan,
+        seat_limit: body.seat_limit,
+        seats_used: body.seats_used,
     }))
 }
 

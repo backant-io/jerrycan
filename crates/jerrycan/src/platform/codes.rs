@@ -824,6 +824,35 @@ mod tests {
     }
 
     #[test]
+    fn jc0564_names_the_reserve_against_integer_fields_rule() {
+        // WHY: JC0564 (#187) is the agent's stop after `check` rejects a malformed
+        // `reserve_against` declaration. `jerrycan explain JC0564` must name the rule
+        // — the counter and its named capacity are DISTINCT integer non-pk fields,
+        // exactly one per entity, on a DB-backed design — so the agent can fix the
+        // shape without reading the generator. The cause enumerates every refusal
+        // (missing/non-integer/self/pk target, >1 per entity, memory-only); the fix
+        // states the well-formed shape and the `db` requirement.
+        let info = lookup("JC0564").unwrap();
+        assert!(
+            info.cause.contains("reserve_against")
+                && info.cause.contains("integer")
+                && info.cause.contains("capacity")
+                && info.cause.contains("primary key")
+                && info.cause.contains("more than one")
+                && info.cause.contains("no database"),
+            "cause must name the reserve/capacity integer-fields rule and every refusal: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("integer")
+                && info.fix.contains("reserve_against")
+                && info.fix.contains("db"),
+            "fix must state the well-formed integer counter+capacity shape and the db requirement: {}",
+            info.fix
+        );
+    }
+
+    #[test]
     fn every_emitted_code_is_in_the_registry() {
         // Grep the workspace source for JC####/JL#### string literals and assert
         // each is registered. This is the "no orphan codes" guard. We walk only
