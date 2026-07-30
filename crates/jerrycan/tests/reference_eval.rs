@@ -334,8 +334,9 @@ fn run_http_battery(addr: &str) {
         201,
         "B creates workspace B",
     );
-    // A creates a lead in A's tenant. The body carries workspace_id to satisfy
-    // the DTO; the handler OVERRIDES it with the authenticated tenant's id.
+    // A creates a lead in A's tenant. The body carries workspace_id; the handler's
+    // `create_for_memberships` verifies it is in A's membership set (WITH CHECK,
+    // #94/#97) — A is a member of workspace 1, so this succeeds.
     assert_status(
         post_json(
             addr,

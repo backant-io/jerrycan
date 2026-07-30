@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.22 — 2026-07-30
+
+### Security
+- **Flat tenant writes are now make-impossible (#97).** For a flat (Supabase-shape)
+  tenant-owned entity, the unchecked bare repo methods (`insert`/`update`/`remove`/
+  `all`/`get`) are no longer generated — only the membership-checked
+  `*_for_memberships` accessors remain. Previously the bar was steer + lint (`JL0006`
+  flagged a bare `repo.insert(body)` but the method still existed), so an agent could
+  write an unchecked cross-tenant write. Now the leaky call cannot be written at all —
+  parity with how per-user entities (#79) already close the leak by construction. A
+  flat create reads its tenant fk from the request body, so it must go through
+  `create_for_memberships` (which verifies the fk against the caller's membership set);
+  the bare `insert` is suppressed.
+- **A generated write-side isolation test (#96)** proves it: a member of tenant A gets
+  **403** creating a row into tenant B.
+
+Byte-identical for every non-flat entity (per-user, path-scoped, tenant root, non-tenant).
+
 ## 0.6.21 — 2026-07-30
 
 ### New

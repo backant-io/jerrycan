@@ -477,6 +477,87 @@ fn tenant_owned_modules_get_isolation_tests() {
     );
 }
 
+/// #96/#97: a FLAT (MembershipSet) tenant-owned module with a guarded creator gets
+/// the flat-WRITE isolation test — user 1 POSTs a create whose tenant fk is tenant 2
+/// (foreign) and must get 403 (`create_for_memberships`'s WITH CHECK). This is the
+/// write-side backstop that #97's make-impossible needs: the bare `insert` is gone,
+/// so a create MUST scope to the caller's memberships. A path-scoped (nested) module
+/// and the tenant ROOT do NOT get it (their writes are not body-fk scoped).
+#[test]
+fn flat_tenant_module_gets_the_write_403_isolation_test() {
+    let s = include_str!("../../../conformance/designs/reference-slice.design.json");
+    let d: Design = serde_json::from_str(s).unwrap();
+
+    // leads (FLAT) — the write-403 test is emitted, aimed at tenant 2, asserting 403.
+    let leads = d.modules.iter().find(|m| m.name == "leads").unwrap();
+    let out = testgen::acceptance_rs(&d, leads);
+    assert!(
+        out.contains("async fn leads_flat_write_into_foreign_tenant_is_403()"),
+        "the flat-write isolation test must be emitted for a flat tenant module: {out}"
+    );
+    // The body's tenant fk is aimed at tenant 2 (a tenant user 1 is not a member of).
+    let iso = out
+        .split("async fn leads_flat_write_into_foreign_tenant_is_403()")
+        .nth(1)
+        .expect("flat-write isolation fn present");
+    assert!(
+        iso.contains("\"workspace_id\": 2"),
+        "the create body must aim its tenant fk at the foreign tenant 2: {iso}"
+    );
+    assert!(
+        iso.contains("test_cookie_for(1)") && iso.contains("403"),
+        "user 1 POSTs and must get 403 (create_for_memberships WITH CHECK): {iso}"
+    );
+
+    // api-keys (also FLAT) gets its own write-403 test.
+    let api_keys = d.modules.iter().find(|m| m.name == "api-keys").unwrap();
+    let ak = testgen::acceptance_rs(&d, api_keys);
+    assert!(
+        ak.contains("async fn api_keys_flat_write_into_foreign_tenant_is_403()"),
+        "the flat-write isolation test must be emitted for api-keys too: {ak}"
+    );
+
+    // The tenant ROOT (workspaces) is NOT tenant-OWNED → no flat-write test.
+    let workspaces = d.modules.iter().find(|m| m.name == "workspaces").unwrap();
+    let ws = testgen::acceptance_rs(&d, workspaces);
+    assert!(
+        !ws.contains("flat_write_into_foreign_tenant_is_403"),
+        "the tenant root gets no flat-write isolation test: {ws}"
+    );
+
+    // A PATH-SCOPED (nested) module is scoped by the verified path tenant, not a body
+    // fk, so it gets the path-scoped read isolation test but NOT the flat-write test.
+    const CLUBS: &str = r#"{
+        "name": "clubs-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "clubs",
+              "entities": [{ "name": "Club", "fields": [
+                  { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_club", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Club" }, "success": { "status": 201, "entity": "Club" } } ] },
+            { "name": "books", "mount": "/clubs/{club_id}",
+              "entities": [{ "name": "Book", "belongs_to": [{ "entity": "Club" }],
+                  "fields": [{ "name": "id", "type": "integer" }, { "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "create_book", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Book" }, "success": { "status": 201, "entity": "Book" } },
+                  { "operation_id": "get_book", "method": "GET", "path": "/{id}", "auth_required": true,
+                    "success": { "status": 200, "entity": "Book" } } ] }
+        ]
+    }"#;
+    let nested: Design = serde_json::from_str(CLUBS).unwrap();
+    let books = nested.modules.iter().find(|m| m.name == "books").unwrap();
+    let books_gen = testgen::acceptance_rs(&nested, books);
+    assert!(
+        !books_gen.contains("flat_write_into_foreign_tenant_is_403"),
+        "a path-scoped nested module gets no flat-write isolation test: {books_gen}"
+    );
+}
+
 /// A per-user (identity-owned) module gets a #79 isolation test: user B cannot
 /// read/list/delete user A's row. WHY (Rule 9): the identity shape JC0540 steers
 /// toward had NO backstop; this is it. It passes only with the owner-scoped

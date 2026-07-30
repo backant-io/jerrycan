@@ -2447,6 +2447,16 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
     let owner_scoped = owner_scoped_methods(e, mode, design);
     let per_user = !owner_scoped.is_empty();
     let public_read = per_user && design.entity_is_public_read(&e.name);
+    // FLAT tenant make-impossible (issue #97): a FLAT (Supabase-shape) tenant-owned
+    // entity takes its tenant fk from the request BODY, so the bare unscoped surface
+    // (all/get/insert/update/remove) is the cross-tenant write leak JL0006 could only
+    // FLAG. Suppress it — as #79 does for per-user — so ONLY the membership-CHECKED
+    // `*_for_memberships` accessors (already emitted by `scoped`) remain and the leak
+    // is impossible by construction, not merely discouraged. Mutually exclusive with
+    // `per_user` (tenant ownership wins and is transitive, #102). A PATH-SCOPED
+    // (nested) tenant entity is scoped by the verified path tenant, so it is NOT flat
+    // and keeps the bare surface byte-identically.
+    let flat_tenant = mode.db && mode.auth && entity_is_flat_tenant_owned(e, design);
     // The tenant entity's OWN membership-lifecycle methods (empty for every other
     // entity); mutually exclusive with `scoped` (an entity can't be BOTH the tenant
     // and belong_to the tenant).
@@ -2484,28 +2494,55 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
              \x20   }}"
         )
     };
-    // The unscoped read/write accessors. Suppressed for a per-user entity (#79) so
-    // the leaky cross-user call cannot be written — only the owner-scoped `*_for`
+    // The bare `insert`. Suppressed for a FLAT tenant entity (#97) — UNLIKE per-user,
+    // which KEEPS `insert` because a per-user create is scoped by the server-INJECTED
+    // owner fk (the client never names the owner, so the bare insert is safe). A flat
+    // create reads the tenant fk from the client BODY, so the bare insert IS the
+    // cross-tenant write leak — the create MUST go through `create_for_memberships`,
+    // whose RLS WITH CHECK verifies that fk ∈ the caller's memberships.
+    let insert = if flat_tenant {
+        String::new()
+    } else {
+        insert_body
+    };
+    // The unscoped read/write accessors. Suppressed for a per-user entity (#79) OR a
+    // FLAT tenant entity (#97) so the leaky cross-user/cross-tenant call cannot be
+    // written — only the owner-scoped `*_for` / membership-scoped `*_for_memberships`
     // methods remain — EXCEPT that a public_read entity (#105) keeps the unscoped
-    // READS: its GET handlers are public and legitimately serve the whole
-    // collection; its unscoped update/remove stay suppressed. `insert` is always
-    // emitted (a create is scoped by the server-injected owner fk, not by the repo
-    // method). Non-per-user output stays byte-identical:
-    // `{reads}{insert_body}{writes}` reproduces the original layout.
+    // READS: its GET handlers are public and legitimately serve the whole collection;
+    // its unscoped update/remove stay suppressed. For a non-flat, non-per-user entity
+    // `insert` is always emitted (a create is scoped by the server-injected owner fk,
+    // not by the repo method). Non-suppressed output stays byte-identical:
+    // `{reads}{insert}{writes}` reproduces the original layout.
     let unscoped_reads = format!(
         "    pub async fn all(&self) -> Result<Vec<{entity}>> {{\n        {snake}::Entity::find()\n            .order_by_asc({snake}::Column::Id)\n            .all(self.db.conn())\n            .await\n            .map_err(db_error)\n    }}\n\n    pub async fn get(&self, id: {key}) -> Result<Option<{entity}>> {{\n        {snake}::Entity::find_by_id(id)\n            .one(self.db.conn())\n            .await\n            .map_err(db_error)\n    }}\n\n"
     );
     let unscoped_writes = format!(
         "\n\n    pub async fn remove(&self, id: {key}) -> Result<bool> {{\n        let r = {snake}::Entity::delete_by_id(id)\n            .exec(self.db.conn())\n            .await\n            .map_err(db_error)?;\n        Ok(r.rows_affected > 0)\n    }}\n\n    pub async fn update(&self, id: {key}, item: {entity}) -> Result<bool> {{\n        let m = {snake}::ActiveModel {{\n            id: Set(id),\n{update_sets}        }};\n        match m.update(self.db.conn()).await {{\n            Ok(_) => Ok(true),\n            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),\n            Err(e) => Err(db_error(e)),\n        }}\n    }}"
     );
-    let (reads, writes) = match (per_user, public_read) {
-        // Plain per-user (#79): everything unscoped is suppressed.
-        (true, false) => (String::new(), String::new()),
-        // public_read (#105): public reads, owner-only writes.
-        (true, true) => (unscoped_reads, String::new()),
-        // Not per-user: the original unscoped surface, byte-identical.
-        _ => (unscoped_reads, unscoped_writes),
+    let (reads, writes) = if flat_tenant {
+        // FLAT tenant (#97): suppress the bare unscoped reads AND writes — parity with
+        // per-user (#79). Only the `*_for`/`*_for_memberships` accessors remain, so an
+        // agent cannot write the unchecked cross-tenant read/update/delete.
+        (String::new(), String::new())
+    } else {
+        match (per_user, public_read) {
+            // Plain per-user (#79): everything unscoped is suppressed.
+            (true, false) => (String::new(), String::new()),
+            // public_read (#105): public reads, owner-only writes.
+            (true, true) => (unscoped_reads, String::new()),
+            // Not per-user: the original unscoped surface, byte-identical.
+            _ => (unscoped_reads, unscoped_writes),
+        }
     };
+    // Assemble the impl body and trim any leading blank lines: a FLAT tenant entity
+    // (#97) suppresses its entire unscoped surface (reads/insert/writes all empty), so
+    // without the trim the body would open with blank lines that `cargo fmt` would
+    // strip — drifting the generated repo from a rustfmt fixpoint. A non-flat entity
+    // always leads with a method (its `insert` is emitted), so the trim is a no-op and
+    // its output stays byte-identical.
+    let impl_body = format!("{reads}{insert}{writes}\n{scoped}{tenant_own}{owner_scoped}");
+    let impl_body = impl_body.trim_start_matches('\n');
     format!(
         r#"{member_row}pub struct {entity}Repo {{
     db: Db,
@@ -2519,8 +2556,7 @@ pub(crate) async fn {snake}_repo(db: Dep<Db>) -> Result<{entity}Repo> {{
 // Stub handlers don't call the repo yet; remove this allow as you implement them.
 #[allow(dead_code)]
 impl {entity}Repo {{
-{reads}{insert_body}{writes}
-{scoped}{tenant_own}{owner_scoped}}}
+{impl_body}}}
 
 "#,
     )
@@ -2572,6 +2608,21 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
     // module gets `ColumnTrait`/`QueryFilter` WITHOUT the unused `ConnectionTrait`.
     let needs_filter = has_direct_scoped || has_owner_scoped; // ColumnTrait + QueryFilter
     let needs_conn = has_scoped || has_tenant_own; // ConnectionTrait (raw SQL)
+    // `QueryOrder` (`.order_by_asc`) is used ONLY by a method built with the typed
+    // sea-orm query builder: the bare `all()` (kept for a non-suppressed entity), a
+    // DIRECT tenant-scoped `all_for`, or a per-user `all_for`. A module of ONLY flat
+    // TRANSITIVE tenant entities (issue #102) emits none of these — its bare `all()` is
+    // suppressed (#97) and its reads are raw JOIN SQL (`ORDER BY` lives in the SQL
+    // string, not the builder) — so importing `QueryOrder` there would trip `-D
+    // warnings`. `has_bare_reads` mirrors the suppression logic in `sql_repo`: the bare
+    // reads are emitted unless the entity is flat-tenant (#97) or plain per-user (#79).
+    let has_bare_reads = m.entities.iter().any(|e| {
+        let flat = mode.db && mode.auth && entity_is_flat_tenant_owned(e, design);
+        let per_user = !owner_scoped_methods(e, mode, design).is_empty();
+        let public_read = per_user && design.entity_is_public_read(&e.name);
+        !flat && (!per_user || public_read)
+    });
+    let needs_order = has_bare_reads || has_direct_scoped || has_owner_scoped;
     let mut imports = vec!["ActiveModelTrait", "ActiveValue::Set"];
     if needs_filter {
         imports.push("ColumnTrait");
@@ -2588,7 +2639,9 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
     if needs_filter {
         imports.push("QueryFilter");
     }
-    imports.push("QueryOrder");
+    if needs_order {
+        imports.push("QueryOrder");
+    }
     let filter_imports = imports.join(", ");
     // The `use jerrycan::db::sea_orm;` alias resolves the bare `sea_orm::` paths
     // the repo writes (DbErr, ActiveValue::NotSet); the trait imports come through
@@ -4314,7 +4367,10 @@ pub(crate) mod tests {
 
     /// db-mode repos run on SeaORM (entity finders + ActiveModel) over the
     /// jerrycan::db facade — never sea-query/sqlx and never `self.db.pool()`
-    /// (that handle no longer exists). The insert returns the generated key.
+    /// (that handle no longer exists). The membership-checked create returns the
+    /// generated key (Lead is a FLAT tenant entity, so its BARE `insert` is suppressed
+    /// by #97 — the SeaORM insert that returns the key now lives in
+    /// `create_for_memberships`).
     #[test]
     fn db_repos_query_via_sea_orm() {
         let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
@@ -4330,13 +4386,86 @@ pub(crate) mod tests {
         assert!(src.contains("lead::Entity::find()"), "{src}");
         assert!(src.contains(".all(self.db.conn())"), "{src}");
         assert!(
-            src.contains("pub async fn insert(&self, item: Lead) -> Result<i64>"),
-            "{src}"
+            src.contains(
+                "pub async fn create_for_memberships(&self, user_id: String, item: Lead) -> Result<i64>"
+            ),
+            "the membership-checked create returns the generated key via SeaORM: {src}"
         );
         assert!(!src.contains("self.db.pool()"), "{src}");
         assert!(
             !src.contains("build_any_sqlx"),
             "repos are SeaORM now: {src}"
+        );
+    }
+
+    /// Issue #97 — MAKE THE FLAT-TENANT WRITE LEAK IMPOSSIBLE. A FLAT (MembershipSet)
+    /// tenant-owned entity (Lead belongs_to the tenancy Workspace, no tenant fk in its
+    /// path) emits ONLY the membership-scoped surface: the BARE unscoped
+    /// `insert`/`all`/`get`/`update`/`remove` are NOT generated (parity with #79), so a
+    /// handler CANNOT write the unchecked cross-tenant call — it would not compile. The
+    /// membership-CHECKED `create_for_memberships` + the scoped `*_for`/`*_for_memberships`
+    /// accessors remain. The tenant ROOT (Workspace) itself is UNCHANGED — it is not
+    /// tenant-OWNED, so it keeps its bare `insert`/`all` (a create seeds the tenant).
+    #[test]
+    fn flat_tenant_owned_entity_suppresses_bare_methods() {
+        let d: Design = serde_json::from_str(crate::platform::design::tests::V1_FULL).unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let lead = repo_rs(&d.modules[1], mode, &d).unwrap();
+        // The BARE unscoped surface is GONE — the cross-tenant write leak is impossible.
+        assert!(
+            !lead.contains("pub async fn insert("),
+            "a flat tenant entity's bare insert must NOT be generated (#97): {lead}"
+        );
+        assert!(
+            !lead.contains("pub async fn all(&self)"),
+            "unscoped all() must NOT be generated for a flat tenant entity: {lead}"
+        );
+        assert!(
+            !lead.contains("pub async fn get(&self, id: i64)"),
+            "unscoped get() must NOT be generated for a flat tenant entity: {lead}"
+        );
+        assert!(
+            !lead.contains("pub async fn remove(&self, id: i64)"),
+            "unscoped remove() must NOT be generated for a flat tenant entity: {lead}"
+        );
+        assert!(
+            !lead.contains("pub async fn update(&self, id: i64, item:"),
+            "unscoped update() must NOT be generated for a flat tenant entity: {lead}"
+        );
+        // The membership-CHECKED create + the scoped accessors remain — a complete surface.
+        assert!(
+            lead.contains(
+                "pub async fn create_for_memberships(&self, user_id: String, item: Lead)"
+            ),
+            "the membership-checked create is retained: {lead}"
+        );
+        assert!(
+            lead.contains("pub async fn all_for_memberships(&self, user_id: String)"),
+            "the membership-scoped list is retained: {lead}"
+        );
+        assert!(
+            lead.contains("pub async fn all_for(&self, workspace_id: i64)"),
+            "the tenant-fk-scoped list is retained: {lead}"
+        );
+        // The repo opens cleanly (no stray blank lines the suppression could leave) so
+        // the generated file stays a rustfmt fixpoint.
+        assert!(
+            !lead.contains("impl LeadRepo {\n\n"),
+            "the suppressed flat repo must not open with a blank line (rustfmt fixpoint): {lead}"
+        );
+
+        // The tenant ROOT (Workspace) is NOT tenant-owned, so it keeps the bare surface.
+        let workspace = repo_rs(&d.modules[0], mode, &d).unwrap();
+        assert!(
+            workspace.contains("pub async fn insert(&self, item: Workspace)"),
+            "the tenant root keeps its bare insert (a create seeds the tenant): {workspace}"
+        );
+        assert!(
+            workspace.contains("pub async fn all(&self) -> Result<Vec<Workspace>>"),
+            "the tenant root keeps its unscoped all(): {workspace}"
         );
     }
 

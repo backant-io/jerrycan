@@ -1,12 +1,15 @@
 //! Handlers for `leads` — tenant-SCOPED CRUD + multipart CSV import.
 //!
-//! Every handler is tenant-guarded: it takes `Dep<Tenant>` and reaches rows only
-//! through the scoped accessors (`all_for`/`get_for`/`update_for`/`remove_for`),
-//! so a caller can never see or mutate another tenant's leads (JL0006).
+//! Reads and the path-scoped writes are tenant-guarded via `Dep<Tenant>` and the
+//! scoped accessors (`all_for`/`get_for`/`update_for`/`remove_for`); the FLAT create
+//! takes `CurrentUser` and calls the membership-CHECKED `create_for_memberships`,
+//! whose RLS `WITH CHECK` verifies the body's `workspace_id` is in the caller's
+//! membership set before inserting (#94/#97). A caller can never see or mutate
+//! another tenant's leads (JL0006).
 use super::model::*;
 use super::repo::*;
 use jerrycan::prelude::*;
-use shared::Tenant;
+use shared::{CurrentUser, Tenant};
 
 /// Coerce a requested status onto the design's enum (`new`|`called`|`dnc`);
 /// anything else defaults to `new` so a free-text value can't violate the DB
@@ -27,30 +30,34 @@ pub(crate) async fn list_leads(
     Ok(Json(repo.all_for(tenant.id()).await?))
 }
 
-/// POST / — create a lead in the caller's tenant. A duplicate phone surfaces as
-/// 409 (the unique index → `db_error` → JC0409). The workspace_id is taken from
-/// the authenticated Tenant, never trusted from the body.
+/// POST / — create a lead. The `workspace_id` comes from the request BODY and is
+/// verified against the caller's membership set by `create_for_memberships` (the
+/// flat-tenant RLS `WITH CHECK`, #94): a create into a workspace the caller does
+/// NOT belong to is 403, and the bare `insert` that would skip that check is not
+/// generated for a flat tenant entity (#97). A duplicate phone surfaces as 409 (the
+/// unique index → `db_error` → JC0409).
 pub(crate) async fn create_lead(
     repo: Dep<LeadRepo>,
-    tenant: Dep<Tenant>,
+    user: CurrentUser,
     Json(body): Json<Lead>,
 ) -> Result<Created<Lead>> {
     let status = normalize_status(&body.status);
+    let workspace_id = body.workspace_id;
     let to_store = Lead {
         id: body.id,
-        workspace_id: tenant.id(),
+        workspace_id,
         phone: body.phone.clone(),
         name: body.name.clone(),
         status: status.clone(),
         custom: body.custom.clone(),
     };
-    // `workspace_id` is pinned to the membership-verified `tenant.id()` above (never
-    // the body), so this bare insert cannot write into a non-member tenant — the flat
-    // create leak (#94) does not apply here.
-    let id = repo.insert(to_store).await?; // jerrycan:allow JL0006
+    // Membership-CHECKED create (#94/#97): `create_for_memberships` verifies the
+    // body's `workspace_id` is in the caller's membership set before inserting — a
+    // create aimed at a non-member workspace is 403, never a silent cross-tenant write.
+    let id = repo.create_for_memberships(user.0.id, to_store).await?;
     Ok(Created(Lead {
         id,
-        workspace_id: tenant.id(),
+        workspace_id,
         phone: body.phone,
         name: body.name,
         status,
