@@ -393,9 +393,14 @@ impl TestApp {
         let cors_origin = parts.headers.get(http::header::ORIGIN).cloned();
 
         // Phase 1: route on the head alone — a reject answers without reading the body.
+        // `body_read_timeout` (the per-route/#111 per-frame deadline) is not
+        // exercised in-process: the test stream lane frames synchronously (no
+        // `TimedRecvBody`) and the buffered path checks length synchronously, so
+        // there is no socket stall for the deadline to govern. It is covered by
+        // the live-socket tests in `tests/`.
         let (limit, stream) = match self.built.route_policy(&parts) {
             Policy::Reject(response) => return TestResponse::collect(response).await,
-            Policy::Route { limit, stream } => (limit, stream),
+            Policy::Route { limit, stream, .. } => (limit, stream),
         };
         // Phase 2: stream routes get a REAL stream lane — frames + the route's
         // `Limited` cap inside it, exactly like the live socket path, so the

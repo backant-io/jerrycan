@@ -76,6 +76,10 @@ pub(crate) struct FlatRoute {
     pub(crate) middleware: Arc<[Arc<dyn Middleware>]>,
     /// Per-route body cap carried from the `MethodRouter` to the `Endpoint`.
     pub(crate) body_limit: Option<usize>,
+    /// Per-route handler-time budget carried from `MethodRouter` to `Endpoint` (#111).
+    pub(crate) handler_timeout: Option<std::time::Duration>,
+    /// Per-route body-read deadline carried from `MethodRouter` to `Endpoint` (#111).
+    pub(crate) body_read_timeout: Option<std::time::Duration>,
 }
 
 pub(crate) fn join_paths(prefix: &str, rel: &str) -> String {
@@ -110,12 +114,16 @@ impl Module {
         let mut out = Vec::new();
         for (path, methods) in self.routes {
             let body_limit = methods.body_limit;
+            let handler_timeout = methods.handler_timeout;
+            let body_read_timeout = methods.body_read_timeout;
             out.push(FlatRoute {
                 path: join_paths(prefix, &path),
                 methods,
                 env: env.clone(),
                 middleware: mw_arc.clone(),
                 body_limit,
+                handler_timeout,
+                body_read_timeout,
             });
         }
         for (sub_prefix, child) in self.mounts {

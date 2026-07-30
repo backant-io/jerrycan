@@ -193,6 +193,168 @@ async fn streamed_request_body_drains_over_a_real_socket_when_written_in_dribble
     server.abort();
 }
 
+/// #111: a `.stream_body()` upload drains the body INSIDE the handler, so a
+/// short app-global handler budget 503s a slow-but-moving dribble even though
+/// every frame arrives well within the read deadline. A raised PER-ROUTE
+/// `.handler_timeout` — set on the agent-owned route registration, not the
+/// tool-owned main.rs global (which would trip JL0003) — gives the drain room,
+/// so the same dribble that 503s a plain route completes 200 on the raised one.
+#[tokio::test]
+async fn streamed_upload_survives_slow_drain_with_raised_per_route_handler_timeout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = App::new()
+        // Short app-global handler budget: `/default` inherits it and 503s the
+        // slow drain; `/patient` overrides it to 10s and completes.
+        .handler_timeout(Duration::from_millis(100))
+        .route("/default", post(echo).stream_body().body_limit(1024))
+        .route(
+            "/patient",
+            post(echo)
+                .stream_body()
+                .body_limit(1024)
+                .handler_timeout(Duration::from_secs(10)),
+        );
+    let server = tokio::spawn(async move { app.serve_with(listener).await });
+
+    // `/patient`: the raised per-route budget lets the dribbled drain finish 200.
+    let patient = tokio::time::timeout(
+        Duration::from_secs(15),
+        dribble_json(addr.clone(), "/patient", Duration::from_millis(200)),
+    )
+    .await
+    .expect("the patient stream must complete, not hang");
+    assert!(
+        patient.starts_with("HTTP/1.1 200"),
+        "the raised per-route budget must survive the slow drain: {}",
+        &patient[..patient.len().min(80)]
+    );
+    let resp_body = patient.split_once("\r\n\r\n").expect("headers").1;
+    let echoed: serde_json::Value = serde_json::from_str(resp_body.trim()).expect("echoed JSON");
+    assert_eq!(echoed, serde_json::json!({"hello": "streamed world"}));
+
+    // `/default`: the same dribble under the 100ms app-global budget → 503 JC0503.
+    let defaulted = tokio::time::timeout(
+        Duration::from_secs(15),
+        dribble_json(addr.clone(), "/default", Duration::from_millis(200)),
+    )
+    .await
+    .expect("the default stream must answer, not hang");
+    assert!(
+        defaulted.starts_with("HTTP/1.1 503") && defaulted.contains("JC0503"),
+        "the 100ms app-global must 503 the slow drain: {}",
+        &defaulted[..defaulted.len().min(80)]
+    );
+
+    server.abort();
+}
+
+/// Dribble a small JSON body across three flushed writes with `gap` between
+/// them, tolerating write errors (the server may 503/close mid-body). Returns
+/// the raw HTTP response text. Shared by the #111 handler-budget tests.
+async fn dribble_json(addr: String, path: &str, gap: Duration) -> String {
+    let body = br#"{"hello":"streamed world"}"#;
+    let (a, rest) = body.split_at(8);
+    let (b, c) = rest.split_at(9);
+    let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = s.write_all(head.as_bytes()).await;
+    let _ = s.flush().await;
+    for chunk in [a, b, c] {
+        let _ = s.write_all(chunk).await;
+        let _ = s.flush().await;
+        tokio::time::sleep(gap).await;
+    }
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// #111 companion: a per-route `.body_read_timeout` overrides the app-global
+/// per-frame read deadline. Under a 100ms global, a route that raises its own
+/// deadline to 3s tolerates an inter-frame stall that a plain route (inheriting
+/// the 100ms global) cuts off. Both routes share ONE app, so the ONLY
+/// difference is the per-route override.
+#[tokio::test]
+async fn per_route_body_read_timeout_tolerates_a_stall_the_global_rejects() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = App::new()
+        .body_read_timeout(Duration::from_millis(100))
+        .route("/strict", post(echo).stream_body().body_limit(1024))
+        .route(
+            "/tolerant",
+            post(echo)
+                .stream_body()
+                .body_limit(1024)
+                .body_read_timeout(Duration::from_secs(3)),
+        );
+    let server = tokio::spawn(async move { app.serve_with(listener).await });
+
+    let body = br#"{"k":"vvvvv"}"#;
+    let (head_bytes, tail_bytes) = body.split_at(6);
+
+    // `/strict` inherits the 100ms global: send the first frame, then stall past
+    // the deadline (never send the tail). The per-frame guard must cut it off —
+    // an explicit 408 JC0408 or a clean close, never a hang.
+    let strict = async {
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /strict HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = s.write_all(head.as_bytes()).await;
+        let _ = s.write_all(head_bytes).await;
+        let _ = s.flush().await;
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+    let strict = tokio::time::timeout(Duration::from_secs(5), strict)
+        .await
+        .expect("the stalled strict frame must be cut off, not hang");
+    assert!(
+        strict.contains("408") && strict.contains("JC0408"),
+        "the 100ms global must reject the stalled frame with 408 JC0408: {strict:?}"
+    );
+
+    // `/tolerant` raises the deadline to 3s: a 400ms inter-frame stall (well over
+    // the 100ms global) is tolerated and the completed body echoes 200.
+    let tolerant = async {
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /tolerant HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.write_all(head_bytes).await.unwrap();
+        s.flush().await.unwrap();
+        // Stall 400ms: > the 100ms global, < the 3s per-route deadline.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        s.write_all(tail_bytes).await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+    let tolerant = tokio::time::timeout(Duration::from_secs(10), tolerant)
+        .await
+        .expect("the tolerant stream must complete, not hang");
+    assert!(
+        tolerant.starts_with("HTTP/1.1 200"),
+        "the per-route 3s deadline must tolerate the stall: {}",
+        &tolerant[..tolerant.len().min(80)]
+    );
+    let resp_body = tolerant.split_once("\r\n\r\n").expect("headers").1;
+    let echoed: serde_json::Value = serde_json::from_str(resp_body.trim()).expect("echoed JSON");
+    assert_eq!(echoed, serde_json::json!({"k": "vvvvv"}));
+
+    server.abort();
+}
+
 /// Collects `(name, text)` pairs from a streamed multipart body. The whole
 /// point: the parser reassembles parts off frames the client dribbles 5 bytes
 /// at a time, with no part ever arriving whole in a single frame.

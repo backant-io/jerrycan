@@ -20,6 +20,12 @@ pub struct MethodRouter {
     /// When true, the body is NOT buffered before dispatch — extractors read
     /// the live stream lane. Applies to ALL methods on the route.
     pub(crate) stream_body: bool,
+    /// Per-route override of the app-global handler-time budget (issue #111).
+    /// `None` defers to the app default. Applies to ALL methods on the route.
+    pub(crate) handler_timeout: Option<std::time::Duration>,
+    /// Per-route override of the app-global per-frame body-read deadline (#111).
+    /// `None` defers to the app default. Applies to ALL methods on the route.
+    pub(crate) body_read_timeout: Option<std::time::Duration>,
 }
 
 pub fn get<H: Handler<A>, A>(h: H) -> MethodRouter {
@@ -44,6 +50,8 @@ impl MethodRouter {
             handlers: Vec::new(),
             body_limit: None,
             stream_body: false,
+            handler_timeout: None,
+            body_read_timeout: None,
         }
     }
 
@@ -68,6 +76,22 @@ impl MethodRouter {
         self.stream_body = true;
         self
     }
+
+    /// Override the app-global handler-time budget for THIS route (issue #111).
+    /// A slow-but-moving upload on a `.stream_body()` route drains inside the
+    /// handler, so raise this (not the app-global in tool-owned main.rs — that
+    /// trips JL0003) to give the drain room. `None` ⇒ the app default applies.
+    pub fn handler_timeout(mut self, budget: std::time::Duration) -> Self {
+        self.handler_timeout = Some(budget);
+        self
+    }
+
+    /// Override the app-global per-frame body-read deadline for THIS route (#111).
+    pub fn body_read_timeout(mut self, budget: std::time::Duration) -> Self {
+        self.body_read_timeout = Some(budget);
+        self
+    }
+
     pub fn get<H: Handler<A>, A>(self, h: H) -> Self {
         self.on(Method::GET, h)
     }
@@ -97,6 +121,12 @@ pub(crate) struct Endpoint {
     /// When true, the body is streamed (not collected upfront) — `route_policy`
     /// reports it so serve hands the live stream lane to dispatch (v2.1).
     pub(crate) stream_body: bool,
+    /// Per-route handler-time budget (#111); `None` = the app default. Resolved
+    /// against the app-global at the `dispatch` timeout wrap.
+    pub(crate) handler_timeout: Option<std::time::Duration>,
+    /// Per-route per-frame body-read deadline (#111); `None` = the app default.
+    /// Resolved against the app-global where `route_policy` sizes the lane.
+    pub(crate) body_read_timeout: Option<std::time::Duration>,
 }
 
 #[derive(Default)]
@@ -302,6 +332,8 @@ mod tests {
             middleware: Arc::from(vec![]),
             body_limit: None,
             stream_body: false,
+            handler_timeout: None,
+            body_read_timeout: None,
         }
     }
 
