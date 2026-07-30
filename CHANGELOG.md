@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.21 — 2026-07-30
+
+### New
+- **Rate limiting is now design-visible (#83).** A design may declare a
+  `rate_limit` block — `{ "limit": 100, "window": "1m", "api_key_header"?, "trust_forwarded_for"? }`
+  — and the generator wires the limiter into `main.rs`
+  (`.extend(RateLimit::per_window(…))`) and enables the `rate-limit` facade
+  feature. Previously rate limiting worked at runtime but had no contract surface:
+  the only wiring path was hand-editing the tool-owned `main.rs`, which
+  **permanently tripped `JL0003`** (the drift lint). Because the wiring is now
+  generated, `main.rs` stays byte-identical and `JL0003` no longer trips. Over-limit
+  requests get 429 + Retry-After; the partition defaults to the authenticated user
+  then client IP (both unspoofable).
+- **`JC0563`** refuses a malformed `rate_limit` — a zero `limit`, an unparseable
+  `window`, or an invalid `api_key_header` name.
+
+### Docs
+- Corrected `06-middleware.md`: api-key partitioning is **off by default** (opt-in),
+  not on, and an unauthenticated api-key header is client-spoofable — only partition
+  by it when the key is validated before the limiter runs.
+
 ## 0.6.20 — 2026-07-30
 
 ### Fixed
