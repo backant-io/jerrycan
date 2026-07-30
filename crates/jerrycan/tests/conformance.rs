@@ -146,6 +146,136 @@ fn db_mode_scaffold_passes_jerrycan_check() {
     assert!(out.status.success());
 }
 
+/// Scaffold the golden app in DB+validate mode PLUS a `rate_limit` block, against
+/// the LOCAL framework (path dep). The block adds only app-level middleware wiring,
+/// so the existing db handler fixtures still drive a green check.
+fn scaffold_golden_db_rate_limited(tmp: &Path) -> PathBuf {
+    let mut design: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
+    design["dependencies"] = serde_json::json!(["db", "validate"]);
+    design["rate_limit"] = serde_json::json!({ "limit": 100, "window": "1m" });
+    let design_path = tmp.join("design.json");
+    std::fs::write(&design_path, serde_json::to_string_pretty(&design).unwrap()).unwrap();
+    let app = tmp.join("todo-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    app
+}
+
+/// The #83 acceptance: a design carrying `rate_limit: { limit: 100, window: "1m" }`
+/// scaffolds a `main.rs` that WIRES the limiter (`.extend(RateLimit::per_window(
+/// 100, Duration::from_secs(60)))`) with the `rate-limit` facade feature on, passes
+/// the full `jerrycan check` gate, and — the whole point of #83 — does so WITHOUT
+/// tripping JL0003. Rate limiting used to be reachable only by hand-editing the
+/// tool-owned main.rs, which permanently drifted it from the generator (JL0003).
+/// Now the wiring is GENERATED from the design, so main.rs equals the generator's
+/// output byte-for-byte and stays a `cargo fmt` fixpoint (no drift, ever).
+#[test]
+#[ignore = "heavy: rate-limited db golden app must build, fmt-clean, and pass the gate w/o JL0003"]
+fn rate_limited_db_scaffold_checks_green_without_tripping_jl0003() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = scaffold_golden_db_rate_limited(tmp.path());
+
+    // The generated main.rs wires the limiter (no-builder regime: rustfmt breaks
+    // per_window's two args). Asserting the exact bytes proves what `check`'s
+    // JL0003 lint compares main.rs against.
+    let main = std::fs::read_to_string(app.join("crates/app/src/main.rs")).unwrap();
+    assert!(
+        main.contains(
+            "        .extend(jerrycan::ratelimit::RateLimit::per_window(\n            100,\n            std::time::Duration::from_secs(60),\n        ))\n"
+        ),
+        "main.rs must wire the generated rate limiter:\n{main}"
+    );
+    // The `rate-limit` facade feature is enabled on the workspace jerrycan dep, so
+    // `jerrycan::ratelimit::RateLimit` resolves.
+    let ws_cargo = std::fs::read_to_string(app.join("Cargo.toml")).unwrap();
+    assert!(
+        ws_cargo.contains("\"rate-limit\""),
+        "the rate-limit facade feature must be enabled:\n{ws_cargo}"
+    );
+
+    // The TOOL-OWNED main.rs must be a `rustfmt` fixpoint: running fmt must not
+    // rewrite the generated `.extend(RateLimit..)` line — a rewrite is exactly what
+    // would drift main.rs from the generator and trip JL0003 on the NEXT check.
+    // (Only the tool-owned files are held to this; agent-owned stubs are theirs to
+    // format, and JL0003 never inspects them.)
+    let fmt = Command::new("rustfmt")
+        .args(["--edition", "2024", "--check"])
+        .arg(app.join("crates/app/src/main.rs"))
+        .output()
+        .unwrap();
+    assert!(
+        fmt.status.success(),
+        "the generated main.rs must be a rustfmt fixpoint (no drift → no JL0003):\n{}\n{}",
+        String::from_utf8_lossy(&fmt.stdout),
+        String::from_utf8_lossy(&fmt.stderr)
+    );
+
+    // The documented workflow: gen-tests → implement → check (#123a refuses a
+    // never-gen-tested module with JC0551). Reuse the golden db handler fixtures.
+    for module in ["todos", "users"] {
+        let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+            .current_dir(&app)
+            .env("CARGO_TARGET_DIR", common::shared_app_target())
+            .args(["gen-tests", "--module", module])
+            .status()
+            .unwrap();
+        assert!(st.success(), "gen-tests {module} must succeed");
+    }
+    for (fixture, target) in [
+        (
+            "db/todos_handlers.rs",
+            "crates/routes/todos/src/handlers.rs",
+        ),
+        (
+            "db/comments_handlers.rs",
+            "crates/routes/todos/src/subroutes/comments/handlers.rs",
+        ),
+        (
+            "db/users_handlers.rs",
+            "crates/routes/users/src/handlers.rs",
+        ),
+    ] {
+        std::fs::copy(
+            repo_root().join("conformance/fixtures").join(fixture),
+            app.join(target),
+        )
+        .unwrap();
+    }
+
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["--json", "check"])
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON doc");
+    assert_eq!(
+        payload["ok"], true,
+        "the rate-limited app must pass the full gate; diagnostics: {}",
+        payload["diagnostics"]
+    );
+    // The crux of #83: the generated wiring must NOT trip JL0003 (generated-file
+    // drift). Assert it explicitly — a green `ok` alone could mask a lint that was
+    // never evaluated.
+    assert!(
+        !payload["diagnostics"].to_string().contains("JL0003"),
+        "generated rate-limit wiring must not trip JL0003: {}",
+        payload["diagnostics"]
+    );
+    assert!(out.status.success());
+}
+
 #[test]
 #[ignore = "heavy: full cargo build of a generated workspace"]
 fn scaffolded_app_builds_with_zero_warnings() {

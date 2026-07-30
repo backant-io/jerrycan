@@ -355,6 +355,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs auth",
     },
     CodeInfo {
+        code: "JC0563",
+        title: "malformed rate_limit block",
+        cause: "the top-level `rate_limit` block (issue #83) is unbuildable: `limit` is 0 (a 0-per-window limit rejects EVERY request — surely unintended), or `window` does not parse to a POSITIVE duration (it must be a bare number of seconds or an `<n>s`/`<n>m`/`<n>h`/`<n>d` string — e.g. \"1m\" — and becomes `Duration::from_secs(N)` in the generated `.extend(RateLimit::per_window(..))` wiring), or `api_key_header` is not a valid HTTP header name (`^[A-Za-z0-9-]+$`) — the header is interpolated into `RateLimit::api_key_header(..)`, so a bad token would panic the generated app at startup",
+        fix: "set `limit` to a positive request count per window; give `window` a positive duration (\"30s\", \"1m\", \"1h\", \"1d\", or a bare seconds count); and make `api_key_header` a valid header token (^[A-Za-z0-9-]+$, e.g. \"x-api-key\") — or omit it to partition by the authenticated user then client IP (both unspoofable; an unauthenticated api-key header is client-controlled)",
+        doc: "jerrycan docs middleware",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -784,6 +791,27 @@ mod tests {
         assert!(
             info.fix.contains("PATH-SCOPED") && info.fix.contains("FLAT"),
             "fix must name both single-shape remedies: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0563_names_all_three_rate_limit_failure_modes() {
+        // WHY: JC0563 (#83) is the agent's stop after `check` rejects a malformed
+        // `rate_limit` block. `jerrycan explain JC0563` must name all three ways it
+        // can be wrong — a 0 limit, a non-positive/unparseable window, and an
+        // invalid api_key_header — and the fix must state the valid shapes.
+        let info = lookup("JC0563").unwrap();
+        assert!(
+            info.cause.contains("limit` is 0")
+                && info.cause.contains("window")
+                && info.cause.contains("api_key_header"),
+            "cause must name all three failure modes: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("positive") && info.fix.contains("^[A-Za-z0-9-]+$"),
+            "fix must state the required shapes: {}",
             info.fix
         );
     }

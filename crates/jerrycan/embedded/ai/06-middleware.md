@@ -84,19 +84,27 @@ assert_eq!(t.get("/locked/").await.status(), jerrycan::http::StatusCode::FORBIDD
 `jerrycan-ratelimit` (the `rate-limit` feature) is an extension, not a hand-rolled
 middleware: `app.extend(RateLimit::per_window(n, dur))` allows `n` requests per
 fixed `dur` window per partition key. The partition is chosen by precedence —
-**api-key header → user-key closure → client IP** — so an authenticated caller is
-limited by identity, anonymous traffic by source. Over-limit requests get
+**api-key header (opt-in, off by default) → user-key closure → client IP** — so an
+authenticated caller is limited by identity, anonymous traffic by source. Over-limit requests get
 `429 JC0429` with a `Retry-After` header; `OPTIONS` is exempt (CORS preflight must
 never be throttled). Time comes from the injected `Clock`, so windows are
 deterministic in tests — `t.clock().advance(dur)` rolls to the next window.
 
-Builders tune the partition and store: `api_key_header("x-key")` changes the tier-1
-header (default `x-api-key`); `user_key(|ctx| ..)` supplies a stable user key (e.g.
+Builders tune the partition and store: `api_key_header("x-api-key")` OPTS IN to an
+api-key partition tier (**off by default** — there is no default header) so the
+named header becomes tier 1; `user_key(|ctx| ..)` supplies a stable user key (e.g.
 a JWT sub) for tier 2; `trust_forwarded_for(true)` makes the IP tier honor
 `X-Forwarded-For` (default OFF — the header is client-spoofable, so only enable it
 behind a trusted proxy); `store(Arc::new(..))` swaps the backend — the default is
 in-memory, and `RedisStore` (behind `rate-limit-redis`) shares one window across
 replicas.
+
+**Api-key caveat:** an api-key header is only safe to partition by when the key is
+authenticated upstream of the limiter. An unauthenticated header is
+client-controlled, so a caller can mint a fresh budget per request by rotating the
+value — bypassing the limit entirely. Leave it off (the default) unless the key is
+validated before the limiter runs; with no api-key tier, the partition falls back
+to the authenticated user then client IP, both unspoofable.
 
 Failure modes split by cause: a missing identity (no peer, no api-key, no
 user-key) or a missing clock fails **open** — a misconfigured limiter must not
@@ -137,6 +145,34 @@ assert_eq!(t.get_from("/ping", ip).await.status().as_u16(), 204);
 # #[cfg(not(feature = "rate-limit"))]
 # fn main() {}
 ```
+
+In a generated app you declare rate limiting in `design.json` rather than
+hand-editing the tool-owned `crates/app/src/main.rs` (that edit trips the JL0003
+tool-owned-file lint and is wiped by the next `jerrycan generate`):
+
+```json
+{
+  "rate_limit": {
+    "limit": 100,
+    "window": "1m",
+    "api_key_header": "x-api-key",
+    "trust_forwarded_for": false
+  }
+}
+```
+
+The generator wires `.extend(RateLimit::per_window(100, Duration::from_secs(60)))`
+into app assembly, right after the `Auth` extension so the limiter's identity-aware
+partition can resolve the authenticated user — so there is no hand-edit and JL0003
+never trips. `limit` is the requests allowed per `window` per partition key;
+`window` is a duration string (`30s`/`1m`/`1h`/`1d`, or a bare number of seconds).
+`api_key_header` and `trust_forwarded_for` are optional — omit them (the default)
+to partition by the authenticated user then client IP, both unspoofable; the
+api-key tier is opt-in and carries the caveat above. Over-limit requests get
+`429 JC0429` with a `Retry-After` header. A malformed block — a 0 limit (blocks
+every request), an unparseable or zero `window`, or an `api_key_header` that is not
+a valid `^[A-Za-z0-9-]+$` token — is refused up front by `jerrycan check` with
+`JC0563`.
 
 ## CORS
 Cross-origin access is a policy on the `App`, not a middleware — preflight `OPTIONS`
