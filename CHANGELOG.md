@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.26 — 2026-07-30
+
+### Added
+- **Type-safe atomic capacity reservations — `reserve_against` (#187).** A field can
+  declare `reserve_against: "<capacity_field>"` — the field is a counter, the named
+  field its ceiling — and the generated `{Entity}Repo` gains a
+  **`reserve(id, n) -> Result<bool>`** method that performs the reservation in ONE
+  atomic conditional `UPDATE … SET used = used + n WHERE id = ? AND used + n <= capacity`
+  (`Ok(true)` reserved, `Ok(false)` at capacity or no such row). This is the
+  make-impossible successor to #108: an agent no longer hand-writes the reservation, so
+  the read-capacity-then-write slip that silently oversells on Postgres cannot be
+  written. Correct on SQLite **and** Postgres — all callers for a row contend on the
+  same primary-key row, so the row lock plus the `WHERE` guard serialize them (proven by
+  a live-Postgres concurrency test: a naive read-then-write oversells; `reserve` holds
+  `used == capacity`). Identifiers in the generated SQL are quoted, so a counter or
+  capacity named after a SQL keyword (`limit`, `order`) is safe.
+- **`JC0564`** refuses a malformed `reserve_against`: a non-existent or non-integer
+  capacity, a non-integer counter, either leg being the pk `id` or a nullable
+  (`required: false`) column (a NULL makes the guard NULL — `reserve` would never
+  succeed), a self-reference, more than one per entity, or a design without a database.
+
+Byte-identical for every design that does not declare `reserve_against` (no method
+emitted, no schema change).
+
 ## 0.6.25 — 2026-07-30
 
 ### Fixed
