@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.25 — 2026-07-30
+
+### Fixed
+- **Anonymous clients can now reach public (scope-`none`) realtime topics when an
+  auth model exists (#117).** The WebSocket upgrade ran the principal resolver with
+  `?`, so a client with no/invalid credential was `401`'d at the *upgrade* — before
+  any per-topic scope check. That made a public topic (e.g. an auction's price feed)
+  unreachable by anonymous clients the moment the app had any auth, contradicting the
+  scope model (`scope_allows(None, None) => Ok`). A resolver **authentication failure
+  (401)** is now treated as an **anonymous connection** (`principal = None`) rather
+  than a hard upgrade `401`; per-topic `scope_allows` still enforces access. A `None`
+  principal reaches **only** scope-`none` topics — every scope-`auth`/`tenant` topic
+  (and every changes/CDC topic) still rejects it at JOIN — so a bad credential
+  accesses nothing an anonymous client couldn't. A genuine non-auth resolver error
+  (e.g. a 5xx backend failure) still aborts the upgrade (no fail-open).
+
+Byte-identical scaffolding — this is a `jerrycan-realtime` runtime fix; generated code
+is unchanged.
+
 ## 0.6.24 — 2026-07-30
 
 ### Fixed
