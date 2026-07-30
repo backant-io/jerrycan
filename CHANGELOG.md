@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.19 — 2026-07-30
+
+### Docs
+- **Concurrency & atomic reservations (#108).** Documented the per-backend write
+  concurrency and the safe way to reserve a limited resource. The SQLite pool caps
+  at 1 connection (single writer — writes serialize), so a *read-capacity-then-insert*
+  reservation is accidentally race-free; on Postgres (real pool) the identical code
+  **silently oversells**. The new section documents the pool sizing, warns about the
+  read-then-insert trap, and gives the correct cross-backend pattern — a single
+  atomic conditional `UPDATE … WHERE used + n <= capacity` (check the affected-row
+  count: 1 = reserved, 0 = at capacity → 409). Backed by a concurrency test that
+  proves the naive pattern oversells on Postgres while the atomic one reserves
+  exactly capacity under load.
+
 ## 0.6.18 — 2026-07-30
 
 Realtime security.

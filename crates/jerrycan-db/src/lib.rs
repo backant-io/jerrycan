@@ -670,4 +670,222 @@ mod tests {
             .await
             .unwrap();
     }
+
+    // ---- #108: atomic reserve-if-capacity, proven under concurrency ----
+    // The SAFE pattern documented in `docs/ai/08-database.md`: reserve one unit
+    // in a SINGLE conditional UPDATE that both checks and reserves. The `WHERE`
+    // carries the capacity guard, so the row locks for the write and no two
+    // callers can both pass the check. Returns true iff THIS caller reserved
+    // (exactly 1 row affected); false means the row was already at capacity.
+
+    /// The safe atomic reservation: one conditional UPDATE, affected-row count
+    /// is the verdict. Atomic on BOTH backends.
+    async fn atomic_reserve_one(db: &Db, id: i64) -> Result<bool> {
+        let stmt = Statement::from_sql_and_values(
+            db.backend_db(),
+            db.sql("UPDATE seats SET used = used + 1 WHERE id = ? AND used + 1 <= capacity"),
+            [id.into()],
+        );
+        let res = db.conn().execute(stmt).await.map_err(db_error)?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn seats_used(db: &Db, id: i64) -> i64 {
+        let row = db
+            .conn()
+            .query_one(Statement::from_sql_and_values(
+                db.backend_db(),
+                db.sql("SELECT used FROM seats WHERE id = ?"),
+                [id.into()],
+            ))
+            .await
+            .unwrap()
+            .expect("seats row");
+        row.try_get::<i64>("", "used")
+            .or_else(|_| row.try_get::<i32>("", "used").map(i64::from))
+            .unwrap()
+    }
+
+    /// The LANDMINE the docs warn about: read the current count, then insert if
+    /// "under capacity". Two concurrent callers both read the same count, both
+    /// pass, both insert → oversell. The small gap between the read and the
+    /// write (every real handler has one) makes the race fire deterministically.
+    async fn naive_reserve_one(db: &Db, resource_id: i64, capacity: i64) -> Result<bool> {
+        let row = db
+            .conn()
+            .query_one(Statement::from_sql_and_values(
+                db.backend_db(),
+                db.sql("SELECT COUNT(*) AS n FROM bookings WHERE resource_id = ?"),
+                [resource_id.into()],
+            ))
+            .await
+            .map_err(db_error)?
+            .expect("count row");
+        let count = row
+            .try_get::<i64>("", "n")
+            .or_else(|_| row.try_get::<i32>("", "n").map(i64::from))
+            .unwrap();
+        if count >= capacity {
+            return Ok(false);
+        }
+        // The window a real handler has between deciding and writing.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        db.conn()
+            .execute(Statement::from_sql_and_values(
+                db.backend_db(),
+                db.sql("INSERT INTO bookings (resource_id) VALUES (?)"),
+                [resource_id.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(true)
+    }
+
+    async fn booking_count(db: &Db, resource_id: i64) -> i64 {
+        let row = db
+            .conn()
+            .query_one(Statement::from_sql_and_values(
+                db.backend_db(),
+                db.sql("SELECT COUNT(*) AS n FROM bookings WHERE resource_id = ?"),
+                [resource_id.into()],
+            ))
+            .await
+            .unwrap()
+            .expect("count row");
+        row.try_get::<i64>("", "n")
+            .or_else(|_| row.try_get::<i32>("", "n").map(i64::from))
+            .unwrap()
+    }
+
+    /// SQLite: the documented atomic conditional-UPDATE reservation grants
+    /// EXACTLY capacity under concurrency — never oversells. SQLite's single
+    /// writer (pool max = 1) serializes writes, so this is also the backend where
+    /// a naive read-then-insert would *accidentally* be safe; the pattern is what
+    /// makes it correct on Postgres too (proven in the PG leg below).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn atomic_reservation_reserves_exactly_capacity_on_sqlite() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        db.conn()
+            .execute_unprepared(
+                "CREATE TABLE seats (id INTEGER PRIMARY KEY, \
+                 used INTEGER NOT NULL DEFAULT 0, capacity INTEGER NOT NULL)",
+            )
+            .await
+            .unwrap();
+        db.conn()
+            .execute_unprepared("INSERT INTO seats (id, used, capacity) VALUES (1, 0, 5)")
+            .await
+            .unwrap();
+
+        let capacity = 5i64;
+        let contenders = 40;
+        let mut handles = Vec::new();
+        for _ in 0..contenders {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                atomic_reserve_one(&db, 1).await.unwrap()
+            }));
+        }
+        let mut reserved = 0i64;
+        for h in handles {
+            if h.await.unwrap() {
+                reserved += 1;
+            }
+        }
+        assert_eq!(reserved, capacity, "atomic reserve grants exactly capacity");
+        assert_eq!(
+            seats_used(&db, 1).await,
+            capacity,
+            "used must never exceed capacity"
+        );
+    }
+
+    /// Postgres — the executable proof, on a pool with REAL concurrent writers:
+    /// (i) the naive read-then-insert OVERSELLS (count > capacity), the landmine
+    /// the docs warn about; and (ii) the atomic conditional UPDATE reserves
+    /// EXACTLY capacity. Needs a live Postgres; reset the schema first
+    /// (`DROP SCHEMA public CASCADE; CREATE SCHEMA public`) then run with
+    /// `JERRYCAN_TEST_PG_URL=… cargo test -p jerrycan-db -- --ignored`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "needs a local postgres (set JERRYCAN_TEST_PG_URL)"]
+    async fn atomic_reservation_beats_the_oversell_race_on_postgres() {
+        let Ok(url) = std::env::var("JERRYCAN_TEST_PG_URL") else {
+            eprintln!("SKIP: JERRYCAN_TEST_PG_URL not set");
+            return;
+        };
+        let capacity = 5i64;
+        let contenders = 40;
+
+        let db = Db::connect(&url).await.unwrap();
+        db.conn()
+            .execute_unprepared(
+                "CREATE TABLE bookings (id BIGSERIAL PRIMARY KEY, resource_id BIGINT NOT NULL)",
+            )
+            .await
+            .unwrap();
+        db.conn()
+            .execute_unprepared(
+                "CREATE TABLE seats (id BIGINT PRIMARY KEY, \
+                 used BIGINT NOT NULL DEFAULT 0, capacity BIGINT NOT NULL)",
+            )
+            .await
+            .unwrap();
+        db.conn()
+            .execute_unprepared("INSERT INTO seats (id, used, capacity) VALUES (1, 0, 5)")
+            .await
+            .unwrap();
+
+        // (i) LANDMINE: every contender reads "under capacity" before any insert
+        // lands (real pool, real concurrency), so they ALL insert → oversell.
+        let mut handles = Vec::new();
+        for _ in 0..contenders {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                naive_reserve_one(&db, 1, capacity).await.unwrap()
+            }));
+        }
+        for h in handles {
+            let _ = h.await.unwrap();
+        }
+        let oversold = booking_count(&db, 1).await;
+        assert!(
+            oversold > capacity,
+            "naive read-then-insert must oversell on Postgres: got {oversold} bookings \
+             for capacity {capacity}"
+        );
+
+        // (ii) SAFE: the atomic conditional UPDATE grants EXACTLY capacity.
+        let mut handles = Vec::new();
+        for _ in 0..contenders {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                atomic_reserve_one(&db, 1).await.unwrap()
+            }));
+        }
+        let mut reserved = 0i64;
+        for h in handles {
+            if h.await.unwrap() {
+                reserved += 1;
+            }
+        }
+        assert_eq!(
+            reserved, capacity,
+            "atomic reserve grants exactly capacity on Postgres"
+        );
+        assert_eq!(
+            seats_used(&db, 1).await,
+            capacity,
+            "used must never exceed capacity"
+        );
+
+        // Leave the schema clean for the next run.
+        db.conn()
+            .execute_unprepared("DROP TABLE bookings")
+            .await
+            .unwrap();
+        db.conn()
+            .execute_unprepared("DROP TABLE seats")
+            .await
+            .unwrap();
+    }
 }

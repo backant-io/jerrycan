@@ -140,6 +140,82 @@ db.conn()
   # }).unwrap(); }
   ```
 
+## Concurrency & atomic reservations
+The two backends have **different write concurrency**, and it changes what is
+safe. `Db::connect` caps the pool per backend (`jerrycan-db` `lib.rs`):
+
+- **SQLite — pool max = 1.** One pooled connection, so every write **serializes**
+  (a single writer). This is deliberate: `sqlite::memory:` is per-connection (a
+  second connection is its own empty database), and a single writer is SQLite's
+  correctness story. A read-then-write sequence can never interleave here — it is
+  *accidentally* race-free.
+- **Postgres — pool max = 5.** A real pool with **concurrent writers**. A
+  read-then-write sequence issued by two requests **can interleave**.
+
+That gap is a trap for "reserve N of a limited resource" (seats, stock, credits).
+The tempting shape — *read the remaining capacity, check it, then insert/update* —
+passes every SQLite test (the single writer serializes it) and **silently
+oversells on Postgres**, where two requests both read the same remaining capacity,
+both pass the check, and both write.
+
+> **WARNING — a read-capacity-then-insert reservation passes every SQLite test and
+> silently oversells on Postgres.** Do not gate a write on a prior, separate read.
+> Use the atomic conditional UPDATE below — it is correct on both backends.
+
+### The safe pattern — one atomic conditional UPDATE
+Reserve and check in a **single statement**. The `WHERE` clause carries the
+capacity guard, so the row is updated only while the reservation still fits; the
+database locks the row for the write, so no two callers can both pass the check:
+
+```sql
+UPDATE resource SET used = used + :n
+WHERE id = :id AND used + :n <= capacity
+```
+
+Then read the affected-row count: **1 ⇒ reserved**, **0 ⇒ at capacity, reject
+(409)**. A single UPDATE is atomic on **both** backends. Using the raw-SQL escape
+hatch (`db.sql()` + `Statement`, shown above):
+
+```rust
+# use jerrycan::prelude::*;
+# use jerrycan::db::sea_orm::{ConnectionTrait, Statement};
+# use jerrycan::db::{db_error, Db};
+// Reserve `n` units of a capacity-limited row in ONE atomic statement. The
+// UPDATE matches only while the reservation fits, so two concurrent callers can
+// never both pass the capacity check — no oversell, on SQLite or Postgres.
+async fn reserve(db: &Db, id: i64, n: i64) -> Result<()> {
+    let stmt = Statement::from_sql_and_values(
+        db.conn().get_database_backend(),
+        db.sql("UPDATE rooms SET used = used + ? WHERE id = ? AND used + ? <= capacity"),
+        [n.into(), id.into(), n.into()],
+    );
+    let reserved = db.conn().execute(stmt).await.map_err(db_error)?.rows_affected();
+    if reserved == 1 {
+        Ok(())                                   // 1 row ⇒ reserved
+    } else {
+        Err(Error::conflict("at capacity"))      // 0 rows ⇒ full → 409
+    }
+}
+
+# fn main() { tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+# let db = Db::connect("sqlite::memory:").await.unwrap();
+# db.conn().execute_unprepared("CREATE TABLE rooms (id INTEGER PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0, capacity INTEGER NOT NULL)").await.unwrap();
+# db.conn().execute_unprepared("INSERT INTO rooms (id, used, capacity) VALUES (1, 0, 2)").await.unwrap();
+reserve(&db, 1, 1).await.unwrap();                       // 0 → 1, fits
+reserve(&db, 1, 1).await.unwrap();                       // 1 → 2, fits exactly
+assert!(reserve(&db, 1, 1).await.is_err());              // 2 → 3 > capacity: rejected — no oversell
+# }); }
+```
+
+### Multi-row capacity — `SELECT … FOR UPDATE` in a transaction
+When the capacity is derived across several rows and a single UPDATE can't
+express it, lock the capacity row(s) first inside a `transaction()`:
+`SELECT … FOR UPDATE` takes a Postgres row lock, so a concurrent reserver blocks
+until you commit — then it reads your write, not stale capacity. It is a Postgres
+row lock; on SQLite it is a harmless no-op (the single writer already serializes).
+Prefer the single conditional UPDATE above; reach for `FOR UPDATE` only for the
+genuinely multi-row case.
+
 ## Foreign keys in the schema contract (`enforced`)
 `jerrycan schema` (and the committed `schema.json`) emits an `"enforced"` bool on
 every foreign key. It tells you **who upholds the relation** — don't read
