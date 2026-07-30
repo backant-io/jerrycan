@@ -2645,6 +2645,79 @@ mod tests {
         );
     }
 
+    /// JC0563 (#83): the three interpolated values of a `rate_limit` block are
+    /// validated up front so a misconfig is a pointed question — not a
+    /// generated-code compile error (bad limit type), a startup panic (a
+    /// non-header `api_key_header` reaching `HeaderName::from_static`), or a
+    /// silently-broken limiter (a 0 limit that rejects everything). A well-formed
+    /// block — including both optional fields — is question-free.
+    #[test]
+    fn jc0563_refuses_a_malformed_rate_limit_block() {
+        let base = |rl: &str| -> Design {
+            serde_json::from_str(&format!(
+                r#"{{ "name": "rl-app", "contract_version": 0, "dependencies": ["db"],
+                    "rate_limit": {rl},
+                    "modules": [{{ "name": "m", "endpoints": [
+                        {{ "operation_id": "list_m", "method": "GET", "path": "/",
+                          "success": {{ "status": 200 }} }}] }}] }}"#,
+            ))
+            .unwrap()
+        };
+
+        // A valid block (both optional fields set) raises no `/rate_limit` question.
+        let ok = base(
+            r#"{ "limit": 100, "window": "1m", "api_key_header": "x-api-key", "trust_forwarded_for": true }"#,
+        );
+        assert!(
+            !validate(&ok)
+                .iter()
+                .any(|q| q.id.starts_with("/rate_limit")),
+            "valid rate_limit block must be question-free: {:?}",
+            validate(&ok)
+        );
+
+        // limit == 0 blocks every request → JC0563 on `/rate_limit/limit`.
+        let zero = base(r#"{ "limit": 0, "window": "1m" }"#);
+        assert!(
+            validate(&zero)
+                .iter()
+                .any(|q| q.id == "/rate_limit/limit" && q.question.contains("JC0563")),
+            "limit 0 must trip JC0563: {:?}",
+            validate(&zero)
+        );
+
+        // An unparseable window → JC0563 on `/rate_limit/window`.
+        let bad_window = base(r#"{ "limit": 10, "window": "soon" }"#);
+        assert!(
+            validate(&bad_window)
+                .iter()
+                .any(|q| q.id == "/rate_limit/window" && q.question.contains("JC0563")),
+            "unparseable window must trip JC0563: {:?}",
+            validate(&bad_window)
+        );
+
+        // A zero-duration window parses but is non-positive → still JC0563.
+        let zero_window = base(r#"{ "limit": 10, "window": "0s" }"#);
+        assert!(
+            validate(&zero_window)
+                .iter()
+                .any(|q| q.id == "/rate_limit/window"),
+            "zero-duration window must trip JC0563: {:?}",
+            validate(&zero_window)
+        );
+
+        // An api_key_header that is not a valid HTTP header token → JC0563. A bad
+        // token would panic `HeaderName::from_static` in the generated app.
+        let bad_header = base(r#"{ "limit": 10, "window": "1m", "api_key_header": "x api key" }"#);
+        assert!(
+            validate(&bad_header)
+                .iter()
+                .any(|q| q.id == "/rate_limit/api_key_header" && q.question.contains("JC0563")),
+            "invalid api_key_header must trip JC0563: {:?}",
+            validate(&bad_header)
+        );
+    }
+
     #[test]
     fn valid_realtime_design_is_question_free() {
         let d = guard_reads(serde_json::from_str(V2_REALTIME).unwrap());

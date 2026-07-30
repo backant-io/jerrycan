@@ -39,6 +39,7 @@ fn sync_facade_features(ws: &str, design: &Design) -> String {
 ///     a trailing comma on the last;
 ///   * ≥1 builder, receiver too wide at indent 12 → `per_window`'s args broken at
 ///     indent 16, builders at indent 12.
+///
 /// Boundary is empirical against the pinned toolchain's rustfmt (1.97): a receiver
 /// whose indent-12 line is 99 cols stays inline, 100 wraps.
 fn rate_limit_extend(rl: &RateLimitDesign) -> String {
@@ -1232,6 +1233,88 @@ mod tests {
         assert!(
             !main.contains(".cors(") && !main.contains("JERRYCAN_CORS_ORIGINS"),
             "no cors block ⇒ no cors wiring:\n{main}"
+        );
+    }
+
+    /// A db+auth design carrying a `rate_limit` block. Auth is active so the
+    /// after-Auth ordering (the limiter's identity-aware partition needs a
+    /// resolvable `CurrentUser`) is observable.
+    fn rate_limit_design() -> Design {
+        serde_json::from_str(
+            r#"{
+                "name": "rl-app", "contract_version": 0, "dependencies": ["db", "auth"],
+                "rate_limit": { "limit": 100, "window": "1m" },
+                "modules": [{ "name": "things",
+                    "endpoints": [{ "operation_id": "list_things", "method": "GET", "path": "/",
+                        "success": { "status": 200 } }] }]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// WHY (#83): rate limiting must be GENERATED from the design's `rate_limit`
+    /// block, not hand-edited into the tool-owned main.rs — a hand-edit trips
+    /// JL0003 (byte-drift) and is wiped by the next `jerrycan generate`. So the
+    /// `.extend(RateLimit::per_window(..))` line is emitted here, pre-wrapped
+    /// EXACTLY as rustfmt formats it (the `rate_limit_extend` regimes are verified
+    /// fixpoints), so a fresh scaffold is a `cargo fmt` no-op and never drifts.
+    #[test]
+    fn expected_main_emits_the_rate_limit_extend_from_the_design_block() {
+        let main = expected_main(&rate_limit_design());
+        // The no-builder regime: rustfmt always breaks per_window's two args.
+        assert!(
+            main.contains(
+                "        .extend(jerrycan::ratelimit::RateLimit::per_window(\n            100,\n            std::time::Duration::from_secs(60),\n        ))\n"
+            ),
+            "the design's rate_limit wires the exact per_window extend line:\n{main}"
+        );
+        // Order: the limiter sits AFTER Auth (so a CurrentUser partition can
+        // resolve) but BEFORE `.extend(db)` moves the db (it needs no db).
+        let auth = main
+            .find(".extend(jerrycan::auth::Auth::from_env()?)")
+            .unwrap();
+        let rl = main
+            .find(".extend(jerrycan::ratelimit::RateLimit::per_window(")
+            .unwrap();
+        let db = main.find(".extend(db)\n").unwrap();
+        assert!(
+            auth < rl && rl < db,
+            "rate limiting sits after Auth, before the db move:\n{main}"
+        );
+    }
+
+    /// The optional builders: `api_key_header` (LOWERCASED — it feeds
+    /// `HeaderName::from_static`, which panics on a non-lowercase name; HTTP header
+    /// names are case-insensitive so the lowercased literal is equivalent) and
+    /// `trust_forwarded_for(true)` are chained in order, still a rustfmt fixpoint
+    /// (the receiver fits inline at indent 12, one builder per line at indent 16).
+    #[test]
+    fn expected_main_rate_limit_chains_optional_builders_lowercasing_the_header() {
+        let mut d = rate_limit_design();
+        let rl = d.rate_limit.as_mut().unwrap();
+        rl.api_key_header = Some("X-API-Key".into());
+        rl.trust_forwarded_for = true;
+        let main = expected_main(&d);
+        assert!(
+            main.contains(
+                "        .extend(\n            jerrycan::ratelimit::RateLimit::per_window(100, std::time::Duration::from_secs(60))\n                .api_key_header(\"x-api-key\")\n                .trust_forwarded_for(true),\n        )\n"
+            ),
+            "both builders chain in order with a lowercased header:\n{main}"
+        );
+    }
+
+    /// No `rate_limit` block ⇒ byte-for-byte no limiter wiring (the byte-identity
+    /// baseline: every existing design scaffolds unchanged).
+    #[test]
+    fn expected_main_without_rate_limit_has_no_limiter_wiring() {
+        let mut d = rate_limit_design();
+        d.rate_limit = None;
+        let main = expected_main(&d);
+        assert!(
+            !main.contains("ratelimit")
+                && !main.contains("RateLimit")
+                && !main.contains("per_window"),
+            "no rate_limit block ⇒ no limiter wiring:\n{main}"
         );
     }
 }
