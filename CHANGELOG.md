@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.17 — 2026-07-30
+
+### Fixed
+- **An aliased `belongs_to` fk used as a path param types correctly (#178).**
+  `path_param_key_type` matched a path param only against an entity's default fk
+  column, so an aliased fk path param (`/{from_account_id}` for
+  `belongs_to Account as from_account`) on a String/uuid-pk target fell through to
+  `i64` → an E0308 mismatch. It now also matches the aliased fk column and
+  resolves to the target entity's pk type. Byte-identical for un-aliased designs.
+
+### Tests
+- The two-references-to-one-entity fk-alias path now has a live create-probe
+  proving the aliased-fk INSERT works end-to-end (two accounts + a transfer
+  referencing both `from_account_id`/`to_account_id`), not just the migration SQL
+  (#179).
+
 ## 0.6.16 — 2026-07-27
 
 Classification-honesty cleanup — four review-filed residuals where the

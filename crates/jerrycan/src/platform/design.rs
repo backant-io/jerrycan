@@ -1529,15 +1529,33 @@ impl Design {
     /// belongs_to fk column (`site_id`) points at that entity's pk, so it must type
     /// from the referent — a string/uuid-pk `Site` → `String`, not a hardcoded
     /// `i64`. Matches `{snake}_id` back to the entity whose `fk_column` equals the
-    /// param, then resolves its pk type. Returns `i64` when the param matches no
-    /// entity's fk column (a synthetic/opaque param like `code`), so every design
-    /// whose non-id path params reference integer-pk entities stays byte-identical.
+    /// param, then resolves its pk type. An ALIASED belongs_to fk (issue #178:
+    /// `Transfer belongs_to Account as from_account` → `{from_account_id}`) matches
+    /// no entity's default fk, so it ALSO scans each entity's `belongs_to` and
+    /// resolves to that belongs_to's TARGET entity — a string/uuid-pk target now
+    /// types correctly instead of falling through to `i64` (the E0308 landmine).
+    /// Returns `i64` when the param matches no entity's fk column (a synthetic/opaque
+    /// param like `code`), so every design whose non-id path params reference
+    /// integer-pk entities stays byte-identical.
     pub fn path_param_key_type(&self, param: &str) -> &'static str {
         fn find_name<'a>(m: &'a ModuleDesign, param: &str) -> Option<&'a str> {
             m.entities
                 .iter()
                 .map(|e| e.name.as_str())
                 .find(|n| Design::fk_column(n) == param)
+                // Issue #178: also match an ALIASED belongs_to fk column and resolve
+                // to its TARGET entity. The entity-default match above stays FIRST,
+                // so an un-aliased belongs_to (whose `fk_column()` equals
+                // `snake(entity)_id`) is already covered there — only aliases are
+                // newly resolved, keeping every existing design byte-identical.
+                .or_else(|| {
+                    m.entities.iter().find_map(|e| {
+                        e.belongs_to
+                            .iter()
+                            .find(|b| b.fk_column() == param)
+                            .map(|b| b.entity.as_str())
+                    })
+                })
                 .or_else(|| m.subroutes.iter().find_map(|s| find_name(s, param)))
         }
         match self.modules.iter().find_map(|m| find_name(m, param)) {
@@ -3005,6 +3023,41 @@ pub(crate) mod tests {
         // belongs_to: Workspace must use). An unknown target falls back to i64.
         assert_eq!(d.target_key_rust_type("Workspace"), "i64");
         assert_eq!(d.target_key_rust_type("Nonexistent"), "i64");
+    }
+
+    #[test]
+    fn path_param_key_type_resolves_aliased_fk_target_pk() {
+        // WHY (issue #178): an ALIASED belongs_to fk used as a path param
+        // (`Transfer belongs_to Account as from_account` → `{from_account_id}`)
+        // matches no entity's DEFAULT fk column (`account_id ≠ from_account_id`),
+        // so before the alias scan it fell through to `i64`. If Account's pk is a
+        // String/uuid, the generated path-param binding typed as `i64` → E0308
+        // (the string-identity landmine). It must resolve to the alias TARGET's pk.
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "ledger", "contract_version": 1, "dependencies": ["db"],
+                "modules": [{ "name": "m",
+                    "entities": [
+                        { "name": "Account",
+                          "fields": [{ "name": "id", "type": "uuid" }] },
+                        { "name": "Transfer",
+                          "belongs_to": [
+                              { "entity": "Account", "as": "from_account" },
+                              { "entity": "Account", "as": "to_account" }],
+                          "fields": [{ "name": "amount", "type": "float" }] }],
+                    "endpoints": [
+                        { "operation_id": "get_by_from", "method": "GET",
+                          "path": "/{from_account_id}", "success": { "status": 200 } }] }] }"#,
+        )
+        .unwrap();
+        // The aliased fk path param now types from Account's uuid pk (String),
+        // not the old hardcoded `i64` fall-through.
+        assert_eq!(d.path_param_key_type("from_account_id"), "String");
+        assert_eq!(d.path_param_key_type("to_account_id"), "String");
+        // Regression: a NON-aliased fk path param resolves exactly as before —
+        // the entity-default match handles `account_id` → Account (String pk).
+        assert_eq!(d.path_param_key_type("account_id"), "String");
+        // A synthetic/opaque param still falls through to i64 (byte-identical).
+        assert_eq!(d.path_param_key_type("code"), "i64");
     }
 
     #[test]

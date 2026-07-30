@@ -2844,6 +2844,212 @@ fn fk_alias_two_refs_and_self_ref_go_green_on_a_correct_scaffold() {
     );
 }
 
+/// A create-surfaced sibling of `FK_ALIAS_LEDGER` (issue #179): the same
+/// two-aliased-fk `Transfer belongs_to Account as from_account / as to_account`
+/// pair, with `create_account` + `create_transfer` POST endpoints so the
+/// two-aliased-fk INSERT can be driven live. Kept separate so the GET-only
+/// `fk_alias_two_refs_and_self_ref_go_green_on_a_correct_scaffold` fixture stays
+/// byte-identical; the self-referential `Comment` is dropped as irrelevant to
+/// the INSERT proof.
+const FK_ALIAS_LEDGER_CREATE: &str = r#"{
+  "name": "ledger-api",
+  "contract_version": 1,
+  "dependencies": ["db"],
+  "modules": [
+    { "name": "ledger",
+      "entities": [
+        { "name": "Account", "fields": [{ "name": "name", "type": "string" }] },
+        { "name": "Transfer",
+          "belongs_to": [
+            { "entity": "Account", "as": "from_account" },
+            { "entity": "Account", "as": "to_account" }
+          ],
+          "fields": [{ "name": "amount", "type": "integer" }] }
+      ],
+      "endpoints": [
+        { "operation_id": "create_account", "method": "POST", "path": "/accounts",
+          "success": { "status": 201, "entity": "Account" } },
+        { "operation_id": "show_account", "method": "GET", "path": "/accounts/{id}",
+          "success": { "status": 200, "entity": "Account" } },
+        { "operation_id": "create_transfer", "method": "POST", "path": "/transfers",
+          "success": { "status": 201, "entity": "Transfer" } },
+        { "operation_id": "show_transfer", "method": "GET", "path": "/transfers/{id}",
+          "success": { "status": 200, "entity": "Transfer" } }
+      ] }
+  ]
+}"#;
+
+/// Correct create/read handlers: the two-aliased-fk INSERT reads BOTH aliased
+/// fk columns straight off the request body and persists them distinctly.
+const FK_ALIAS_CREATE_HANDLERS: &str = r#"//! Correct #119 create/read handlers: the two-aliased-fk INSERT run live.
+use super::model::*;
+use super::repo::*;
+use jerrycan::prelude::*;
+
+pub(crate) async fn create_account(
+    repo: Dep<AccountRepo>,
+    Json(body): Json<Account>,
+) -> Result<Created<Account>> {
+    let id = repo.insert(Account { id: body.id, name: body.name.clone() }).await?;
+    Ok(Created(Account { id, name: body.name }))
+}
+
+pub(crate) async fn show_account(repo: Dep<AccountRepo>, Path(id): Path<i64>) -> Result<Json<Account>> {
+    repo.get(id).await?.map(Json).ok_or_else(Error::not_found)
+}
+
+pub(crate) async fn create_transfer(
+    repo: Dep<TransferRepo>,
+    Json(body): Json<Transfer>,
+) -> Result<Created<Transfer>> {
+    let id = repo
+        .insert(Transfer {
+            id: body.id,
+            from_account_id: body.from_account_id,
+            to_account_id: body.to_account_id,
+            amount: body.amount,
+        })
+        .await?;
+    Ok(Created(Transfer {
+        id,
+        from_account_id: body.from_account_id,
+        to_account_id: body.to_account_id,
+        amount: body.amount,
+    }))
+}
+
+pub(crate) async fn show_transfer(repo: Dep<TransferRepo>, Path(id): Path<i64>) -> Result<Json<Transfer>> {
+    repo.get(id).await?.map(Json).ok_or_else(Error::not_found)
+}
+"#;
+
+/// Issue #179: the two-aliased-fk INSERT (#119) proven END TO END, live over HTTP.
+/// The GET-only sibling above only asserts the migration SQL; the INSERT path
+/// (seeding a row under BOTH `from_account_id` and `to_account_id`) was never run.
+/// Here the app scaffolds, the correct insert handlers COMPILE, and — served on a
+/// real port over a fresh sqlite file — two `Account` rows are POSTed, then a
+/// `Transfer` referencing BOTH via the two DISTINCT aliased fks: it must 201 and
+/// the persisted row (GET round-trip) must carry the two distinct fk values.
+///
+/// The hand-driven POST (not the generated create probe) is deliberate: the
+/// generated happy-path probe posts `{}`, which cannot express the two required
+/// aliased fk values nor seed the referenced accounts — so it is an AGENT-TODO
+/// stub for this shape, not a valid INSERT proof. Framework code is untouched;
+/// this is coverage of already-shipped #119 behaviour.
+#[test]
+#[ignore = "heavy: scaffold + build + serve + live two-aliased-fk INSERT over HTTP (#119/#179)"]
+fn fk_alias_two_refs_insert_persists_both_aliased_fks_live() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, FK_ALIAS_LEDGER_CREATE).unwrap();
+    let app = tmp.path().join("ledger-api");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .args(["new"])
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "the fk-alias create design must scaffold");
+
+    install_handler(
+        &app,
+        "crates/routes/ledger/src/handlers.rs",
+        FK_ALIAS_CREATE_HANDLERS,
+    );
+
+    // Compile the app binary (proves the two-aliased-fk insert handlers build
+    // against the generated aliased Model/repo) before serving it.
+    let build = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["build", "-p", "app"])
+        .status()
+        .unwrap();
+    assert!(build.success(), "the app with insert handlers must compile");
+
+    // Serve live over a fresh sqlite file (so migrations run clean and account
+    // ids start at 1); `mode=rwc` lets sqlx CREATE the file.
+    let port = pick_port();
+    let addr = format!("127.0.0.1:{port}");
+    let db_file = app.join("live.db");
+    let _ = std::fs::remove_file(&db_file);
+    let db_url = format!("sqlite://{}?mode=rwc", db_file.display());
+    let mut server = Command::new("cargo")
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .env("JERRYCAN_ADDR", &addr)
+        .env("JERRYCAN_SECRET", "a-very-long-development-secret-string!!")
+        .env("JERRYCAN_DATABASE_URL", &db_url)
+        .args(["run", "-p", "app"])
+        .spawn()
+        .unwrap();
+
+    // Drive the battery; ALWAYS kill the server afterwards, even on a panic.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        await_listen(&addr, 180);
+
+        // Seed two DISTINCT accounts (ids assigned by the DB, read from the
+        // responses so the proof never assumes the autoincrement values).
+        let a1 = http_post_json(&addr, "/ledger/accounts", r#"{"name":"alice"}"#);
+        assert_eq!(http_status(&a1), 201, "create account A must 201:\n{a1}");
+        let from_id = http_json_body(&a1)["id"].as_i64().expect("account A id");
+        let a2 = http_post_json(&addr, "/ledger/accounts", r#"{"name":"bob"}"#);
+        assert_eq!(http_status(&a2), 201, "create account B must 201:\n{a2}");
+        let to_id = http_json_body(&a2)["id"].as_i64().expect("account B id");
+        assert_ne!(from_id, to_id, "the two accounts must be distinct rows");
+
+        // The two-aliased-fk INSERT: a Transfer referencing BOTH accounts.
+        let body =
+            format!(r#"{{"from_account_id":{from_id},"to_account_id":{to_id},"amount":100}}"#);
+        let created = http_post_json(&addr, "/ledger/transfers", &body);
+        assert_eq!(
+            http_status(&created),
+            201,
+            "the two-aliased-fk INSERT must 201:\n{created}"
+        );
+        let created = http_json_body(&created);
+        assert_eq!(
+            created["from_account_id"].as_i64(),
+            Some(from_id),
+            "created transfer echoes from_account_id"
+        );
+        assert_eq!(
+            created["to_account_id"].as_i64(),
+            Some(to_id),
+            "created transfer echoes to_account_id"
+        );
+
+        // Round-trip: the PERSISTED row carries the two distinct aliased fks.
+        let tid = created["id"].as_i64().expect("transfer id");
+        let got = http_json_body(&http_get(&addr, &format!("/ledger/transfers/{tid}")));
+        assert_eq!(
+            got["from_account_id"].as_i64(),
+            Some(from_id),
+            "persisted from_account_id"
+        );
+        assert_eq!(
+            got["to_account_id"].as_i64(),
+            Some(to_id),
+            "persisted to_account_id"
+        );
+        assert_ne!(
+            got["from_account_id"], got["to_account_id"],
+            "the two aliased fks persist as DISTINCT values: {got}"
+        );
+    }));
+    let _ = server.kill();
+    let _ = server.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 // Small helpers for the deploy-anywhere test (no earlier-phase equivalents exist
 // in this file; the auth_observe test inlines its own closures).
 fn pick_port() -> u16 {
@@ -2894,6 +3100,31 @@ fn http_get(addr: &str, path: &str) -> String {
     let mut buf = Vec::new();
     let _ = s.read_to_end(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()
+}
+/// POST a JSON body over raw HTTP and return the whole response (status line +
+/// headers + body). No auth header — the fk-alias ledger design is unguarded.
+fn http_post_json(addr: &str, path: &str, body: &str) -> String {
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: l\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+/// The numeric status of a raw HTTP response (`HTTP/1.1 201 Created` → 201).
+fn http_status(raw: &str) -> u16 {
+    raw.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no status in response:\n{raw}"))
+}
+/// Parse the JSON body (everything past the header terminator) of a raw response.
+fn http_json_body(raw: &str) -> serde_json::Value {
+    let body = raw.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("");
+    serde_json::from_str(body.trim()).unwrap_or_else(|e| panic!("body not JSON ({e}):\n{raw}"))
 }
 /// True when `jerrycan package --binary` produced a static musl binary (so a
 /// distroless/static runtime base is appropriate); false ⇒ a gnu host binary.
