@@ -70,11 +70,13 @@ pub(crate) async fn run_with_shutdown(
                             let cors_origin = parts.headers.get(http::header::ORIGIN).cloned();
                             // Phase 1: route on the head ALONE. A reject (404/405/400)
                             // answers here — the body is dropped, never read.
-                            let (limit, stream) = match app.route_policy(&parts) {
+                            let (limit, stream, body_read_timeout) = match app.route_policy(&parts) {
                                 Policy::Reject(response) => {
                                     return Ok::<_, std::convert::Infallible>(response);
                                 }
-                                Policy::Route { limit, stream } => (limit, stream),
+                                Policy::Route { limit, stream, body_read_timeout } => {
+                                    (limit, stream, body_read_timeout)
+                                }
                             };
                             // Phase 2 splits on the route's streaming marker.
                             let response = if stream {
@@ -84,7 +86,7 @@ pub(crate) async fn run_with_shutdown(
                                 use http_body_util::combinators::UnsyncBoxBody;
                                 let lane = BodyLane::Stream(Some(UnsyncBoxBody::new(TimedRecvBody::new(
                                     http_body_util::Limited::new(body, limit),
-                                    app.body_read_timeout,
+                                    body_read_timeout,
                                 ))));
                                 dispatch_isolated(&app, parts, lane, cors_origin.as_ref()).await
                             } else {
@@ -93,7 +95,7 @@ pub(crate) async fn run_with_shutdown(
                                 use http_body_util::BodyExt;
                                 let limited = http_body_util::Limited::new(body, limit);
                                 let collected =
-                                    tokio::time::timeout(app.body_read_timeout, limited.collect()).await;
+                                    tokio::time::timeout(body_read_timeout, limited.collect()).await;
                                 match collected {
                                     Ok(Ok(collected)) => {
                                         let lane = BodyLane::Buffered(collected.to_bytes());

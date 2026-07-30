@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.28 — 2026-07-30
+
+### Added
+- **Per-route timeout overrides — `.handler_timeout()` / `.body_read_timeout()` (#111).**
+  A route can now override the app-global handler-time budget and per-frame body-read
+  deadline for itself, mirroring the existing per-route `.body_limit()`:
+  `.route("/upload", post(h).stream_body().handler_timeout(Duration::from_secs(120)))`.
+  A slow-but-moving large upload drains inside the handler, so the app-global
+  `handler_timeout` (default 30s) used to `503` it (JC0503) — and the only escape was
+  raising the budget app-wide in tool-owned `main.rs`, a permanent JL0003 trip. The
+  per-route knob lives on the agent-owned route registration, so it does not trip
+  JL0003. `None` (the default) keeps the app-global budget, so every route that does not
+  opt in is unchanged.
+
+Additive, byte-identical scaffolding — no generated route sets the new knobs.
+
 ## 0.6.27 — 2026-07-30
 
 ### Fixed

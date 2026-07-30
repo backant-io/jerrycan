@@ -75,6 +75,95 @@ async fn fast_handlers_are_unaffected_by_the_default_timeout() {
     assert_eq!(t.get("/").await.text(), "quick");
 }
 
+/// #111: a per-route `.handler_timeout` RAISES the budget above a short
+/// app-global. The point is the agent-owned route registration can lift the
+/// budget for one slow route without touching tool-owned main.rs (no JL0003):
+/// under a 50ms global the same 200ms handler 503s on a plain route but
+/// completes on the route that overrides the budget to 2s.
+#[tokio::test]
+async fn per_route_handler_timeout_raises_the_budget() {
+    async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        "done"
+    }
+    let t = App::new()
+        .route("/plain", get(slow))
+        .route(
+            "/patient",
+            get(slow).handler_timeout(Duration::from_secs(2)),
+        )
+        .handler_timeout(Duration::from_millis(50))
+        .into_test();
+
+    let plain = t.get("/plain").await;
+    assert_eq!(
+        plain.status(),
+        jerrycan_core::http::StatusCode::SERVICE_UNAVAILABLE,
+        "the 50ms app-global fires on the plain route: {}",
+        plain.text()
+    );
+    assert!(plain.text().contains("JC0503"), "{}", plain.text());
+
+    let patient = t.get("/patient").await;
+    assert_eq!(
+        patient.status(),
+        jerrycan_core::http::StatusCode::OK,
+        "the per-route 2s budget lets the same handler finish: {}",
+        patient.text()
+    );
+    assert_eq!(patient.text(), "done");
+}
+
+/// #111: the override applies DOWNWARD too — a per-route `.handler_timeout`
+/// below the (default 30s) app-global fires where the global would not.
+#[tokio::test]
+async fn per_route_handler_timeout_lowers_the_budget() {
+    async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        "done"
+    }
+    let t = App::new()
+        .route(
+            "/tight",
+            get(slow).handler_timeout(Duration::from_millis(50)),
+        )
+        .into_test();
+    let res = t.get("/tight").await;
+    assert_eq!(
+        res.status(),
+        jerrycan_core::http::StatusCode::SERVICE_UNAVAILABLE,
+        "the per-route 50ms cap fires under the generous app default: {}",
+        res.text()
+    );
+    assert!(res.text().contains("JC0503"), "{}", res.text());
+}
+
+/// Byte-identity guard: a route that sets NEITHER timeout knob behaves exactly
+/// as before — the app-global alone governs it. Under a 50ms global the 200ms
+/// handler 503s and a fast handler is untouched, identical to pre-#111.
+#[tokio::test]
+async fn route_without_timeout_knobs_defers_to_the_app_global() {
+    async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        "late"
+    }
+    let t = App::new()
+        .route("/slow", get(slow))
+        .route("/fast", get(|| async { "quick" }))
+        .handler_timeout(Duration::from_millis(50))
+        .into_test();
+
+    let slow_res = t.get("/slow").await;
+    assert_eq!(
+        slow_res.status(),
+        jerrycan_core::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        slow_res.text()
+    );
+    assert!(slow_res.text().contains("JC0503"), "{}", slow_res.text());
+    assert_eq!(t.get("/fast").await.text(), "quick");
+}
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn raw_get(addr: &str, path: &str) -> String {

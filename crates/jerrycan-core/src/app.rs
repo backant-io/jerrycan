@@ -227,6 +227,8 @@ impl App {
 
         for (path, methods) in self.routes {
             let body_limit = methods.body_limit;
+            let handler_timeout = methods.handler_timeout;
+            let body_read_timeout = methods.body_read_timeout;
             insert_flat(
                 &mut trie,
                 FlatRoute {
@@ -235,6 +237,8 @@ impl App {
                     env: app_env.clone(),
                     middleware: app_mw.clone(),
                     body_limit,
+                    handler_timeout,
+                    body_read_timeout,
                 },
             )?;
         }
@@ -304,6 +308,8 @@ fn insert_flat(trie: &mut Trie, flat: FlatRoute) -> Result<()> {
             middleware: flat.middleware,
             body_limit: flat.body_limit,
             stream_body,
+            handler_timeout: flat.handler_timeout,
+            body_read_timeout: flat.body_read_timeout,
         },
     )
 }
@@ -348,7 +354,14 @@ pub(crate) enum Policy {
     /// The route exists: read its body up to `limit`, then dispatch. When
     /// `stream` is set the body is NOT collected upfront — serve hands the live
     /// stream lane (`Limited` cap + per-frame deadline inside) to dispatch.
-    Route { limit: usize, stream: bool },
+    /// `body_read_timeout` is the resolved per-frame read deadline for THIS route
+    /// (per-route override of the app-global, #111), fed into the stream lane's
+    /// `TimedRecvBody` and the buffered read's collect timeout.
+    Route {
+        limit: usize,
+        stream: bool,
+        body_read_timeout: std::time::Duration,
+    },
     /// The request is answered from the head alone (404 / 405 / 400). The body
     /// is never read. The response already carries security headers.
     Reject(Response),
@@ -478,6 +491,7 @@ impl BuiltApp {
             RouteMatch::Found { endpoint, .. } => Policy::Route {
                 limit: endpoint.body_limit.unwrap_or(BODY_LIMIT),
                 stream: endpoint.stream_body,
+                body_read_timeout: endpoint.body_read_timeout.unwrap_or(self.body_read_timeout),
             },
             RouteMatch::NotFound => reject(Error::not_found().into_response()),
             RouteMatch::MethodMissing => reject(Error::method_not_allowed().into_response()),
@@ -519,6 +533,9 @@ impl BuiltApp {
                 Error::bad_request("malformed percent-encoding in path").into_response()
             }
             RouteMatch::Found { endpoint, params } => {
+                // Per-route override of the app-global handler budget (#111); the
+                // route's `.handler_timeout(..)` wins, else the app default.
+                let budget = endpoint.handler_timeout.unwrap_or(self.handler_timeout);
                 let mut ctx = RequestCtx::with_lane(
                     parts,
                     lane,
@@ -534,7 +551,7 @@ impl BuiltApp {
                     endpoint: handler,
                 }
                 .run(&mut ctx);
-                match tokio::time::timeout(self.handler_timeout, run).await {
+                match tokio::time::timeout(budget, run).await {
                     Ok(response) => response,
                     Err(_) => Error::handler_timeout().into_response(),
                 }
