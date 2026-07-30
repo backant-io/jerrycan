@@ -94,9 +94,14 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
                     entity: Some("User".into()),
                     fields: vec![],
                 }),
+                // #106: no `entity` on the success — jwt login must return the
+                // freshly minted bearer token, NOT the User row. An entity-shaped
+                // success (`Json<User>`) pins the return type and leaves nowhere
+                // for the token; a bare 200 lets the handler return its own token
+                // response (the reference-slice login shape).
                 success: Success {
                     status: 200,
-                    entity: Some("User".into()),
+                    entity: None,
                     list: false,
                 },
                 errors: vec![],
@@ -180,6 +185,19 @@ mod tests {
                 .endpoints
                 .iter()
                 .any(|e| e.operation_id == "login" && e.public)
+        );
+        // #106: jwt login must NOT carry an entity-shaped success — a `Json<User>`
+        // return leaves nowhere for the bearer token. A bare 200 lets the handler
+        // return its own token response (the reference-slice login shape).
+        let login = users
+            .endpoints
+            .iter()
+            .find(|e| e.operation_id == "login")
+            .expect("login endpoint");
+        assert!(
+            login.success.entity.is_none(),
+            "jwt login success must have no entity so the handler can return the token, got {:?}",
+            login.success.entity
         );
     }
 
