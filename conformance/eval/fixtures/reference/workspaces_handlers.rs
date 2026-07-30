@@ -26,15 +26,20 @@ pub(crate) async fn create_workspace(
     repo: Dep<WorkspaceRepo>,
     db: Dep<Db>,
     user: CurrentUser,
-    Json(body): Json<Workspace>,
+    Json(body): Json<WorkspaceRequest>,
 ) -> Result<Created<Workspace>> {
     // Ignore any client-supplied `plan`: new workspaces can't self-grant `pro`.
     let plan = NEW_WORKSPACE_PLAN.to_string();
+    // `seats_used` is a server-owned counter (`default: 0`, dropped from the request
+    // DTO) — the reserve-against counter starts empty and only the generated
+    // `WorkspaceRepo::reserve` moves it.
     let id = repo
         .insert(Workspace {
             id: body.id,
             name: body.name.clone(),
             plan: plan.clone(),
+            seat_limit: body.seat_limit,
+            seats_used: 0,
         })
         .await?;
     // Seed ownership: the membership row is what `shared::tenant` resolves to
@@ -53,6 +58,8 @@ pub(crate) async fn create_workspace(
         id,
         name: body.name,
         plan,
+        seat_limit: body.seat_limit,
+        seats_used: 0,
     }))
 }
 

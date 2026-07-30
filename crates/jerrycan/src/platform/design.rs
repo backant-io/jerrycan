@@ -259,6 +259,18 @@ pub struct Field {
     /// (the id must be returned).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub write_only: bool,
+    /// Atomic reserve counter (issue #187): naming a sibling integer *capacity*
+    /// field wires the generated `{Entity}Repo::reserve(id, n) -> Result<bool>`
+    /// method — the #108-proven conditional UPDATE `SET {this} = {this} + n WHERE
+    /// id = ? AND {this} + n <= {capacity}` — so an agent never hand-writes the
+    /// reservation (a hand-written read-then-write silently oversells on Postgres).
+    /// This field and the named capacity are ordinary integer columns; only the
+    /// method is wired. JC0564 refuses a non-existent/non-integer/self/pk target,
+    /// more than one per entity, or a memory-only design (the method is emitted on
+    /// the SQL-backed repo only). Serde-default None + skipped-when-None so every
+    /// existing design round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_against: Option<String>,
 }
 
 fn default_true() -> bool {

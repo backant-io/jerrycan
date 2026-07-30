@@ -207,6 +207,36 @@ assert!(reserve(&db, 1, 1).await.is_err());              // 2 → 3 > capacity: 
 # }); }
 ```
 
+### Generated `reserve` method — `reserve_against`
+You do not have to hand-write that UPDATE. Declaring `reserve_against` on an
+integer *counter* field, naming the sibling integer *capacity* it is bounded by,
+wires the atomic reserve for you:
+
+```json
+{
+  "name": "bookings",
+  "fields": [
+    { "name": "capacity", "type": "integer" },
+    { "name": "used", "type": "integer", "default": 0, "reserve_against": "capacity" }
+  ]
+}
+```
+
+The generator emits `BookingRepo::reserve(&self, id, n) -> Result<bool>` on the
+SQL-backed repo — the exact conditional UPDATE shown above, returning `Ok(true)`
+when the reservation fit (reserved) and `Ok(false)` at capacity (or no such row).
+`n` must be a positive reservation amount — a negative `n` is treated as a release
+that always fits and can drive the counter below 0 (releases/refunds are out of
+scope for this primitive). Both stay ordinary integer columns; only the method is
+wired. **Prefer the generated `reserve` over hand-writing the pattern** — a
+hand-written read-then-write silently oversells on Postgres (see the WARNING
+above), and the generated method is the #108-proven UPDATE by construction. The
+counter and its capacity must be DISTINCT integer non-`id` NOT-NULL fields (the
+counter idiomatically carries `default: 0`, a server-owned counter starting at 0;
+a nullable counter or capacity makes the guard NULL, so `reserve` never reserves),
+at most one `reserve_against` per entity, on a DB-backed design — otherwise
+`jerrycan check` refuses with JC0564.
+
 ### Multi-row capacity — `SELECT … FOR UPDATE` in a transaction
 When the capacity is derived across several rows and a single UPDATE can't
 express it, lock the capacity row(s) first inside a `transaction()`:

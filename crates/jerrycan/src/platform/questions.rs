@@ -1695,6 +1695,155 @@ pub fn validate(d: &Design) -> Vec<Question> {
         check_composite_unique(m, &format!("/modules/{i}"), &mut qs);
     }
 
+    // JC0564 (#187): a field's `reserve_against` wires the generated atomic
+    // `{Entity}Repo::reserve(id, n)` method (the #108-proven conditional UPDATE), so it
+    // must name a DISTINCT sibling integer *capacity* field and itself be an integer
+    // *counter* — neither the pk `id`. Refuse a non-existent capacity, a non-integer
+    // counter or capacity, the pk on either leg, a self-reference, more than one
+    // `reserve_against` per entity (the `reserve` name must be unambiguous), or a
+    // memory-only design (the atomic UPDATE is emitted on the SQL repo only). Inert for
+    // every entity without `reserve_against` (byte-identity baseline).
+    fn check_reserve_against(d: &Design, m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+        for (i, e) in m.entities.iter().enumerate() {
+            let reservers: Vec<(usize, &Field)> = e
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.reserve_against.is_some())
+                .collect();
+            if reservers.is_empty() {
+                continue;
+            }
+            // (6) at most one `reserve_against` per entity — else the generated `reserve`
+            // method name would collide.
+            if reservers.len() > 1 {
+                let names = reservers
+                    .iter()
+                    .map(|(_, f)| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                qs.push(q(
+                    format!("{ptr}/entities/{i}"),
+                    format!(
+                        "Entity `{}` declares `reserve_against` on {} fields ({names}) — at most one reserve counter per entity is allowed so the generated `reserve` method name stays unambiguous. Keep `reserve_against` on a single counter field. See `jerrycan explain JC0564`.",
+                        e.name,
+                        reservers.len(),
+                    ),
+                ));
+            }
+            for (fi, f) in &reservers {
+                let cap = f.reserve_against.as_deref().unwrap_or_default();
+                let fptr = format!("{ptr}/entities/{i}/fields/{fi}");
+                // (7) memory-only design — the conditional UPDATE lives on the SQL repo.
+                if !d.wants_db() {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against` but the design has no database — the atomic `reserve` method is generated on the SQL-backed repo only (a memory repo cannot run the conditional UPDATE). Add `db` to `dependencies`, or drop `reserve_against`. See `jerrycan explain JC0564`.",
+                            e.name, f.name
+                        ),
+                    ));
+                }
+                // (2) the counter field must be integer.
+                if f.field_type != FieldType::Integer {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against` but is `{:?}`, not `integer` — the reserve counter is incremented by an integer amount, so it must be an integer column. Make `{}` integer, or drop `reserve_against`. See `jerrycan explain JC0564`.",
+                            e.name, f.name, f.field_type, f.name
+                        ),
+                    ));
+                }
+                // (8) the counter must be NOT NULL. A nullable (`required: false`)
+                // counter is NULL on insert, so the atomic guard `used + n <= capacity`
+                // evaluates to NULL (never true) and `reserve` returns `Ok(false)`
+                // FOREVER — silently dead. Require it, ideally with `"default": 0`.
+                if !f.required {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against` but is nullable (`required: false`) — a NULL counter makes the atomic guard `{} + n <= {}` NULL, so `reserve` returns `Ok(false)` forever (it can never reserve). Make `{}` `required: true` (add `\"default\": 0` for a server-owned counter starting at 0). See `jerrycan explain JC0564`.",
+                            e.name, f.name, f.name, cap, f.name
+                        ),
+                    ));
+                }
+                // (4a) the counter field must not be the pk `id`.
+                if f.name == "id" {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `id` declares `reserve_against` — the reserve counter cannot be the primary key `id` (server-assigned and identifying the row, not a mutable amount). Move `reserve_against` to a dedicated integer counter field. See `jerrycan explain JC0564`.",
+                            e.name
+                        ),
+                    ));
+                }
+                // (5) a field cannot reserve against itself.
+                if cap == f.name {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against: \"{}\"` — a field cannot reserve against itself; name the SEPARATE integer capacity ceiling. See `jerrycan explain JC0564`.",
+                            e.name, f.name, cap
+                        ),
+                    ));
+                    // A self-reference resolves to this same field, so the capacity
+                    // checks below (existence/integer/pk) would only re-report it — skip.
+                    continue;
+                }
+                // (4b) the capacity leg must not be the pk `id`.
+                if cap == "id" {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against: \"id\"` — the capacity ceiling cannot be the primary key `id`. Name a dedicated integer capacity field. See `jerrycan explain JC0564`.",
+                            e.name, f.name
+                        ),
+                    ));
+                    continue;
+                }
+                // (1) the named capacity field must exist on the same entity.
+                let Some(capf) = e.fields.iter().find(|g| g.name == cap) else {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against: \"{}\"`, but `{}` is not a field of `{}` — name the sibling integer capacity field the counter is bounded by. See `jerrycan explain JC0564`.",
+                            e.name, f.name, cap, cap, e.name
+                        ),
+                    ));
+                    continue;
+                };
+                // (3) the capacity field must be integer.
+                if capf.field_type != FieldType::Integer {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` reserves against `{}`, which is `{:?}`, not `integer` — the capacity ceiling must be an integer column. Make `{}` integer, or point `reserve_against` at an integer field. See `jerrycan explain JC0564`.",
+                            e.name, f.name, cap, capf.field_type, cap
+                        ),
+                    ));
+                }
+                // (9) the capacity field must be NOT NULL. A nullable capacity is NULL
+                // on insert, so the guard `used + n <= capacity` is NULL and `reserve`
+                // returns `Ok(false)` forever — the same silent-dead failure as (8).
+                if !capf.required {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` reserves against `{}`, which is nullable (`required: false`) — a NULL capacity makes the atomic guard `{} + n <= {}` NULL, so `reserve` returns `Ok(false)` forever (it can never reserve). Make `{}` `required: true`. See `jerrycan explain JC0564`.",
+                            e.name, f.name, cap, f.name, cap, cap
+                        ),
+                    ));
+                }
+            }
+        }
+        for (i, sub) in m.subroutes.iter().enumerate() {
+            check_reserve_against(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
+        }
+    }
+    for (i, m) in d.modules.iter().enumerate() {
+        check_reserve_against(d, m, &format!("/modules/{i}"), &mut qs);
+    }
+
     // JC0560 (#119): a `belongs_to` fk column must be BUILDABLE and DISTINCT. The
     // fk column a belongs_to derives (`{as}_id` when aliased, else
     // `snake(entity)_id`) becomes a Model field AND a migration column, so per
@@ -3748,6 +3897,203 @@ mod tests {
         );
     }
 
+    // ---- #187 (JC0564): reserve_against atomic reserve primitive ---------------
+
+    /// A well-formed `reserve_against`: a `used` integer counter bounded by a
+    /// SEPARATE `capacity` integer field on a db-backed design. This is the buildable
+    /// baseline the seven refusals are measured against — the generated `reserve`
+    /// method wires the #108-proven atomic UPDATE from exactly this shape.
+    const RESERVE_OK: &str = r#"{
+        "name": "reserve-api", "contract_version": 1,
+        "dependencies": ["db"],
+        "modules": [{
+            "name": "venue",
+            "entities": [
+                { "name": "Booking", "fields": [
+                    { "name": "capacity", "type": "integer" },
+                    { "name": "used", "type": "integer", "reserve_against": "capacity" }
+                ]}
+            ],
+            "endpoints": [
+                { "operation_id": "create_booking", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Booking" },
+                  "success": { "status": 201, "entity": "Booking" } }
+            ]
+        }]
+    }"#;
+
+    /// The buildable shape passes clean — no JC0564. Also the byte-identity floor:
+    /// an entity with no `reserve_against` at all never trips it (MINIMAL below).
+    #[test]
+    fn well_formed_reserve_against_passes_and_absence_is_inert() {
+        assert!(
+            !validate(&design(RESERVE_OK))
+                .iter()
+                .any(|q| q.question.contains("JC0564")),
+            "a well-formed reserve_against must not trip JC0564: {:?}",
+            validate(&design(RESERVE_OK))
+        );
+        assert!(
+            !validate(&design(MINIMAL))
+                .iter()
+                .any(|q| q.question.contains("JC0564")),
+            "a design with no reserve_against must never mention JC0564"
+        );
+    }
+
+    /// Helper: mutate RESERVE_OK and return the first JC0564 question, panicking with
+    /// the full question list if none fired (the refusal is the whole point).
+    fn reserve_refusal(from: &str, to: &str) -> Question {
+        let json = RESERVE_OK.replace(from, to);
+        let qs = validate(&design(&json));
+        qs.into_iter()
+            .find(|q| q.question.contains("JC0564"))
+            .unwrap_or_else(|| panic!("mutation `{from}` -> `{to}` must trip JC0564"))
+    }
+
+    /// (1) `reserve_against` names a field that does not exist on the entity.
+    #[test]
+    fn reserve_against_nonexistent_capacity_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#""reserve_against": "capacity""#,
+            r#""reserve_against": "ceiling""#,
+        );
+        assert!(
+            hit.question.contains("is not a field of") && hit.question.contains("ceiling"),
+            "message must name the missing capacity field: {}",
+            hit.question
+        );
+    }
+
+    /// (2) the counter field carrying `reserve_against` is not integer.
+    #[test]
+    fn reserve_against_non_integer_counter_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "used", "type": "integer", "reserve_against": "capacity" }"#,
+            r#"{ "name": "used", "type": "string", "reserve_against": "capacity" }"#,
+        );
+        assert!(
+            hit.question.contains("not `integer`") && hit.question.contains("counter"),
+            "message must name the non-integer counter rule: {}",
+            hit.question
+        );
+    }
+
+    /// (3) the named capacity field is not integer.
+    #[test]
+    fn reserve_against_non_integer_capacity_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "capacity", "type": "integer" }"#,
+            r#"{ "name": "capacity", "type": "string" }"#,
+        );
+        assert!(
+            hit.question.contains("capacity ceiling must be an integer"),
+            "message must name the non-integer capacity rule: {}",
+            hit.question
+        );
+    }
+
+    /// (4a) the counter leg is the primary key `id`.
+    #[test]
+    fn reserve_against_on_pk_counter_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "used", "type": "integer", "reserve_against": "capacity" }"#,
+            r#"{ "name": "id", "type": "integer", "reserve_against": "capacity" }"#,
+        );
+        assert!(
+            hit.question.contains("counter cannot be the primary key"),
+            "message must refuse the pk counter: {}",
+            hit.question
+        );
+    }
+
+    /// (4b) the capacity leg is the primary key `id`.
+    #[test]
+    fn reserve_against_pk_capacity_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#""reserve_against": "capacity""#,
+            r#""reserve_against": "id""#,
+        );
+        assert!(
+            hit.question
+                .contains("capacity ceiling cannot be the primary key"),
+            "message must refuse the pk capacity: {}",
+            hit.question
+        );
+    }
+
+    /// (5) a field cannot reserve against itself.
+    #[test]
+    fn reserve_against_self_reference_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#""reserve_against": "capacity""#,
+            r#""reserve_against": "used""#,
+        );
+        assert!(
+            hit.question.contains("cannot reserve against itself"),
+            "message must refuse the self-reference: {}",
+            hit.question
+        );
+    }
+
+    /// (6) more than one `reserve_against` field on one entity — the generated
+    /// `reserve` method name would be ambiguous.
+    #[test]
+    fn reserve_against_more_than_one_per_entity_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "capacity", "type": "integer" }"#,
+            r#"{ "name": "capacity", "type": "integer", "reserve_against": "used" }"#,
+        );
+        assert!(
+            hit.question.contains("at most one"),
+            "message must refuse >1 reserve_against per entity: {}",
+            hit.question
+        );
+    }
+
+    /// (7) a memory-only design — the atomic UPDATE is emitted on the SQL repo only.
+    #[test]
+    fn reserve_against_on_memory_only_design_is_refused_with_jc0564() {
+        let hit = reserve_refusal(r#""dependencies": ["db"],"#, r#""dependencies": [],"#);
+        assert!(
+            hit.question.contains("no database"),
+            "message must refuse reserve_against without a database: {}",
+            hit.question
+        );
+    }
+
+    /// (8) a NULLABLE counter (review FIX 2). A `required: false` counter is NULL on
+    /// insert, so the guard `used + n <= capacity` is NULL → `reserve` returns
+    /// `Ok(false)` forever (silently dead). The counter must be NOT NULL.
+    #[test]
+    fn reserve_against_nullable_counter_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "used", "type": "integer", "reserve_against": "capacity" }"#,
+            r#"{ "name": "used", "type": "integer", "required": false, "reserve_against": "capacity" }"#,
+        );
+        assert!(
+            hit.question.contains("nullable") && hit.question.contains("Ok(false)` forever"),
+            "message must refuse a nullable counter and name the silent-dead failure: {}",
+            hit.question
+        );
+    }
+
+    /// (9) a NULLABLE capacity (review FIX 2). A `required: false` capacity is NULL on
+    /// insert, so the guard is NULL → `reserve` returns `Ok(false)` forever. The named
+    /// capacity field must be NOT NULL.
+    #[test]
+    fn reserve_against_nullable_capacity_is_refused_with_jc0564() {
+        let hit = reserve_refusal(
+            r#"{ "name": "capacity", "type": "integer" }"#,
+            r#"{ "name": "capacity", "type": "integer", "required": false }"#,
+        );
+        assert!(
+            hit.question.contains("nullable") && hit.question.contains("capacity"),
+            "message must refuse a nullable capacity: {}",
+            hit.question
+        );
+    }
+
     // ---- #119 (JC0560): belongs_to fk alias -----------------------------------
 
     /// A ledger with two aliased refs to Account (from/to) AND a self-referential
@@ -5494,6 +5840,7 @@ mod tests {
             min_len: None,
             max_len: None,
             write_only: false,
+            reserve_against: None,
         });
         assert!(
             validate(&d)
