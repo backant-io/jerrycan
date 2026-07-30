@@ -6,7 +6,7 @@ use super::model::*;
 use super::repo::*;
 use jerrycan::auth::{ApiKeyRecord, ApiKeys, hash_key, mint};
 use jerrycan::prelude::*;
-use shared::Tenant;
+use shared::{CurrentUser, Tenant};
 
 /// The scopes a tenant may grant to a minted key — a server-owned allowlist.
 /// A key's scope set is NEVER taken verbatim from the request: the requested
@@ -24,14 +24,15 @@ pub(crate) async fn list_api_keys(
     Ok(Json(repo.all_for(tenant.id()).await?))
 }
 
-/// POST / — mint a new key for the caller's tenant. Persist the hash + prefix +
-/// scopes (never the plaintext) and ALSO register the record in the in-memory
-/// `ApiKeys` store the `usage` endpoint authenticates against. The plaintext is
-/// returned ONCE, in a `plaintext` field alongside the echoed row.
+/// POST / — mint a new key for the workspace named in the body (verified against
+/// the caller's memberships). Persist the hash + prefix + scopes (never the
+/// plaintext) and ALSO register the record in the in-memory `ApiKeys` store the
+/// `usage` endpoint authenticates against. The plaintext is returned ONCE, in a
+/// `plaintext` field alongside the echoed row.
 pub(crate) async fn create_api_key(
     repo: Dep<ApiKeyRepo>,
     store: Dep<SharedKeyStore>,
-    tenant: Dep<Tenant>,
+    user: CurrentUser,
     Json(body): Json<ApiKey>,
 ) -> Result<Created<serde_json::Value>> {
     let minted = mint("sk_live");
@@ -52,17 +53,19 @@ pub(crate) async fn create_api_key(
     // list, and is unique because the hash is. `mint`'s class prefix (`sk_live`)
     // alone would collide across a tenant's keys.
     let display_prefix = format!("{}_{}", minted.prefix, &minted.hash[..8]);
+    let workspace_id = body.workspace_id;
     let row = ApiKey {
         id: body.id,
-        workspace_id: tenant.id(),
+        workspace_id,
         prefix: display_prefix.clone(),
         label: body.label,
         scopes: granted_csv.clone(),
     };
-    // `workspace_id` is pinned to the membership-verified `tenant.id()` above (never
-    // the body), so this bare insert cannot write into a non-member tenant — the flat
-    // create leak (#94) does not apply here.
-    let id = repo.insert(row.clone()).await?; // jerrycan:allow JL0006
+    // Membership-CHECKED create (#94/#97): `create_for_memberships` verifies the
+    // body's `workspace_id` is in the caller's membership set before inserting — a
+    // create into a non-member workspace is 403, and the bare `insert` that would skip
+    // the check is not generated for a flat tenant entity.
+    let id = repo.create_for_memberships(user.0.id, row.clone()).await?;
     // Register the lookup record (hash → scopes) in the shared store the `usage`
     // authenticator reads. We persist only the hash, never the plaintext.
     store.0.insert(ApiKeyRecord {
@@ -73,7 +76,7 @@ pub(crate) async fn create_api_key(
     });
     Ok(Created(serde_json::json!({
         "id": id,
-        "workspace_id": tenant.id(),
+        "workspace_id": workspace_id,
         "prefix": display_prefix,
         "label": row.label,
         "scopes": granted_csv,

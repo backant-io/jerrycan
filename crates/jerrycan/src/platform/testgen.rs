@@ -1556,6 +1556,7 @@ fn seed_second_tenant_fn(design: &Design, module: &ModuleDesign) -> String {
 fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
     let mut out = String::new();
     out.push_str(&tenant_owned_isolation_test(design, module));
+    out.push_str(&flat_write_isolation_test(design, module));
     out.push_str(&per_user_isolation_test(design, module));
     out.push_str(&public_read_isolation_test(design, module));
     out.push_str(&tenant_collection_isolation_test(design, module));
@@ -1713,6 +1714,87 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
     }
     t.push_str("}\n\n");
     t
+}
+
+/// The FLAT-write (#96) cross-tenant isolation test: a member of tenant 1 must NOT
+/// be able to CREATE a row into a tenant they don't belong to. WHY (Rule 9): #97
+/// makes the bare `insert` non-existent, so a flat create must go through
+/// `create_for_memberships`, whose RLS `WITH CHECK` verifies the body's tenant fk is
+/// in the caller's membership set (403 otherwise). This test is that contract's
+/// backstop — it POSTs a create whose tenant fk is tenant 2 (a tenant `app()` seeds
+/// for user 2 ONLY, via `seed_second_tenant`) as user 1 and asserts 403. RED on
+/// stubs (the create 500s), green only with the membership-checked create. FLAT
+/// (MembershipSet) entities only: a path-scoped/nested write takes its tenant from
+/// the VERIFIED path, not the body, so it has no body-fk leak (and is covered by the
+/// path-scoped read isolation test instead).
+fn flat_write_isolation_test(design: &Design, module: &ModuleDesign) -> String {
+    let Some(tenancy) = design.tenancy.as_ref() else {
+        return String::new();
+    };
+    // A DIRECT flat tenant-owned entity on this module — the tenant fk is a real column
+    // it carries in the BODY (empty tenant-path joins), so we can aim that fk at a
+    // foreign tenant. A transitive grandchild (non-empty joins, nested `/accounts/{id}`
+    // mount) resolves its tenant through the parent chain and drops the fk from the body
+    // (it rides the path), so this body-fk probe does not apply — the read isolation
+    // test covers it. A path-scoped entity is scoped by the verified path tenant.
+    let Some(entity) = module.entities.iter().find(|e| {
+        super::genroute::entity_is_flat_tenant_owned(e, design)
+            && design
+                .tenant_path(&e.name)
+                .is_some_and(|p| p.joins.is_empty())
+    }) else {
+        return String::new();
+    };
+    // A GUARDED creator at "/" with this entity's body — the write whose body fk we
+    // aim at a foreign tenant. `create_for_memberships` needs the session `_user`, so a
+    // create must be guarded to prove the 403; without one there is nothing to probe.
+    let Some(create) = module.endpoints.iter().find(|ep| {
+        ep.method == HttpMethod::POST
+            && ep.path == "/"
+            && ep.is_guarded()
+            && ep
+                .request_body
+                .as_ref()
+                .is_some_and(|rb| rb.entity.as_deref() == Some(entity.name.as_str()))
+    }) else {
+        return String::new();
+    };
+    let base = module.effective_mount();
+    let base = base.trim_end_matches('/');
+    // Defensive: a direct flat child never mounts under a path token, but if it somehow
+    // did the probe URL would carry an unsubstituted `{..}` — skip rather than emit it.
+    if base.contains('{') {
+        return String::new();
+    }
+    let plural = module.name.replace('-', "_");
+    let fk_col = Design::fk_column(&tenancy.entity);
+    // Start from the seeded-tenant fixture body, then re-aim ONLY the tenant fk at
+    // tenant 2 — a tenant user 1 is NOT a member of (`seed_second_tenant` seeds tenant
+    // 2 for user 2 only). `fixture_json` values a belongs_to fk at the seeded id 1 (a
+    // text pk quoted, an integer pk bare), so the swap target is exact. A field-level
+    // `overrides` entry would not reach the fk (fixture_json values fks separately), so
+    // we do the targeted swap here.
+    let (seeded_fk, foreign_fk) = match design.target_key_rust_type(&tenancy.entity) {
+        "String" => ("\"1\"", "\"2\""),
+        _ => ("1", "2"),
+    };
+    let body = fixture_json(
+        design,
+        module,
+        &entity.name,
+        omits_identity_fk(design, module, create),
+        &[],
+        false, // a create body omits defaults
+    )
+    .replacen(
+        &format!("\"{fk_col}\": {seeded_fk}"),
+        &format!("\"{fk_col}\": {foreign_fk}"),
+        1,
+    );
+    let hk = design.test_auth_header();
+    format!(
+        "/// SECURITY (#96/#97): a member of one tenant must NOT create a row into a\n/// tenant they don't belong to. User 1 (tenant 1) POSTs a create whose `{fk_col}` is\n/// tenant 2 (foreign); `create_for_memberships`'s RLS WITH CHECK must reject it with\n/// 403. Passes only with the membership-checked create — the bare `insert` that would\n/// skip the check is not generated for a flat tenant entity (#97).\n#[tokio::test]\nasync fn {plural}_flat_write_into_foreign_tenant_is_403() {{\n    let t = app().await;\n    let res = t.post_json_with(\"{base}/\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(res.status().as_u16(), 403, \"a create into a non-member tenant must 403 (create_for_memberships WITH CHECK, #94); body: {{}}\", res.text());\n}}\n\n"
+    )
 }
 
 /// The per-user (#79) isolation test: user 1 creates a row (the server injects
