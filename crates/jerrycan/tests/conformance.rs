@@ -3123,7 +3123,7 @@ fn http_status(raw: &str) -> u16 {
 }
 /// Parse the JSON body (everything past the header terminator) of a raw response.
 fn http_json_body(raw: &str) -> serde_json::Value {
-    let body = raw.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
+    let body = raw.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("");
     serde_json::from_str(body.trim()).unwrap_or_else(|e| panic!("body not JSON ({e}):\n{raw}"))
 }
 /// True when `jerrycan package --binary` produced a static musl binary (so a
