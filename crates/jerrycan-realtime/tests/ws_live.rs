@@ -81,6 +81,15 @@ fn header_resolver() -> jerrycan_realtime::PrincipalResolver {
     })
 }
 
+/// A resolver whose failure is NOT an authentication failure: it returns a 500.
+/// #117's fix must let a 401 through as anonymous but still ABORT the upgrade on
+/// any other error — this stands in for a backend/dependency failure.
+fn failing_resolver() -> jerrycan_realtime::PrincipalResolver {
+    std::sync::Arc::new(|_ctx: &mut jerrycan_core::RequestCtx| {
+        Box::pin(async move { Err(jerrycan_core::Error::internal("auth backend unavailable")) })
+    })
+}
+
 async fn connect_as(port: u16, user: &str, tenant: &str) -> WsClient {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut req = format!("ws://127.0.0.1:{port}/realtime")
@@ -314,6 +323,80 @@ async fn oversized_inbound_frame_is_rejected_and_closes_the_connection() {
     .await
     .expect("connection did not close after an oversized frame");
     assert!(closed);
+
+    let _ = shutdown.send(());
+    let _ = task.await;
+}
+
+/// #117 END-TO-END: with a resolver INSTALLED (an auth model present), an
+/// anonymous client (no credential ⇒ the resolver 401s) can STILL complete the
+/// WS upgrade and reach a public scope-`none` topic — join it, publish, and
+/// receive its broadcast. Before the fix the resolver `?`-401'd this client at
+/// the upgrade, so `connect(port)` itself would have errored. A scope-`auth`
+/// topic still rejects it at JOIN (JC0401 — no escalation).
+#[tokio::test(flavor = "multi_thread")]
+async fn anonymous_client_reaches_scope_none_topic_when_resolver_installed() {
+    let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
+    let rt = Realtime::new(db)
+        .broadcast("lobby", TopicScope::None)
+        .broadcast("events", TopicScope::Auth)
+        .principal(header_resolver());
+    let (port, shutdown, task) = serve(rt).await;
+
+    // No x-user header ⇒ the resolver returns 401 ⇒ anonymous. The upgrade must
+    // still succeed (was: 401 at the upgrade, `connect` would panic here).
+    let mut a = connect(port).await;
+    let mut b = connect(port).await;
+
+    // Both anon clients JOIN the public scope-none topic.
+    for ws in [&mut a, &mut b] {
+        send_text(ws, r#"{"op":"join","channel":"broadcast:lobby","ref":1}"#).await;
+        assert_eq!(recv_json(ws).await["op"], "joined");
+    }
+
+    // A scope-auth topic still rejects the anonymous principal at JOIN.
+    send_text(
+        &mut a,
+        r#"{"op":"join","channel":"broadcast:events","ref":2}"#,
+    )
+    .await;
+    let err = recv_json(&mut a).await;
+    assert_eq!(err["op"], "error");
+    assert_eq!(err["code"], "JC0401", "scope-auth must reject anon: {err}");
+
+    // An anon client publishes to the public topic; the other anon client gets it.
+    send_text(
+        &mut a,
+        r#"{"op":"publish","channel":"broadcast:lobby","payload":{"msg":"hi"},"ref":3}"#,
+    )
+    .await;
+    let ev = recv_json(&mut b).await;
+    assert_eq!(ev["op"], "event");
+    assert_eq!(ev["channel"], "broadcast:lobby");
+    assert_eq!(ev["payload"]["msg"], "hi");
+
+    let _ = shutdown.send(());
+    let _ = task.await;
+}
+
+/// #117 does NOT swallow all errors: a resolver returning a NON-auth error (500)
+/// still ABORTS the upgrade — the connection must NOT silently degrade to
+/// anonymous. The upgrade fails, so the client's `connect_async` errors.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_auth_resolver_error_still_fails_the_upgrade() {
+    let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
+    let rt = Realtime::new(db)
+        .broadcast("lobby", TopicScope::None)
+        .principal(failing_resolver());
+    let (port, shutdown, task) = serve(rt).await;
+
+    // Even with no credential, a 500 from the resolver aborts the upgrade rather
+    // than mapping to anonymous — the handshake never switches protocols.
+    let result = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/realtime")).await;
+    assert!(
+        result.is_err(),
+        "a non-401 resolver error must fail the WS upgrade, not become anonymous"
+    );
 
     let _ = shutdown.send(());
     let _ = task.await;
