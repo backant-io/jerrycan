@@ -189,6 +189,9 @@ fn build_one(
                     // Migration import sets no explicit write_only (#112); a
                     // `password_hash` column is auto-hidden by the classifier.
                     write_only: false,
+                    // Migration import derives no capacity reservation (#187);
+                    // `reserve_against` is a design-authored wiring only.
+                    reserve_against: None,
                 });
             }
             MappedType::Unmappable { pg_type, reason } => {

@@ -362,6 +362,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs middleware",
     },
     CodeInfo {
+        code: "JC0564",
+        title: "invalid reserve_against field",
+        cause: "a field's `reserve_against` (issue #187) wires the generated atomic `{Entity}Repo::reserve(id, n)` method — the #108-proven conditional UPDATE `SET counter = counter + n WHERE id = ? AND counter + n <= capacity` — but the declaration is unbuildable: it names a capacity field that does not exist on the entity; the counter field (the one carrying `reserve_against`) is not `integer`; the named capacity field is not `integer`; the counter or the capacity is the primary key `id`; `reserve_against` names the field's OWN name (a field cannot reserve against itself); more than one field on the entity carries `reserve_against` (the generated `reserve` method name would be ambiguous); or the design has no database (the atomic UPDATE is emitted on the SQL-backed repo only — a memory repo cannot run it)",
+        fix: "put `reserve_against` on exactly ONE integer counter field per entity, naming a SEPARATE integer capacity field (both ordinary columns, neither the pk `id`) — e.g. `{ \"name\": \"used\", \"type\": \"integer\", \"default\": 0, \"reserve_against\": \"capacity\" }` beside `{ \"name\": \"capacity\", \"type\": \"integer\" }`; and give the design a database (`db` in `dependencies`) so the SQL-backed `reserve` method is generated",
+        doc: "jerrycan docs designing",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",

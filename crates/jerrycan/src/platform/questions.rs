@@ -1695,6 +1695,130 @@ pub fn validate(d: &Design) -> Vec<Question> {
         check_composite_unique(m, &format!("/modules/{i}"), &mut qs);
     }
 
+    // JC0564 (#187): a field's `reserve_against` wires the generated atomic
+    // `{Entity}Repo::reserve(id, n)` method (the #108-proven conditional UPDATE), so it
+    // must name a DISTINCT sibling integer *capacity* field and itself be an integer
+    // *counter* — neither the pk `id`. Refuse a non-existent capacity, a non-integer
+    // counter or capacity, the pk on either leg, a self-reference, more than one
+    // `reserve_against` per entity (the `reserve` name must be unambiguous), or a
+    // memory-only design (the atomic UPDATE is emitted on the SQL repo only). Inert for
+    // every entity without `reserve_against` (byte-identity baseline).
+    fn check_reserve_against(d: &Design, m: &ModuleDesign, ptr: &str, qs: &mut Vec<Question>) {
+        for (i, e) in m.entities.iter().enumerate() {
+            let reservers: Vec<(usize, &Field)> = e
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.reserve_against.is_some())
+                .collect();
+            if reservers.is_empty() {
+                continue;
+            }
+            // (6) at most one `reserve_against` per entity — else the generated `reserve`
+            // method name would collide.
+            if reservers.len() > 1 {
+                let names = reservers
+                    .iter()
+                    .map(|(_, f)| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                qs.push(q(
+                    format!("{ptr}/entities/{i}"),
+                    format!(
+                        "Entity `{}` declares `reserve_against` on {} fields ({names}) — at most one reserve counter per entity is allowed so the generated `reserve` method name stays unambiguous. Keep `reserve_against` on a single counter field. See `jerrycan explain JC0564`.",
+                        e.name,
+                        reservers.len(),
+                    ),
+                ));
+            }
+            for (fi, f) in &reservers {
+                let cap = f.reserve_against.as_deref().unwrap_or_default();
+                let fptr = format!("{ptr}/entities/{i}/fields/{fi}");
+                // (7) memory-only design — the conditional UPDATE lives on the SQL repo.
+                if !d.wants_db() {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against` but the design has no database — the atomic `reserve` method is generated on the SQL-backed repo only (a memory repo cannot run the conditional UPDATE). Add `db` to `dependencies`, or drop `reserve_against`. See `jerrycan explain JC0564`.",
+                            e.name, f.name
+                        ),
+                    ));
+                }
+                // (2) the counter field must be integer.
+                if f.field_type != FieldType::Integer {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against` but is `{:?}`, not `integer` — the reserve counter is incremented by an integer amount, so it must be an integer column. Make `{}` integer, or drop `reserve_against`. See `jerrycan explain JC0564`.",
+                            e.name, f.name, f.field_type, f.name
+                        ),
+                    ));
+                }
+                // (4a) the counter field must not be the pk `id`.
+                if f.name == "id" {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `id` declares `reserve_against` — the reserve counter cannot be the primary key `id` (server-assigned and identifying the row, not a mutable amount). Move `reserve_against` to a dedicated integer counter field. See `jerrycan explain JC0564`.",
+                            e.name
+                        ),
+                    ));
+                }
+                // (5) a field cannot reserve against itself.
+                if cap == f.name {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against: \"{}\"` — a field cannot reserve against itself; name the SEPARATE integer capacity ceiling. See `jerrycan explain JC0564`.",
+                            e.name, f.name, cap
+                        ),
+                    ));
+                    // A self-reference resolves to this same field, so the capacity
+                    // checks below (existence/integer/pk) would only re-report it — skip.
+                    continue;
+                }
+                // (4b) the capacity leg must not be the pk `id`.
+                if cap == "id" {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against: \"id\"` — the capacity ceiling cannot be the primary key `id`. Name a dedicated integer capacity field. See `jerrycan explain JC0564`.",
+                            e.name, f.name
+                        ),
+                    ));
+                    continue;
+                }
+                // (1) the named capacity field must exist on the same entity.
+                let Some(capf) = e.fields.iter().find(|g| g.name == cap) else {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` declares `reserve_against: \"{}\"`, but `{}` is not a field of `{}` — name the sibling integer capacity field the counter is bounded by. See `jerrycan explain JC0564`.",
+                            e.name, f.name, cap, cap, e.name
+                        ),
+                    ));
+                    continue;
+                };
+                // (3) the capacity field must be integer.
+                if capf.field_type != FieldType::Integer {
+                    qs.push(q(
+                        fptr.clone(),
+                        format!(
+                            "Entity `{}` field `{}` reserves against `{}`, which is `{:?}`, not `integer` — the capacity ceiling must be an integer column. Make `{}` integer, or point `reserve_against` at an integer field. See `jerrycan explain JC0564`.",
+                            e.name, f.name, cap, capf.field_type, cap
+                        ),
+                    ));
+                }
+            }
+        }
+        for (i, sub) in m.subroutes.iter().enumerate() {
+            check_reserve_against(d, sub, &format!("{ptr}/subroutes/{i}"), qs);
+        }
+    }
+    for (i, m) in d.modules.iter().enumerate() {
+        check_reserve_against(d, m, &format!("/modules/{i}"), &mut qs);
+    }
+
     // JC0560 (#119): a `belongs_to` fk column must be BUILDABLE and DISTINCT. The
     // fk column a belongs_to derives (`{as}_id` when aliased, else
     // `snake(entity)_id`) becomes a Model field AND a migration column, so per
@@ -5494,6 +5618,7 @@ mod tests {
             min_len: None,
             max_len: None,
             write_only: false,
+            reserve_against: None,
         });
         assert!(
             validate(&d)

@@ -2570,13 +2570,58 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
             _ => (unscoped_reads, unscoped_writes),
         }
     };
+    // Atomic reserve-if-capacity (issue #187): a field declaring `reserve_against`
+    // wires a generated `reserve` method emitting the #108-proven conditional UPDATE,
+    // so an agent never hand-writes the reservation (a hand-written read-then-write
+    // silently oversells on Postgres). JC0564 guarantees at most one such field per
+    // entity and both legs are distinct integer non-pk columns, so the raw SQL below is
+    // always buildable; the method is emitted on this SQL-backed repo only (the memory
+    // repo can't run the conditional UPDATE — JC0564 also refuses a memory-only design).
+    // Mirrors the #138 `remove_for_memberships` raw-SQL idiom verbatim (self.db.conn(),
+    // sea_orm::Statement::from_sql_and_values, db_error, rows_affected()). Empty for
+    // every entity without `reserve_against`, so their repo output stays byte-identical.
+    let reserve = e
+        .fields
+        .iter()
+        .find_map(|f| {
+            f.reserve_against
+                .as_deref()
+                .map(|cap| (f.name.as_str(), cap))
+        })
+        .map(|(used, capacity)| {
+            let table = design.table_name(entity);
+            format!(
+                r#"
+    /// Atomically reserve `n` units of `{used}` against `{capacity}` in ONE
+    /// conditional UPDATE — correct on SQLite AND Postgres (all callers contend on the
+    /// SAME pk row, so the row lock + WHERE guard serialize them; no oversell).
+    /// `Ok(true)` reserved; `Ok(false)` at capacity, or no such row.
+    pub async fn reserve(&self, id: {key}, n: i64) -> Result<bool> {{
+        let r = self
+            .db
+            .conn()
+            .execute(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "UPDATE {table} SET {used} = {used} + ? WHERE id = ? AND {used} + ? <= {capacity}",
+                ),
+                [n.into(), id.into(), n.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        Ok(r.rows_affected() == 1)
+    }}
+"#
+            )
+        })
+        .unwrap_or_default();
     // Assemble the impl body and trim any leading blank lines: a FLAT tenant entity
     // (#97) suppresses its entire unscoped surface (reads/insert/writes all empty), so
     // without the trim the body would open with blank lines that `cargo fmt` would
     // strip — drifting the generated repo from a rustfmt fixpoint. A non-flat entity
     // always leads with a method (its `insert` is emitted), so the trim is a no-op and
     // its output stays byte-identical.
-    let impl_body = format!("{reads}{insert}{writes}\n{scoped}{tenant_own}{owner_scoped}");
+    let impl_body = format!("{reads}{insert}{writes}\n{scoped}{tenant_own}{owner_scoped}{reserve}");
     let impl_body = impl_body.trim_start_matches('\n');
     format!(
         r#"{member_row}pub struct {entity}Repo {{
@@ -2642,7 +2687,15 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
     // tenant-owned, pure-tenant, or plain module stays byte-identical, and a per-user
     // module gets `ColumnTrait`/`QueryFilter` WITHOUT the unused `ConnectionTrait`.
     let needs_filter = has_direct_scoped || has_owner_scoped; // ColumnTrait + QueryFilter
-    let needs_conn = has_scoped || has_tenant_own; // ConnectionTrait (raw SQL)
+    // A `reserve_against` field (issue #187) emits a raw-SQL `reserve` method on the SQL
+    // repo — it calls `self.db.conn().execute(..)`/`.get_database_backend()`, both
+    // `ConnectionTrait` methods — so a module carrying one needs `ConnectionTrait` even
+    // without a tenant-scoped or member surface, or the generated repo won't compile.
+    let has_reserve = m
+        .entities
+        .iter()
+        .any(|e| e.fields.iter().any(|f| f.reserve_against.is_some()));
+    let needs_conn = has_scoped || has_tenant_own || has_reserve; // ConnectionTrait (raw SQL)
     // `QueryOrder` (`.order_by_asc`) is used ONLY by a method built with the typed
     // sea-orm query builder: the bare `all()` (kept for a non-suppressed entity), a
     // DIRECT tenant-scoped `all_for`, or a per-user `all_for`. A module of ONLY flat
@@ -4049,6 +4102,7 @@ pub(crate) mod tests {
             min_len: None,
             max_len: None,
             write_only: false,
+            reserve_against: None,
         });
         d.modules[1].entities[0].belongs_to[0].on_delete = OnDelete::SetNull;
         let ddl = migration_ddl(&d.modules[1], false, &d)
@@ -7044,6 +7098,7 @@ pub(crate) mod tests {
                 min_len: None,
                 max_len: None,
                 write_only: false,
+                reserve_against: None,
             },
         );
         let ddl = migration_ddl(&m, false, &demo()).unwrap();
@@ -7085,6 +7140,7 @@ pub(crate) mod tests {
                 min_len: None,
                 max_len: None,
                 write_only: false,
+                reserve_against: None,
             },
         );
         let ddl = migration_ddl(&m, false, &demo()).unwrap();
