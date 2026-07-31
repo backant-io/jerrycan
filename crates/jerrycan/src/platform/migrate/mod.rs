@@ -31,6 +31,33 @@ use typemap::{MappedType, map_pg_type};
 
 use crate::platform::design::{Design, Entity, FieldType, ModuleDesign, RealtimeDesign, Tenancy};
 
+/// #144: does `entity` reach `tenant` by following `belongs_to` edges? A DIRECT
+/// child (`belongs_to == tenant`) returns true; a GRANDCHILD returns true through
+/// its parent chain; an unowned table returns false. This mirrors the framework's
+/// transitive `Design::tenant_path` on the migrator's pre-`Design` entity model, so
+/// `strip_public`'s tenant-owned test is as deep as the framework's. `seen` guards a
+/// `belongs_to` cycle (a malformed export). The tenant's OWN table is excluded by the
+/// caller (`tenant_path(tenant)` is `None`), not here.
+fn reaches_tenant(
+    entity: &str,
+    tenant: &str,
+    by_name: &BTreeMap<String, &Entity>,
+    seen: &mut BTreeSet<String>,
+) -> bool {
+    if entity == tenant {
+        return true;
+    }
+    if !seen.insert(entity.to_string()) {
+        return false; // cycle
+    }
+    let Some(e) = by_name.get(entity) else {
+        return false;
+    };
+    e.belongs_to
+        .iter()
+        .any(|b| reaches_tenant(&b.entity, tenant, by_name, seen))
+}
+
 pub struct MigrateOptions {
     pub export_dir: PathBuf,
     pub out_dir: PathBuf,
@@ -301,6 +328,16 @@ fn emit_from_db(
 
     let mut modules_by_table: BTreeMap<String, String> = BTreeMap::new();
     let mut endpoint_map: Vec<(String, String)> = Vec::new();
+    // #144: a NAME-keyed view of every detected entity, so `strip_public`'s
+    // tenant-owned test can walk the `belongs_to` chain transitively (matching the
+    // framework's `Design::tenant_path`) — `entity_by_table` is keyed by TABLE, but
+    // `belongs_to.entity` names an ENTITY. Built once; the `Design` this reasons
+    // about is not assembled until later in the pipeline, so we cannot call
+    // `tenant_path` here.
+    let entities_by_name: BTreeMap<String, &Entity> = entity_by_table
+        .values()
+        .map(|e| (e.name.clone(), e))
+        .collect();
     for (mod_name, tables) in groups {
         let mut m_entities = Vec::new();
         let mut m_endpoints = Vec::new();
@@ -347,9 +384,15 @@ fn emit_from_db(
             }
             let mut eps = crud::endpoints_for(&entity.name, access, &covered);
             // questions.rs forbids public on a tenant-owned entity: downgrade + advise.
-            let tenant_owned = tenant_entity
-                .as_ref()
-                .is_some_and(|te| entity.belongs_to.iter().any(|b| &b.entity == te));
+            // #144: tenant ownership is TRANSITIVE (a grandchild is tenant-owned
+            // through its parent chain), matching the framework's `Design::tenant_path`
+            // — the earlier direct-`belongs_to`-only test let a transitively-tenant-
+            // owned public-SELECT source leak through. The tenant's OWN table is NOT
+            // tenant-owned (`tenant_path(tenant)` is `None`), so exclude it explicitly.
+            let tenant_owned = tenant_entity.as_ref().is_some_and(|te| {
+                &entity.name != te
+                    && reaches_tenant(&entity.name, te, &entities_by_name, &mut BTreeSet::new())
+            });
             if tenant_owned && eps.iter().any(|e| e.public) {
                 crud::strip_public(&mut eps);
                 gaps.push(GapItem {
@@ -1070,6 +1113,61 @@ create publication supabase_realtime for table public.customers;
             "id,workspace_id,email\n",
         )
         .unwrap();
+    }
+
+    fn ent(name: &str, parents: &[&str]) -> Entity {
+        Entity {
+            name: name.into(),
+            table: None,
+            belongs_to: parents
+                .iter()
+                .map(|p| super::super::design::BelongsTo {
+                    entity: (*p).into(),
+                    on_delete: Default::default(),
+                    r#as: None,
+                })
+                .collect(),
+            public_read: false,
+            unique: vec![],
+            fields: vec![],
+        }
+    }
+
+    #[test]
+    fn reaches_tenant_walks_the_belongs_to_chain_transitively() {
+        // #144: Org (tenant) <- Account <- Contact (grandchild); Widget is unowned.
+        // The migrator's tenant-owned test must be as DEEP as the framework's
+        // `Design::tenant_path` — a grandchild is tenant-owned through its chain.
+        let (org, account, contact, widget) = (
+            ent("Org", &[]),
+            ent("Account", &["Org"]),
+            ent("Contact", &["Account"]),
+            ent("Widget", &[]),
+        );
+        let by_name: BTreeMap<String, &Entity> = [&org, &account, &contact, &widget]
+            .into_iter()
+            .map(|e| (e.name.clone(), e))
+            .collect();
+        let r = |name: &str| reaches_tenant(name, "Org", &by_name, &mut BTreeSet::new());
+        assert!(r("Account"), "a DIRECT child reaches the tenant");
+        assert!(
+            r("Contact"),
+            "a GRANDCHILD reaches the tenant transitively (#144)"
+        );
+        assert!(!r("Widget"), "an UNOWNED table does not reach the tenant");
+        assert!(
+            r("Org"),
+            "the tenant reaches itself (base case; the caller excludes the root)"
+        );
+        // A `belongs_to` cycle (malformed export) must TERMINATE, not hang or
+        // falsely reach an unrelated tenant.
+        let (a, b) = (ent("A", &["B"]), ent("B", &["A"]));
+        let cyc: BTreeMap<String, &Entity> =
+            [&a, &b].into_iter().map(|e| (e.name.clone(), e)).collect();
+        assert!(
+            !reaches_tenant("A", "Org", &cyc, &mut BTreeSet::new()),
+            "a belongs_to cycle must terminate"
+        );
     }
 
     #[test]

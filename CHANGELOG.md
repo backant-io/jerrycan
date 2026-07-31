@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.31 — 2026-07-31
+
+### Fixed
+- **The Supabase migrator's public-read downgrade is now transitive (#144).** When a
+  source table carries a public-SELECT policy, the migrator strips the public reads for
+  a *tenant-owned* table (a public read would leak across tenants) and emits an advisory.
+  That tenant-owned test checked only a **direct** `belongs_to` the tenant, while the
+  framework classifies ownership **transitively** (`Design::tenant_path`, since #102) — so
+  a *transitively* tenant-owned source (a grandchild) with a public-SELECT policy could
+  slip past the check. The migrator now walks the `belongs_to` chain (cycle-guarded, the
+  tenant root excluded) so its ownership view is as deep as the framework's. Currently
+  unreachable via the released migration path (a latent inconsistency), so this is
+  hardening; direct-child and unowned inputs are byte-identical.
+
 ## 0.6.30 — 2026-07-31
 
 ### Fixed
