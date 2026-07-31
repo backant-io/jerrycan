@@ -700,6 +700,15 @@ pub struct HandlerRef {
     /// and a correct detail handler calls `get`, not `all`. Empty for every
     /// per-user ref and for tenant modules without a hosted child's handlers.
     pub exempt_fns: std::collections::BTreeSet<String>,
+    /// Signature markers the JL0006 exemption is verified against (issue #147):
+    /// an exempt-named fn is honored ONLY if its signature actually binds BOTH a
+    /// `Dep<Tenant>` guard AND a param bound `repo` of the tenant's own repo type.
+    /// `tenant_repo_type` is `{Tenant}Repo` (e.g. `WorkspaceRepo`) — the receiver
+    /// the exempt detail calls must target; `tenant_guard_type` is the last path
+    /// segment of the generated membership guard (`Tenant`, from `Dep<Tenant>`).
+    /// Both are only meaningful when `exempt_fns` is non-empty — empty otherwise.
+    pub tenant_repo_type: String,
+    pub tenant_guard_type: String,
 }
 
 /// The JL0006 fix text for a TENANT-owned handler (both route shapes, issue #94):
@@ -769,6 +778,15 @@ impl Design {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Issue #147: the signature markers the exemption is checked against.
+            // Derived from the tenancy entity — the tenant's own repo type is
+            // `{Tenant}Repo`, and the generated membership guard is `Dep<Tenant>`
+            // (a fixed `shared::Tenant`, matched on the `Tenant` final segment).
+            let (tenant_repo_type, tenant_guard_type) = self
+                .tenancy
+                .as_ref()
+                .map(|t| (format!("{}Repo", t.entity), "Tenant".to_string()))
+                .unwrap_or_default();
             out.push(HandlerRef {
                 rel_path: format!("{src_rel}/handlers.rs"),
                 is_flat,
@@ -776,6 +794,8 @@ impl Design {
                 leak_desc: "another tenant's rows",
                 suggestion: TENANT_SCOPED_SUGGESTION.to_string(),
                 exempt_fns,
+                tenant_repo_type,
+                tenant_guard_type,
             });
         }
         for sub in &m.subroutes {

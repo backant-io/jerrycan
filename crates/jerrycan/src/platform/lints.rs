@@ -207,8 +207,11 @@ fn lint_unscoped_tenant_queries(root: &Path, design: &Design, out: &mut Vec<Diag
                 "call the owner-scoped accessor (all_for/get_for/remove_for) with the session user's id (_user.0.id)".to_string()
             },
             // The #124 exemption is tenant-only (a path-verified Dep<Tenant>
-            // guard); per-user refs never exempt anything.
+            // guard); per-user refs never exempt anything, so the #147 signature
+            // markers are unused here (empty exempt_fns → never consulted).
             exempt_fns: BTreeSet::new(),
+            tenant_repo_type: String::new(),
+            tenant_guard_type: String::new(),
         };
         scan_unscoped(root, &h, false, !reads_public, out);
     }
@@ -252,6 +255,8 @@ fn scan_unscoped(
         flag_insert: h.is_flat,
         flag_reads,
         exempt_fns: &h.exempt_fns,
+        expected_repo_type: &h.tenant_repo_type,
+        guard_marker: &h.tenant_guard_type,
         fn_stack: Vec::new(),
         src: &src,
     };
@@ -287,6 +292,35 @@ fn jl0008(rel: &str) -> Diagnostic {
     )
 }
 
+/// Issue #147: if `ty` is `Dep<T>` (outer type `Dep`, exactly one generic type
+/// arg), the inner type's LAST path segment ident — else `None`. Lenient on the
+/// leading path on both levels (`jerrycan::Dep<shared::Tenant>` → `Tenant`), exact
+/// on the final ident, so the signature check compares against `Tenant` /
+/// `{Tenant}Repo` the same way the generated `Dep<…>` params are written.
+fn dep_inner_last_segment(ty: &syn::Type) -> Option<String> {
+    let syn::Type::Path(tp) = ty else { return None };
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "Dep" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    let syn::GenericArgument::Type(syn::Type::Path(inner)) = args.args.first()? else {
+        return None;
+    };
+    Some(inner.path.segments.last()?.ident.to_string())
+}
+
+/// True when a param pattern is exactly the ident `name` (e.g. `repo` or
+/// `mut repo`) — issue #147's tenant-own-repo binding check.
+fn pat_is_ident(pat: &syn::Pat, name: &str) -> bool {
+    matches!(pat, syn::Pat::Ident(pi) if pi.ident == name)
+}
+
 /// True when `expr` is (syntactically) the `repo` binding — a bare `repo` path,
 /// possibly wrapped in parens/refs/groups. A genuinely aliased binding falls
 /// through to no-hit (acceptable: the steering trains `repo.` usage).
@@ -320,13 +354,22 @@ struct UnscopedVisitor<'a> {
     flag_reads: bool,
     /// Fn names (operation_ids) whose `get`/`update`/`remove`/`insert` hits are
     /// exempt (#124): the tenant's own PathScoped detail handlers. `all()` is
-    /// NEVER exempt — see [`HandlerRef::exempt_fns`].
+    /// NEVER exempt — see [`HandlerRef::exempt_fns`]. The exemption is honored
+    /// only when the fn's SIGNATURE also qualifies (#147, see `fn_stack`).
     exempt_fns: &'a BTreeSet<String>,
-    /// Enclosing-`fn` frames, innermost last (#124), so each hit attributes to
-    /// its handler. A stack, not a slot: a nested named fn attributes to
+    /// The tenant's own repo type `{Tenant}Repo` (#147): an exempt-named fn is
+    /// honored only if it binds a param `repo` of type `Dep<{Tenant}Repo>`.
+    expected_repo_type: &'a str,
+    /// The membership-guard marker `Tenant` (#147): an exempt-named fn is honored
+    /// only if it ALSO binds a `Dep<…Tenant>`-typed param (the guard, any name).
+    guard_marker: &'a str,
+    /// Enclosing-`fn` frames, innermost last (#124/#147): `(name, exempt_qualified)`
+    /// where `exempt_qualified` is the #147 signature check (both the `Dep<Tenant>`
+    /// guard AND a `repo: Dep<{Tenant}Repo>` param are present). Each hit attributes
+    /// to its handler. A stack, not a slot: a nested named fn attributes to
     /// ITSELF, and a helper is never an operation_id → it stays armed
     /// (under-suppress, never over-suppress).
-    fn_stack: Vec<String>,
+    fn_stack: Vec<(String, bool)>,
     src: &'a [&'a str],
 }
 
@@ -335,12 +378,14 @@ impl<'ast> syn::visit::Visit<'ast> for UnscopedVisitor<'_> {
     // the innermost one. Closures keep their enclosing frame — inline closure
     // code is part of the handler body.
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.fn_stack.push(node.sig.ident.to_string());
+        let qualified = self.signature_qualifies_for_exempt(&node.sig.inputs);
+        self.fn_stack.push((node.sig.ident.to_string(), qualified));
         syn::visit::visit_item_fn(self, node);
         self.fn_stack.pop();
     }
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.fn_stack.push(node.sig.ident.to_string());
+        let qualified = self.signature_qualifies_for_exempt(&node.sig.inputs);
+        self.fn_stack.push((node.sig.ident.to_string(), qualified));
         syn::visit::visit_impl_item_fn(self, node);
         self.fn_stack.pop();
     }
@@ -401,12 +446,46 @@ impl UnscopedVisitor<'_> {
     /// which repo the `repo` binding holds; a correct detail handler calls
     /// `get`, not `all`). Attribution is to the INNERMOST frame, and no frame
     /// (top-level macro/item code) is never exempt.
+    ///
+    /// Issue #147: the name-keyed exemption is honored ONLY when the innermost
+    /// frame's SIGNATURE also qualifies (`exempt_qualified`) — it binds both the
+    /// `Dep<Tenant>` guard and the tenant's own `repo`. Dropping the guard, or
+    /// binding a child repo as `repo`, drops the exemption so the needle fires.
+    /// The signature check only ever REMOVES exemptions (moves toward flagging),
+    /// so it stays on the safe side of the under-exempt-never-over-exempt rule.
     fn armed_in_current_fn(&self, display: &str) -> bool {
         display == "all()"
             || !self
                 .fn_stack
                 .last()
-                .is_some_and(|f| self.exempt_fns.contains(f))
+                .is_some_and(|(name, qualified)| *qualified && self.exempt_fns.contains(name))
+    }
+
+    /// Issue #147: whether a fn's signature qualifies it for the tenant-detail
+    /// exemption — it must bind BOTH a `Dep<…Tenant>`-typed param (the membership
+    /// guard, any binding name) AND a param whose pattern is the ident `repo` of
+    /// type `Dep<{Tenant}Repo>` (the tenant's OWN repo, the receiver the exempt
+    /// unscoped calls target). Only these two together justify the exemption; an
+    /// exempt-named fn that qualifies on neither is flagged like any other.
+    fn signature_qualifies_for_exempt(
+        &self,
+        inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
+    ) -> bool {
+        let mut has_guard = false;
+        let mut has_own_repo = false;
+        for arg in inputs {
+            let syn::FnArg::Typed(pt) = arg else { continue };
+            let Some(inner) = dep_inner_last_segment(&pt.ty) else {
+                continue;
+            };
+            if inner == self.guard_marker {
+                has_guard = true;
+            }
+            if inner == self.expected_repo_type && pat_is_ident(&pt.pat, "repo") {
+                has_own_repo = true;
+            }
+        }
+        has_guard && has_own_repo
     }
 
     /// Scan a macro's raw token stream for the unscoped `repo.<method>(` calls the
@@ -1226,7 +1305,10 @@ async fn list_books(repo: Dep<BookRepo>) -> Result<()> {
     /// handler. WHY: fn-level suppression cannot see which repo the `repo`
     /// binding holds — a correct tenant detail handler calls `get`, not `all` —
     /// so keeping `all()` armed cheaply bounds the "agent bound the CHILD repo
-    /// as `repo` in the tenant's detail handler" residual.
+    /// as `repo` in the tenant's detail handler" residual. The `get_club`
+    /// signature is fully-qualified (#147: `Dep<Tenant>` guard + `repo:
+    /// Dep<ClubRepo>`) so the fn IS genuinely exempt — this pins that `all()`
+    /// stays armed even then, not merely because the fn failed to qualify.
     #[test]
     fn jl0006_keeps_all_armed_inside_an_exempt_detail_handler() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1235,7 +1317,7 @@ async fn list_books(repo: Dep<BookRepo>) -> Result<()> {
         std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
         std::fs::write(
             &handlers,
-            "async fn get_club(repo: Dep<ClubRepo>) -> Result<()> {\n    let _ = repo.all().await?;\n    Ok(())\n}\n",
+            "async fn get_club(repo: Dep<ClubRepo>, _tenant: Dep<Tenant>) -> Result<()> {\n    let _ = repo.all().await?;\n    Ok(())\n}\n",
         )
         .unwrap();
         let hits = jl0006_only(root, &child_hosting_tenant_design());
@@ -1258,7 +1340,10 @@ async fn list_books(repo: Dep<BookRepo>) -> Result<()> {
     /// exactly like the plain call, while a macro-wrapped `repo.all()` in the
     /// SAME fn stays armed. WHY (Rule 9): if the macro arm's suppression drifted
     /// from the AST visitor's, the exemption would be spelling-dependent —
-    /// wrapping a call in `json!` would flip the verdict on identical code.
+    /// wrapping a call in `json!` would flip the verdict on identical code. The
+    /// `get_club` signature is fully-qualified (#147: `Dep<Tenant>` guard +
+    /// `repo: Dep<ClubRepo>`) so the fn IS genuinely exempt and the macro-wrapped
+    /// `get(` is legitimately suppressed there.
     #[test]
     fn jl0006_macro_scan_attributes_to_the_enclosing_fn() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1267,7 +1352,7 @@ async fn list_books(repo: Dep<BookRepo>) -> Result<()> {
         std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
         std::fs::write(
             &handlers,
-            "async fn get_club(repo: Dep<ClubRepo>) -> Result<()> {\n    let _ = serde_json::json!({ \"club\": repo.get(id).await? });\n    let _ = serde_json::json!({ \"rows\": repo.all().await? });\n    Ok(())\n}\n",
+            "async fn get_club(repo: Dep<ClubRepo>, _tenant: Dep<Tenant>) -> Result<()> {\n    let _ = serde_json::json!({ \"club\": repo.get(id).await? });\n    let _ = serde_json::json!({ \"rows\": repo.all().await? });\n    Ok(())\n}\n",
         )
         .unwrap();
         let hits = jl0006_only(root, &child_hosting_tenant_design());
@@ -1444,6 +1529,161 @@ async fn list_books(repo: Dep<BookRepo>) -> Result<()> {
             "names the `remove` needle: {:?}",
             hits[0]
         );
+    }
+
+    // ---- JL0006 tenant-detail exemption is signature-aware (issue #147) ----
+
+    /// A Workspace tenancy whose `workspaces` module HOSTS a tenant-owned child
+    /// (Member) — so `collect_owned_handlers` drags the tenant's OWN handlers
+    /// into the JL0006 scan and `get_workspace` (the guarded PathScoped `/{id}`
+    /// detail) enters the exemption set, with signature markers `WorkspaceRepo`
+    /// (the tenant's own repo) + `Tenant` (the `Dep<Tenant>` guard). Mirrors the
+    /// #124 `child_hosting_tenant_design` shape with Workspace-named entities.
+    fn child_hosting_workspace_design() -> Design {
+        serde_json::from_value(serde_json::json!({
+            "name": "workspace-api",
+            "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+            "modules": [{
+                "name": "workspaces",
+                "entities": [
+                    { "name": "Workspace", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Member",
+                      "belongs_to": [{ "entity": "Workspace" }],
+                      "fields": [{ "name": "role", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "list_workspaces", "method": "GET", "path": "/",
+                      "success": { "status": 200, "entity": "Workspace", "list": true } },
+                    { "operation_id": "get_workspace", "method": "GET", "path": "/{id}",
+                      "auth_required": true,
+                      "success": { "status": 200, "entity": "Workspace" } },
+                    { "operation_id": "list_members", "method": "GET", "path": "/{workspace_id}/members",
+                      "success": { "status": 200, "entity": "Member", "list": true } }
+                ]
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// Write `source` as the `workspaces` module's handlers.rs and return only
+    /// its JL0006 diagnostics (the module is the sole tenant-owned handler).
+    fn workspace_jl0006(source: &str) -> Vec<Diagnostic> {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let handlers = root.join("crates/routes/workspaces/src/handlers.rs");
+        std::fs::create_dir_all(handlers.parent().unwrap()).unwrap();
+        std::fs::write(&handlers, source).unwrap();
+        jl0006_only(root, &child_hosting_workspace_design())
+    }
+
+    /// Issue #147, the legitimate case (unchanged): a fully-qualified tenant
+    /// detail handler — it binds BOTH the `Dep<Tenant>` guard (membership was
+    /// verified) AND `repo: Dep<WorkspaceRepo>` (the tenant's own repo) — stays
+    /// EXEMPT, so its `repo.get(id)` is silent. This must match the #124
+    /// expectation exactly: the signature check only tightens the name-key.
+    #[test]
+    fn jl0006_147_qualified_exempt_detail_handler_stays_exempt() {
+        let hits = workspace_jl0006(
+            "async fn get_workspace(_tenant: Dep<Tenant>, repo: Dep<WorkspaceRepo>, Path(id): Path<i64>) -> Result<()> {\n    let _ = repo.get(id).await?;\n    Ok(())\n}\n",
+        );
+        assert!(
+            hits.is_empty(),
+            "a fully-qualified tenant detail handler (Dep<Tenant> guard + repo: \
+             Dep<WorkspaceRepo>) stays exempt: {hits:?}"
+        );
+    }
+
+    /// Issue #147 residual 1: an agent DROPS the `_tenant: Dep<Tenant>` guard from
+    /// the exempt-named `get_workspace` and calls `repo.get(id)` — with no guard
+    /// there is nothing verifying path membership, so the exemption is withdrawn
+    /// and JL0006 FIRES (was silently green under the pure name-key). WHY (Rule 9):
+    /// the name-keyed exemption trusted the operation_id alone; a hand-edit that
+    /// removes the guard is exactly the anonymous-tenant-read this lint must catch.
+    #[test]
+    fn jl0006_147_exempt_fn_without_tenant_guard_fires() {
+        let hits = workspace_jl0006(
+            "async fn get_workspace(repo: Dep<WorkspaceRepo>, Path(id): Path<i64>) -> Result<()> {\n    let _ = repo.get(id).await?;\n    Ok(())\n}\n",
+        );
+        assert_eq!(
+            hits.len(),
+            1,
+            "dropping the Dep<Tenant> guard withdraws the exemption — the unscoped \
+             get fires: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.get(` line");
+        assert!(
+            hits[0].message.contains("get(...)"),
+            "names the `get` needle: {:?}",
+            hits[0]
+        );
+    }
+
+    /// Issue #147 residual 2: the exempt-named `get_workspace` keeps its
+    /// `Dep<Tenant>` guard but binds a DIFFERENT repo as `repo` — a child's
+    /// `Dep<MemberRepo>`, not the tenant's `Dep<WorkspaceRepo>` — then calls
+    /// `repo.get(id)`. That reads the CHILD table unscoped (a cross-tenant child
+    /// read), so the exemption (which only justifies the tenant's OWN repo) is
+    /// withdrawn and JL0006 FIRES. WHY (Rule 9): the guard verifies the path
+    /// tenant, not arbitrary access to a mis-bound child repo.
+    #[test]
+    fn jl0006_147_exempt_fn_binding_a_child_repo_fires() {
+        let hits = workspace_jl0006(
+            "async fn get_workspace(_tenant: Dep<Tenant>, repo: Dep<MemberRepo>, Path(id): Path<i64>) -> Result<()> {\n    let _ = repo.get(id).await?;\n    Ok(())\n}\n",
+        );
+        assert_eq!(
+            hits.len(),
+            1,
+            "`repo` bound to a NON-tenant repo (MemberRepo) withdraws the exemption \
+             — the unscoped get fires: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.get(` line");
+        assert!(
+            hits[0].message.contains("get(...)"),
+            "names the `get` needle: {:?}",
+            hits[0]
+        );
+    }
+
+    /// Issue #147: `all()` is NEVER exempt, even inside a fully-qualified exempt
+    /// detail handler (unchanged #124 invariant) — a correct detail handler calls
+    /// `get`, not `all`, so an `all()` in one is a cross-tenant read regardless of
+    /// signature. The signature check does not loosen this.
+    #[test]
+    fn jl0006_147_all_stays_armed_in_a_qualified_exempt_fn() {
+        let hits = workspace_jl0006(
+            "async fn get_workspace(_tenant: Dep<Tenant>, repo: Dep<WorkspaceRepo>) -> Result<()> {\n    let _ = repo.all().await?;\n    Ok(())\n}\n",
+        );
+        assert_eq!(
+            hits.len(),
+            1,
+            "all() is never exempt, even in a fully-qualified detail fn: {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.all()` line");
+        assert!(
+            hits[0].message.contains("all()"),
+            "names the `all()` needle: {:?}",
+            hits[0]
+        );
+    }
+
+    /// Issue #147 baseline: a NON-exempt child handler (`show_member`, not the
+    /// tenant's `get_workspace`) calling `repo.get(id)` still fires — the
+    /// signature check only ever REMOVES exemptions, never grants one to a name
+    /// that was never exempt. The child's real fix is the scoped accessor.
+    #[test]
+    fn jl0006_147_non_exempt_child_handler_still_fires() {
+        let hits = workspace_jl0006(
+            "async fn show_member(repo: Dep<MemberRepo>, Path(id): Path<i64>) -> Result<()> {\n    let _ = repo.get(id).await?;\n    Ok(())\n}\n",
+        );
+        assert_eq!(
+            hits.len(),
+            1,
+            "a non-exempt child handler's unscoped get still fires (baseline): {hits:?}"
+        );
+        assert_eq!(hits[0].line, Some(2), "points at the `repo.get(` line");
     }
 
     /// Run the full lint pass over a V1_FULL `leads` (FLAT tenant-owned) handler
