@@ -184,6 +184,9 @@ fn scaffold_and_apply_fixtures(app: &Path) {
         .status()
         .expect("scaffold reference");
     assert!(st.success(), "reference design must scaffold");
+    // #118: unique runnable-bin name so this app's `debug/app_<uid>` never collides
+    // with a concurrently-built sibling in the shared target dir.
+    common::isolate_app_bin(app);
 
     // gen-tests per module (makes the generated acceptance suite, incl. the
     // cross-tenant isolation tests, present and runnable).

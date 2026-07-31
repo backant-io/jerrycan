@@ -98,6 +98,7 @@ fn reset_pg_public_schema(pg_url: &str) {
 fn db_mode_scaffold_passes_jerrycan_check() {
     let tmp = tempfile::tempdir().unwrap();
     let app = scaffold_golden_db(tmp.path());
+    common::isolate_app_bin(&app);
     // The documented workflow, in order: gen-tests → implement → check. Since
     // #123a a never-gen-tested scaffold is refused with JC0551, and the gate's
     // tests step then runs the generated acceptance suite — so the db fixtures
@@ -185,6 +186,7 @@ fn scaffold_golden_db_rate_limited(tmp: &Path) -> PathBuf {
 fn rate_limited_db_scaffold_checks_green_without_tripping_jl0003() {
     let tmp = tempfile::tempdir().unwrap();
     let app = scaffold_golden_db_rate_limited(tmp.path());
+    common::isolate_app_bin(&app);
 
     // The generated main.rs wires the limiter (no-builder regime: rustfmt breaks
     // per_window's two args). Asserting the exact bytes proves what `check`'s
@@ -281,6 +283,7 @@ fn rate_limited_db_scaffold_checks_green_without_tripping_jl0003() {
 fn scaffolded_app_builds_with_zero_warnings() {
     let tmp = tempfile::tempdir().unwrap();
     let app = scaffold_golden(tmp.path());
+    common::isolate_app_bin(&app);
     let out = Command::new("cargo")
         .current_dir(&app)
         .env("CARGO_TARGET_DIR", common::shared_app_target())
@@ -361,6 +364,7 @@ fn flat_grandchild_steer_following_handler_compiles() {
         .status()
         .unwrap();
     assert!(st.success(), "jerrycan new must scaffold the #116 shape");
+    common::isolate_app_bin(&app);
 
     // The grandchild's flat write lives in the `cards` subroute of `boards`.
     let handlers_path = app.join("crates/routes/boards/src/subroutes/cards/handlers.rs");
@@ -417,6 +421,7 @@ fn flat_grandchild_steer_following_handler_compiles() {
 fn fresh_scaffold_check_refuses_hollow_green_with_jc0551() {
     let tmp = tempfile::tempdir().unwrap();
     let app = scaffold_golden(tmp.path());
+    common::isolate_app_bin(&app);
     let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
         .current_dir(&app)
         .env("CARGO_TARGET_DIR", common::shared_app_target())
@@ -510,6 +515,7 @@ fn scaffold_golden_auth(tmp: &Path) -> PathBuf {
 fn auth_observe_app_builds_checks_and_guards() {
     let tmp = tempfile::tempdir().unwrap();
     let app = scaffold_golden_auth(tmp.path());
+    common::isolate_app_bin(&app);
     for (fixture, target) in [
         (
             "auth/todos_handlers.rs",
@@ -860,6 +866,7 @@ fn second_entity_id_probes_go_green_on_a_correct_scaffold() {
         .status()
         .unwrap();
     assert!(st.success(), "J3 must scaffold");
+    common::isolate_app_bin(&app);
 
     // gen-tests: the two /{id} probes seed a Task via its OWN creator.
     let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
@@ -1057,6 +1064,7 @@ fn public_read_feed_goes_green_on_a_correct_scaffold() {
         .status()
         .unwrap();
     assert!(st.success(), "the public_read design must scaffold");
+    common::isolate_app_bin(&app);
 
     // The generated posts handlers: public GETs take no CurrentUser (despite the
     // declared auth_required on list_posts), writes keep the guard.
@@ -1301,6 +1309,7 @@ fn child_hosting_tenant_app_goes_green_on_correct_handlers() {
         st.success(),
         "the child-hosting tenant design must scaffold"
     );
+    common::isolate_app_bin(&app);
 
     // Implement the correct handlers: get_club reads the guard-verified tenant
     // via the unscoped `repo.get`, the child stays on the scoped accessors.
@@ -1498,6 +1507,7 @@ fn body_omittable_fields_go_green_on_a_correct_scaffold() {
         .status()
         .unwrap();
     assert!(st.success(), "design must scaffold");
+    common::isolate_app_bin(&app);
 
     // gen-tests both modules; capture the generated probe bodies.
     for module in ["subscribers", "habits"] {
@@ -1669,6 +1679,7 @@ fn now_default_timestamp_goes_green_on_a_correct_scaffold() {
         .status()
         .unwrap();
     assert!(st.success(), "the now-default design must scaffold");
+    common::isolate_app_bin(&app);
 
     // BOTH request DTOs drop `created_at` (server-owned on create, immutable on
     // update); the entity Model KEEPS it (present in every response).
@@ -1818,6 +1829,7 @@ fn constrained_design_goes_green_on_a_correct_scaffold() {
         .status()
         .unwrap();
     assert!(st.success(), "the constrained design must scaffold");
+    common::isolate_app_bin(&app);
 
     // Defense-in-depth: every constrained column carries its migration CHECK,
     // so the in-range fixtures below are proven against the DB too.
@@ -1973,6 +1985,7 @@ fn constrained_design_goes_green_on_a_correct_scaffold() {
 fn tdd_loop_goes_red_then_green_on_sqlite() {
     let tmp = tempfile::tempdir().unwrap();
     let app = scaffold_golden_db(tmp.path());
+    common::isolate_app_bin(&app);
 
     // 1. Generate acceptance tests for both top-level modules.
     let mut expected_failing = 0usize;
@@ -2098,6 +2111,7 @@ fn agent_builds_postgres_backed_api_test_first() {
     };
     let tmp = tempfile::tempdir().unwrap();
     let app = scaffold_golden_db(tmp.path());
+    common::isolate_app_bin(&app);
 
     for module in ["todos", "users"] {
         let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
@@ -2474,6 +2488,7 @@ fn reference_slice_scaffold_passes_check() {
         .status()
         .unwrap();
     assert!(st.success(), "reference-slice must scaffold");
+    common::isolate_app_bin(&app);
 
     // schema.json is written by the db-mode scaffold (derived from migrations).
     assert!(
@@ -2715,6 +2730,7 @@ fn composite_unique_conflict_goes_409_on_a_correct_scaffold() {
         .status()
         .unwrap();
     assert!(st.success(), "the composite-unique design must scaffold");
+    common::isolate_app_bin(&app);
 
     // The migration carries the composite unique index on the likes table.
     for dialect in ["sqlite", "postgres"] {
@@ -2887,6 +2903,7 @@ fn fk_alias_two_refs_and_self_ref_go_green_on_a_correct_scaffold() {
         .status()
         .unwrap();
     assert!(st.success(), "the fk-alias design must scaffold");
+    common::isolate_app_bin(&app);
 
     // The migration carries the two aliased fk columns + the self-ref column, with
     // two distinct FKs to accounts (distinct constraint names on Postgres, where
@@ -3091,6 +3108,7 @@ fn fk_alias_two_refs_insert_persists_both_aliased_fks_live() {
         .status()
         .unwrap();
     assert!(st.success(), "the fk-alias create design must scaffold");
+    common::isolate_app_bin(&app);
 
     install_handler(
         &app,
