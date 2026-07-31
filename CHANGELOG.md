@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.29 — 2026-07-31
+
+### Fixed
+- **JL0006's tenant-detail exemption is now signature-aware (#147).** `jerrycan check`
+  exempts the tenant's own detail handlers from the unscoped-repo lint because their
+  `Dep<Tenant>` guard already verified membership. That exemption was keyed on the
+  handler's name alone, so two hand-edits slipped through green: dropping the
+  `_tenant: Dep<Tenant>` guard from an exempt handler that still calls `repo.get(id)`,
+  or binding a *child* repo as `repo` inside it. The exemption now also inspects the
+  signature — it holds only when the handler binds BOTH a `Dep<Tenant>` guard AND a
+  `repo: Dep<{Tenant}Repo>` (the tenant's own repo); otherwise JL0006 fires. `all()`
+  stays armed regardless. The check only ever withdraws an exemption (never adds one),
+  so a correctly written handler is unaffected. (Its acceptance-suite counterpart — a
+  non-member-404 probe for the tenant root's own detail route — shipped in 0.6.27.)
+
+Lint-only — every generated app is byte-identical.
+
 ## 0.6.28 — 2026-07-30
 
 ### Added
