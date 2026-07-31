@@ -270,6 +270,159 @@ const FMT_PROBE: &str = r#"{
     }]
 }"#;
 
+/// #201 db-tenant fixpoint probe: a LONG tenant-owned CHILD
+/// (`SubscriptionBillingRecord`) under a SHORT-fk `Workspace` tenant. The long child
+/// name pushes the membership/scoped signatures (`create_for_memberships`,
+/// `update_for_memberships`, `all_for_memberships`, `get_for_memberships`, `get_for`,
+/// `update_for`, the `{snake}_repo` factory) past `max_width` so they wrap ONE PARAM
+/// PER LINE — the width regime exercised in the LONG direction. The short `workspace_id`
+/// tenant fk keeps every method BODY (the `Column::WorkspaceId.eq(..)` filter chains,
+/// the `Set(..)` struct fills, the `item.fk != existing.fk` guards) comfortably under
+/// 100, so the ONLY drift is the signatures + the 7-trait `sea_orm::{…}` import.
+const LONG_CHILD_TENANT: &str = r#"{
+    "name": "long-child-tenant-app",
+    "contract_version": 2,
+    "auth": { "model": "jwt", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth", "validate"],
+    "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+    "modules": [
+        {
+            "name": "users",
+            "entities": [
+                { "name": "User", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "email", "type": "string", "unique": true },
+                    { "name": "password", "type": "string" },
+                    { "name": "role", "type": "string", "values": ["admin", "user"] }
+                ]}
+            ],
+            "endpoints": [
+                { "operation_id": "register", "method": "POST", "path": "/register",
+                  "public": true,
+                  "request_body": { "entity": "User" },
+                  "success": { "status": 201, "entity": "User" },
+                  "errors": [
+                    { "status": 409, "when": "email already registered" },
+                    { "status": 422, "when": "request body fails validation" }
+                  ] },
+                { "operation_id": "login", "method": "POST", "path": "/login",
+                  "public": true,
+                  "success": { "status": 200 },
+                  "errors": [{ "status": 401, "when": "invalid email or password" }] }
+            ]
+        },
+        {
+            "name": "workspaces",
+            "entities": [
+                { "name": "Workspace", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "name", "type": "string" }
+                ]}
+            ],
+            "endpoints": [
+                { "operation_id": "list_workspaces", "method": "GET", "path": "/",
+                  "auth_required": true,
+                  "success": { "status": 200, "entity": "Workspace", "list": true } },
+                { "operation_id": "create_workspace", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "Workspace" },
+                  "success": { "status": 201, "entity": "Workspace" },
+                  "errors": [{ "status": 422, "when": "request body fails validation" }] }
+            ]
+        },
+        {
+            "name": "billing-records",
+            "entities": [
+                { "name": "SubscriptionBillingRecord",
+                  "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+                  "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "label", "type": "string" },
+                    { "name": "status", "type": "string", "values": ["new", "active", "closed"] }
+                  ]}
+            ],
+            "endpoints": [
+                { "operation_id": "list_billing_records", "method": "GET", "path": "/",
+                  "auth_required": true,
+                  "success": { "status": 200, "entity": "SubscriptionBillingRecord", "list": true } },
+                { "operation_id": "create_billing_record", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "SubscriptionBillingRecord" },
+                  "success": { "status": 201, "entity": "SubscriptionBillingRecord" },
+                  "errors": [{ "status": 422, "when": "request body fails validation" }] }
+            ]
+        }
+    ]
+}"#;
+
+/// #201 per-user OWNER-scoped fixpoint probe (issue #79): a LONG entity
+/// (`CustomerSubscriptionPreference`) that belongs_to the identity `User`, so it gets
+/// the `user_id`-keyed owner-scoped accessors. The long entity name wraps the
+/// `get_for` / `update_for` accessors + the `{snake}_repo` factory ONE PARAM PER LINE;
+/// the fixed short `user_id` fk keeps the filter chains + struct fills on one line — so
+/// the only drift is the wrapped signatures, exercising the width regime for the #79
+/// owner-scoped repo shape.
+const OWNER_SCOPED_LONG: &str = r#"{
+    "name": "owner-scoped-app",
+    "contract_version": 2,
+    "auth": { "model": "jwt", "roles": ["user"] },
+    "dependencies": ["db", "auth", "validate"],
+    "modules": [
+        {
+            "name": "users",
+            "entities": [
+                { "name": "User", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "email", "type": "string", "unique": true },
+                    { "name": "password", "type": "string" },
+                    { "name": "role", "type": "string", "values": ["admin", "user"] }
+                ]}
+            ],
+            "endpoints": [
+                { "operation_id": "register", "method": "POST", "path": "/register",
+                  "public": true,
+                  "request_body": { "entity": "User" },
+                  "success": { "status": 201, "entity": "User" },
+                  "errors": [
+                    { "status": 409, "when": "email already registered" },
+                    { "status": 422, "when": "request body fails validation" }
+                  ] },
+                { "operation_id": "login", "method": "POST", "path": "/login",
+                  "public": true,
+                  "success": { "status": 200 },
+                  "errors": [{ "status": 401, "when": "invalid email or password" }] }
+            ]
+        },
+        {
+            "name": "preferences",
+            "entities": [
+                { "name": "CustomerSubscriptionPreference",
+                  "belongs_to": [{ "entity": "User" }],
+                  "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "label", "type": "string" },
+                    { "name": "channel", "type": "string", "values": ["email", "sms"] }
+                  ]}
+            ],
+            "endpoints": [
+                { "operation_id": "list_preferences", "method": "GET", "path": "/",
+                  "auth_required": true,
+                  "success": { "status": 200, "entity": "CustomerSubscriptionPreference", "list": true } },
+                { "operation_id": "create_preference", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "CustomerSubscriptionPreference" },
+                  "success": { "status": 201, "entity": "CustomerSubscriptionPreference" },
+                  "errors": [{ "status": 422, "when": "request body fails validation" }] },
+                { "operation_id": "update_preference", "method": "PUT", "path": "/{id}",
+                  "auth_required": true,
+                  "request_body": { "entity": "CustomerSubscriptionPreference" },
+                  "success": { "status": 200, "entity": "CustomerSubscriptionPreference" },
+                  "errors": [{ "status": 404, "when": "unknown id" }] }
+            ]
+        }
+    ]
+}"#;
+
 /// Recursively collect every agent-owned `handlers.rs` / `repo.rs` under
 /// `crates/routes` (top-level modules AND subroutes).
 fn agent_owned_stub_files(routes: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -295,7 +448,7 @@ fn agent_owned_stub_files(routes: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// #165: a FRESH scaffold's AGENT-OWNED stubs (`crates/routes/*/src/handlers.rs`
+/// #165/#201: a FRESH scaffold's AGENT-OWNED stubs (`crates/routes/*/src/handlers.rs`
 /// and `repo.rs`, subroutes included) must be `cargo fmt` FIXPOINTS out of the box
 /// — otherwise `cargo fmt --check` (and the app's first `jerrycan check`/CI fmt
 /// step) fails before the agent writes a line, and JL0003-style drift blames the
@@ -305,14 +458,15 @@ fn agent_owned_stub_files(routes: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// rustfmt and asserting NO diff. Covers memory + db modes and BOTH signature/body
 /// width regimes (short entity/op ⇒ one line; long ⇒ wrapped).
 ///
-/// SCOPE (matching the #165 spec's 6 dirt items — handlers.rs + the memory repo):
-/// the db TENANT/OWNER membership-repo templates (`reference-slice`) carry a
-/// SEPARATE, larger fmt gap not enumerated by #165 — rustfmt's greedy fill of a
-/// long `use jerrycan::db::sea_orm::{…}` (7+ traits) and width-dependent wrapping
-/// of long membership/scoped method signatures (`update_for_memberships`, …). That
-/// class needs a width-regime pass across every repo-method template and is tracked
-/// as a follow-up, so this test deliberately covers memory + SIMPLE db (no tenant
-/// membership surface).
+/// #201 extends the coverage to the db TENANT/OWNER membership-repo shapes that #165
+/// scoped out: `reference-slice` (a real db tenant design — its `sea_orm::{…}` 7-trait
+/// import greedy-fills and its `update_for_memberships` signature wraps even at short
+/// entity names), a LONG tenant-owned CHILD design (`SubscriptionBillingRecord` under a
+/// `Workspace` tenant — the `*_for_memberships` / `*_for` membership/scoped signatures
+/// wrap in the LONG direction, with a short tenant fk keeping the bodies untouched), and
+/// a per-user OWNER-scoped design (issue #79, keyed on `user_id`) whose long entity name
+/// wraps the `*_for` / factory signatures. Every agent-owned `repo.rs` — membership
+/// methods included — must round-trip through the pinned rustfmt with ZERO diff.
 #[test]
 fn scaffold_stub_handlers_and_repos_are_rustfmt_fixpoints() {
     let cases: &[(&str, &str)] = &[
@@ -322,6 +476,19 @@ fn scaffold_stub_handlers_and_repos_are_rustfmt_fixpoints() {
             "limits-api (db)",
             include_str!("../../../conformance/designs/limits-api.design.json"),
         ),
+        // #201: a real db TENANT design — 7-trait `sea_orm::{…}` greedy-fill import +
+        // the inherently-long `update_for_memberships` signature wrap (short names).
+        (
+            "reference-slice (db tenant)",
+            include_str!("../../../conformance/designs/reference-slice.design.json"),
+        ),
+        // #201: a LONG tenant-owned CHILD under a short-fk tenant — the membership/
+        // scoped `*_for_memberships` / `*_for` signatures wrap in the LONG direction
+        // while the short `workspace_id` fk keeps every method BODY a fixpoint.
+        ("long-child (db tenant, long child)", LONG_CHILD_TENANT),
+        // #201: a per-user OWNER-scoped (`user_id`, issue #79) design with a long entity
+        // — the owner-scoped `*_for` accessors + `{snake}_repo` factory wrap.
+        ("owner-scoped (db per-user, long)", OWNER_SCOPED_LONG),
     ];
     for (label, src) in cases {
         let design: Design = serde_json::from_str(src).unwrap();
