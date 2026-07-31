@@ -606,7 +606,7 @@ const STORAGE_MINIMAL: &str = r#"{
                   { "name": "nick", "type": "string" } ],
                 "belongs_to": [{ "entity": "Org" }] }
           ],
-          "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+          "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/", "auth_required": true,
               "success": { "status": 200, "entity": "Org", "list": true } }] }
     ]
 }"#;
@@ -747,7 +747,7 @@ const STORAGE_UUID: &str = r#"{
                   { "name": "nick", "type": "string" } ],
                 "belongs_to": [{ "entity": "Org" }] }
           ],
-          "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+          "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/", "auth_required": true,
               "success": { "status": 200, "entity": "Org", "list": true } }] }
     ]
 }"#;
@@ -829,14 +829,14 @@ const REALTIME_MINIMAL: &str = r#"{
         { "name": "workspaces",
           "entities": [{ "name": "Workspace", "fields": [
               { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
-          "endpoints": [{ "operation_id": "list_workspaces", "method": "GET", "path": "/",
+          "endpoints": [{ "operation_id": "list_workspaces", "method": "GET", "path": "/", "auth_required": true,
               "success": { "status": 200, "entity": "Workspace", "list": true } }] },
         { "name": "leads",
           "entities": [{ "name": "Lead",
               "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
               "fields": [{ "name": "id", "type": "integer" },
                          { "name": "phone", "type": "string" }] }],
-          "endpoints": [{ "operation_id": "list_leads", "method": "GET", "path": "/",
+          "endpoints": [{ "operation_id": "list_leads", "method": "GET", "path": "/", "auth_required": true,
               "success": { "status": 200, "entity": "Lead", "list": true } }] }
     ]
 }"#;
@@ -978,9 +978,11 @@ fn generated_cors_app_main_passes_strict_clippy() {
     // Sanity: main.rs carries the emitted CORS layer + the env-override preamble.
     let main = fs::read_to_string(app.join("crates/app/src/main.rs")).expect("read main.rs");
     assert!(
-        main.contains(".cors(CorsConfig::new(cors_origins)")
+        main.contains("let cors = CorsConfig::new(cors_origins);")
+            && main.contains(".cors(cors)")
             && main.contains("std::env::var(\"JERRYCAN_CORS_ORIGINS\")"),
-        "main.rs must wire .cors(..) with the env override:\n{main}"
+        "main.rs must wire the split CORS builder (`let cors = CorsConfig::new(..)` + \
+         `.cors(cors)`, the #128 fmt-fixpoint form) with the env override:\n{main}"
     );
 
     // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.

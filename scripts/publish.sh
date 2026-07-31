@@ -36,6 +36,11 @@ if [ "${SKIP_EVAL_GATE:-0}" != "1" ]; then
   cargo test -p jerrycan --all-features --test reference_eval -- --include-ignored --nocapture --test-threads=1
   cargo test -p jerrycan --all-features --test conformance -- --include-ignored --test-threads=1
   cargo test -p jerrycan --test eval -- --include-ignored --test-threads=1
+  # #203: genroute_compile builds real crates from inline designs under strict
+  # clippy — it lives ONLY in the manual heavy.yml, so a stale fixture (e.g. one
+  # that predates a new lint like JC0558) went red for ~20 releases unnoticed. Run
+  # it at publish time so that class of red is caught before a release ships.
+  cargo test -p jerrycan --test genroute_compile -- --include-ignored --test-threads=1
   echo "=== eval gate GREEN — proceeding to publish ==="
 else
   echo "!!! SKIP_EVAL_GATE=1 — skipping the eval gate (emergency republish only) !!!"
