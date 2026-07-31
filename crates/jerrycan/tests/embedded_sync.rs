@@ -36,4 +36,16 @@ fn embedded_copies_match_canonical_repo_files() {
             "embedded copy is stale: cp {canonical} crates/jerrycan/{embedded}"
         );
     }
+
+    // #136: the Claude Code skill twin lives at the REPO ROOT (`.claude/skills/…`),
+    // not under the crate, so it resolves against repo_root — the embedded_sync
+    // tripwire previously guarded docs/SKILL.md <-> embedded/SKILL.md but NOT this
+    // pair, so an edit to one and not the other passed CI. Guard it too.
+    let skill_canon = fs::read_to_string(repo_root.join("docs/SKILL.md")).unwrap();
+    let skill_twin = fs::read_to_string(repo_root.join(".claude/skills/jerrycan-backend/SKILL.md"))
+        .unwrap_or_default();
+    assert_eq!(
+        skill_canon, skill_twin,
+        "skill twin is stale: cp docs/SKILL.md .claude/skills/jerrycan-backend/SKILL.md"
+    );
 }

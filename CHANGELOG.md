@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.30 — 2026-07-31
+
+### Fixed
+- **`jerrycan onboard` hardening (#136).** Two small robustness gaps from the onboard
+  CLI review: (1) `upsert_block` (the AGENTS.md marker updater) fell through to its
+  append arm on a *corrupted* marker pair — an orphan start/end, reversed order, or a
+  duplicate pair — which could let a later run pair a stray marker with the new block's
+  end and swallow the content between them; it now refuses with an actionable error
+  instead of compounding a hand-corruption (the tool's own writes are always balanced,
+  so this only guards a hand-edited file). (2) The `embedded_sync` CI tripwire guarded
+  `docs/SKILL.md` against its `embedded/` copy but not against the Claude Code skill
+  twin at `.claude/skills/jerrycan-backend/SKILL.md`; that pair is now guarded too, so
+  editing one and not the other fails CI.
+
+Tooling/test only — every generated app is byte-identical.
+
 ## 0.6.29 — 2026-07-31
 
 ### Fixed

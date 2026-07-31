@@ -83,15 +83,36 @@ fn write_if_changed(path: &Path, content: &str, out: &mut Emitted) -> std::io::R
 
 /// Upsert the marker block into an AGENTS.md body, preserving everything
 /// outside the markers.
-fn upsert_block(existing: &str) -> String {
+fn upsert_block(existing: &str) -> std::io::Result<String> {
     let block = marker_block();
+    let starts = existing.matches(MARKER_START).count();
+    let ends = existing.matches(MARKER_END).count();
     match (existing.find(MARKER_START), existing.find(MARKER_END)) {
-        (Some(start), Some(end)) if end > start => {
+        // Exactly one balanced pair (END after START): replace it in place,
+        // preserving everything outside the markers.
+        (Some(start), Some(end)) if end > start && starts == 1 && ends == 1 => {
             let after = existing[end + MARKER_END.len()..].trim_start_matches('\n');
-            format!("{}{block}{after}", &existing[..start])
+            Ok(format!("{}{block}{after}", &existing[..start]))
         }
-        _ if existing.trim().is_empty() => block,
-        _ => format!("{}\n{block}", existing.trim_end_matches('\n')),
+        // No markers at all: append a fresh block (or the block alone if empty).
+        (None, None) => Ok(if existing.trim().is_empty() {
+            block
+        } else {
+            format!("{}\n{block}", existing.trim_end_matches('\n'))
+        }),
+        // Corrupted markers (#136): an orphan START/END, END before START, or a
+        // duplicate pair. Appending here would let a LATER run pair the orphan
+        // START with the new block's END and swallow the foreign content between
+        // them — so refuse rather than compound a hand-corruption. The tool's own
+        // writes always emit one balanced pair, so this is unreachable via the
+        // tool itself; it guards a hand-edited AGENTS.md.
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "AGENTS.md has corrupted jerrycan-backend markers ({starts}× `{MARKER_START}`, \
+                 {ends}× `{MARKER_END}`, or out of order) — remove the stray marker(s) and re-run"
+            ),
+        )),
     }
 }
 
@@ -116,7 +137,7 @@ pub fn emit_skill(agent: Agent, project_dir: &Path, home_dir: &Path) -> std::io:
         Agent::Cursor | Agent::Codex | Agent::Windsurf => {
             let path = project_dir.join("AGENTS.md");
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
-            write_if_changed(&path, &upsert_block(&existing), &mut out)?;
+            write_if_changed(&path, &upsert_block(&existing)?, &mut out)?;
             let hint = match agent {
                 Agent::Cursor => ".cursor/mcp.json",
                 Agent::Codex => "~/.codex/config.toml (mcp_servers section)",
@@ -185,6 +206,47 @@ mod tests {
         assert_eq!(second.unchanged, vec![proj.path().join("AGENTS.md")]);
         let again = std::fs::read_to_string(proj.path().join("AGENTS.md")).unwrap();
         assert_eq!(again.matches("jerrycan-backend:start").count(), 1);
+    }
+
+    #[test]
+    fn upsert_refuses_corrupted_markers_instead_of_appending() {
+        // WHY (#136): appending a second block into an already-corrupted file lets a
+        // LATER run pair the orphan marker with the new block's END and swallow the
+        // foreign content between them. The tool must refuse, not compound corruption.
+        // Orphan START (no END).
+        let orphan_start = format!("keep me\n{MARKER_START}\nhalf a block\n");
+        assert!(
+            upsert_block(&orphan_start).is_err(),
+            "orphan START must refuse"
+        );
+        // Orphan END (no START).
+        let orphan_end = format!("keep me\n{MARKER_END}\n");
+        assert!(upsert_block(&orphan_end).is_err(), "orphan END must refuse");
+        // END before START (reversed).
+        let reversed = format!("{MARKER_END}\nx\n{MARKER_START}\n");
+        assert!(
+            upsert_block(&reversed).is_err(),
+            "reversed markers must refuse"
+        );
+        // Duplicate pair.
+        let dup = format!(
+            "{}\n{}\n",
+            marker_block().trim_end(),
+            marker_block().trim_end()
+        );
+        assert!(upsert_block(&dup).is_err(), "duplicate pair must refuse");
+        // A clean single balanced pair still replaces in place (regression guard).
+        let clean = format!("top\n{}\nbottom\n", marker_block().trim_end());
+        let out = upsert_block(&clean).unwrap();
+        assert!(
+            out.contains("top") && out.contains("bottom"),
+            "foreign content lost"
+        );
+        assert_eq!(out.matches(MARKER_START).count(), 1);
+        // No markers → appends one block.
+        let appended = upsert_block("just text").unwrap();
+        assert_eq!(appended.matches(MARKER_START).count(), 1);
+        assert!(appended.contains("just text"));
     }
 
     #[test]
