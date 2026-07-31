@@ -248,6 +248,104 @@ fn tool_owned_main_and_migrations_are_rustfmt_fixpoints() {
     }
 }
 
+/// A memory-mode design that exercises BOTH width regimes of the #165 stub fix in
+/// ONE scaffold: a SHORT custom op (`stats`, op_len 5 ⇒ the `Error::internal("…")`
+/// body stays on one line) alongside a LONG entity + op (whose handler signature
+/// AND stub body both exceed rustfmt's wrap points). If either regime were emitted
+/// wrong, `cargo fmt` would rewrite the untouched stub and the fixpoint assert trips.
+const FMT_PROBE: &str = r#"{
+    "name": "fmt-probe", "contract_version": 0, "dependencies": [],
+    "modules": [{
+        "name": "metrics",
+        "entities": [{ "name": "OrganizationSubscriptionRecord",
+            "fields": [{ "name": "label", "type": "string" }] }],
+        "endpoints": [
+            { "operation_id": "stats", "method": "GET", "path": "/stats",
+              "success": { "status": 200 } },
+            { "operation_id": "create_organization_subscription_record",
+              "method": "POST", "path": "/",
+              "request_body": { "entity": "OrganizationSubscriptionRecord" },
+              "success": { "status": 201, "entity": "OrganizationSubscriptionRecord" } }
+        ]
+    }]
+}"#;
+
+/// Recursively collect every agent-owned `handlers.rs` / `repo.rs` under
+/// `crates/routes` (top-level modules AND subroutes).
+fn agent_owned_stub_files(routes: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if matches!(
+                p.file_name().and_then(|n| n.to_str()),
+                Some("handlers.rs") | Some("repo.rs")
+            ) {
+                out.push(p);
+            }
+        }
+    }
+    walk(routes, &mut out);
+    out.sort();
+    out
+}
+
+/// #165: a FRESH scaffold's AGENT-OWNED stubs (`crates/routes/*/src/handlers.rs`
+/// and `repo.rs`, subroutes included) must be `cargo fmt` FIXPOINTS out of the box
+/// — otherwise `cargo fmt --check` (and the app's first `jerrycan check`/CI fmt
+/// step) fails before the agent writes a line, and JL0003-style drift blames the
+/// agent for a file they never touched. The tool pre-wraps generated code exactly
+/// as rustfmt formats it (the #128 convention — no runtime `cargo fmt` pass), so
+/// the ONLY honest proof is feeding the emitted bytes back through the pinned
+/// rustfmt and asserting NO diff. Covers memory + db modes and BOTH signature/body
+/// width regimes (short entity/op ⇒ one line; long ⇒ wrapped).
+///
+/// SCOPE (matching the #165 spec's 6 dirt items — handlers.rs + the memory repo):
+/// the db TENANT/OWNER membership-repo templates (`reference-slice`) carry a
+/// SEPARATE, larger fmt gap not enumerated by #165 — rustfmt's greedy fill of a
+/// long `use jerrycan::db::sea_orm::{…}` (7+ traits) and width-dependent wrapping
+/// of long membership/scoped method signatures (`update_for_memberships`, …). That
+/// class needs a width-regime pass across every repo-method template and is tracked
+/// as a follow-up, so this test deliberately covers memory + SIMPLE db (no tenant
+/// membership surface).
+#[test]
+fn scaffold_stub_handlers_and_repos_are_rustfmt_fixpoints() {
+    let cases: &[(&str, &str)] = &[
+        ("todo-api (memory)", GOLDEN),
+        ("fmt-probe (memory, short+long)", FMT_PROBE),
+        (
+            "limits-api (db)",
+            include_str!("../../../conformance/designs/limits-api.design.json"),
+        ),
+    ];
+    for (label, src) in cases {
+        let design: Design = serde_json::from_str(src).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        scaffold::scaffold(&root, &design).unwrap();
+        let files = agent_owned_stub_files(&root.join("crates/routes"));
+        assert!(
+            !files.is_empty(),
+            "{label}: scaffold produced no handlers.rs/repo.rs to check"
+        );
+        for path in files {
+            let emitted = fs::read_to_string(&path).unwrap();
+            let formatted = rustfmt(&root, &emitted);
+            let rel = path.strip_prefix(&root).unwrap_or(&path).display();
+            assert_eq!(
+                emitted, formatted,
+                "{label}: {rel} must be a rustfmt fixpoint — a fresh scaffold's \
+                 agent-owned stub must survive `cargo fmt --check` untouched (#165)"
+            );
+        }
+    }
+}
+
 #[test]
 fn sql_identifiers_are_quoted_so_reserved_words_survive() {
     // A field named `order` is a SQL reserved word; quoting is the only thing that

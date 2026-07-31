@@ -380,8 +380,9 @@ fn flat_grandchild_steer_following_handler_compiles() {
     );
 
     // Follow the steer verbatim: call the membership-checked create. Keep the stub's
-    // Err return (the create returns the new id; the point is that it type-checks).
-    let stub = "    Err(Error::internal(\"create_card not implemented — replace this stub\"))";
+    // Err return (the create returns the new id; the point is that it type-checks). The
+    // stub body wraps (op_len 11 ⇒ inner call past rustfmt's fn_call_width, issue #165).
+    let stub = "    Err(Error::internal(\n        \"create_card not implemented — replace this stub\",\n    ))";
     assert!(handlers.contains(stub), "unexpected stub body:\n{handlers}");
     let implemented = handlers.replace(
         stub,
@@ -1064,8 +1065,12 @@ fn public_read_feed_goes_green_on_a_correct_scaffold() {
         stubs.contains("async fn list_posts(_repo: Dep<PostRepo>)"),
         "the public list stub must take no CurrentUser:\n{stubs}"
     );
+    // The signature wraps one param per line (issue #165 — its one-line width exceeds
+    // rustfmt's max_width), so the guard param appears on its own line.
     assert!(
-        stubs.contains("async fn create_post(_repo: Dep<PostRepo>, _user: CurrentUser,"),
+        stubs.contains(
+            "pub(crate) async fn create_post(\n    _repo: Dep<PostRepo>,\n    _user: CurrentUser,"
+        ),
         "writes keep the guard:\n{stubs}"
     );
 

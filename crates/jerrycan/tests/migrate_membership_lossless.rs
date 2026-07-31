@@ -146,8 +146,12 @@ fn recognized_membership_policy_migrates_to_flat_membership_set_methods() {
     // trust one arbitrary membership) and are steered to the set methods.
     let handlers =
         std::fs::read_to_string(app.join("crates/routes/customers/src/handlers.rs")).unwrap();
+    // The signature wraps to one param per line (issue #165 — its one-line width
+    // exceeds rustfmt's max_width, so the fresh scaffold is a `cargo fmt` fixpoint).
     assert!(
-        handlers.contains("list_customers(_repo: Dep<CustomerRepo>, _user: CurrentUser)"),
+        handlers.contains(
+            "pub(crate) async fn list_customers(\n    _repo: Dep<CustomerRepo>,\n    _user: CurrentUser,\n) -> Result<Json<Vec<Customer>>> {"
+        ),
         "flat list takes CurrentUser, not Dep<Tenant>:\n{handlers}"
     );
     assert!(

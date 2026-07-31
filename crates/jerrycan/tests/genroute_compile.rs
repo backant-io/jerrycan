@@ -340,8 +340,10 @@ fn implement_publish_and_clippy(app: &std::path::Path) {
     );
     // Implement the one-liner the comment advertises: the publish call must
     // type-check against the real facade (the return keeps the stub's Err).
+    // The stub body wraps (op_len 11 ⇒ the inner `Error::internal("…")` call exceeds
+    // rustfmt's fn_call_width, issue #165), so match the wrapped form.
     let implemented = handlers.replace(
-        "    Err(Error::internal(\"create_note not implemented — replace this stub\"))",
+        "    Err(Error::internal(\n        \"create_note not implemented — replace this stub\",\n    ))",
         "    _rt.publish(\"note_created\", serde_json::json!({ \"type\": \"created\" })).await?;\n    Err(Error::internal(\"realtime publish wired\"))",
     );
     assert_ne!(
