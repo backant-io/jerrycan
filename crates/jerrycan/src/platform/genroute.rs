@@ -190,7 +190,7 @@ fn endpoint_emits_realtime_publish(ep: &Endpoint, design: &Design) -> bool {
 // testgen.rs (401 probe), so the handler, the advertised contract, and the
 // acceptance suite cannot disagree about whether a GET is guarded.
 
-fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> String {
+fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> Vec<String> {
     let mut params = Vec::new();
     if let Some(e) = endpoint_repo_entity(m, ep) {
         params.push(format!("_repo: Dep<{e}Repo>"));
@@ -269,7 +269,36 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
             )),
         }
     }
-    params.join(", ")
+    params
+}
+
+/// The handler fn signature line(s) — `pub(crate) async fn <op>(<params>) -> <ret> {`
+/// — pre-wrapped EXACTLY as the pinned toolchain's rustfmt (1.97, edition 2024)
+/// formats it (the #128 convention), so a fresh scaffold's agent-owned handlers.rs
+/// is a `cargo fmt` fixpoint out of the box (issue #165). rustfmt keeps the whole
+/// signature on one line while it fits `max_width` (100); past that it breaks EACH
+/// param onto its own line at indent 4, closing `) -> <ret> {` at indent 0. The
+/// boundary is empirical against the pinned rustfmt: a one-line signature of 100
+/// cols stays inline, 101 wraps. The zero-param over-100 case (a pathologically
+/// long op name) is rustfmt's third regime — nothing to break, so it drops the
+/// return type onto its own line — reproduced too for completeness.
+fn handler_signature(op: &str, params: &[String], ret: &str) -> String {
+    let one_line = format!(
+        "pub(crate) async fn {op}({}) -> {ret} {{",
+        params.join(", ")
+    );
+    if one_line.chars().count() <= 100 {
+        return format!("{one_line}\n");
+    }
+    if params.is_empty() {
+        return format!("pub(crate) async fn {op}()\n-> {ret} {{\n");
+    }
+    let mut s = format!("pub(crate) async fn {op}(\n");
+    for p in params {
+        s.push_str(&format!("    {p},\n"));
+    }
+    s.push_str(&format!(") -> {ret} {{\n"));
+    s
 }
 
 /// A leading comment for role-guarded endpoints, reminding the agent how to
@@ -315,10 +344,22 @@ fn success_body(ep: &Endpoint) -> String {
             "    // TODO (issue #46): redirect to the real target — replace \"/\" with the\n    // destination this {status} endpoint should send clients to.\n    Ok(Redirect::{ctor}(\"/\"))"
         );
     }
-    format!(
-        "    Err(Error::internal(\"{op} not implemented — replace this stub\"))",
-        op = ep.operation_id
-    )
+    // Pre-wrapped exactly as rustfmt formats it (issue #165): rustfmt breaks the
+    // string arg onto its own line once the inner `Error::internal("…")` call
+    // exceeds `fn_call_width` (60). WIDTH-GATED like #128/mounting.rs — a short op
+    // (`login`, `stats`, `root`: op_len ≤ 5 ⇒ inner call ≤ 60) stays on one line,
+    // so an unconditional wrap would let `cargo fmt` collapse it back and drift the
+    // stub off the fixpoint. Boundary is empirical against the pinned rustfmt: the
+    // inner call at 60 cols stays inline, 61 wraps.
+    let op = &ep.operation_id;
+    let inner = format!("Error::internal(\"{op} not implemented — replace this stub\")");
+    if inner.chars().count() <= 60 {
+        format!("    Err({inner})")
+    } else {
+        format!(
+            "    Err(Error::internal(\n        \"{op} not implemented — replace this stub\",\n    ))"
+        )
+    }
 }
 
 /// A stub comment naming the EXACT scoped repo method a tenant-owned READ handler
@@ -503,7 +544,12 @@ fn owner_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &
 }
 
 pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
-    let mut uses = String::from("use jerrycan::prelude::*;\n");
+    // Import order is rustfmt's `reorder_imports` order (issue #165), so a fresh
+    // scaffold's handlers.rs is a `cargo fmt` fixpoint out of the box: `super::*`
+    // (model before repo), then `jerrycan::prelude`, then `shared::*` (CurrentUser
+    // before Tenant). Emitting prelude-first (or Tenant before CurrentUser) would
+    // let `cargo fmt` reorder the untouched stub and fail `cargo fmt --check`.
+    let mut uses = String::new();
     let mentions_entities = m
         .endpoints
         .iter()
@@ -514,10 +560,12 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
     if !m.entities.is_empty() {
         uses.push_str("use super::repo::*;\n");
     }
+    uses.push_str("use jerrycan::prelude::*;\n");
     // Auth mode: a guarded endpoint takes either `_tenant: Dep<Tenant>` (tenant-
     // owned) or `_user: CurrentUser` (everything else). Import ONLY the alias(es)
     // a param actually uses, or `-D warnings` trips on an unused import. The agent
     // adds `require_role` itself (see guard_comment); a raw stub never calls it.
+    // `CurrentUser` is emitted before `Tenant` — rustfmt sorts them that way.
     if mode.auth {
         let needs_tenant = m
             .endpoints
@@ -531,11 +579,11 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
                 && !endpoint_uses_tenant_guard(m, ep, design)
                 && !design.endpoint_is_public_read_get(m, ep)
         });
-        if needs_tenant {
-            uses.push_str("use shared::Tenant;\n");
-        }
         if needs_user {
             uses.push_str("use shared::CurrentUser;\n");
+        }
+        if needs_tenant {
+            uses.push_str("use shared::Tenant;\n");
         }
     }
     let mut out = format!(
@@ -553,15 +601,22 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
         let collection = tenant_collection_comment(m, ep, mode, design);
         let server_owned = server_owned_fk_comment(m, ep, mode, design);
         let realtime = realtime_publish_comment(ep, design);
+        // The signature is pre-wrapped to rustfmt's width regime (issue #165):
+        // one line while it fits max_width (100), else one param per line.
+        let sig = handler_signature(
+            &ep.operation_id,
+            &handler_params(m, ep, mode, design),
+            &return_type(ep),
+        );
         out.push_str(&format!(
-            "pub(crate) async fn {op}({params}) -> {ret} {{\n{guard}{scope}{owner_scope}{collection}{server_owned}{realtime}{body}\n}}\n\n",
-            op = ep.operation_id,
-            params = handler_params(m, ep, mode, design),
-            ret = return_type(ep),
+            "{sig}{guard}{scope}{owner_scope}{collection}{server_owned}{realtime}{body}\n}}\n\n",
             body = success_body(ep),
         ));
     }
-    out
+    // The last handler leaves a trailing blank line rustfmt strips (issue #165);
+    // trim to exactly one final newline so a fresh scaffold's handlers.rs is a
+    // `cargo fmt` fixpoint.
+    format!("{}\n", out.trim_end_matches('\n'))
 }
 
 /// A leading comment for endpoints whose body DTO omits the identity FK (issue
@@ -1359,7 +1414,10 @@ pub struct {n}Repo {{
 #[allow(dead_code)]
 impl {n}Repo {{
     pub fn new() -> Self {{
-        Self {{ items: Mutex::new(BTreeMap::new()), next_id: AtomicI64::new(1) }}
+        Self {{
+            items: Mutex::new(BTreeMap::new()),
+            next_id: AtomicI64::new(1),
+        }}
     }}
     pub fn all(&self) -> Vec<{n}> {{
         self.items.lock().unwrap().values().cloned().collect()
@@ -1395,7 +1453,10 @@ impl Default for {n}Repo {{
 "#
         ));
     }
-    out
+    // The per-entity block ends with a blank line; the LAST one is a trailing blank
+    // line rustfmt strips (issue #165). Trim to exactly one final newline so a fresh
+    // scaffold's repo.rs is a `cargo fmt` fixpoint.
+    format!("{}\n", out.trim_end_matches('\n'))
 }
 
 /// The Model field names in struct order — the order `model_rs_db` emits and
@@ -2738,12 +2799,15 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
     // the repo writes (DbErr, ActiveValue::NotSet); the trait imports come through
     // the same facade so generated crates carry NO direct sea-orm dependency.
     let mut out = format!(
-        "//! Data access — SeaORM over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sea_orm;\nuse jerrycan::db::sea_orm::{{{filter_imports}}};\nuse jerrycan::db::{{db_error, Db}};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
+        "//! Data access — SeaORM over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sea_orm;\nuse jerrycan::db::sea_orm::{{{filter_imports}}};\nuse jerrycan::db::{{Db, db_error}};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
     );
     for e in &m.entities {
         out.push_str(&sql_repo(e, design, mode));
     }
-    Some(out)
+    // The last entity block leaves a trailing blank line rustfmt strips (issue
+    // #165); trim to exactly one final newline so a fresh scaffold's repo.rs is a
+    // `cargo fmt` fixpoint.
+    Some(format!("{}\n", out.trim_end_matches('\n')))
 }
 
 /// The SchemaBuilder matching a dialect — renders both `CREATE TABLE` and the
@@ -3832,6 +3896,45 @@ pub(crate) mod tests {
 
     fn demo() -> Design {
         serde_json::from_str(MINIMAL).unwrap()
+    }
+
+    /// Collapse rustfmt's per-param handler-signature wrapping (issue #165) back to
+    /// one line, so a signature assertion can test the param MAPPING (which repo /
+    /// guard / DTO / path types a handler binds, and in what order) without caring
+    /// about the width regime — that is owned by the dbgen `..._are_rustfmt_fixpoints`
+    /// test, which feeds the emitted bytes through the pinned rustfmt. A signature
+    /// wraps as `pub(crate) async fn NAME(\n    P0,\n    P1,\n) -> RET {`; this rejoins
+    /// it to `pub(crate) async fn NAME(P0, P1) -> RET {`, the pre-#165 one-line form.
+    /// Non-signature wrapping (the stub body) is left untouched.
+    fn flatten_sigs(h: &str) -> String {
+        let lines: Vec<&str> = h.lines().collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if line.trim_start().starts_with("pub(crate) async fn") && line.ends_with('(') {
+                let mut sig = line.to_string(); // `pub(crate) async fn NAME(`
+                i += 1;
+                let mut params: Vec<String> = Vec::new();
+                while i < lines.len() && !lines[i].trim_start().starts_with(')') {
+                    params.push(lines[i].trim().trim_end_matches(',').to_string());
+                    i += 1;
+                }
+                sig.push_str(&params.join(", "));
+                // lines[i] is the `) -> RET {` closer (trim its indent, which is 0 here).
+                sig.push_str(lines[i].trim_start());
+                out.push(sig);
+                i += 1;
+            } else {
+                out.push(line.to_string());
+                i += 1;
+            }
+        }
+        let mut joined = out.join("\n");
+        if h.ends_with('\n') {
+            joined.push('\n');
+        }
+        joined
     }
 
     fn todos() -> ModuleDesign {
@@ -4949,6 +5052,7 @@ pub(crate) mod tests {
             },
             &d,
         );
+        let h = flatten_sigs(&h);
         // The declared-guarded list GET loses its CurrentUser — the flag overrides.
         assert!(
             h.contains("pub(crate) async fn list_posts(_repo: Dep<PostRepo>) ->"),
@@ -5046,6 +5150,7 @@ pub(crate) mod tests {
             },
             &d,
         );
+        let h = flatten_sigs(&h);
         assert!(
             h.contains("pub(crate) async fn list_posts(_repo: Dep<PostRepo>, _user: CurrentUser)"),
             "a role-gated GET keeps its CurrentUser despite public_read: {h}"
@@ -5131,6 +5236,7 @@ pub(crate) mod tests {
             },
             &d,
         );
+        let h = flatten_sigs(&h);
         assert!(
             h.contains("pub(crate) async fn get_stats(_repo: Dep<PostRepo>, _user: CurrentUser)"),
             "an entity-less auth_required GET keeps its declared guard: {h}"
@@ -5574,7 +5680,7 @@ pub(crate) mod tests {
             db: true,
             auth: true,
         };
-        let books = handlers_rs(&d.modules[1], mode, &d);
+        let books = flatten_sigs(&handlers_rs(&d.modules[1], mode, &d));
         assert!(
             books.contains("Json(_body): Json<BookRequest>"),
             "create_book takes the trimmed DTO, not Json<Book>:\n{books}"
@@ -5923,7 +6029,7 @@ pub(crate) mod tests {
         };
 
         // PathScoped (nested) → Dep<Tenant>; scope comment names all_for / get_for.
-        let books = handlers_rs(&d.modules[1], mode, &d);
+        let books = flatten_sigs(&handlers_rs(&d.modules[1], mode, &d));
         assert!(
             books.contains(
                 "pub(crate) async fn list_books(_repo: Dep<BookRepo>, _tenant: Dep<Tenant>)"
@@ -5940,7 +6046,7 @@ pub(crate) mod tests {
         );
 
         // MembershipSet (flat) → CurrentUser, never Dep<Tenant>; comment names the set methods.
-        let customers = handlers_rs(&d.modules[2], mode, &d);
+        let customers = flatten_sigs(&handlers_rs(&d.modules[2], mode, &d));
         assert!(
             customers.contains(
                 "pub(crate) async fn list_customers(_repo: Dep<CustomerRepo>, _user: CurrentUser)"
@@ -5961,7 +6067,7 @@ pub(crate) mod tests {
         );
 
         // Collection root → CurrentUser; the tenant's OWN detail route is path-scoped.
-        let clubs = handlers_rs(&d.modules[0], mode, &d);
+        let clubs = flatten_sigs(&handlers_rs(&d.modules[0], mode, &d));
         assert!(
             clubs.contains(
                 "pub(crate) async fn create_club(_repo: Dep<ClubRepo>, _user: CurrentUser"
@@ -6028,7 +6134,7 @@ pub(crate) mod tests {
 
         // The flat mutation handlers are STEERED to the checked methods (never the
         // unscoped insert/update/remove), and still take `CurrentUser` — not `Dep<Tenant>`.
-        let handlers = handlers_rs(&d.modules[2], mode, &d);
+        let handlers = flatten_sigs(&handlers_rs(&d.modules[2], mode, &d));
         assert!(
             handlers.contains("CustomerRepo::create_for_memberships(_user.0.id, customer)"),
             "flat create stub is steered to create_for_memberships:\n{handlers}"
@@ -6695,7 +6801,7 @@ pub(crate) mod tests {
         );
 
         // Handler: the path param is renamed AND keeps the tenant entity key type.
-        let clubs = handlers_rs(&d.modules[0], mode, &d);
+        let clubs = flatten_sigs(&handlers_rs(&d.modules[0], mode, &d));
         assert!(
             clubs.contains(
                 "pub(crate) async fn get_club(_repo: Dep<ClubRepo>, _tenant: Dep<Tenant>, Path(_club_id): Path<i64>)"
@@ -6721,7 +6827,7 @@ pub(crate) mod tests {
     #[test]
     fn handler_signatures_follow_the_mapping_rules() {
         let m = todos();
-        let h = handlers_rs(&m, GenMode::default(), &demo());
+        let h = flatten_sigs(&handlers_rs(&m, GenMode::default(), &demo()));
         assert!(
             h.contains(
                 "pub(crate) async fn list_todos(_repo: Dep<TodoRepo>) -> Result<Json<Vec<Todo>>>"
@@ -6903,7 +7009,7 @@ pub(crate) mod tests {
             },
             errors: vec![],
         });
-        let h = handlers_rs(&m, GenMode::default(), &demo());
+        let h = flatten_sigs(&handlers_rs(&m, GenMode::default(), &demo()));
         assert!(
             h.contains("pub(crate) async fn move_todo(_repo: Dep<TodoRepo>, Path((_id, _slot)): Path<(i64, i64)>) -> Result<NoContent>"),
             "{h}"
@@ -7214,7 +7320,7 @@ pub(crate) mod tests {
             }"#,
         )
         .unwrap();
-        let h = handlers_rs(&m, GenMode::default(), &demo());
+        let h = flatten_sigs(&handlers_rs(&m, GenMode::default(), &demo()));
         // The no-body DELETE binds the Task repo (its collection's entity), not Project.
         assert!(
             h.contains("pub(crate) async fn delete_task(_repo: Dep<TaskRepo>, Path(_id): Path<i64>) -> Result<NoContent>"),
@@ -7450,6 +7556,7 @@ pub(crate) mod tests {
             },
             &d,
         );
+        let h = flatten_sigs(&h);
         assert!(
             h.contains(
                 "pub(crate) async fn create_collection(_repo: Dep<CollectionRepo>, _user: CurrentUser, Json(_body): Json<CollectionRequest>)"
@@ -7509,6 +7616,7 @@ pub(crate) mod tests {
             },
             &d,
         );
+        let h = flatten_sigs(&h);
         // The update also takes the DTO (user_id off the wire) — method-agnostic rule.
         assert!(
             h.contains(
@@ -7853,7 +7961,7 @@ pub(crate) mod tests {
             db: true,
             auth: false,
         };
-        let h = handlers_rs(m, mode, &d);
+        let h = flatten_sigs(&handlers_rs(m, mode, &d));
         assert!(
             h.contains(
                 "pub(crate) async fn create_checkin(_repo: Dep<CheckinRepo>, Path(_habit_id): Path<i64>, Json(_body): Json<CheckinRequest>)"
@@ -8367,7 +8475,7 @@ pub(crate) mod tests {
             db: true,
             auth: false,
         };
-        let h = handlers_rs(m, mode, &d);
+        let h = flatten_sigs(&handlers_rs(m, mode, &d));
         assert!(
             h.contains("async fn create_subscriber(_repo: Dep<SubscriberRepo>, Json(_body): Json<SubscriberRequest>)"),
             "create binds the create DTO (omits the default): {h}"
@@ -8407,7 +8515,7 @@ pub(crate) mod tests {
             db: true,
             auth: false,
         };
-        let h = handlers_rs(m, mode, &d);
+        let h = flatten_sigs(&handlers_rs(m, mode, &d));
         assert!(
             h.contains("async fn list_pages(_repo: Dep<PageRepo>, Path(_site_id): Path<String>)"),
             "a non-id path param referencing a string-pk entity must be Path<String>, not Path<i64>: {h}"

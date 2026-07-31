@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.32 — 2026-07-31
+
+### Fixed
+- **A fresh scaffold's agent-owned stubs are now `cargo fmt` fixpoints (#165).** The
+  generated `handlers.rs`/`repo.rs` stubs were not rustfmt-clean, so `cargo fmt --check`
+  (and the new app's first `jerrycan check`/CI fmt step) failed before the agent wrote a
+  line — and JL0003-style drift would blame the agent for a file they never touched. The
+  stub templates now pre-wrap exactly as the pinned toolchain's rustfmt formats them (the
+  #128 convention — no runtime `cargo fmt` pass), covering the width-dependent cases (a
+  short entity/op keeps its signature and error body on one line; a long one wraps). A
+  rustfmt round-trip test proves fixpoint-ness across memory and db modes and both width
+  regimes.
+
+The generated stubs change (that is the fix); a re-`cargo fmt` of any fresh scaffold is
+now a no-op.
+
 ## 0.6.31 — 2026-07-31
 
 ### Fixed
