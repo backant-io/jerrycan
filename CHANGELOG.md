@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.33 — 2026-08-01
+
+### Fixed
+- **db tenant/owner repo templates are now `cargo fmt` fixpoints (#201, follow-up to #165).**
+  #165 made `handlers.rs` + the memory `repo.rs` rustfmt fixpoints but scoped out the db
+  tenant/owner membership-repo templates, so a fresh db-tenant scaffold's agent-owned
+  `repo.rs` still failed `cargo fmt --check`: rustfmt greedy-fills a long
+  `use jerrycan::db::sea_orm::{…}` import and wraps long membership/scoped method
+  signatures (`create_for_memberships`, `update_for`, …). Those templates now pre-wrap
+  exactly as the pinned rustfmt formats them (reusing #165's width-regime helper —
+  width-gated, so short-name repos stay byte-identical). The #165 rustfmt round-trip test
+  now covers db tenant/owner shapes (tenant-child + per-user owner, short and long names).
+
+A fresh scaffold of any design — memory or db, tenant or owner — now survives
+`cargo fmt --check` untouched.
+
 ## 0.6.32 — 2026-07-31
 
 ### Fixed

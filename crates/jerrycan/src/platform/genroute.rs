@@ -272,33 +272,137 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
     params
 }
 
-/// The handler fn signature line(s) — `pub(crate) async fn <op>(<params>) -> <ret> {`
-/// — pre-wrapped EXACTLY as the pinned toolchain's rustfmt (1.97, edition 2024)
-/// formats it (the #128 convention), so a fresh scaffold's agent-owned handlers.rs
-/// is a `cargo fmt` fixpoint out of the box (issue #165). rustfmt keeps the whole
-/// signature on one line while it fits `max_width` (100); past that it breaks EACH
-/// param onto its own line at indent 4, closing `) -> <ret> {` at indent 0. The
-/// boundary is empirical against the pinned rustfmt: a one-line signature of 100
-/// cols stays inline, 101 wraps. The zero-param over-100 case (a pathologically
-/// long op name) is rustfmt's third regime — nothing to break, so it drops the
-/// return type onto its own line — reproduced too for completeness.
-fn handler_signature(op: &str, params: &[String], ret: &str) -> String {
-    let one_line = format!(
-        "pub(crate) async fn {op}({}) -> {ret} {{",
-        params.join(", ")
-    );
+/// The width-regime signature wrapper (issue #165, generalized for #201): given the
+/// pieces of a fn signature `<indent><prefix>(<params>) -> <ret> {`, emit it EXACTLY
+/// as the pinned toolchain's rustfmt (1.97 / rustfmt 1.9.0, edition 2024) formats it
+/// (the #128 convention). rustfmt keeps the whole signature on one line while it fits
+/// `max_width` (100); past that it breaks EACH param onto its own line at `indent + 4`,
+/// closing `) -> <ret> {` back at `indent`. The boundary is empirical against the
+/// pinned rustfmt: a one-line signature of 100 cols stays inline, 101 wraps. The
+/// zero-param over-100 case (a pathologically long name) is rustfmt's third regime —
+/// nothing to break, so it drops the return type onto its own line. The result carries
+/// NO trailing newline (callers add their own). `indent` is the byte column of the
+/// signature; every prefix here is ASCII so byte == char width.
+fn wrap_signature(indent: usize, prefix: &str, params: &[String], ret: &str) -> String {
+    let pad = " ".repeat(indent);
+    let one_line = format!("{pad}{prefix}({}) -> {ret} {{", params.join(", "));
     if one_line.chars().count() <= 100 {
-        return format!("{one_line}\n");
+        return one_line;
     }
     if params.is_empty() {
-        return format!("pub(crate) async fn {op}()\n-> {ret} {{\n");
+        return format!("{pad}{prefix}()\n{pad}-> {ret} {{");
     }
-    let mut s = format!("pub(crate) async fn {op}(\n");
+    let inner = " ".repeat(indent + 4);
+    let mut s = format!("{pad}{prefix}(\n");
     for p in params {
-        s.push_str(&format!("    {p},\n"));
+        s.push_str(&format!("{inner}{p},\n"));
     }
-    s.push_str(&format!(") -> {ret} {{\n"));
+    s.push_str(&format!("{pad}) -> {ret} {{"));
     s
+}
+
+/// The handler fn signature line(s) — `pub(crate) async fn <op>(<params>) -> <ret> {`
+/// — pre-wrapped to rustfmt's width regime (issue #165) via `wrap_signature`, with the
+/// trailing newline the emitter expects.
+fn handler_signature(op: &str, params: &[String], ret: &str) -> String {
+    format!(
+        "{}\n",
+        wrap_signature(0, &format!("pub(crate) async fn {op}"), params, ret)
+    )
+}
+
+/// Re-wrap every one-line `fn` signature in `src` that exceeds `max_width` (100)
+/// exactly as the pinned rustfmt does — one param per line — by reconstructing its
+/// `(indent, prefix, params, ret)` and feeding them back through `wrap_signature`
+/// (issue #201). This extends #165's width regime to the db tenant/owner/membership
+/// repo methods, whose long `{entity}`/`{fk_col}`/`{key}` names push
+/// `create_for_memberships`, `update_for_memberships`, `all_for`, the `{snake}_repo`
+/// factory, … past 100. Only a line that IS a complete one-line signature
+/// (`<indent>pub[(crate)] [async] fn NAME(<params>) -> <ret> {`) is touched; a
+/// signature that already fits round-trips unchanged (so this is a no-op for the
+/// short-name repos), and every other line — SQL strings, method bodies, comments,
+/// the wrapped `use` block — is passed through verbatim. Repo params are all simple
+/// `name: Type` (no nested commas / parens), so splitting the param list on `, ` is
+/// exact.
+fn rewrap_signatures(src: &str) -> String {
+    let ends_nl = src.ends_with('\n');
+    let mut joined = src
+        .lines()
+        .map(|line| rewrap_signature_line(line).unwrap_or_else(|| line.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if ends_nl {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// Parse one line as a complete one-line fn signature and re-wrap it via
+/// `wrap_signature` (issue #201); `None` if the line is not such a signature, so the
+/// caller passes it through unchanged.
+fn rewrap_signature_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let is_fn = trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("pub async fn ")
+        || trimmed.starts_with("pub(crate) fn ")
+        || trimmed.starts_with("pub(crate) async fn ");
+    if !is_fn {
+        return None;
+    }
+    let indent = line.len() - trimmed.len();
+    // A complete one-line signature is `PREFIX(PARAMS) -> RET {`.
+    let body = trimmed.strip_suffix(" {")?;
+    let arrow = body.find(" -> ")?;
+    let head = &body[..arrow]; // `PREFIX(PARAMS)`
+    let ret = &body[arrow + 4..];
+    // The param list opens at the `(` AFTER `fn NAME`, never the `(` inside a
+    // `pub(crate)` visibility modifier — find `fn ` first, then the paren past it.
+    let fn_kw = head.find("fn ")?;
+    let open = fn_kw + head[fn_kw..].find('(')?;
+    if !head.ends_with(')') {
+        return None;
+    }
+    let prefix = &head[..open];
+    let params_str = &head[open + 1..head.len() - 1];
+    let params: Vec<String> = if params_str.is_empty() {
+        Vec::new()
+    } else {
+        params_str.split(", ").map(str::to_string).collect()
+    };
+    Some(wrap_signature(indent, prefix, &params, ret))
+}
+
+/// Emit `use jerrycan::db::sea_orm::{<items>};` exactly as the pinned rustfmt formats
+/// it (issue #201): one line while it fits `max_width` (100); past that, rustfmt opens
+/// the brace and GREEDY-FILLS the items across `indent + 4` lines — as many `Ident,`
+/// tokens (space-separated, each with a trailing comma) as fit within 100 per line —
+/// closing `};` at indent 0. No trailing newline (the caller adds it).
+fn wrap_use_braced(head: &str, items: &[&str]) -> String {
+    let one_line = format!("{head}{}}};", items.join(", "));
+    if one_line.chars().count() <= 100 {
+        return one_line;
+    }
+    let mut out = format!("{head}\n");
+    let mut line = String::from("    ");
+    for item in items {
+        let tok = format!("{item},");
+        let candidate = if line == "    " {
+            format!("    {tok}")
+        } else {
+            format!("{line} {tok}")
+        };
+        if candidate.chars().count() <= 100 {
+            line = candidate;
+        } else {
+            out.push_str(&line);
+            out.push('\n');
+            line = format!("    {tok}");
+        }
+    }
+    out.push_str(&line);
+    out.push('\n');
+    out.push_str("};");
+    out
 }
 
 /// A leading comment for role-guarded endpoints, reminding the agent how to
@@ -2794,16 +2898,27 @@ pub(crate) fn repo_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> Optio
     if needs_order {
         imports.push("QueryOrder");
     }
-    let filter_imports = imports.join(", ");
+    // The `use jerrycan::db::sea_orm::{..}` trait import is pre-wrapped to rustfmt's
+    // greedy-fill layout when it exceeds `max_width` (issue #201) — a 7+ trait list
+    // (e.g. the tenant-owned `ColumnTrait, ConnectionTrait, …, QueryFilter, QueryOrder`)
+    // overflows one line, and emitting it flat would fail `cargo fmt --check` on a fresh
+    // scaffold. Width-gated: a short list stays one line, byte-identical to pre-#201.
+    let sea_orm_import = wrap_use_braced("use jerrycan::db::sea_orm::{", &imports);
     // The `use jerrycan::db::sea_orm;` alias resolves the bare `sea_orm::` paths
     // the repo writes (DbErr, ActiveValue::NotSet); the trait imports come through
     // the same facade so generated crates carry NO direct sea-orm dependency.
     let mut out = format!(
-        "//! Data access — SeaORM over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sea_orm;\nuse jerrycan::db::sea_orm::{{{filter_imports}}};\nuse jerrycan::db::{{Db, db_error}};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
+        "//! Data access — SeaORM over jerrycan::db (agent-owned; edit freely).\nuse jerrycan::db::sea_orm;\n{sea_orm_import}\nuse jerrycan::db::{{Db, db_error}};\nuse jerrycan::prelude::*;\n\nuse super::model::*;\n\n",
     );
     for e in &m.entities {
         out.push_str(&sql_repo(e, design, mode));
     }
+    // Pre-wrap every long repo-method signature (membership/scoped `*_for_memberships`,
+    // `*_for`, the `{snake}_repo` factory, …) to rustfmt's one-param-per-line regime
+    // when a long `{entity}`/`{fk_col}`/`{key}` pushes it past `max_width` (issue #201,
+    // extending #165 to the db tenant/owner shapes). Width-gated per signature, so the
+    // short-name repos stay byte-identical.
+    let out = rewrap_signatures(&out);
     // The last entity block leaves a trailing blank line rustfmt strips (issue
     // #165); trim to exactly one final newline so a fresh scaffold's repo.rs is a
     // `cargo fmt` fixpoint.
@@ -3898,13 +4013,15 @@ pub(crate) mod tests {
         serde_json::from_str(MINIMAL).unwrap()
     }
 
-    /// Collapse rustfmt's per-param handler-signature wrapping (issue #165) back to
+    /// Collapse rustfmt's per-param signature wrapping (issue #165/#201) back to
     /// one line, so a signature assertion can test the param MAPPING (which repo /
-    /// guard / DTO / path types a handler binds, and in what order) without caring
+    /// guard / DTO / path types a fn binds, and in what order) without caring
     /// about the width regime — that is owned by the dbgen `..._are_rustfmt_fixpoints`
     /// test, which feeds the emitted bytes through the pinned rustfmt. A signature
-    /// wraps as `pub(crate) async fn NAME(\n    P0,\n    P1,\n) -> RET {`; this rejoins
-    /// it to `pub(crate) async fn NAME(P0, P1) -> RET {`, the pre-#165 one-line form.
+    /// wraps as `pub[(crate)] async fn NAME(\n    P0,\n    P1,\n) -> RET {`; this rejoins
+    /// it to `pub[(crate)] async fn NAME(P0, P1) -> RET {`, the pre-wrap one-line form
+    /// (indentation preserved from the opener). Covers both the handler
+    /// `pub(crate) async fn` and the db repo-method `pub async fn` shapes (#201).
     /// Non-signature wrapping (the stub body) is left untouched.
     fn flatten_sigs(h: &str) -> String {
         let lines: Vec<&str> = h.lines().collect();
@@ -3912,8 +4029,11 @@ pub(crate) mod tests {
         let mut i = 0;
         while i < lines.len() {
             let line = lines[i];
-            if line.trim_start().starts_with("pub(crate) async fn") && line.ends_with('(') {
-                let mut sig = line.to_string(); // `pub(crate) async fn NAME(`
+            let t = line.trim_start();
+            if (t.starts_with("pub(crate) async fn") || t.starts_with("pub async fn"))
+                && line.ends_with('(')
+            {
+                let mut sig = line.to_string(); // `pub[(crate)] async fn NAME(`
                 i += 1;
                 let mut params: Vec<String> = Vec::new();
                 while i < lines.len() && !lines[i].trim_start().starts_with(')') {
@@ -3921,7 +4041,8 @@ pub(crate) mod tests {
                     i += 1;
                 }
                 sig.push_str(&params.join(", "));
-                // lines[i] is the `) -> RET {` closer (trim its indent, which is 0 here).
+                // lines[i] is the `) -> RET {` closer; trim its indent (0 for a
+                // handler, 4 for a repo method) since the opener already carries it.
                 sig.push_str(lines[i].trim_start());
                 out.push(sig);
                 i += 1;
@@ -6097,8 +6218,11 @@ pub(crate) mod tests {
             auth: true,
         };
 
-        // FLAT `customers`: the repo emits the three membership-CHECKED writes.
-        let customers = repo_rs(&d.modules[2], mode, &d).unwrap();
+        // FLAT `customers`: the repo emits the three membership-CHECKED writes. Flatten
+        // rustfmt's per-param signature wrapping (#201: `update_for_memberships` exceeds
+        // max_width for this entity) so the assertions test the param MAPPING, not the
+        // width regime — the fixpoint test owns that.
+        let customers = flatten_sigs(&repo_rs(&d.modules[2], mode, &d).unwrap());
         assert!(
             customers.contains(
                 "pub async fn create_for_memberships(&self, user_id: String, item: Customer) -> Result<i64>"
@@ -6394,12 +6518,14 @@ pub(crate) mod tests {
             "an out-of-set role is refused as 422:\n{src}"
         );
         // `find_by_statement` (typed member rows) is a FromQueryResult trait
-        // method, so the trait joins the facade imports for this module.
+        // method, so the trait joins the facade imports for this module. The 6-trait
+        // list overflows `max_width`, so it is emitted in rustfmt's greedy-fill layout
+        // (issue #201) — asserted verbatim so this stays a fixpoint check.
         assert!(
             src.contains(
-                "use jerrycan::db::sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait, EntityTrait, FromQueryResult, QueryOrder};"
+                "use jerrycan::db::sea_orm::{\n    ActiveModelTrait, ActiveValue::Set, ConnectionTrait, EntityTrait, FromQueryResult, QueryOrder,\n};"
             ),
-            "FromQueryResult joins the trait imports:\n{src}"
+            "FromQueryResult joins the trait imports (greedy-filled):\n{src}"
         );
         // No second conflict path: add_member carries no Error::conflict of its
         // own — the UNIQUE index + db_error IS the 409.

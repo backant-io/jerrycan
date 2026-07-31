@@ -127,9 +127,11 @@ fn recognized_membership_policy_migrates_to_flat_membership_set_methods() {
         ),
         "flat list uses the membership-set accessor:\n{repo}"
     );
+    // The signature wraps one param per line (issue #201 — its one-line width with a
+    // String pk exceeds rustfmt's max_width, so the fresh scaffold stays a fixpoint).
     assert!(
         repo.contains(
-            "pub async fn get_for_memberships(&self, user_id: String, id: String) -> Result<Option<Customer>>"
+            "pub async fn get_for_memberships(\n        &self,\n        user_id: String,\n        id: String,\n    ) -> Result<Option<Customer>> {"
         ),
         "flat get uses the membership-set accessor:\n{repo}"
     );
@@ -236,9 +238,11 @@ fn migrated_flat_entity_gets_membership_checked_write_methods() {
         ),
         "flat create is membership-checked:\n{repo}"
     );
+    // `update_for_memberships` wraps one param per line (issue #201 — its one-line
+    // width with a String pk exceeds max_width); `remove_for_memberships` still fits.
     assert!(
         repo.contains(
-            "pub async fn update_for_memberships(&self, user_id: String, id: String, item: Customer) -> Result<bool>"
+            "pub async fn update_for_memberships(\n        &self,\n        user_id: String,\n        id: String,\n        item: Customer,\n    ) -> Result<bool> {"
         ) && repo.contains(
             "pub async fn remove_for_memberships(&self, user_id: String, id: String) -> Result<bool>"
         ),
