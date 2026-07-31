@@ -28,6 +28,49 @@ pub fn shared_app_target() -> std::path::PathBuf {
         .join("target/conformance-apps")
 }
 
+/// Give a freshly-scaffolded app a globally-unique runnable-binary name so
+/// concurrent builds into the shared `shared_app_target()` can never collide on
+/// its final artifact (#118).
+///
+/// WHY: every scaffolded app is package `app` whose bin is ALSO `app`, so every
+/// app uplifts to the SAME `.../debug/app`. Two builds racing into the shared
+/// target — a rogue/orphaned `cargo test` beside a gate, or a parallel harness —
+/// overwrite each other's `debug/app`, so a served process can exec a STALE
+/// binary from a *different* design (phantom `no such column`/404s). Renaming the
+/// bin to `app_<uid>` gives each app its own `debug/app_<uid>`; the intermediate
+/// `deps/<crate>-<hash>` are already path-hash-distinguished, and the framework
+/// deps are the SAME path dep across apps, so they still compile ONCE into the
+/// shared target (no per-app framework rebuild). `cargo run -p app` /
+/// `cargo build --workspace` / `cargo test --workspace` all select by *package*,
+/// so they run/build the sole renamed bin with no serve-site changes.
+///
+/// `uid` is a hash of the app's absolute path, which carries the tempdir's
+/// per-process random component — a stable, cross-process-unique nonce we did not
+/// mint from time/`rand`. (The dir *basename* is NOT unique — conformance apps are
+/// all `todo-api`, eval apps are the spec name — only the full path is.)
+/// Idempotent: a second call for the same app is a no-op.
+///
+/// Do NOT call this for an app that will run `jerrycan package --binary`: that
+/// product path copies `release/app` by its real name, and the package test must
+/// keep exercising the faithful `app` bin the real product emits.
+pub fn isolate_app_bin(app_dir: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    app_dir
+        .canonicalize()
+        .unwrap_or_else(|_| app_dir.to_path_buf())
+        .hash(&mut h);
+    let bin = format!("app_{:016x}", h.finish());
+    let manifest = app_dir.join("crates/app/Cargo.toml");
+    let toml = std::fs::read_to_string(&manifest).expect("scaffolded app crate Cargo.toml");
+    // Idempotent: the scaffold never emits [[bin]]; its presence means we already ran.
+    if !toml.contains("[[bin]]") {
+        let patched = format!("{toml}\n[[bin]]\nname = \"{bin}\"\npath = \"src/main.rs\"\n");
+        std::fs::write(&manifest, patched).expect("rewrite app crate Cargo.toml with unique bin");
+    }
+    bin
+}
+
 pub struct McpClient {
     pub child: Child,
     pub stdin: ChildStdin,
