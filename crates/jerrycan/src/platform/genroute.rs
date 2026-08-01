@@ -57,9 +57,21 @@ fn return_type(ep: &Endpoint) -> String {
     }
 }
 
-fn path_params(ep: &Endpoint) -> Vec<String> {
+/// The `{param}` tokens on this endpoint's RESOLVED path — the module's
+/// `effective_mount` (trailing `/` trimmed) plus `ep.path` (see `design.rs`
+/// `endpoint_tenant_shape`) — in path order (mount-inherited tokens first, then
+/// the endpoint's own). Scanning the resolved path (not `ep.path` alone) is what
+/// lets `handler_params` bind a mount-INHERITED fk (a nested `/clubs/{club_id}`
+/// or `/accounts/{account_id}` prefix, issue #127) that #82 dropped from the body
+/// but the handler must still inject. A flat/top-level module's `effective_mount`
+/// carries no `{token}`, so its result is byte-identical to the old `ep.path`-only
+/// scan.
+fn path_params(m: &ModuleDesign, ep: &Endpoint) -> Vec<String> {
+    let mount = m.effective_mount();
+    let mount = mount.strip_suffix('/').unwrap_or(&mount);
+    let resolved = format!("{mount}{}", ep.path);
     let mut out = Vec::new();
-    let mut rest = ep.path.as_str();
+    let mut rest = resolved.as_str();
     while let Some(start) = rest.find('{') {
         let Some(end_rel) = rest[start..].find('}') else {
             break;
@@ -115,7 +127,7 @@ fn entity_key_param(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String 
         let fk = Design::fk_column(&tenancy.entity);
         if m.entities.iter().any(|e| e.name == tenancy.entity)
             && endpoint_repo_entity(m, ep) == Some(tenancy.entity.as_str())
-            && path_params(ep) == [fk.clone()]
+            && path_params(m, ep) == [fk.clone()]
         {
             return fk;
         }
@@ -216,7 +228,32 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
     if endpoint_emits_realtime_publish(ep, design) {
         params.push("_rt: Dep<jerrycan::realtime::RealtimeHandle>".to_string());
     }
-    let params_in_path = path_params(ep);
+    // Every `{param}` on the RESOLVED path binds as a `Path` (issue #127) so the
+    // handler can inject a mount-inherited parent fk that #82 dropped from the
+    // body — EXCEPT a MOUNT-inherited tenant fk when the endpoint already takes
+    // `Dep<Tenant>` (which resolves the tenant from the same path segment; binding
+    // it again would be a double-bind). The exclusion is narrow: it fires only for
+    // a tenant fk carried by the module MOUNT (a nested `/clubs/{club_id}` prefix),
+    // never one spelled in `ep.path` — so the tenant's OWN detail route `/{club_id}`
+    // keeps its `Path(_club_id)` binding (byte-identical), and a flat/top-level
+    // module (no mount token) is untouched. Every OTHER resolved token — a
+    // grandchild's parent fk `/accounts/{account_id}`, a non-tenant mount param, or
+    // the endpoint's own `{id}` — binds.
+    let has_tenant_dep = mode.auth && ep.is_guarded() && endpoint_uses_tenant_guard(m, ep, design);
+    let mount = m.effective_mount();
+    let excluded_tenant_fk = has_tenant_dep
+        .then(|| {
+            design
+                .tenancy
+                .as_ref()
+                .map(|t| Design::fk_column(&t.entity))
+        })
+        .flatten()
+        .filter(|fk| mount.contains(&format!("{{{fk}}}")));
+    let params_in_path: Vec<String> = path_params(m, ep)
+        .into_iter()
+        .filter(|p| Some(p) != excluded_tenant_fk.as_ref())
+        .collect();
     // The param that keys the endpoint's entity takes that entity's key type
     // (String for text pks); other params stay i64. Conventionally `id`, but the
     // tenant entity's OWN detail route is normalized to `/{tenant_fk}` (#78), so
@@ -526,11 +563,30 @@ fn tenant_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: 
                 "    // tenant scope (membership-set): this flat route has no tenant in the path —\n    // scope to the CALLER'S memberships via `{call}` so a multi-tenant user sees every\n    // tenant's rows they belong to and nothing outside the set (issues #78/#79).\n"
             )
         }
-        // Flat (membership-set) WRITES take the tenant fk from the BODY, so they MUST
-        // verify it against the caller's memberships (RLS `WITH CHECK`, issue #94) —
-        // steer to the membership-CHECKED method, never the unscoped `insert`/`update`/
-        // `remove` which would let a caller write into a tenant they don't belong to.
+        // Flat (membership-set) WRITES verify the tenant against the caller's
+        // memberships (RLS `WITH CHECK`, issue #94) — steer to the membership-CHECKED
+        // method, never the unscoped `insert`/`update`/`remove` which would let a caller
+        // write into a tenant they don't belong to. Where the tenant/parent fk lives
+        // depends on the route SHAPE: a DIRECT flat child reads it from the BODY; a
+        // PARAM-MOUNT grandchild (`/accounts/{account_id}`, issue #127) has it dropped
+        // from the body by #82 and injected from the now-bound PATH param — the POST arm
+        // splits on `endpoint_omits_path_fk` so the steer stays coherent with
+        // `server_owned_fk_comment` (which names the same path injection).
         TenantShape::MembershipSet => match ep.method {
+            // Param-mount grandchild: the parent fk is path-owned, so DON'T claim the
+            // body carries it — point at the Path injection `server_owned_fk_comment`
+            // already describes, then the membership-checked create.
+            HttpMethod::POST if design.endpoint_omits_path_fk(m, ep) => {
+                let injected = design
+                    .entity_path_fk_columns(entity)
+                    .iter()
+                    .map(|c| format!("`_{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "    // tenant create (membership-set, issues #94/#127): the parent fk comes from the\n    // PATH — inject {injected} (the bound Path param, see the path-owned fk note below), NOT\n    // the body — then call `{entity}Repo::create_for_memberships(_user.0.id, {snake})` so the\n    // parent is verified ∈ your memberships (403 otherwise), NEVER the bare `insert`.\n"
+                )
+            }
             HttpMethod::POST => format!(
                 "    // tenant create (membership-set, issue #94): this flat create reads the tenant\n    // fk from the BODY — call `{entity}Repo::create_for_memberships(_user.0.id, {snake})`\n    // so that fk is verified ∈ your memberships (403 otherwise), NEVER the bare `insert`,\n    // which would write into a tenant the caller doesn't belong to.\n"
             ),
@@ -6052,6 +6108,128 @@ pub(crate) mod tests {
         assert!(
             scoped_handlers.contains("_tenant: Dep<Tenant>"),
             "path-scoped grandchild handler takes Dep<Tenant>:\n{scoped_handlers}"
+        );
+    }
+
+    /// Issue #127: a MembershipSet grandchild mounted under its PARENT
+    /// (`/accounts/{account_id}`) now BINDS the mount-inherited parent fk as a
+    /// `Path` param, so the fk #82 dropped from the body is injectable without a
+    /// hand-added extractor. The tenant fk is NOT in this path, so the handler still
+    /// takes the bare `_user: CurrentUser` (never `Dep<Tenant>`) and there is no
+    /// tenant fk to double-bind. Before the fix `handler_params` scanned `ep.path`
+    /// (`/`) only, so no Path param existed and the steering pointed at `_account_id`
+    /// the framework never generated.
+    #[test]
+    fn param_mount_grandchild_binds_the_inherited_parent_fk() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_UNDER_PARENT).unwrap();
+        let contacts = &d.modules[2];
+        let h = flatten_sigs(&handlers_rs(contacts, mode, &d));
+        assert!(
+            h.contains(
+                "pub(crate) async fn list_contacts(_repo: Dep<ContactRepo>, _user: CurrentUser, Path(_account_id): Path<i64>)"
+            ),
+            "grandchild handler must bind the mount-inherited parent fk `_account_id` as a Path:\n{h}"
+        );
+        assert!(
+            !h.contains("Dep<Tenant>"),
+            "a MembershipSet grandchild takes the bare session, never Dep<Tenant>:\n{h}"
+        );
+    }
+
+    /// Issue #127 byte-identity: a DIRECT tenant child mounted at `/orgs/{org_id}`
+    /// (the tenant fk lives in the mount) already resolves the tenant via
+    /// `Dep<Tenant>`, so the mount-inherited tenant fk must NOT be double-bound as a
+    /// `Path` — the handler is byte-identical to today (repo + `Dep<Tenant>`, no
+    /// Path param). This is the tenant-fk-dedup witness.
+    #[test]
+    fn param_mount_tenant_fk_is_not_double_bound() {
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        let d: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_UNDER_TENANT).unwrap();
+        let contacts = &d.modules[2];
+        let h = flatten_sigs(&handlers_rs(contacts, mode, &d));
+        assert!(
+            h.contains(
+                "pub(crate) async fn list_contacts(_repo: Dep<ContactRepo>, _tenant: Dep<Tenant>) -> Result<Json<Vec<Contact>>>"
+            ),
+            "the mount-inherited tenant fk is resolved by Dep<Tenant> and must not be bound as a Path:\n{h}"
+        );
+        assert!(
+            !h.contains("Path("),
+            "no Path param on a tenant-fk-only mount (Dep<Tenant> resolves it):\n{h}"
+        );
+    }
+
+    /// Issue #127 (the LATENT case): a NON-tenant param-mount child
+    /// (`items` mounted at `/orgs/{org_id}`, no `tenancy` block) has its parent fk
+    /// `org_id` dropped from the body by #82 but — with no `Dep<Tenant>` to resolve
+    /// it — was previously UN-injectable (no Path param), so a handler following the
+    /// steering could not compile. The fk now binds as `Path(_org_id)`. The
+    /// `genroute_compile` gate proves the emitted crate builds; this pins the exact
+    /// binding.
+    #[test]
+    fn non_tenant_param_mount_child_binds_the_mount_fk() {
+        const NON_TENANT_PARAM_MOUNT: &str = r#"{ "name": "shop-api", "contract_version": 1,
+            "dependencies": ["db"],
+            "modules": [
+                { "name": "orgs",
+                  "entities": [{ "name": "Org", "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "name", "type": "string" } ]}],
+                  "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+                      "success": { "status": 200, "entity": "Org", "list": true } }] },
+                { "name": "items", "mount": "/orgs/{org_id}",
+                  "entities": [{ "name": "Item",
+                      "belongs_to": [{ "entity": "Org" }],
+                      "fields": [{ "name": "id", "type": "integer" },
+                                 { "name": "label", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_item", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Item" },
+                      "success": { "status": 201, "entity": "Item" } }] }
+            ] }"#;
+        let mode = GenMode {
+            db: true,
+            auth: false,
+        };
+        let d: Design = serde_json::from_str(NON_TENANT_PARAM_MOUNT).unwrap();
+        let items = &d.modules[1];
+        // The DTO drops the mount-carried parent fk (#82)…
+        assert!(
+            d.endpoint_omits_path_fk(items, &items.endpoints[0]),
+            "the non-tenant param-mount create must drop the path-owned parent fk from the DTO"
+        );
+        // …and the handler now BINDS it as a Path so the injection is compilable.
+        let h = flatten_sigs(&handlers_rs(items, mode, &d));
+        assert!(
+            h.contains(
+                "pub(crate) async fn create_item(_repo: Dep<ItemRepo>, Path(_org_id): Path<i64>, Json(_body): Json<ItemRequest>)"
+            ),
+            "non-tenant param-mount child must bind the mount fk `_org_id` as a Path:\n{h}"
+        );
+    }
+
+    /// Issue #127 byte-identity witness: a FLAT top-level module (no mount token)
+    /// binds exactly its own `ep.path` params, unchanged by the resolved-path scan.
+    #[test]
+    fn flat_top_level_handler_path_binding_is_byte_identical() {
+        let m = todos();
+        let h = flatten_sigs(&handlers_rs(&m, GenMode::default(), &demo()));
+        // `delete_todo DELETE /{id}` binds a single leaf `Path(_id)`, never a tuple.
+        assert!(
+            h.contains(
+                "pub(crate) async fn delete_todo(_repo: Dep<TodoRepo>, Path(_id): Path<i64>)"
+            ),
+            "a flat module's leaf handler stays a single Path over its own `{{id}}`:\n{h}"
+        );
+        assert!(
+            !h.contains("Path((_"),
+            "no flat top-level handler gains a tuple over a mount param:\n{h}"
         );
     }
 
