@@ -369,6 +369,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs designing",
     },
     CodeInfo {
+        code: "JC0565",
+        title: "owner-scoped storage bucket without owner_prefix",
+        cause: "a storage bucket (issue #133) is OWNER-SCOPED — it declares an `owner` (a User, user-in-tenant, or Tenant scope) — but omits `owner_prefix`, so every owner's keys land in ONE global key namespace. The upload duplicate-key check (`meta::key_exists`, unscoped) then leaks a cross-owner EXISTENCE ORACLE — one owner uploading another owner's key gets a 409 and learns that owner holds it — and lets owners SQUAT each other's keys. `owner_prefix: true` is immune: keys are stored under `{owner_id}/…`, so the blob path, the unique index, and the duplicate check are all naturally per-owner. The naive runtime fix (scope only the check) CORRUPTS data — the blob write lands at the shared path, overwriting the other owner's bytes before the 409 with no compensation — and the full scope-the-path-and-index fix breaks the Supabase-parity global-namespace contract (a 0.7 change), so the unsafe shape is refused at design time instead",
+        fix: "set `owner_prefix: true` on the owner-scoped bucket for per-owner key isolation (keys become `{owner_id}/…`, prefix-asserted on every access, so owners cannot observe or collide on each other's keys); `owner_prefix` changes only the key LAYOUT, never read-visibility (the scope already governs who-sees-what). A bucket that is intentionally SHARED across everyone should instead have no `owner` (Unowned) — no per-owner scope, no oracle, and `owner_prefix: false` stays valid there",
+        doc: "jerrycan docs storage",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -850,6 +857,31 @@ mod tests {
                 && info.fix.contains("reserve_against")
                 && info.fix.contains("db"),
             "fix must state the well-formed integer counter+capacity shape and the db requirement: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0565_names_the_owner_scoped_owner_prefix_rule() {
+        // WHY: JC0565 (#133) is the agent's stop after `check` rejects an
+        // owner-scoped storage bucket that omits `owner_prefix`. `jerrycan
+        // explain JC0565` must name the rule — an OWNED bucket needs
+        // `owner_prefix` for per-owner key isolation, else the cross-owner key
+        // ORACLE / squatting — and it must name the intentionally-shared
+        // alternative (an Unowned bucket) so the agent can fix the shape without
+        // reading the generator or the runtime.
+        let info = lookup("JC0565").unwrap();
+        assert!(
+            info.cause.contains("owner_prefix")
+                && info.cause.contains("OWNER-SCOPED")
+                && info.cause.contains("ORACLE")
+                && info.cause.contains("#133"),
+            "cause must name the owner-scoped owner_prefix rule and the cross-owner oracle: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("owner_prefix: true") && info.fix.contains("Unowned"),
+            "fix must state owner_prefix:true and the Unowned (shared-bucket) alternative: {}",
             info.fix
         );
     }

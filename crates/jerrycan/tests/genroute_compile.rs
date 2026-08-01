@@ -586,11 +586,11 @@ const STORAGE_MINIMAL: &str = r#"{
     "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
     "storage": { "buckets": [
         { "name": "avatars", "visibility": "public", "owner": "User",
-          "max_size": "1MB", "allowed_mime": ["image/*"] },
+          "owner_prefix": true, "max_size": "1MB", "allowed_mime": ["image/*"] },
         { "name": "invoices", "visibility": "private", "owner": "Org",
           "owner_prefix": true, "max_size": "1MB" },
         { "name": "exports", "visibility": "private" },
-        { "name": "reports", "visibility": "private", "owner": "Member" }
+        { "name": "reports", "visibility": "private", "owner": "Member", "owner_prefix": true }
     ]},
     "modules": [
         { "name": "orgs",
@@ -727,11 +727,11 @@ const STORAGE_UUID: &str = r#"{
     "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
     "storage": { "buckets": [
         { "name": "avatars", "visibility": "public", "owner": "User",
-          "max_size": "1MB", "allowed_mime": ["image/*"] },
+          "owner_prefix": true, "max_size": "1MB", "allowed_mime": ["image/*"] },
         { "name": "invoices", "visibility": "private", "owner": "Org",
           "owner_prefix": true, "max_size": "1MB" },
         { "name": "exports", "visibility": "private" },
-        { "name": "reports", "visibility": "private", "owner": "Member" }
+        { "name": "reports", "visibility": "private", "owner": "Member", "owner_prefix": true }
     ]},
     "modules": [
         { "name": "orgs",

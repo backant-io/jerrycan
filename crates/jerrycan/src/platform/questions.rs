@@ -2140,6 +2140,31 @@ pub fn validate(d: &Design) -> Vec<Question> {
                     format!("Bucket `{}` sets owner_prefix without an owner — owner_prefix stores keys under {{owner_id}}/… and needs `owner`.", b.name),
                 ));
             }
+            // JC0565 (#133): an OWNER-SCOPED bucket (any `owner` → User,
+            // UserInTenant, or Tenant scope — `storagegen::bucket_scope` is not
+            // `Unowned`, which is exactly `b.owner.is_some()`) that omits
+            // `owner_prefix` puts every owner's keys in ONE global namespace.
+            // The unscoped upload duplicate-key check then leaks a cross-owner
+            // EXISTENCE ORACLE (B uploading A's key gets a 409, learning A holds
+            // it) and lets owners SQUAT each other's keys. `owner_prefix: true`
+            // is immune — keys are `{owner_id}/…`, so the blob path, the unique
+            // index, and the check are all naturally per-owner. The naive
+            // runtime "just scope the check" fix corrupts data (the blob lands
+            // at the shared path before the 409) and the full path+index
+            // scoping is a 0.7 Supabase-parity break, so refuse the footgun at
+            // design time. An Unowned bucket has no per-owner namespace and
+            // stays valid with owner_prefix false — do NOT flag it.
+            if let Some(ref owner) = b.owner
+                && !b.owner_prefix
+            {
+                qs.push(q(
+                    format!("{bptr}/owner_prefix"),
+                    format!(
+                        "Bucket `{}` is owned by `{owner}` but has no `owner_prefix`, so all owners share ONE global key namespace — one owner can learn of or squat another owner's keys (the cross-owner key oracle, #133). Set `owner_prefix: true` for per-owner key isolation (keys become `{{owner}}/…`). An intentionally SHARED bucket should have no `owner` (Unowned) instead. See `jerrycan explain JC0565`.",
+                        b.name
+                    ),
+                ));
+            }
             if let Some(ref max) = b.max_size
                 && Design::parse_size(max).is_none()
             {
@@ -3172,6 +3197,68 @@ mod tests {
                 .iter()
                 .any(|q| q.id.starts_with("/storage/buckets/0/allowed_mime")),
             "*/*, type/* and type/subtype are all valid"
+        );
+    }
+
+    /// JC0565 (#133): an OWNER-SCOPED bucket that omits `owner_prefix` shares
+    /// ONE global key namespace across all owners — the cross-owner existence
+    /// oracle / key squatting. Refuse it at design time for a User-scoped AND a
+    /// Tenant-scoped bucket; the same bucket WITH `owner_prefix` is clean; an
+    /// UNOWNED bucket has no per-owner namespace, so `owner_prefix: false` stays
+    /// valid there (no false positive). WHY (Rule 9): the refusal is the only
+    /// thing standing between a scoped bucket and a shipped cross-owner oracle —
+    /// if it stopped firing, the unsafe shape would pass `check` green again.
+    #[test]
+    fn owner_scoped_bucket_without_owner_prefix_is_refused_with_jc0565() {
+        let jc0565_at = |d: &Design, ptr: &str| {
+            validate(d)
+                .iter()
+                .any(|q| q.id == ptr && q.question.contains("JC0565"))
+        };
+
+        // User-scoped: avatars (owner User) without owner_prefix → JC0565.
+        let mut user: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        user.storage.as_mut().unwrap().buckets[0].owner_prefix = false;
+        assert!(
+            jc0565_at(&user, "/storage/buckets/0/owner_prefix"),
+            "a user-scoped bucket without owner_prefix must fire JC0565: {:?}",
+            validate(&user)
+        );
+
+        // Tenant-scoped: invoices (owner Org == tenancy.entity) without
+        // owner_prefix → JC0565 too.
+        let mut tenant: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        tenant.storage.as_mut().unwrap().buckets[1].owner_prefix = false;
+        assert!(
+            jc0565_at(&tenant, "/storage/buckets/1/owner_prefix"),
+            "a tenant-scoped bucket without owner_prefix must fire JC0565: {:?}",
+            validate(&tenant)
+        );
+
+        // Both fixture buckets set owner_prefix, so the scoped shape is clean.
+        let clean: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        assert!(
+            !validate(&clean)
+                .iter()
+                .any(|q| q.question.contains("JC0565")),
+            "owner-scoped buckets WITH owner_prefix must not fire JC0565: {:?}",
+            validate(&clean)
+        );
+
+        // An UNOWNED bucket (no owner) keeps owner_prefix:false VALID — no
+        // per-owner namespace, no oracle. Must NOT be flagged (no false positive).
+        let mut unowned: Design = serde_json::from_str(V2_STORAGE).unwrap();
+        {
+            let b = &mut unowned.storage.as_mut().unwrap().buckets[0];
+            b.owner = None;
+            b.owner_prefix = false;
+        }
+        assert!(
+            !validate(&unowned)
+                .iter()
+                .any(|q| q.question.contains("JC0565")),
+            "an unowned bucket without owner_prefix must not fire JC0565: {:?}",
+            validate(&unowned)
         );
     }
 

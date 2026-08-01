@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.34 — 2026-08-01
+
+### Fixed (security)
+- **An owner-scoped storage bucket now requires `owner_prefix` — JC0565 (#133).** A bucket
+  WITHOUT `owner_prefix` shares ONE global key namespace across all owners, so `put_object`'s
+  duplicate check leaks a cross-owner existence oracle (owner B uploading owner A's key gets a
+  `409`, learning A has it) and lets owners squat each other's keys. `owner_prefix: true` is
+  immune (keys are `{owner}/…` — path, unique index, and check are all naturally per-owner).
+  The naive runtime fix corrupts data (the blob write lands at the shared path first) and the
+  full path/index-scoping fix breaks the Supabase-parity global namespace, so the design-time
+  refusal is the non-corrupting, non-breaking fix: **JC0565 refuses an owned bucket that lacks
+  `owner_prefix`** — set `owner_prefix: true` for per-owner isolation, or drop the `owner` for
+  an intentionally shared (Unowned) bucket. An Unowned bucket is unaffected. Requiring
+  `owner_prefix` changes only the key layout, never read-visibility.
+
+Byte-identical for any design whose scoped buckets already set `owner_prefix` (or have no owner).
+
 ## 0.6.33 — 2026-08-01
 
 ### Fixed
