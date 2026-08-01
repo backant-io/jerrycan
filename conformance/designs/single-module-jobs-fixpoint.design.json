@@ -1,0 +1,33 @@
+{
+  "name": "single-module-jobs-fixpoint",
+  "contract_version": 2,
+  "description": "Issue #221 guard fixture (residual D): a jobs design with EXACTLY ONE route module, so the jobs `tests/acceptance.rs` AND the route `tests/acceptance.rs` each emit a SINGLE-element `db.migrate(&[...])` array, which rustfmt HUGS onto the `db.migrate(&[` line (de-indenting the sole Migration struct). The multi-field entity keeps its ActiveModel multi-line (clear of residual E) and the cron job name is short (clear of residual F), so this design exercises D in isolation.",
+  "auth": { "model": "none" },
+  "dependencies": ["db"],
+  "jobs": [
+    { "name": "expire_trials", "schedule": "0 * * * *" }
+  ],
+  "modules": [
+    {
+      "name": "customers",
+      "entities": [
+        { "name": "Customer", "fields": [
+          { "name": "id", "type": "integer" },
+          { "name": "email", "type": "string", "unique": true },
+          { "name": "name", "type": "string" },
+          { "name": "notes", "type": "string", "required": false }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_customers", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Customer", "list": true } },
+        { "operation_id": "create_customer", "method": "POST", "path": "/",
+          "request_body": { "entity": "Customer" },
+          "success": { "status": 201, "entity": "Customer" } },
+        { "operation_id": "show_customer", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Customer" },
+          "errors": [{ "status": 404, "when": "unknown id" }] }
+      ]
+    }
+  ]
+}

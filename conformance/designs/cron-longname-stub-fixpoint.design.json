@@ -1,0 +1,46 @@
+{
+  "name": "cron-longname-stub-fixpoint",
+  "contract_version": 2,
+  "description": "Issue #221 guard fixture (residual F, task stub): a CRON job whose name is long enough (>= 39 cols) that its agent-owned task-module stub signature `pub async fn {name}(mut _ctx: TaskContext) -> jerrycan::Result<()> {` exceeds max_width (100) and rustfmt breaks it one param per line — the #218 fix wrapped the QUEUE stub but MISSED the cron stub. (In the registry, a >= 37-col name makes rustfmt bail on the whole chain, so the one-line closure it emits is a fixpoint there — the stub file formats independently and IS reformatted.) Two multi-field route modules keep it clear of residuals D and E.",
+  "auth": { "model": "none" },
+  "dependencies": ["db"],
+  "jobs": [
+    { "name": "regenerate_monthly_subscription_invoices", "schedule": "0 * * * *" }
+  ],
+  "modules": [
+    {
+      "name": "customers",
+      "entities": [
+        { "name": "Customer", "fields": [
+          { "name": "id", "type": "integer" },
+          { "name": "email", "type": "string", "unique": true },
+          { "name": "name", "type": "string" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_customers", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Customer", "list": true } },
+        { "operation_id": "create_customer", "method": "POST", "path": "/",
+          "request_body": { "entity": "Customer" },
+          "success": { "status": 201, "entity": "Customer" } }
+      ]
+    },
+    {
+      "name": "invoices",
+      "entities": [
+        { "name": "Invoice", "fields": [
+          { "name": "id", "type": "integer" },
+          { "name": "number", "type": "string", "unique": true },
+          { "name": "amount_cents", "type": "integer" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_invoices", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Invoice", "list": true } },
+        { "operation_id": "create_invoice", "method": "POST", "path": "/",
+          "request_body": { "entity": "Invoice" },
+          "success": { "status": 201, "entity": "Invoice" } }
+      ]
+    }
+  ]
+}

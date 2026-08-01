@@ -172,6 +172,49 @@ fn wrap_res_await(head: &str, args: &[&str]) -> String {
     format!("{one}\n")
 }
 
+/// The cron closure body `Box::pin({name}::{name}(ctx))` at the fixed closure-body
+/// indent (20 cols), pre-wrapped EXACTLY as the pinned rustfmt (1.9.0, edition 2024)
+/// formats it (issue #221). rustfmt's wrap here is NON-MONOTONIC in the job-name length
+/// `L` — the one-line candidate width is `2*L + 37`. MEASURED against the oracle (emit
+/// this line at each length, run `rustfmt --edition 2024`, record the wrap):
+///
+///   - `L ≤ 26` (candW ≤ 89): ONE line.
+///   - `L = 27, 28` (candW 91, 93): the INNER call breaks its `ctx` arg — the inner
+///     `{name}::{name}(ctx)` first exceeds `fn_call_width` (60) here.
+///   - `L = 29, 30, 31` (candW 95, 97, 99): ONE line AGAIN — the outer `Box::pin(…)`
+///     one-line still fits `max_width` (100), so rustfmt keeps it whole.
+///   - `L = 32, 33, 34` (candW 101–105): the OUTER `Box::pin(` breaks, inner one line.
+///   - `L = 35, 36` (candW 107, 109): BOTH break.
+///   - `L ≥ 37` (candW ≥ 111): ONE line AGAIN — breaking cannot help (the inner callee
+///     `{name}::{name}(` itself overflows 100 at indent 24), so rustfmt gives up.
+///
+/// A naive "break when the inner call exceeds `fn_call_width` (60)" is WRONG: it would
+/// regress the 29–31 and ≥37 one-line ranges. This reproduces rustfmt's actual output
+/// so a fresh scaffold's cron registry is a `cargo fmt` fixpoint for every realistic
+/// cron name (up to ~40 chars). (A 1-char job name inlines the whole closure body onto
+/// the return-type line — a separate pathological regime not handled; realistic job
+/// names are ≥ 2 chars.) Mirrors the width-sensitivity precedent of `payload_bind` /
+/// `wrap_res_await`. Output starts at 20 cols, no trailing newline.
+fn cron_box_pin(name: &str) -> String {
+    let l = name.chars().count();
+    match l {
+        // INNER call breaks its `ctx` arg (the outer `Box::pin(…)` still fits).
+        27 | 28 => format!(
+            "                    Box::pin({name}::{name}(\n                        ctx,\n                    ))"
+        ),
+        // OUTER `Box::pin(` breaks; the inner call stays on one line.
+        32..=34 => format!(
+            "                    Box::pin(\n                        {name}::{name}(ctx),\n                    )"
+        ),
+        // BOTH the outer and inner calls break.
+        35 | 36 => format!(
+            "                    Box::pin(\n                        {name}::{name}(\n                            ctx,\n                        ),\n                    )"
+        ),
+        // One line: L ≤ 26, L ∈ 29..=31, and L ≥ 37 (rustfmt gives up).
+        _ => format!("                    Box::pin({name}::{name}(ctx))"),
+    }
+}
+
 /// The tool-owned registry + wiring `src/lib.rs`. Declares one agent-owned task
 /// module per job, then exports `jobs(db)` building the fully-wired `Jobs`:
 /// `.queue(...)` per distinct queue (sorted), `.register(...)` per job (array
@@ -211,9 +254,14 @@ pub fn registry_rs(design: &Design) -> String {
                 // name-independent width that always exceeds `max_width` (100), so
                 // rustfmt always opens `Arc::new(` and breaks the closure params
                 // one per line — pre-wrapped here (issue #218) so a fresh scaffold's
-                // registry is a `cargo fmt` fixpoint.
+                // registry is a `cargo fmt` fixpoint. The closure BODY
+                // `Box::pin({name}::{name}(ctx))` wraps NON-MONOTONICALLY in the name
+                // length; `cron_box_pin` reproduces rustfmt's actual output (issue #221)
+                // — the earlier always-one-line form drifted for names of 27–28 and
+                // 32–36 cols.
+                let box_pin = cron_box_pin(name);
                 format!(
-                    "        .register(\n            \"{name}\",\n            std::sync::Arc::new(\n                |ctx: jerrycan::TaskContext,\n                 _payload: serde_json::Value|\n                 -> jerrycan::jobs::JobFuture<'static, ()> {{\n                    Box::pin({name}::{name}(ctx))\n                }},\n            ),\n        )\n"
+                    "        .register(\n            \"{name}\",\n            std::sync::Arc::new(\n                |ctx: jerrycan::TaskContext,\n                 _payload: serde_json::Value|\n                 -> jerrycan::jobs::JobFuture<'static, ()> {{\n{box_pin}\n                }},\n            ),\n        )\n"
                 )
             } else {
                 // Queue: deserialize the JSON payload into the task module's
@@ -235,17 +283,28 @@ pub fn registry_rs(design: &Design) -> String {
         })
         .collect();
 
-    // One `.cron(...)` per cron job, in array order, on its queue.
+    // One `.cron(...)` per cron job, in array order, on its queue. rustfmt breaks a
+    // call's args one per line once they exceed `fn_call_width` (60) — a long cron name
+    // pushes `.cron("name", "expr", "queue")` past it, so pre-wrap it (issue #221) to
+    // stay a `cargo fmt` fixpoint. The args are `"name", "expr", "queue"`; their width is
+    // name + expr + queue + 10 (the six quotes plus the two `, ` separators). A short
+    // name keeps the one-line form, byte-identical to pre-#221.
     let cron_lines: String = design
         .jobs
         .iter()
         .filter_map(|j| {
             j.schedule.as_ref().map(|expr| {
-                format!(
-                    "        .cron(\"{name}\", \"{expr}\", \"{queue}\")\n",
-                    name = j.name,
-                    queue = job_queue(j),
-                )
+                let name = &j.name;
+                let queue = job_queue(j);
+                let args_w =
+                    name.chars().count() + expr.chars().count() + queue.chars().count() + 10;
+                if args_w <= 60 {
+                    format!("        .cron(\"{name}\", \"{expr}\", \"{queue}\")\n")
+                } else {
+                    format!(
+                        "        .cron(\n            \"{name}\",\n            \"{expr}\",\n            \"{queue}\",\n        )\n"
+                    )
+                }
             })
         })
         .collect();
@@ -283,13 +342,26 @@ pub fn task_rs(job: &JobDesign) -> String {
         "    Err(jerrycan::Error::internal(\n        \"{name} not implemented — replace this stub\",\n    ))\n"
     );
     if job.schedule.is_some() {
-        // Cron: owned ctx, no payload (JobFn passes an owned TaskContext).
+        // Cron: owned ctx, no payload (JobFn passes an owned TaskContext). The 1-arg
+        // signature is pre-wrapped as the pinned rustfmt does (issue #221) — one param
+        // per line once the one-line form exceeds `max_width` (100), which a long cron
+        // name (≥ 39 cols) hits. A short-name stub stays on one line (byte-identical to
+        // pre-#221). Mirrors the queue-stub width gate below.
+        let sig_one =
+            format!("pub async fn {name}(mut _ctx: TaskContext) -> jerrycan::Result<()> {{");
+        let signature = if sig_one.chars().count() <= 100 {
+            format!("{sig_one}\n")
+        } else {
+            format!(
+                "pub async fn {name}(\n    mut _ctx: TaskContext,\n) -> jerrycan::Result<()> {{\n"
+            )
+        };
         format!(
             "//! Background job `{name}` (cron). Agent-owned: implement the task here.\n\
              //! Regeneration never clobbers this file.\n\n\
              use jerrycan::TaskContext;\n\n\
              /// The `{name}` cron task. The leader enqueues it each due tick.\n\
-             pub async fn {name}(mut _ctx: TaskContext) -> jerrycan::Result<()> {{\n\
+             {signature}\
              {idempotency}{unimpl}}}\n"
         )
     } else {
@@ -401,21 +473,14 @@ pub fn acceptance_rs(design: &Design) -> String {
     // (`crates/jobs/tests/acceptance.rs` → `../../routes/<m>`). `into_test` would
     // drop any `on_serve` loops, but we call the task fns directly so that's
     // irrelevant.
-    let mut route_items = String::new();
-    super::testgen::migration_items(
-        design,
-        |name| format!("../../routes/{name}"),
-        &mut route_items,
-    );
     // Only emit the second migrate call when there are route tables to migrate — a
     // jobs design with no entity modules keeps the byte-identical single-migrate form.
-    let route_migrations = if route_items.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "    db.migrate(&[\n{route_items}    ])\n    .await\n    .expect(\"route migrations\");\n"
-        )
-    };
+    // `migrate_call_block` returns "" for zero items, and HUGS a single-element array
+    // exactly as rustfmt does (issue #221) — a jobs design with ONE route module
+    // otherwise drifted under `cargo fmt`.
+    let route_items =
+        super::testgen::collect_migration_items(design, |name| format!("../../routes/{name}"));
+    let route_migrations = super::testgen::migrate_call_block(&route_items, "route migrations");
     // The `Db::connect(..).await.expect(..)` and `db.migrate(..).await.expect(..)`
     // chains exceed `max_width` (100), so rustfmt breaks each `.await`/`.expect(..)`
     // onto its own line — pre-wrapped here (issue #218) so the scaffold is a
@@ -519,6 +584,99 @@ mod tests {
     /// path without touching the frozen fixture.
     fn queue_job() -> JobDesign {
         serde_json::from_str(r#"{ "name": "send_welcome_email" }"#).unwrap()
+    }
+
+    /// A cron job (with schedule) of a given name, grafted to exercise the long-name
+    /// wrap regimes without touching the frozen fixture.
+    fn cron_job(name: &str) -> JobDesign {
+        serde_json::from_str(&format!(
+            r#"{{ "name": "{name}", "schedule": "0 * * * *" }}"#
+        ))
+        .unwrap()
+    }
+
+    /// Issue #221 (residual F): the cron closure body `Box::pin({name}::{name}(ctx))`
+    /// wraps NON-MONOTONICALLY in the name length. `cron_box_pin` must reproduce the
+    /// pinned rustfmt's EXACT output at each regime, or a fresh cron registry drifts
+    /// under `cargo fmt` (the make-impossible contract behind the no-rustfmt-at-scaffold
+    /// design: green means a scaffold survives `cargo fmt` untouched). WHY these exact
+    /// bytes: they were measured against `rustfmt --edition 2024` at each length; a naive
+    /// monotonic rule regresses the 29–31 and ≥ 37 one-line ranges.
+    #[test]
+    fn cron_box_pin_reproduces_rustfmt_non_monotonic_wrap() {
+        // ≤ 26: one line.
+        assert_eq!(
+            cron_box_pin("expire_trials"),
+            "                    Box::pin(expire_trials::expire_trials(ctx))"
+        );
+        // 27/28: the INNER call breaks its `ctx` arg.
+        assert_eq!(
+            cron_box_pin("reconcile_daily_ledger_rows"),
+            "                    Box::pin(reconcile_daily_ledger_rows::reconcile_daily_ledger_rows(\n                        ctx,\n                    ))"
+        );
+        // 29–31: one line AGAIN (the outer `Box::pin(…)` still fits max_width).
+        assert_eq!(
+            cron_box_pin("expire_abandoned_shopping_cart"),
+            "                    Box::pin(expire_abandoned_shopping_cart::expire_abandoned_shopping_cart(ctx))"
+        );
+        // 32–34: the OUTER `Box::pin(` breaks, the inner call one line.
+        assert_eq!(
+            cron_box_pin("recompute_search_index_documents"),
+            "                    Box::pin(\n                        recompute_search_index_documents::recompute_search_index_documents(ctx),\n                    )"
+        );
+        // 35–36: BOTH break.
+        assert_eq!(
+            cron_box_pin("synchronize_external_billing_ledger"),
+            "                    Box::pin(\n                        synchronize_external_billing_ledger::synchronize_external_billing_ledger(\n                            ctx,\n                        ),\n                    )"
+        );
+        // ≥ 37: one line AGAIN (rustfmt gives up — breaking cannot make it fit).
+        assert_eq!(
+            cron_box_pin("regenerate_monthly_subscription_invoices"),
+            "                    Box::pin(regenerate_monthly_subscription_invoices::regenerate_monthly_subscription_invoices(ctx))"
+        );
+    }
+
+    /// Issue #221 (residual F, task stub): a long cron name overflows the 1-arg stub
+    /// signature, which rustfmt breaks one param per line — the #218 fix wrapped the
+    /// QUEUE stub but missed the cron stub. A short name stays on one line.
+    #[test]
+    fn cron_task_stub_signature_wraps_for_a_long_name() {
+        let long = task_rs(&cron_job("regenerate_monthly_subscription_invoices"));
+        assert!(
+            long.contains(
+                "pub async fn regenerate_monthly_subscription_invoices(\n    mut _ctx: TaskContext,\n) -> jerrycan::Result<()> {"
+            ),
+            "long cron stub signature must wrap one param per line: {long}"
+        );
+        let short = task_rs(&cron_job("expire_trials"));
+        assert!(
+            short.contains(
+                "pub async fn expire_trials(mut _ctx: TaskContext) -> jerrycan::Result<()> {"
+            ),
+            "short cron stub signature stays on one line: {short}"
+        );
+    }
+
+    /// Issue #221 (residual F, `.cron(…)`): a long cron name pushes the `.cron("name",
+    /// "expr", "queue")` args past `fn_call_width` (60), so rustfmt breaks each arg onto
+    /// its own line. A short name stays on one line (byte-identical to pre-#221).
+    #[test]
+    fn cron_schedule_line_wraps_when_args_exceed_fn_call_width() {
+        let mut d = reference();
+        d.jobs = vec![cron_job("synchronize_external_billing_ledger")]; // args 61 > 60
+        let r = registry_rs(&d);
+        assert!(
+            r.contains(
+                "        .cron(\n            \"synchronize_external_billing_ledger\",\n            \"0 * * * *\",\n            \"default\",\n        )\n"
+            ),
+            "a long cron name breaks the .cron args one per line: {r}"
+        );
+        // reference's own short cron names keep the one-line `.cron(...)`.
+        let short = registry_rs(&reference());
+        assert!(
+            short.contains(".cron(\"expire_trials\", \"0 * * * *\", \"billing\")\n"),
+            "a short cron name keeps the one-line .cron: {short}"
+        );
     }
 
     /// The registry for reference's two CRON jobs is byte-identical across two calls

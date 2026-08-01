@@ -1740,6 +1740,28 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
     out
 }
 
+/// A sea-orm `ActiveModel { … }` struct literal with exactly ONE field collapses to a
+/// single line under the pinned rustfmt when it fits `max_width` (100) — the ID-ONLY
+/// entity case (issue #221). `active_sets`/the update template emit each field on its
+/// own line; for an entity whose only column is the pk, the `insert` literal
+/// (`ActiveModel { id: Set(item.id) }`, string pk) and the `update` literal
+/// (`ActiveModel { id: Set(id) }`) are the only single-field literals — a fresh scaffold
+/// of such an entity drifted on them until this collapse. A multi-field literal (every
+/// entity with a non-pk column, an fk, etc.) always stays expanded, byte-identical to
+/// pre-#221. Given the field-lines block `sets` (each `            field: …,\n`), returns
+/// the sole trimmed field (`id: Set(item.id)`) when there is exactly one, else `None`.
+/// NOTE: the INTEGER-pk insert literal (`ActiveModel { id: sea_orm::ActiveValue::NotSet }`)
+/// is NOT collapsed by rustfmt — it is the receiver of a `.insert(..)` method chain, which
+/// rustfmt keeps expanded — so that site is left untouched (still a fixpoint).
+fn single_active_field(sets: &str) -> Option<String> {
+    let mut lines = sets.lines();
+    let only = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    Some(only.trim().trim_end_matches(',').to_string())
+}
+
 /// Like `active_sets`, but the column named `pin_col` is written from `pin_expr`
 /// (a path-verified value) instead of `item.{col}`. Used to pin the tenant fk to
 /// the PATH param in path-scoped writes so the body cannot relocate the row (#125).
@@ -2808,16 +2830,27 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
     // ("Failed to find inserted item" — it refetches by rowid, not the text id),
     // so run the INSERT via `Entity::insert(..).exec(..)` and return the known id.
     let insert_body = if key == "String" {
+        // #221: an ID-ONLY entity's insert ActiveModel is single-field, which rustfmt
+        // collapses to one line when it fits `max_width` (100) — the collapsed struct
+        // arg then hangs the `.exec` chain at indent 12. A multi-field literal (every
+        // normal entity) stays expanded with the chain at indent 8, byte-identical to
+        // pre-#221. (A module name ≥ 30 cols would push rustfmt to break `Entity::insert(`
+        // — an absurd length for an id-only string entity, left as multi-line.)
+        let insert_chain = single_active_field(&insert_sets)
+            .map(|f| format!("        {snake}::Entity::insert({snake}::ActiveModel {{ {f} }})"))
+            .filter(|head| head.chars().count() <= 100)
+            .map(|head| {
+                format!(
+                    "{head}\n            .exec(self.db.conn())\n            .await\n            .map_err(db_error)?;"
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "        {snake}::Entity::insert({snake}::ActiveModel {{\n{insert_sets}        }})\n        .exec(self.db.conn())\n        .await\n        .map_err(db_error)?;"
+                )
+            });
         format!(
-            "    pub async fn insert(&self, item: {entity}) -> Result<{key}> {{\n\
-             \x20       let id = item.id.clone();\n\
-             \x20       {snake}::Entity::insert({snake}::ActiveModel {{\n\
-             {insert_sets}        }})\n\
-             \x20       .exec(self.db.conn())\n\
-             \x20       .await\n\
-             \x20       .map_err(db_error)?;\n\
-             \x20       Ok(id)\n\
-             \x20   }}"
+            "    pub async fn insert(&self, item: {entity}) -> Result<{key}> {{\n        let id = item.id.clone();\n{insert_chain}\n        Ok(id)\n    }}"
         )
     } else {
         format!(
@@ -2854,8 +2887,18 @@ fn sql_repo(e: &Entity, design: &Design, mode: GenMode) -> String {
     let unscoped_reads = format!(
         "    pub async fn all(&self) -> Result<Vec<{entity}>> {{\n        {snake}::Entity::find()\n            .order_by_asc({snake}::Column::Id)\n            .all(self.db.conn())\n            .await\n            .map_err(db_error)\n    }}\n\n    pub async fn get(&self, id: {key}) -> Result<Option<{entity}>> {{\n        {snake}::Entity::find_by_id(id)\n            .one(self.db.conn())\n            .await\n            .map_err(db_error)\n    }}\n\n"
     );
+    // #221: for an ID-ONLY entity the update ActiveModel is single-field
+    // (`id: Set(id)`, `update_sets` empty), which rustfmt collapses to one line when it
+    // fits `max_width` (100). A multi-field literal stays expanded, byte-identical.
+    let update_fields = format!("            id: Set(id),\n{update_sets}");
+    let update_let_m = single_active_field(&update_fields)
+        .map(|f| format!("        let m = {snake}::ActiveModel {{ {f} }};"))
+        .filter(|line| line.chars().count() <= 100)
+        .unwrap_or_else(|| {
+            format!("        let m = {snake}::ActiveModel {{\n{update_fields}        }};")
+        });
     let unscoped_writes = format!(
-        "\n\n    pub async fn remove(&self, id: {key}) -> Result<bool> {{\n        let r = {snake}::Entity::delete_by_id(id)\n            .exec(self.db.conn())\n            .await\n            .map_err(db_error)?;\n        Ok(r.rows_affected > 0)\n    }}\n\n    pub async fn update(&self, id: {key}, item: {entity}) -> Result<bool> {{\n        let m = {snake}::ActiveModel {{\n            id: Set(id),\n{update_sets}        }};\n        match m.update(self.db.conn()).await {{\n            Ok(_) => Ok(true),\n            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),\n            Err(e) => Err(db_error(e)),\n        }}\n    }}"
+        "\n\n    pub async fn remove(&self, id: {key}) -> Result<bool> {{\n        let r = {snake}::Entity::delete_by_id(id)\n            .exec(self.db.conn())\n            .await\n            .map_err(db_error)?;\n        Ok(r.rows_affected > 0)\n    }}\n\n    pub async fn update(&self, id: {key}, item: {entity}) -> Result<bool> {{\n{update_let_m}\n        match m.update(self.db.conn()).await {{\n            Ok(_) => Ok(true),\n            Err(sea_orm::DbErr::RecordNotUpdated) => Ok(false),\n            Err(e) => Err(db_error(e)),\n        }}\n    }}"
     );
     let (reads, writes) = if flat_tenant {
         // FLAT tenant (#97): suppress the bare unscoped reads AND writes — parity with
@@ -5868,6 +5911,91 @@ pub(crate) mod tests {
         assert!(
             !owner_update.contains("id: Set(item.id),"),
             "per-user update_for must NOT write the client-controlled body id (#92):\n{owner_update}"
+        );
+    }
+
+    /// Issue #221 (residual E): an ID-ONLY entity's repo emits a SINGLE-field
+    /// `ActiveModel`, which the pinned rustfmt collapses to one line — the string-pk
+    /// `insert` (`ActiveModel { id: Set(item.id) }`) and the `update`
+    /// (`ActiveModel { id: Set(id) }`, its `update_sets` empty). The emitter must emit
+    /// the collapsed form so a fresh scaffold of such an entity is a `cargo fmt` fixpoint
+    /// (green means it survives `cargo fmt` untouched — the make-impossible #221
+    /// contract); RED while the emitter writes a single field as a multi-line literal.
+    #[test]
+    fn id_only_entity_collapses_single_field_active_model() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "tok-api", "contract_version": 0, "dependencies": ["db"],
+                "modules": [{ "name": "tokens",
+                  "entities": [{ "name": "Token", "fields": [{ "name": "id", "type": "string" }] }],
+                  "endpoints": [
+                    { "operation_id": "create_token", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Token" },
+                      "success": { "status": 201, "entity": "Token" } },
+                    { "operation_id": "update_token", "method": "PUT", "path": "/{id}",
+                      "request_body": { "entity": "Token" },
+                      "success": { "status": 200, "entity": "Token" } }
+                  ] }] }"#,
+        )
+        .unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: false,
+        };
+        let repo = repo_rs(&d.modules[0], mode, &d).unwrap();
+        // String-pk insert: the single-field ActiveModel collapses onto one line.
+        assert!(
+            repo.contains("token::Entity::insert(token::ActiveModel { id: Set(item.id) })"),
+            "id-only insert must collapse the single-field ActiveModel:\n{repo}"
+        );
+        // update: `id: Set(id)` collapses too (update_sets is empty for an id-only entity).
+        assert!(
+            repo.contains("let m = token::ActiveModel { id: Set(id) };"),
+            "id-only update must collapse the single-field ActiveModel:\n{repo}"
+        );
+        // No expanded single-field literal survives (the multi-line form is byte-gone).
+        assert!(
+            !repo.contains("token::ActiveModel {\n"),
+            "no expanded single-field ActiveModel remains:\n{repo}"
+        );
+    }
+
+    /// A MULTI-field entity keeps its `ActiveModel` literals EXPANDED (byte-identical to
+    /// pre-#221) — the collapse must fire only for a genuinely single-field literal, so a
+    /// normal entity's repo is unaffected.
+    #[test]
+    fn multi_field_entity_keeps_active_model_expanded() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "shop-api", "contract_version": 0, "dependencies": ["db"],
+                "modules": [{ "name": "customers",
+                  "entities": [{ "name": "Customer", "fields": [
+                    { "name": "id", "type": "string" },
+                    { "name": "email", "type": "string" } ] }],
+                  "endpoints": [
+                    { "operation_id": "create_customer", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Customer" },
+                      "success": { "status": 201, "entity": "Customer" } },
+                    { "operation_id": "update_customer", "method": "PUT", "path": "/{id}",
+                      "request_body": { "entity": "Customer" },
+                      "success": { "status": 200, "entity": "Customer" } }
+                  ] }] }"#,
+        )
+        .unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: false,
+        };
+        let repo = repo_rs(&d.modules[0], mode, &d).unwrap();
+        assert!(
+            repo.contains("customer::Entity::insert(customer::ActiveModel {\n"),
+            "multi-field insert ActiveModel must stay expanded:\n{repo}"
+        );
+        assert!(
+            repo.contains("let m = customer::ActiveModel {\n"),
+            "multi-field update ActiveModel must stay expanded:\n{repo}"
+        );
+        assert!(
+            !repo.contains("ActiveModel { id: Set("),
+            "a multi-field literal must never collapse:\n{repo}"
         );
     }
 
