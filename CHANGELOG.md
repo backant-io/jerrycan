@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.7 — 2026-08-02
+
+### Fixed
+- **A permanently mis-provisioned replication Postgres now fails loud instead of a silent dead feed
+  (#228).** When the change source picked logical replication (the role has `REPLICATION`) but the
+  server could never start a WAL stream (`max_wal_senders=0`, slot exhaustion, pgoutput unavailable),
+  the supervisor retried forever while `changes:` subscribers were admitted to a feed that never
+  delivers. The supervisor now tracks whether it ever attached: a first-connect failure marks the
+  change source unavailable so a join answers JC0530 (mirroring the #212 trigger-DDL branch), while a
+  drop after a successful connect stays a transient reconnect — and a later successful attach lifts the
+  flag. Two non-ignored tests now turn red if the fail-loud is removed (previously the only such test
+  hit a different branch).
+- **The realtime CDC behavioral tests now gate releases (#227).** The live-Postgres change-delivery
+  tests (trigger LISTEN/NOTIFY and logical-replication streaming, including the tenant-move refetch
+  race) were `#[ignore]`d behind env vars no workflow set — the whole CDC path had no automated
+  verification. They now run in `publish.sh`'s Postgres behavioral gate (release-blocking) and
+  `heavy.yml` (nightly); the Redis bus test runs in `heavy.yml`.
+- **A per-user `changes` entity gets a correctly-framed owner-scope test (#229).** The generated
+  realtime negative control for an owner-scoped entity was mislabeled cross-*tenant* ("tenant B"); it
+  is now cross-*user* ("user B"), matching the #216 owner-scoping the non-ignored `change_visible`
+  filter test asserts.
+
 ## 0.7.6 — 2026-08-01
 
 ### Fixed
