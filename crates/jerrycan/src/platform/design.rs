@@ -154,10 +154,10 @@ pub struct Auth {
     /// The entity the authenticated session PRINCIPAL maps to (issue #150) — the
     /// "identity" entity. Per-user owner-scoping, the #34 server-injected fk, and
     /// `public_read` all detect ownership by this entity's derived fk column
-    /// (`snake(identity)_id`; see [`Design::identity_fk_column`]). Absent ⇒ the
+    /// (`snake(identity)_id`, via `Design::identity_fk_column`). Absent ⇒ the
     /// default `"User"` ⇒ `user_id`, so every existing design is byte-identical;
     /// this field is opt-in only. The membership-table PRINCIPAL column stays the
-    /// fixed `user_id` regardless (see [`MEMBERSHIP_PRINCIPAL_COLUMN`]) — it stores
+    /// fixed `user_id` regardless (`MEMBERSHIP_PRINCIPAL_COLUMN`) — it stores
     /// the session principal, not this entity's fk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
