@@ -12,7 +12,7 @@ bytes live in a pluggable blob store.
   "storage": {
     "buckets": [
       { "name": "avatars", "visibility": "public", "owner": "User",
-        "max_size": "5MB", "allowed_mime": ["image/*"] },
+        "owner_prefix": true, "max_size": "5MB", "allowed_mime": ["image/*"] },
       { "name": "invoices", "visibility": "private", "owner": "Org",
         "owner_prefix": true, "max_size": "20MB",
         "write_roles": ["admin"] }
@@ -37,13 +37,16 @@ bytes live in a pluggable blob store.
   (`JC0556`).
 - Storage requires the `db` dependency and an active auth model.
 
-> **Per-owner key isolation (`owner_prefix`).** An OWNED bucket (tenant- or
-> user-scoped) shares ONE key namespace across all owners unless
-> `owner_prefix: true` is set: a key like `report.pdf` is a single global path,
-> so one owner can learn of or squat another owner's keys (the #133 cross-owner
-> key oracle). Set `owner_prefix: true` for per-owner key isolation — keys are
-> stored under `{owner_id}/…` and asserted on every access, so owners cannot
-> observe or collide on each other's keys.
+> **Per-owner key isolation (`owner_prefix`) is REQUIRED on an owned bucket.** An
+> OWNED bucket (tenant- or user-scoped) shares ONE key namespace across all
+> owners unless `owner_prefix: true` is set: a key like `report.pdf` is a single
+> global path, so one owner can learn of or squat another owner's keys (the #133
+> cross-owner key oracle). jerrycan therefore REFUSES an owner-scoped bucket that
+> omits `owner_prefix` (`JC0565`) — set `owner_prefix: true` for per-owner key
+> isolation, so keys are stored under `{owner_id}/…` and asserted on every access
+> and owners cannot observe or collide on each other's keys. A bucket that is
+> intentionally SHARED across everyone should have no `owner` (Unowned) instead —
+> no per-owner scope, no oracle.
 
 ## Generated endpoints (per bucket `<b>`)
 

@@ -749,7 +749,7 @@ mod tests {
             "{m}"
         );
         assert!(
-            m.contains("owner_prefix: false") && m.contains("max_size: 5242880"),
+            m.contains("owner_prefix: true") && m.contains("max_size: 5242880"),
             "{m}"
         );
         assert!(m.contains("allowed_mime: &[\"image/*\"]"), "{m}");
@@ -785,6 +785,26 @@ mod tests {
         );
         assert!(m.contains("object_response(&meta, bytes, true)"), "{m}");
         // No tenant machinery on a plain user bucket.
+        assert!(!m.contains("Tenant"), "{m}");
+    }
+
+    /// Re-pointed `owner_prefix: false` codegen control (#133 / JC0565): a
+    /// SCOPED bucket may no longer omit `owner_prefix`, so the
+    /// `owner_prefix: false` emission path is now exercised by an UNOWNED bucket
+    /// (no owner: no per-owner namespace, no cross-owner oracle — false stays
+    /// valid there). Prove the false-y flag is emitted verbatim and the bucket
+    /// is genuinely unowned (the default, empty Scope; no tenant machinery).
+    #[test]
+    fn unowned_bucket_emits_owner_prefix_false() {
+        let mut d = design();
+        {
+            let b = &mut d.storage.as_mut().unwrap().buckets[0];
+            b.owner = None;
+            b.owner_prefix = false;
+        }
+        let m = bucket_rs(&d, &d.storage.as_ref().unwrap().buckets[0].clone());
+        assert!(m.contains("owner_prefix: false"), "{m}");
+        assert!(m.contains("Scope::default()"), "{m}");
         assert!(!m.contains("Tenant"), "{m}");
     }
 

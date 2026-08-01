@@ -1935,7 +1935,7 @@ pub(crate) mod tests {
         "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
         "storage": { "buckets": [
             { "name": "avatars", "visibility": "public", "owner": "User",
-              "max_size": "5MB", "allowed_mime": ["image/*"] },
+              "owner_prefix": true, "max_size": "5MB", "allowed_mime": ["image/*"] },
             { "name": "invoices", "visibility": "private", "owner": "Org",
               "owner_prefix": true, "max_size": "20MB" }
         ]},
@@ -2227,7 +2227,10 @@ pub(crate) mod tests {
         assert_eq!(s.buckets[0].name, "avatars");
         assert_eq!(s.buckets[0].visibility, Visibility::Public);
         assert_eq!(s.buckets[0].owner.as_deref(), Some("User"));
-        assert!(!s.buckets[0].owner_prefix, "owner_prefix defaults false");
+        assert!(
+            s.buckets[0].owner_prefix,
+            "an owner-scoped bucket sets owner_prefix (JC0565)"
+        );
         assert!(s.buckets[1].owner_prefix);
         assert!(d.wants_storage());
         let back = serde_json::to_string(&d).unwrap();
