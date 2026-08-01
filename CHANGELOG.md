@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.5 — 2026-08-01
+
+### Fixed
+- **More scaffold `cargo fmt` fixpoints (#221, follow-up to #218).** Three design shapes the #218
+  guard did not exercise still produced code the pinned rustfmt would rewrite: a **single-route-module
+  jobs** design's one-element `db.migrate(&[…])` array (rustfmt hugs it onto one line), an
+  **id-only (single-field) entity**'s `ActiveModel { id: Set(…) }` in the repo `insert`/`update`
+  (rustfmt collapses it), and a **cron job with a long name** (the `Box::pin(name::name(ctx))` line,
+  the `.cron(…)` registration, and the cron task-stub signature — all name-width-sensitive). The
+  emitters now reproduce rustfmt's output for each (measured against the pinned rustfmt, including its
+  non-monotonic cron-name wrap), and the `scaffold_is_a_rustfmt_fixpoint` guard now covers all three
+  shapes (6 designs) so a regression turns the gate red. Whitespace only — generated code compiles and
+  runs identically.
+
 ## 0.7.4 — 2026-08-01
 
 ### Fixed
