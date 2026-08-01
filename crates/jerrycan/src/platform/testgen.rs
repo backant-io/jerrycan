@@ -252,14 +252,20 @@ fn fixture_json(
 /// in the generated `{Op}Request`, so a minimal body still deserializes. No fk
 /// columns and no entity lookup — an inline body is not a table row.
 ///
-/// `overrides` replaces a named required field's literal (issue #217): the reject
-/// probe corrupts ONE field to an out-of-range value — mirroring `fixture_json`'s
-/// override discipline — so the ONLY reason for a 422 is that field. An override on
-/// an absent (optional/omitted) field is inert, exactly as on the entity path.
+/// `overrides` replaces a named field's literal (issue #217): the reject probe
+/// corrupts ONE field to an out-of-range value — mirroring `fixture_json`'s override
+/// discipline — so the ONLY reason for a 422 is that field.
+///
+/// A required field is ALWAYS on the wire; an OPTIONAL field is included ONLY when it
+/// is the field an override corrupts (issue #225 Gap B) — the reject body must carry
+/// the field it invalidates or the boundary 422 never fires, exactly as `fixture_json`
+/// keeps optional non-defaulted fields for the entity path. With no overrides (the
+/// happy path) this reduces to required-only, so the happy-path body stays
+/// byte-identical to the pre-#225 emission.
 fn inline_fixture_json(fields: &[Field], overrides: &[(&str, &str)]) -> String {
     let cols = fields
         .iter()
-        .filter(|f| f.required)
+        .filter(|f| f.required || overrides.iter().any(|(name, _)| *name == f.name))
         .map(|f| {
             let value = match overrides.iter().find(|(name, _)| *name == f.name) {
                 Some((_, literal)) => (*literal).to_string(),
@@ -1196,19 +1202,24 @@ fn push_constraint_reject_test(
 /// #80/#47 machinery as an entity body — but the entity reject probes key on
 /// `rb.entity`, so an inline body (`rb.entity == None`) got a happy-path test yet
 /// NO boundary reject, leaving a declared inline constraint UNVERIFIED by `check`.
-/// This emits ONE reject probe against the inline body: a #80 constraint violation
-/// when a required inline field has a derivable one, else an out-of-range enum
-/// value. It reuses `push_constraint_reject_test`/`push_enum_reject_test`, so it
-/// corrupts exactly that field (`request_expr` threads the override into
-/// `inline_fixture_json`), threads the credential when guarded, asserts 422, and
-/// counts toward `out.reject` (the 422 precedes the stub). Emits NOTHING when no
-/// required inline field is rejectable — byte-identical for unconstrained inline
-/// designs and for every entity-body / bodyless endpoint (`rb` not inline).
+/// This mirrors the entity-body path exactly (`testgen.rs` create/update sites):
+/// it emits an ENUM reject (first inline field with `values` && no `default`) AND,
+/// INDEPENDENTLY, a #80 CONSTRAINT reject (first inline field with a derivable
+/// out-of-range literal) — issue #225 Gap A retired the old `if constraint … else if
+/// enum` XOR that dropped one whenever the other existed. It reuses
+/// `push_enum_reject_test`/`push_constraint_reject_test`, so each corrupts exactly
+/// its field (`request_expr` threads the override into `inline_fixture_json`),
+/// threads the credential when guarded, asserts 422, and counts toward `out.reject`
+/// (the 422 precedes the stub). Emits NOTHING when no inline field is rejectable —
+/// byte-identical for unconstrained inline designs and for every entity-body /
+/// bodyless endpoint (`rb` not inline).
 ///
-/// The reject field must be a REQUIRED inline field: `inline_fixture_json` puts
-/// only required fields on the wire, so an override on an optional (omitted) field
-/// would be inert. A defaulted field is skipped for the same reason as the entity
-/// helpers' `default.is_none()` gate.
+/// The reject field may be REQUIRED or OPTIONAL (issue #225 Gap B): the gate is only
+/// `default.is_none()`, matching the entity helpers' `first_enum_field` /
+/// `first_constraint_reject`. `inline_fixture_json` now carries an overridden optional
+/// field on the wire, so the corrupted value is present for the validator to reject.
+/// (An enum string field yields no constraint literal and an integer/length field has
+/// no `values`, so the two probes never target the same field — no duplicate fn name.)
 fn push_inline_reject_test(
     design: &Design,
     out: &mut TestOut,
@@ -1220,18 +1231,24 @@ fn push_inline_reject_test(
     let Some(rb) = ep.request_body.as_ref().filter(|rb| rb.is_inline()) else {
         return;
     };
-    // Prefer a #80 constraint reject (mirrors `first_constraint_reject`'s ordering);
-    // an enum field rides the sentinel probe instead.
+    // Enum reject (issue #47): first inline field with an allow-list, no default.
+    if let Some(field) = rb
+        .fields
+        .iter()
+        .find_map(|f| (f.values.is_some() && f.default.is_none()).then_some(f.name.as_str()))
+    {
+        push_enum_reject_test(design, out, unit, ep, path, guarded, field);
+    }
+    // Constraint reject (issue #80): first inline field with a rejectable bound, no
+    // default. `constraint_reject_literal` returns None for an enum/vacuous field, so
+    // this never re-probes the enum field above.
     if let Some((field, literal)) = rb.fields.iter().find_map(|f| {
-        (f.required && f.default.is_none())
+        f.default
+            .is_none()
             .then(|| constraint_reject_literal(f).map(|lit| (f.name.as_str(), lit)))
             .flatten()
     }) {
         push_constraint_reject_test(design, out, unit, ep, path, guarded, field, &literal);
-    } else if let Some(field) = rb.fields.iter().find_map(|f| {
-        (f.required && f.values.is_some() && f.default.is_none()).then_some(f.name.as_str())
-    }) {
-        push_enum_reject_test(design, out, unit, ep, path, guarded, field);
     }
 }
 
@@ -3018,6 +3035,166 @@ mod tests {
         assert!(
             content.contains("async fn create_item_rejects_out_of_range_qty()"),
             "entity-body reject probe still fires:\n{content}"
+        );
+    }
+
+    /// Issue #225 Gap A: an inline-DTO action carrying BOTH a #80-constrained field
+    /// AND a #47 enum field gets BOTH reject probes independently — the pre-#225 XOR
+    /// (`if constraint … else if enum`) dropped the enum probe whenever a constrained
+    /// field existed, exactly the entity path never did. Both count toward `reject`.
+    #[test]
+    fn inline_dto_constraint_and_enum_action_gets_both_reject_probes() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "checkout",
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/",
+                      "request_body": { "fields": [
+                          { "name": "quantity", "type": "integer", "min": 1, "max": 100 },
+                          { "name": "tier", "type": "string", "values": ["free", "pro", "enterprise"] } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let (content, reject) = render_acceptance(&d, &d.modules[0]);
+        assert!(
+            content.contains("async fn checkout_rejects_out_of_range_quantity()"),
+            "the constraint reject probe must fire (Gap A):\n{content}"
+        );
+        assert!(
+            content.contains("async fn checkout_rejects_out_of_range_tier()"),
+            "the enum reject probe must ALSO fire (Gap A — no XOR):\n{content}"
+        );
+        assert_eq!(
+            reject, 2,
+            "both inline rejects must count toward `reject`:\n{content}"
+        );
+    }
+
+    /// Issue #225 Gap B: an inline-DTO action whose ENUM field is OPTIONAL still gets
+    /// a reject probe — the pre-#225 `f.required` gate skipped it, and even without
+    /// the gate the corrupted value must be ON THE WIRE. `inline_fixture_json` now
+    /// carries the overridden optional field, so the sentinel reaches the validator.
+    #[test]
+    fn inline_dto_optional_enum_field_gets_a_reject_probe() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "checkout",
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/",
+                      "request_body": { "fields": [
+                          { "name": "note", "type": "string" },
+                          { "name": "tier", "type": "string", "required": false, "values": ["free", "pro"] } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let (content, reject) = render_acceptance(&d, &d.modules[0]);
+        assert!(
+            content.contains("async fn checkout_rejects_out_of_range_tier()"),
+            "the OPTIONAL enum field must be probed (Gap B):\n{content}"
+        );
+        // The corrupted optional field must appear on the wire (else no 422).
+        assert!(
+            content.contains(&format!("\"tier\": \"{ENUM_REJECT_SENTINEL}\"")),
+            "the reject body must carry the corrupted optional field:\n{content}"
+        );
+        assert_eq!(reject, 1, "the optional-enum reject counts toward `reject`");
+    }
+
+    /// Issue #225 Gap B (constraint twin): an inline-DTO action whose #80-constrained
+    /// field is OPTIONAL still gets a reject probe carrying the out-of-range value.
+    #[test]
+    fn inline_dto_optional_constrained_field_gets_a_reject_probe() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "checkout",
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/",
+                      "request_body": { "fields": [
+                          { "name": "note", "type": "string" },
+                          { "name": "amount", "type": "integer", "required": false, "max": 100 } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let (content, reject) = render_acceptance(&d, &d.modules[0]);
+        assert!(
+            content.contains("async fn checkout_rejects_out_of_range_amount()"),
+            "the OPTIONAL constrained field must be probed (Gap B):\n{content}"
+        );
+        assert!(
+            content.contains("\"amount\": 101"),
+            "the reject body must carry the out-of-range optional value (max + 1):\n{content}"
+        );
+        assert_eq!(
+            reject, 1,
+            "the optional-constraint reject counts toward `reject`"
+        );
+    }
+
+    /// Issue #225: the HAPPY-path inline body stays required-only (byte-identical to
+    /// the pre-#225 emission) — only the REJECT body gains the optional field it
+    /// corrupts. Tests `inline_fixture_json` directly on both call shapes.
+    #[test]
+    fn inline_fixture_happy_path_stays_required_only() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "checkout",
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/",
+                      "request_body": { "fields": [
+                          { "name": "note", "type": "string" },
+                          { "name": "tier", "type": "string", "required": false, "values": ["free", "pro"] } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let rb = d.modules[0].endpoints[0]
+            .request_body
+            .as_ref()
+            .expect("inline body");
+        // Happy path (no overrides): required-only — the optional `tier` is absent.
+        assert_eq!(
+            inline_fixture_json(&rb.fields, &[]),
+            "{\"note\": \"test-value\"}",
+            "the happy-path body must stay required-only (byte-identical)"
+        );
+        // Reject path: an override on the optional field pulls it onto the wire.
+        assert_eq!(
+            inline_fixture_json(&rb.fields, &[("tier", "\"__invalid_enum_value__\"")]),
+            "{\"note\": \"test-value\", \"tier\": \"__invalid_enum_value__\"}",
+            "the reject body must carry the corrupted optional field"
         );
     }
 }

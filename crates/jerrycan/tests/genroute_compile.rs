@@ -1659,6 +1659,40 @@ fn db_mode_inline_request_body_app_passes_strict_clippy() {
     );
 }
 
+/// Issue #224 (the entity-LESS inline-DTO case): a module whose ONLY endpoint
+/// carries an inline request body (`request_body: {fields:[…]}`) and which declares
+/// NO entities. `model.rs` IS emitted for it (the inline `CheckoutRequest` DTO), and
+/// `handlers.rs` does `use super::model::*;`, but `mod_decls` used to gate `mod
+/// model;` on `!entities.is_empty()` — so the declaration was dropped and the module
+/// failed `cargo build` with `E0432 unresolved import super::model`. The existing
+/// `inline-db` fixture co-locates an `Order` entity, which emitted `mod model;`
+/// anyway and masked the bug. This fixture has NO entity, so a fresh scaffold must
+/// still compile clean — the make-impossible half of #224. It also carries a
+/// constrained + enum inline field, proving the synthetic-entity validators compile
+/// in a module with no real entity.
+#[test]
+#[ignore = "scaffolds an entity-less inline-body app and invokes cargo on it; run with --include-ignored"]
+fn entity_less_inline_request_body_app_compiles() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    scaffold_and_strict_clippy(
+        tmp.path(),
+        "inline-noentity",
+        r#"{
+            "name": "inline-noentity", "contract_version": 0,
+            "modules": [{
+                "name": "checkout",
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/",
+                      "request_body": { "fields": [
+                        { "name": "quantity", "type": "integer", "min": 1, "max": 100 },
+                        { "name": "tier", "type": "string", "values": ["free", "pro"] } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+    );
+}
+
 /// Issue #127 (the LATENT uncompilable case): a NON-tenant param-mount child —
 /// `items` mounted at `/orgs/{org_id}`, NO `tenancy` block — has its parent fk
 /// `org_id` dropped from the request DTO by #82. With no `Dep<Tenant>` to resolve

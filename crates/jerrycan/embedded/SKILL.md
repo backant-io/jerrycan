@@ -163,7 +163,7 @@ OpenAPI · `jerrycan package` (binaries/containers/k8s/systemd).
 |---|---|---|
 | GraphQL / gRPC / JSON-RPC | **Out of scope** | REST only; remodel as REST or separate service |
 | Aggregate / filter / search / pagination / reporting queries | Not design-expressible | Hand-write raw SeaORM in the agent-owned `repo.rs`/handler |
-| Composite / nested / computed response shapes | `request_body`/`success` are entity-only | Hand-write a `Json<Value>` handler (declare `success.status` only) |
+| Composite / nested / computed response shapes | `success` is entity-only; a `request_body` is an entity or flat inline `fields` (not nested) | Hand-write a `Json<Value>` handler (declare `success.status` only) |
 | Custom middleware / interceptors | Fixed kit only (CORS, rate-limit, access-log) | Not extensible per-route in v2 |
 | Multi-step workflows / job chains / priorities | Jobs are single-shot | Out (the jobs contract is capped) |
 | WebAuthn / SAML | Out of scope | session/JWT(HS) + OAuth2-client + API keys; native Apple/Google Sign-In via RS256 provider ID-token verify (`jerrycan-auth` `idtoken` feature) |
@@ -317,9 +317,11 @@ the tool-owned `lib.rs`/subroute `mod.rs` from `design.json`; if you hand-added 
 - **`public` endpoints can't live in a module that owns a tenant-owned entity**
   (the generator binds the endpoint to that entity → guard bypass). Put webhooks /
   login / inbound-ingest routes in their OWN module (entity-less is fine).
-- **`request_body` is entity-only.** A public endpoint receives `Json<Entity>`
-  (all fields), so the untrusted client can send server-controlled fields — force
-  them in-handler (take the id from the path, fix the status, etc.).
+- **An entity `request_body` exposes every field.** A public endpoint with an
+  entity body receives `Json<Entity>` (all fields), so the untrusted client can send
+  server-controlled fields — force them in-handler (take the id from the path, fix
+  the status, etc.), or declare a narrow inline `request_body: {fields:[…]}` (#122)
+  that accepts only the fields you name.
 - **Non-entity / custom success** → declare `success.status` only; the stub is
   `Result<Json<serde_json::Value>>` you hand-write.
 - **Webhook stubs generate with no extractors** — add `Headers` + `RawBody`
