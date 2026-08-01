@@ -625,6 +625,56 @@ mod tests {
         assert_eq!(a, wiring_rs(&rt_design()), "resolver is deterministic");
     }
 
+    /// DRIFT-GUARD for the executed live-WS mirror. The regression test
+    /// `crates/jerrycan-realtime/tests/ws_tenant_partition.rs` installs a resolver
+    /// that is the BYTE-FOR-BYTE runtime twin of what `tenant_resolve_block` emits
+    /// for this integer-pk Workspace design, and PROVES the resolver→delivery seam
+    /// end-to-end (a non-member's `?tenant=` is refused; a socket receives only its
+    /// chosen tenant's events). `jerrycan-realtime` cannot dev-depend on `jerrycan`
+    /// (the dependency runs the other way), so that mirror copies these exact
+    /// strings and this test is the pin that keeps them honest. If it goes red, the
+    /// generated resolver's SQL or its membership-guard-BEFORE-`Some(tenant)`
+    /// ordering changed — update the mirror in lockstep or the live test stops
+    /// proving the current code. The ordering pin is the specific defense against
+    /// the ONE leak-shaped regression that passes every structural/compile gate:
+    /// hoisting `Some(tenant)` out from behind the `let Some(row) else { forbidden }`
+    /// guard so a non-member gets a tenant.
+    #[test]
+    fn tenant_resolve_block_pins_the_ws_live_mirror_contract() {
+        let block = tenant_resolve_block(&rt_design());
+        // The two membership queries the mirror binds verbatim.
+        assert!(
+            block.contains(
+                "SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?"
+            ),
+            "mirror's MEMBERSHIP_VERIFY_SQL must match the generated verify: {block}"
+        );
+        assert!(
+            block.contains(
+                "SELECT workspace_id, role FROM workspace_members WHERE user_id = ? LIMIT 2"
+            ),
+            "mirror's SOLE_MEMBERSHIP_SQL must match the generated fallback: {block}"
+        );
+        // Verify-BEFORE-Some: the membership row guard MUST precede the member
+        // success tuple, and the guard body MUST refuse a non-member.
+        let guard = block
+            .find("let Some(row) = row else {")
+            .expect("the membership row guard must be present");
+        let success = block
+            .find("(Some(tenant_key.to_string()), Some(role))")
+            .expect("the member success tuple must be present");
+        assert!(
+            guard < success,
+            "the non-member membership guard MUST come BEFORE Some(tenant): a \
+             Some(tenant) hoisted above the guard is the cross-tenant leak the \
+             ws_tenant_partition live test catches at runtime: {block}"
+        );
+        assert!(
+            block[guard..success].contains("return Err(jerrycan::Error::forbidden());"),
+            "the membership guard must REFUSE a non-member with forbidden(): {block}"
+        );
+    }
+
     #[test]
     fn non_tenant_entity_gets_no_tenant_column_and_session_model_uses_current_user() {
         // With tenancy PRESENT, a changes entity that neither IS the tenant nor
