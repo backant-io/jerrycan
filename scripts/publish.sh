@@ -70,6 +70,23 @@ if [ "${SKIP_PG_GATE:-0}" != "1" ]; then
   cargo test -p jerrycan-db --lib -- --ignored --test-threads=1
   cargo test -p jerrycan --all-features --test reserve_capacity_concurrency -- --ignored --test-threads=1
   cargo test -p jerrycan --all-features --test last_admin_concurrency -- --ignored --test-threads=1
+  # #227: the realtime CDC change-delivery path (pgoutput WAL decode + slot/
+  # publication reconcile; trigger LISTEN/NOTIFY + the tenant-move refetch race)
+  # was #[ignore]d behind env vars NO gate set, so a regression could ship green.
+  # Both self-manage their schema (uniquely-named table, drop-slot on teardown)
+  # so they are repeatable against the throwaway DB. They read JERRYCAN_TEST_PG /
+  # JERRYCAN_TEST_PG_LOGICAL (NOT _URL); the local gate container is
+  # wal_level=logical, so both point at the same DB. (bus_redis needs Redis →
+  # heavy.yml only.)
+  echo "=== PG behavioral gate: realtime CDC (triggers + logical replication) ==="
+  JERRYCAN_TEST_PG="$JERRYCAN_TEST_PG_URL" \
+    cargo test -p jerrycan-realtime --lib \
+      changes::triggers::tests::triggers_install_idempotently_and_stream_insert_update_delete \
+      -- --ignored --test-threads=1
+  JERRYCAN_TEST_PG_LOGICAL="$JERRYCAN_TEST_PG_URL" \
+    cargo test -p jerrycan-realtime --lib \
+      changes::replication::tests::replication_streams_insert_and_reconcile_is_idempotent \
+      -- --ignored --test-threads=1
   echo "=== PG behavioral gate GREEN ==="
 else
   echo "!!! SKIP_PG_GATE=1 — skipping the Postgres behavioral gate (emergency republish only) !!!"
