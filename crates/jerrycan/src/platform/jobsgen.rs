@@ -17,8 +17,9 @@
 //!   into it before calling the task.
 //!
 //! Determinism: jobs are emitted in `design.jobs` array order; the distinct queues
-//! are sorted before the `.queue(...)` calls. The output is byte-identical across
-//! runs.
+//! are sorted before the `.queue(...)` calls, and the `pub mod` declarations are
+//! sorted alphabetically (rustfmt's `reorder_modules`). The output is byte-identical
+//! across runs.
 
 use super::design::{Design, JobDesign};
 use std::collections::BTreeSet;
@@ -65,19 +66,130 @@ pub fn cargo_toml() -> String {
     "[package]\nname = \"jobs\"\nversion.workspace = true\nedition.workspace = true\npublish = false\n\n[dependencies]\njerrycan.workspace = true\nserde.workspace = true\nserde_json.workspace = true\n\n[dev-dependencies]\ntokio.workspace = true\n".to_string()
 }
 
+/// The queue closure's `let p: {payload} = if payload.is_null() { … } else { … };`
+/// payload bind, pre-wrapped exactly as the pinned rustfmt (1.9.0, edition 2024)
+/// formats it at the closure's fixed indent (24 cols). The only width-variable token
+/// is the fully-qualified payload path, so there are three regimes, measured against
+/// rustfmt (issue #218):
+///   - the head fits on one line (`… = if payload.is_null() {`): payload ≤ 44 cols.
+///   - the head minus its trailing `{` fits (payload 45–46 cols): rustfmt drops the
+///     `{` onto its own line at the `let` indent.
+///   - wider (payload ≥ 47 cols): rustfmt breaks after `=`, indenting the whole
+///     if-expr one level deeper.
+///
+/// Reproducing all three keeps a fresh scaffold's registry a `cargo fmt` fixpoint for
+/// every realistic job name (the earlier emitter always emitted the first form, so any
+/// name whose payload exceeded 44 cols drifted). Output starts at 24 cols, ends `};\n`.
+fn payload_bind(payload: &str) -> String {
+    let mut out = String::new();
+    let push = |out: &mut String, indent: usize, text: &str| {
+        out.push_str(&" ".repeat(indent));
+        out.push_str(text);
+        out.push('\n');
+    };
+    let from_value = "serde_json::from_value(payload).map_err(|e| {";
+    let inner = "jerrycan::Error::unprocessable(format!(\"bad job payload: {e}\"))";
+    let head_one = format!("let p: {payload} = if payload.is_null() {{");
+    let head_no_brace = format!("let p: {payload} = if payload.is_null()");
+    if 24 + head_one.chars().count() <= 100 {
+        push(&mut out, 24, &head_one);
+        push(&mut out, 28, "Default::default()");
+        push(&mut out, 24, "} else {");
+        push(&mut out, 28, from_value);
+        push(&mut out, 32, inner);
+        push(&mut out, 28, "})?");
+        push(&mut out, 24, "};");
+    } else if 24 + head_no_brace.chars().count() <= 100 {
+        push(&mut out, 24, &head_no_brace);
+        push(&mut out, 24, "{");
+        push(&mut out, 28, "Default::default()");
+        push(&mut out, 24, "} else {");
+        push(&mut out, 28, from_value);
+        push(&mut out, 32, inner);
+        push(&mut out, 28, "})?");
+        push(&mut out, 24, "};");
+    } else {
+        push(&mut out, 24, &format!("let p: {payload} ="));
+        push(&mut out, 28, "if payload.is_null() {");
+        push(&mut out, 32, "Default::default()");
+        push(&mut out, 28, "} else {");
+        push(&mut out, 32, from_value);
+        push(&mut out, 36, inner);
+        push(&mut out, 32, "})?");
+        push(&mut out, 28, "};");
+    }
+    out
+}
+
+/// The acceptance test's `let res = <call>.await;` binding, pre-wrapped exactly as the
+/// pinned rustfmt formats it (issue #218). `head` is the fully-qualified task-fn path
+/// and `args` its call arguments; the awaited call's layout is a pure function of their
+/// combined width, so a table of width-gated regimes (measured against rustfmt) makes
+/// it a `cargo fmt` fixpoint for every job name — unlike the earlier binary rule, which
+/// dropped the value onto its own line but never broke the call arguments, so any name
+/// long enough to overflow the value line drifted. Widest realistic name lands in the
+/// first few regimes; the last two only fire for pathologically long names. In order:
+///   1. the whole `let res = …await;` fits (≤ 100): one line.
+///   2. value on its own line (indent 8) with `.await;` attached.
+///   3. value on its own line with `.await` broken off (the call fills the line).
+///   4. call broken open, one arg per line, head on the `let` line.
+///   5. same, but the broken head itself overflows, so it sits under a broken `let res =`.
+///   6. even the indent-8 head overflows: rustfmt gives up and keeps one line.
+///
+/// Output ends with a trailing newline.
+fn wrap_res_await(head: &str, args: &[&str]) -> String {
+    let call = format!("{head}({})", args.join(", "));
+    let one = format!("    let res = {call}.await;");
+    if one.chars().count() <= 100 {
+        return format!("{one}\n");
+    }
+    let val_await = format!("        {call}.await;");
+    if val_await.chars().count() <= 100 {
+        return format!("    let res =\n{val_await}\n");
+    }
+    let val = format!("        {call}");
+    if val.chars().count() < 100 {
+        return format!("    let res =\n{val}\n            .await;\n");
+    }
+    let r3_head = format!("    let res = {head}(");
+    if r3_head.chars().count() <= 100 {
+        let mut out = format!("{r3_head}\n");
+        for a in args {
+            out.push_str(&format!("        {a},\n"));
+        }
+        out.push_str("    )\n    .await;\n");
+        return out;
+    }
+    let r4_head = format!("        {head}(");
+    if r4_head.chars().count() <= 100 {
+        let mut out = format!("    let res =\n{r4_head}\n");
+        for a in args {
+            out.push_str(&format!("            {a},\n"));
+        }
+        out.push_str("        )\n        .await;\n");
+        return out;
+    }
+    format!("{one}\n")
+}
+
 /// The tool-owned registry + wiring `src/lib.rs`. Declares one agent-owned task
 /// module per job, then exports `jobs(db)` building the fully-wired `Jobs`:
 /// `.queue(...)` per distinct queue (sorted), `.register(...)` per job (array
 /// order), `.cron(...)` per cron job (array order). Byte-identical across runs.
 pub fn registry_rs(design: &Design) -> String {
-    // Agent-owned task module declarations, in array order. `pub` so the
-    // tool-owned `tests/acceptance.rs` integration test can reach each task fn
-    // as `jobs::{name}::{name}` (an integration test sees only the crate's
-    // public surface).
-    let mods: String = design
-        .jobs
+    // Agent-owned task module declarations, SORTED alphabetically. rustfmt's
+    // `reorder_modules` sorts `pub mod` declarations by name, so emitting them in
+    // `design.jobs` array order drifts under `cargo fmt` whenever the design order
+    // isn't already alphabetical (issue #218). Pre-sorting makes the scaffold a
+    // fixpoint regardless of design order. Job names are ASCII (`^[a-z][a-z0-9_]*$`),
+    // so `str` byte order matches rustfmt's. `pub` so the tool-owned
+    // `tests/acceptance.rs` integration test can reach each task fn as
+    // `jobs::{name}::{name}` (an integration test sees only the crate's public surface).
+    let mut mod_names: Vec<&str> = design.jobs.iter().map(|j| j.name.as_str()).collect();
+    mod_names.sort_unstable();
+    let mods: String = mod_names
         .iter()
-        .map(|j| format!("pub mod {};\n", j.name))
+        .map(|n| format!("pub mod {n};\n"))
         .collect();
 
     // Distinct queues, sorted deterministically — each gets one worker pool.
@@ -111,12 +223,13 @@ pub fn registry_rs(design: &Design) -> String {
                 // Pre-wrapped as the pinned rustfmt formats it (issue #218): the
                 // fixed-width closure signature always breaks the params one per
                 // line, deepening the body indent so the `.map_err` chain reflows
-                // too. The `let p: {payload} = …` line is width-sensitive on the
-                // payload struct name — it stays on one line for realistic job
-                // names (fully-qualified payload ≤ ~50 cols) and a pathologically
-                // long name is the one residual case rustfmt would re-wrap further.
+                // too. The `let p: {payload} = …` bind is width-sensitive on the
+                // fully-qualified payload path; `payload_bind` reproduces rustfmt's
+                // three wrap regimes so the registry is a fixpoint for every realistic
+                // job name (the earlier single-line form drifted for a payload > 44 cols).
+                let bind = payload_bind(&payload);
                 format!(
-                    "        .register(\n            \"{name}\",\n            std::sync::Arc::new(\n                |ctx: jerrycan::TaskContext,\n                 payload: serde_json::Value|\n                 -> jerrycan::jobs::JobFuture<'static, ()> {{\n                    Box::pin(async move {{\n                        // A no-payload enqueue carries `Value::Null` (NewJob's default);\n                        // `from_value(Null)` into a struct fails, so treat null as the\n                        // default payload (the struct derives Default) rather than\n                        // erroring → retries → dead-letter.\n                        let p: {payload} = if payload.is_null() {{\n                            Default::default()\n                        }} else {{\n                            serde_json::from_value(payload).map_err(|e| {{\n                                jerrycan::Error::unprocessable(format!(\"bad job payload: {{e}}\"))\n                            }})?\n                        }};\n                        {name}::{name}(ctx, p).await\n                    }})\n                }},\n            ),\n        )\n"
+                    "        .register(\n            \"{name}\",\n            std::sync::Arc::new(\n                |ctx: jerrycan::TaskContext,\n                 payload: serde_json::Value|\n                 -> jerrycan::jobs::JobFuture<'static, ()> {{\n                    Box::pin(async move {{\n                        // A no-payload enqueue carries `Value::Null` (NewJob's default);\n                        // `from_value(Null)` into a struct fails, so treat null as the\n                        // default payload (the struct derives Default) rather than\n                        // erroring → retries → dead-letter.\n{bind}                        {name}::{name}(ctx, p).await\n                    }})\n                }},\n            ),\n        )\n"
                 )
             }
         })
@@ -234,12 +347,14 @@ pub fn acceptance_rs(design: &Design) -> String {
         .iter()
         .map(|job| {
             let name = &job.name;
-            // at-least-once reminder mirrors the stub: an implemented job must be
-            // idempotent because the engine may run it more than once.
-            let call = if job.schedule.is_some() {
-                format!("jobs::{name}::{name}(t.task_context()).await")
+            // The direct task-fn call: cron takes only the ctx; a queue job also takes a
+            // `Default::default()` payload (its `{Name}Payload` derives Default). Jobs are
+            // at-least-once, so an implemented job must be idempotent (it may run again).
+            let head = format!("jobs::{name}::{name}");
+            let args: &[&str] = if job.schedule.is_some() {
+                &["t.task_context()"]
             } else {
-                format!("jobs::{name}::{name}(t.task_context(), Default::default()).await")
+                &["t.task_context()", "Default::default()"]
             };
             // The `assert!` line is pre-wrapped exactly as the pinned rustfmt does
             // (issue #218): rustfmt keeps the two args on one line until the call
@@ -256,14 +371,13 @@ pub fn acceptance_rs(design: &Design) -> String {
                     "    assert!(\n        res.is_ok(),\n        \"design: job {name} must succeed; got {{res:?}}\"\n    );\n"
                 )
             };
-            // A queue job's 2-arg call can push `let res = …;` past `max_width` (100);
-            // rustfmt then drops the value onto its own line. Width-gated (issue #218).
-            let res_one = format!("    let res = {call};");
-            let res_block = if res_one.chars().count() <= 100 {
-                format!("{res_one}\n")
-            } else {
-                format!("    let res =\n        {call};\n")
-            };
+            // The `let res = <call>.await;` binding, pre-wrapped exactly as the pinned
+            // rustfmt formats it (issue #218). A queue job's 2-arg call can overflow the
+            // line; `wrap_res_await` reproduces rustfmt's wrap regimes (value on its own
+            // line / call arguments broken one per line) so a long-named job stays a
+            // `cargo fmt` fixpoint — the earlier rule only ever dropped the value onto its
+            // own line and drifted once even that overflowed.
+            let res_block = wrap_res_await(&head, args);
             format!(
                 "/// Job `{name}` must succeed once implemented (jobs are at-least-once —\n\
                  /// the implementation must be idempotent). RED on the stub (it returns Err).\n\

@@ -14,6 +14,13 @@ const GOLDEN: &str = include_str!("../../../conformance/designs/todo-api.design.
 /// heavy gate proving the full SeaORM stack scaffolds, builds, and behaves.
 const REFERENCE: &str = include_str!("../../../conformance/designs/reference-slice.design.json");
 
+/// Issue #218 guard fixture: db-backed QUEUE jobs (no schedule) with realistic,
+/// NON-alphabetical names spanning every rustfmt wrap regime of the registry payload
+/// bind + the acceptance-call line, plus two multi-field route modules. reference-slice's
+/// two jobs are both CRON, so it never exercised the queue-job emitters this locks.
+const QUEUE_JOBS_FIXPOINT: &str =
+    include_str!("../../../conformance/designs/queue-jobs-fixpoint.design.json");
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -115,10 +122,26 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 /// `#[ignore]`d. It needs only `rustfmt`, which CI already has.
 #[test]
 fn scaffold_is_a_rustfmt_fixpoint() {
+    // reference-slice: jobs+realtime, but its two jobs are CRON. Locks the cron
+    // registry closure + the whole tenant/realtime SeaORM surface.
+    assert_scaffold_is_fixpoint(REFERENCE, "reference-slice");
+    // queue-jobs-fixpoint: db-backed QUEUE jobs with realistic, non-alphabetical names
+    // spanning every wrap regime of the queue emitters (payload bind + acceptance call)
+    // AND the `pub mod` reorder. reference-slice never reaches these (cron-only), so
+    // this second design is what actually guards the #218 queue-job fixes. Its two
+    // multi-field route modules keep the migration/db arrays multi-line, clear of the
+    // single-element collapses tracked separately.
+    assert_scaffold_is_fixpoint(QUEUE_JOBS_FIXPOINT, "queue-jobs-fixpoint");
+}
+
+/// Scaffold `design_json` (wired to the LOCAL framework) into a fresh temp app named
+/// `app_name`, then assert EVERY generated `.rs` is a `rustfmt` fixpoint — `rustfmt
+/// --check` reports no rewrite. FAST (no cargo build), so it stays in the per-PR gate.
+fn assert_scaffold_is_fixpoint(design_json: &str, app_name: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let design = tmp.path().join("design.json");
-    std::fs::write(&design, REFERENCE).unwrap();
-    let app = tmp.path().join("reference-slice");
+    std::fs::write(&design, design_json).unwrap();
+    let app = tmp.path().join(app_name);
     let dep = format!(
         "jerrycan = {{ path = \"{}\", default-features = false }}",
         repo_root().join("crates/jerrycan").display()
@@ -131,12 +154,15 @@ fn scaffold_is_a_rustfmt_fixpoint() {
         .arg(&design)
         .status()
         .unwrap();
-    assert!(st.success(), "jerrycan new must scaffold reference-slice");
+    assert!(st.success(), "jerrycan new must scaffold {app_name}");
 
     let mut files = Vec::new();
     collect_rs(&app, &mut files);
     files.sort();
-    assert!(!files.is_empty(), "the scaffold must contain .rs files");
+    assert!(
+        !files.is_empty(),
+        "the {app_name} scaffold must contain .rs files"
+    );
 
     let mut drift = Vec::new();
     for f in &files {
@@ -156,7 +182,7 @@ fn scaffold_is_a_rustfmt_fixpoint() {
     }
     assert!(
         drift.is_empty(),
-        "every generated .rs must be a rustfmt fixpoint (issue #218); {} file(s) drifted:\n{}",
+        "every generated .rs must be a rustfmt fixpoint (issue #218); {app_name}: {} file(s) drifted:\n{}",
         drift.len(),
         drift.join("\n")
     );
