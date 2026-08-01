@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.35 — 2026-08-01
+
+### Fixed
+- **Nested-mount handlers auto-bind mount-inherited path params (#127).** A handler under a
+  parameterized mount (`/accounts/{account_id}/…`) read only its OWN path (`{id}`), not the
+  mount-inherited tokens, so a tenant grandchild's parent fk (`account_id`) — dropped from the
+  request body (#82) but not bound as a `Path` — had to be hand-injected, and a NON-tenant
+  param-mount child had no way to inject the dropped fk at all (uncompilable, a latent shape).
+  `path_params`/`handler_params` now bind every RESOLVED-path param (`effective_mount + ep.path`)
+  as a `Path`, EXCEPT the tenant fk that `Dep<Tenant>` already resolves (no double-bind). The
+  steering comments are reconciled — a param-mount grandchild's parent fk comes from the PATH, the
+  tenant from `Dep<Tenant>`. The previously-uncompilable non-tenant param-mount child now compiles
+  under strict clippy (proven in genroute_compile).
+
+Byte-identical for flat/top-level modules and direct tenant children (their resolved path adds no
+new token, or the only token is the tenant fk already resolved by the guard).
+
 ## 0.6.34 — 2026-08-01
 
 ### Fixed (security)
