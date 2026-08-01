@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.7.6 — 2026-08-01
+
+### Fixed
+- **An entity-less module with an inline-DTO action now compiles (#224).** A module with no
+  entities whose only endpoint used an inline request body (`request_body: {fields: […]}`, #122)
+  did not compile from a clean scaffold — the tool-owned `lib.rs` gated `mod model;` on the module
+  having entities, but `model.rs` (the inline DTO) is emitted and imported regardless, so
+  `cargo build`/`jerrycan check` failed with `E0432 unresolved import super::model`. `mod model;`
+  is now emitted whenever `model.rs` is (entities OR an inline body), and an entity-less
+  inline-DTO compile fixture locks it. (Fixing it also removed an unused `serde` import the
+  entity-less `model.rs` emitted.)
+- **Inline-DTO 422 reject probes reach parity with entity bodies (#225, follow-up to #217).** The
+  generated reject probe for an inline-DTO action emitted at most one 422 test and only for required
+  fields, so a declared constraint (#80) *and* enum (`values`) on the same body — or a constraint/enum
+  on an *optional* field — left the generated (and live) validator unverified. `gen-tests` now emits a
+  constraint reject AND an enum reject independently, and probes optional-but-present fields too,
+  mirroring the entity-body path.
+- **The design schema + docs accept the inline-DTO shape (#226).** `docs/contracts/design-schema.json`
+  and the `request_body`-is-entity-only prose in `docs/ai/00-designing.md` and the `SKILL.md` twins were
+  stale vs the #122 validator; the schema now allows `request_body` as `entity` XOR `fields`, and the
+  docs document the inline shape (and that a narrow inline body is the fix for entity over-exposure on
+  public endpoints).
+
 ## 0.7.5 — 2026-08-01
 
 ### Fixed
