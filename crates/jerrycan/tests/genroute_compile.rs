@@ -889,9 +889,16 @@ fn generated_realtime_crate_passes_strict_clippy() {
             && lib.contains(".presence(\"editors\""),
         "realtime lib must wire changes + broadcast + presence:\n{lib}"
     );
+    // #104: the tenant leg is now membership-aware — it reads an optional `?tenant=`,
+    // verifies it against the `{tenant}_members` table (refusing a non-member), and
+    // falls back to the sole membership — instead of binding an arbitrary first
+    // membership via `ctx.resolve::<shared::Tenant>()`. This is the exact resolver
+    // whose compile is the whole point of this gate.
     assert!(
-        lib.contains(".principal(") && lib.contains("shared::Tenant"),
-        "jwt + tenancy design must emit a tenant-resolving principal:\n{lib}"
+        lib.contains(".principal(")
+            && lib.contains(r#".and_then(|m| m.get("tenant").cloned())"#)
+            && lib.contains("_members WHERE workspace_id = ? AND user_id = ?"),
+        "jwt + tenancy design must emit a membership-verified WS tenant-select:\n{lib}"
     );
 
     // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.

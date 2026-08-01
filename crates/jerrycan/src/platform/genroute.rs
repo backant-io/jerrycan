@@ -197,6 +197,30 @@ fn endpoint_emits_realtime_publish(ep: &Endpoint, design: &Design) -> bool {
     !matches!(ep.method, HttpMethod::GET) && design.server_publishable_broadcast().is_some()
 }
 
+/// True when this endpoint gets the TENANT-partitioned realtime publish wiring
+/// (issue #104): a MUTATING, path-scoped tenant handler (so it already binds
+/// `_tenant: Dep<Tenant>` — the membership-verified tenant the write acted on) in a
+/// design that declares a `tenant`-scoped broadcast topic. The stub shows
+/// `_rt.publish_to(_tenant.id(), …)`, the partitioned twin of the #50 `publish`
+/// stub. Gated on `endpoint_uses_tenant_guard` on PURPOSE: only a path-scoped
+/// tenant handler has an in-scope `_tenant.id()`, so the emitted one-liner always
+/// type-checks. A flat (membership-set), collection, or non-tenant mutating
+/// handler emits nothing here (stays byte-identical) — it has no single `_tenant`
+/// to partition by; it can still call `publish_to` by hand with a tenant id it
+/// derives. GET endpoints and designs without a tenant broadcast emit nothing.
+fn endpoint_emits_realtime_publish_to(
+    m: &ModuleDesign,
+    ep: &Endpoint,
+    mode: GenMode,
+    design: &Design,
+) -> bool {
+    !matches!(ep.method, HttpMethod::GET)
+        && mode.auth
+        && ep.is_guarded()
+        && design.server_publishable_tenant_broadcast().is_some()
+        && endpoint_uses_tenant_guard(m, ep, design)
+}
+
 // The public-read guarding split (issue #105) is `Design::endpoint_is_public_read_get`
 // — the ONE role-aware predicate shared with openapi.rs (`security` stanza) and
 // testgen.rs (401 probe), so the handler, the advertised contract, and the
@@ -225,7 +249,9 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
     // server-publishable-broadcast design resolves the RealtimeHandle so it can
     // push the write to subscribers (fully-qualified path — no `use` line to
     // keep byte-identical output for designs the rule doesn't touch).
-    if endpoint_emits_realtime_publish(ep, design) {
+    if endpoint_emits_realtime_publish(ep, design)
+        || endpoint_emits_realtime_publish_to(m, ep, mode, design)
+    {
         params.push("_rt: Dep<jerrycan::realtime::RealtimeHandle>".to_string());
     }
     // Every `{param}` on the RESOLVED path binds as a `Path` (issue #127) so the
@@ -761,6 +787,7 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
         let collection = tenant_collection_comment(m, ep, mode, design);
         let server_owned = server_owned_fk_comment(m, ep, mode, design);
         let realtime = realtime_publish_comment(ep, design);
+        let realtime_to = realtime_publish_to_comment(m, ep, mode, design);
         // The signature is pre-wrapped to rustfmt's width regime (issue #165):
         // one line while it fits max_width (100), else one param per line.
         let sig = handler_signature(
@@ -769,7 +796,7 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
             &return_type(ep),
         );
         out.push_str(&format!(
-            "{sig}{guard}{scope}{owner_scope}{collection}{server_owned}{realtime}{body}\n}}\n\n",
+            "{sig}{guard}{scope}{owner_scope}{collection}{server_owned}{realtime}{realtime_to}{body}\n}}\n\n",
             body = success_body(ep),
         ));
     }
@@ -916,6 +943,30 @@ fn realtime_publish_comment(ep: &Endpoint, design: &Design) -> String {
         .expect("gated by endpoint_emits_realtime_publish");
     format!(
         "    // realtime (issue #50): after the write succeeds, push it to every\n    // subscriber of a broadcast topic —\n    //   _rt.publish(\"{topic}\", serde_json::json!({{ /* event payload */ }})).await?;\n"
+    )
+}
+
+/// The stub comment for TENANT-partitioned server realtime publish (issue #104):
+/// shows the `publish_to` one-liner that pushes this write to only the CURRENT
+/// tenant's subscribers of a `tenant`-scoped broadcast topic, using the
+/// `_rt: Dep<RealtimeHandle>` param `handler_params` added and the `_tenant`
+/// membership guard already in scope (`_tenant.id()`). Empty unless
+/// `endpoint_emits_realtime_publish_to`, so untouched designs — and flat/collection
+/// mutating handlers — stay byte-identical.
+fn realtime_publish_to_comment(
+    m: &ModuleDesign,
+    ep: &Endpoint,
+    mode: GenMode,
+    design: &Design,
+) -> String {
+    if !endpoint_emits_realtime_publish_to(m, ep, mode, design) {
+        return String::new();
+    }
+    let topic = design
+        .server_publishable_tenant_broadcast()
+        .expect("gated by endpoint_emits_realtime_publish_to");
+    format!(
+        "    // realtime (issue #104): after the write succeeds, push it to this\n    // tenant's subscribers of a tenant-scoped broadcast topic (partitioned —\n    // only `_tenant`'s sockets receive it) —\n    //   _rt.publish_to(&_tenant.id().to_string(), \"{topic}\", serde_json::json!({{ /* event payload */ }})).await?;\n"
     )
 }
 
@@ -7402,6 +7453,89 @@ pub(crate) mod tests {
         assert!(
             !h.contains("_rt"),
             "tenant-only broadcast designs get no server-publish wiring:\n{h}"
+        );
+    }
+
+    /// #104: a design with tenancy + a `tenant`-scoped broadcast topic, hosting a
+    /// PATH-SCOPED tenant child (`books` mounted at `/clubs/{club_id}`). Its
+    /// mutating handler already binds `_tenant: Dep<Tenant>` (the membership-verified
+    /// tenant the write acted on), so it gets the `_rt: Dep<RealtimeHandle>` param
+    /// PLUS a `publish_to(&_tenant.id()…, "board", …)` stub — the partitioned twin
+    /// of the #50 `publish` stub. This is what makes a tenant-partitioned server
+    /// broadcast expressible from generated code.
+    const CLUBS_RT: &str = r#"{ "name": "clubs-rt", "contract_version": 2,
+        "auth": { "model": "jwt", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth", "realtime"],
+        "tenancy": { "entity": "Club", "member_roles": ["owner", "member"] },
+        "realtime": { "changes": [], "broadcast": [{ "name": "board", "scope": "tenant" }], "presence": [] },
+        "modules": [
+            { "name": "clubs",
+              "entities": [{ "name": "Club", "fields": [
+                  { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_club", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Club" },
+                    "success": { "status": 201, "entity": "Club" } } ] },
+            { "name": "books", "mount": "/clubs/{club_id}",
+              "entities": [{ "name": "Book",
+                  "belongs_to": [{ "entity": "Club" }],
+                  "fields": [{ "name": "id", "type": "integer" },
+                             { "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "list_books", "method": "GET", "path": "/", "auth_required": true,
+                    "success": { "status": 200, "entity": "Book", "list": true } },
+                  { "operation_id": "create_book", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Book" },
+                    "success": { "status": 201, "entity": "Book" } } ] }
+        ]
+    }"#;
+
+    #[test]
+    fn path_scoped_tenant_write_handler_gets_publish_to_wiring() {
+        let d: Design = serde_json::from_str(CLUBS_RT).unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        // The path-scoped child module (books @ /clubs/{club_id}).
+        let books = d.modules.iter().find(|m| m.name == "books").unwrap();
+        let h = handlers_rs(books, mode, &d);
+        // create_book binds the membership guard AND the realtime handle...
+        let create = h
+            .split("pub(crate) async fn create_book")
+            .nth(1)
+            .expect("create_book handler present");
+        let create = create.split("pub(crate) async fn").next().unwrap();
+        assert!(
+            create.contains("_tenant: Dep<Tenant>")
+                && create.contains("_rt: Dep<jerrycan::realtime::RealtimeHandle>"),
+            "path-scoped tenant write handler binds both the tenant guard and the RealtimeHandle:\n{create}"
+        );
+        // ...and the stub shows the partitioned publish_to one-liner on the tenant topic.
+        assert!(
+            create.contains("_rt.publish_to(")
+                && create.contains("_tenant.id()")
+                && create.contains("\"board\""),
+            "create_book stub shows publish_to(_tenant.id(), \"board\", …):\n{create}"
+        );
+        // A READ handler is untouched (no dep, no comment) — write→push only.
+        let list = h
+            .split("pub(crate) async fn create_book")
+            .next()
+            .expect("list_books precedes create_book");
+        assert!(
+            !list.contains("_rt"),
+            "read handlers must not gain the realtime dep:\n{list}"
+        );
+
+        // The tenant's OWN collection root (create_club — a Collection, not
+        // PathScoped) has no single `_tenant` to partition by, so it stays
+        // byte-identical: no `_rt`, no publish_to stub.
+        let clubs = d.modules.iter().find(|m| m.name == "clubs").unwrap();
+        let ch = handlers_rs(clubs, mode, &d);
+        assert!(
+            !ch.contains("_rt"),
+            "the tenant collection-create handler gets no publish_to wiring:\n{ch}"
         );
     }
 

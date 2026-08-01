@@ -126,14 +126,22 @@ pub fn resolver_rs(design: &Design) -> String {
         AuthModel::None => unreachable!("guarded above"),
     };
 
+    // #104: the WS tenant leg is membership-aware. A single-membership user still
+    // binds exactly their one tenant (behavior-identical to the old
+    // `ctx.resolve::<shared::Tenant>()`), but a multi-membership user chooses via
+    // `?tenant=` (verified, non-members refused) and a zero/many-membership user
+    // connects with `tenant_id = None` (reaching only None/Auth topics) rather than
+    // being 403'd off `/realtime`. The bindings are named `resolved_tenant` /
+    // `resolved_role` so the Principal's field init stays non-redundant (avoids
+    // clippy::redundant_field_names under -D warnings).
     let (tenant_block, tenant_id_expr, role_expr) = if has_tenancy {
         (
-            "            let tenant = ctx.resolve::<shared::Tenant>().await?;\n",
-            "Some(tenant.id().to_string())",
-            "Some(tenant.role.clone())",
+            tenant_resolve_block(design),
+            "resolved_tenant".to_string(),
+            "resolved_role".to_string(),
         )
     } else {
-        ("", "None", "None")
+        (String::new(), "None".to_string(), "None".to_string())
     };
 
     format!(
@@ -147,6 +155,100 @@ pub fn resolver_rs(design: &Design) -> String {
          \x20               }})\n\
          \x20           }})\n\
          \x20       }}))\n"
+    )
+}
+
+/// The membership-aware WS tenant resolve (issue #104, parts 2+4). Binds
+/// `(resolved_tenant, resolved_role): (Option<String>, Option<String>)`:
+/// - An explicit `?tenant=<id>` in the WS connect query is VERIFIED against the
+///   `{tenant}_members` table (`{fk} = ? AND user_id = ?`, the fixed
+///   `MEMBERSHIP_PRINCIPAL_COLUMN`). A member ⇒ `Some(that)`; a NON-member (or a
+///   malformed id) REFUSES the upgrade with a 403 — the make-impossible guard: a
+///   socket can never scope to a tenant the session user is not a verified member
+///   of.
+/// - Absent `?tenant=`: resolve memberships. EXACTLY ONE ⇒ that tenant
+///   (behavior-identical to the pre-#104 sole-membership resolve). ZERO or MORE
+///   THAN ONE ⇒ `None` (connect, reaching only None/Auth topics; a Tenant topic
+///   rejects a `None` principal at JOIN). It NEVER aborts for "no tenant" — only
+///   for an explicit non-member `?tenant=`.
+fn tenant_resolve_block(design: &Design) -> String {
+    let tenant = &design.tenancy.as_ref().expect("has_tenancy checked").entity;
+    let fk = Design::fk_column(tenant);
+    let tenant_snake = Design::to_snake(tenant);
+    let id_ty = design.target_key_rust_type(tenant);
+    // Parse the `?tenant=` string into the tenant pk type and bind it typed, and
+    // choose the canonical string form of the verified tenant (must equal the CDC
+    // `::text` key the delivery filter compares against). A text pk is verbatim; an
+    // integer pk parses (a non-numeric id reads as a non-member → 403, no probing).
+    let (fk_parse, fk_bind, canonical) = if id_ty == "String" {
+        (
+            String::new(),
+            "tenant.clone().into()".to_string(),
+            "tenant".to_string(),
+        )
+    } else {
+        (
+            format!(
+                "                    let tenant_key: {id_ty} = match tenant.parse() {{\n\
+                 \x20                       Ok(v) => v,\n\
+                 \x20                       Err(_) => return Err(jerrycan::Error::forbidden()),\n\
+                 \x20                   }};\n"
+            ),
+            "tenant_key.into()".to_string(),
+            "tenant_key.to_string()".to_string(),
+        )
+    };
+    format!(
+        "            let (resolved_tenant, resolved_role): (Option<String>, Option<String>) = {{\n\
+         \x20               use jerrycan::db::sea_orm::ConnectionTrait;\n\
+         \x20               let db = ctx.resolve::<jerrycan::db::Db>().await?;\n\
+         \x20               let requested = jerrycan::serde_urlencoded::from_str::<std::collections::HashMap<String, String>>(\n\
+         \x20                   ctx.uri().query().unwrap_or(\"\"),\n\
+         \x20               )\n\
+         \x20               .ok()\n\
+         \x20               .and_then(|m| m.get(\"tenant\").cloned());\n\
+         \x20               match requested {{\n\
+         \x20                   Some(tenant) => {{\n\
+         \x20                       // #104: an explicit ?tenant= is honored ONLY for a\n\
+         \x20                       // VERIFIED member — a non-member REFUSES the upgrade.\n\
+         {fk_parse}\
+         \x20                       let row = db\n\
+         \x20                           .conn()\n\
+         \x20                           .query_one(jerrycan::db::sea_orm::Statement::from_sql_and_values(\n\
+         \x20                               db.conn().get_database_backend(),\n\
+         \x20                               db.sql(\"SELECT role FROM {tenant_snake}_members WHERE {fk} = ? AND user_id = ?\"),\n\
+         \x20                               [{fk_bind}, user.0.id.clone().into()],\n\
+         \x20                           ))\n\
+         \x20                           .await\n\
+         \x20                           .map_err(jerrycan::db::db_error)?;\n\
+         \x20                       let Some(row) = row else {{\n\
+         \x20                           return Err(jerrycan::Error::forbidden());\n\
+         \x20                       }};\n\
+         \x20                       let role: String = row.try_get(\"\", \"role\").map_err(jerrycan::db::db_error)?;\n\
+         \x20                       (Some({canonical}), Some(role))\n\
+         \x20                   }}\n\
+         \x20                   None => {{\n\
+         \x20                       // No ?tenant=: EXACTLY ONE membership ⇒ that tenant;\n\
+         \x20                       // ZERO or MANY ⇒ None (connect, None/Auth topics only).\n\
+         \x20                       let rows = db\n\
+         \x20                           .conn()\n\
+         \x20                           .query_all(jerrycan::db::sea_orm::Statement::from_sql_and_values(\n\
+         \x20                               db.conn().get_database_backend(),\n\
+         \x20                               db.sql(\"SELECT {fk}, role FROM {tenant_snake}_members WHERE user_id = ? LIMIT 2\"),\n\
+         \x20                               [user.0.id.clone().into()],\n\
+         \x20                           ))\n\
+         \x20                           .await\n\
+         \x20                           .map_err(jerrycan::db::db_error)?;\n\
+         \x20                       if rows.len() == 1 {{\n\
+         \x20                           let tenant_key: {id_ty} = rows[0].try_get(\"\", \"{fk}\").map_err(jerrycan::db::db_error)?;\n\
+         \x20                           let role: String = rows[0].try_get(\"\", \"role\").map_err(jerrycan::db::db_error)?;\n\
+         \x20                           (Some(tenant_key.to_string()), Some(role))\n\
+         \x20                       }} else {{\n\
+         \x20                           (None, None)\n\
+         \x20                       }}\n\
+         \x20                   }}\n\
+         \x20               }}\n\
+         \x20           }};\n"
     )
 }
 
@@ -453,10 +555,6 @@ mod tests {
     fn jwt_resolver_reads_bearer_then_token_query_and_resolves_tenant() {
         let a = wiring_rs(&rt_design()); // V2_REALTIME is jwt + tenancy
         assert!(
-            a.contains("shared::Tenant"),
-            "tenancy design resolves the Tenant guard: {a}"
-        );
-        assert!(
             a.contains("token"),
             "jwt designs accept ?token= (browsers can't set WS headers): {a}"
         );
@@ -465,7 +563,7 @@ mod tests {
         // compile-smoke, pinned cheaply here): under the jwt model CurrentUser is
         // Bearer<SessionUser> (issue #29), so the JWT `?token=` fallback wraps
         // claims in `Bearer(..)` — matching the alias so the `match` type-checks;
-        // the user id is the `user.0.id` String field; Tenant.role is a FIELD.
+        // the user id is the `user.0.id` String field.
         assert!(
             a.contains("jerrycan::auth::Bearer(claims)"),
             "JWT fallback wraps claims in Bearer (CurrentUser = Bearer<SessionUser>): {a}"
@@ -478,9 +576,102 @@ mod tests {
             a.contains("user_id: user.0.id.clone()"),
             "user id is the SessionUser.id String field via user.0.id, not user.id(): {a}"
         );
+    }
+
+    /// #104 (parts 2+4): the WS principal resolver's tenant leg is
+    /// MEMBERSHIP-AWARE — it no longer binds an arbitrary first-membership tenant
+    /// via `ctx.resolve::<shared::Tenant>()`. It (1) reads an optional `?tenant=`
+    /// from the WS query, (2) VERIFIES that tenant against the `{tenant}_members`
+    /// table and REFUSES (403) a non-member, (3) falls back to the sole membership
+    /// when absent, and (4) NEVER aborts for "no tenant" (zero/many ⇒ `None`, which
+    /// reaches only None/Auth topics). This is the security invariant: a socket's
+    /// `principal.tenant_id` is only ever a verified membership.
+    #[test]
+    fn tenant_resolver_is_membership_verified_and_never_aborts_on_no_tenant() {
+        let a = wiring_rs(&rt_design()); // V2_REALTIME: jwt + Workspace (integer) tenancy
+        // The old arbitrary-first-membership resolve is GONE.
         assert!(
-            a.contains("role: Some(tenant.role.clone())"),
-            "Tenant.role is a field, not a method: {a}"
+            !a.contains("ctx.resolve::<shared::Tenant>()"),
+            "the WS tenant leg must NOT bind an arbitrary first membership: {a}"
+        );
+        // (1) reads the optional ?tenant= query param (same channel as ?token=).
+        assert!(
+            a.contains(r#".and_then(|m| m.get("tenant").cloned())"#),
+            "resolver reads an optional ?tenant= from the WS query: {a}"
+        );
+        // (2) VERIFIES membership in the requested tenant against {tenant}_members
+        // (fk + the fixed MEMBERSHIP_PRINCIPAL_COLUMN user_id) and 403s a non-member.
+        assert!(
+            a.contains("SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?"),
+            "explicit ?tenant= is membership-verified: {a}"
+        );
+        assert!(
+            a.contains("return Err(jerrycan::Error::forbidden());"),
+            "a non-member ?tenant= REFUSES the upgrade (make-impossible guard): {a}"
+        );
+        // (3) sole-membership fallback (behavior-identical to the pre-#104 resolve).
+        assert!(
+            a.contains(
+                "SELECT workspace_id, role FROM workspace_members WHERE user_id = ? LIMIT 2"
+            ) && a.contains("if rows.len() == 1 {"),
+            "absent ?tenant= resolves the sole membership: {a}"
+        );
+        // (4) zero/many memberships ⇒ None (connect) — never a hard error.
+        assert!(
+            a.contains("(None, None)"),
+            "zero/many memberships ⇒ None tenant (no abort, fixes zero-membership 403): {a}"
+        );
+        // Determinism (JL0003): byte-identical across runs.
+        assert_eq!(a, wiring_rs(&rt_design()), "resolver is deterministic");
+    }
+
+    /// DRIFT-GUARD for the executed live-WS mirror. The regression test
+    /// `crates/jerrycan-realtime/tests/ws_tenant_partition.rs` installs a resolver
+    /// that is the BYTE-FOR-BYTE runtime twin of what `tenant_resolve_block` emits
+    /// for this integer-pk Workspace design, and PROVES the resolver→delivery seam
+    /// end-to-end (a non-member's `?tenant=` is refused; a socket receives only its
+    /// chosen tenant's events). `jerrycan-realtime` cannot dev-depend on `jerrycan`
+    /// (the dependency runs the other way), so that mirror copies these exact
+    /// strings and this test is the pin that keeps them honest. If it goes red, the
+    /// generated resolver's SQL or its membership-guard-BEFORE-`Some(tenant)`
+    /// ordering changed — update the mirror in lockstep or the live test stops
+    /// proving the current code. The ordering pin is the specific defense against
+    /// the ONE leak-shaped regression that passes every structural/compile gate:
+    /// hoisting `Some(tenant)` out from behind the `let Some(row) else { forbidden }`
+    /// guard so a non-member gets a tenant.
+    #[test]
+    fn tenant_resolve_block_pins_the_ws_live_mirror_contract() {
+        let block = tenant_resolve_block(&rt_design());
+        // The two membership queries the mirror binds verbatim.
+        assert!(
+            block.contains(
+                "SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?"
+            ),
+            "mirror's MEMBERSHIP_VERIFY_SQL must match the generated verify: {block}"
+        );
+        assert!(
+            block.contains(
+                "SELECT workspace_id, role FROM workspace_members WHERE user_id = ? LIMIT 2"
+            ),
+            "mirror's SOLE_MEMBERSHIP_SQL must match the generated fallback: {block}"
+        );
+        // Verify-BEFORE-Some: the membership row guard MUST precede the member
+        // success tuple, and the guard body MUST refuse a non-member.
+        let guard = block
+            .find("let Some(row) = row else {")
+            .expect("the membership row guard must be present");
+        let success = block
+            .find("(Some(tenant_key.to_string()), Some(role))")
+            .expect("the member success tuple must be present");
+        assert!(
+            guard < success,
+            "the non-member membership guard MUST come BEFORE Some(tenant): a \
+             Some(tenant) hoisted above the guard is the cross-tenant leak the \
+             ws_tenant_partition live test catches at runtime: {block}"
+        );
+        assert!(
+            block[guard..success].contains("return Err(jerrycan::Error::forbidden());"),
+            "the membership guard must REFUSE a non-member with forbidden(): {block}"
         );
     }
 

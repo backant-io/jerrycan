@@ -24,25 +24,45 @@ impl crate::RealtimeHandle {
     /// current subscriber of the topic — publishing to a `tenant`-scoped topic is
     /// therefore a JC0403 `Err` (delivering to all tenants would break the
     /// per-tenant isolation the scope promises). Declare the topic scope `none`
-    /// or `auth` to publish it from a handler.
+    /// or `auth` to publish it from a handler, or use
+    /// [`publish_to`](Self::publish_to) to reach a single tenant's sockets on a
+    /// `tenant`-scoped topic.
     pub async fn publish(&self, topic: &str, payload: serde_json::Value) -> Result<()> {
         self.hub.publish_from_server(topic, payload).await
+    }
+
+    /// Tenant-partitioned server publish (issue #104): the partitioned twin of
+    /// [`publish`](Self::publish). It goes through the same server-publish path but
+    /// stamps the event with `tenant_id`, so on a `tenant`-scoped topic delivery
+    /// reaches ONLY that tenant's sockets (a socket receives it exactly when
+    /// `principal.tenant_id == tenant_id`). This is the tenant-partitioned
+    /// broadcast plain `publish` cannot express — it is un-partitioned and so
+    /// refused (JC0403) on a `tenant`-scoped topic. Resolve `Dep<RealtimeHandle>`
+    /// in a handler and call it after a tenant-scoped write.
+    ///
+    /// `topic` MUST name a declared **`tenant`-scoped** broadcast topic: an unknown
+    /// name (or a `changes`/`presence` channel) is JC0404, and a `none`/`auth`
+    /// topic is JC0403 — those are un-partitioned, so the `tenant_id` argument
+    /// would be silently ignored; use `publish` for them. The two methods are thus
+    /// a clean duality: `publish` for `none`/`auth`, `publish_to` for `tenant`.
+    /// Because delivery admits a socket only when its verified `principal.tenant_id`
+    /// equals `tenant_id`, `publish_to(A, …)` can never reach another tenant.
+    pub async fn publish_to(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        self.hub.publish_to_tenant(tenant_id, topic, payload).await
     }
 }
 
 impl crate::Hub {
-    /// Server-side broadcast publish (no connection, no principal). Validates the
-    /// topic against the same invariants the WS client `publish` gate enforces,
-    /// then puts it on the bus with `origin: None` (nothing to exclude) and
-    /// `tenant_id: None` (un-partitioned) so `deliver_broadcast` fans it out to
-    /// every subscriber on every node.
-    pub(crate) async fn publish_from_server(
-        &self,
-        topic: &str,
-        payload: serde_json::Value,
-    ) -> Result<()> {
-        let scope = self
-            .config
+    /// The declared scope of a broadcast `topic`, or JC0404 when no such broadcast
+    /// topic exists (an unknown name, or a `changes`/`presence` channel). Shared by
+    /// both server-publish paths so they agree on what a valid target is.
+    fn server_publish_scope(&self, topic: &str) -> Result<crate::TopicScope> {
+        self.config
             .broadcast
             .iter()
             .find(|(n, _)| n == topic)
@@ -55,13 +75,26 @@ impl crate::Hub {
                         "no broadcast topic `{topic}` is declared — server publish targets a declared broadcast topic"
                     ),
                 )
-            })?;
+            })
+    }
+
+    /// Server-side broadcast publish (no connection, no principal). Validates the
+    /// topic against the same invariants the WS client `publish` gate enforces,
+    /// then puts it on the bus with `origin: None` (nothing to exclude) and
+    /// `tenant_id: None` (un-partitioned) so `deliver_broadcast` fans it out to
+    /// every subscriber on every node.
+    pub(crate) async fn publish_from_server(
+        &self,
+        topic: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let scope = self.server_publish_scope(topic)?;
         if scope == crate::TopicScope::Tenant {
             return Err(Error::new(
                 StatusCode::FORBIDDEN,
                 "JC0403",
                 format!(
-                    "broadcast topic `{topic}` is tenant-scoped; a server-side publish is un-partitioned and would leak across tenants, so it is refused. Tenant-partitioned server publish is not supported yet (tracked upstream) — do NOT downgrade the topic's scope to work around this: `none`/`auth` topics are visible to every tenant"
+                    "broadcast topic `{topic}` is tenant-scoped; a plain `publish` is un-partitioned and would leak across tenants, so it is refused. Use `publish_to(tenant_id, \"{topic}\", payload)` to reach a single tenant's sockets — and do NOT downgrade the topic's scope to work around this: `none`/`auth` topics are visible to every tenant"
                 ),
             ));
         }
@@ -69,6 +102,39 @@ impl crate::Hub {
             .publish(BusMessage::Broadcast {
                 topic: topic.to_string(),
                 tenant_id: None,
+                payload,
+                origin: None,
+            })
+            .await
+    }
+
+    /// Tenant-partitioned server publish (issue #104). Validates the topic, then
+    /// puts it on the bus with `tenant_id: Some(tenant)` so `deliver_broadcast`
+    /// admits ONLY sockets whose verified `principal.tenant_id` equals `tenant` —
+    /// the same partition key the WS client `publish` derives from its own
+    /// principal. A `none`/`auth` topic is refused (JC0403): those are
+    /// un-partitioned, so the tenant argument would be silently ignored — plain
+    /// `publish` is the supported path there. Unknown topic ⇒ JC0404.
+    pub(crate) async fn publish_to_tenant(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let scope = self.server_publish_scope(topic)?;
+        if scope != crate::TopicScope::Tenant {
+            return Err(Error::new(
+                StatusCode::FORBIDDEN,
+                "JC0403",
+                format!(
+                    "broadcast topic `{topic}` is not tenant-scoped; `publish_to` partitions per tenant, so on an un-partitioned `none`/`auth` topic the tenant argument would be silently ignored. Use `publish(\"{topic}\", payload)` for it"
+                ),
+            ));
+        }
+        self.bus
+            .publish(BusMessage::Broadcast {
+                topic: topic.to_string(),
+                tenant_id: Some(tenant_id.to_string()),
                 payload,
                 origin: None,
             })
@@ -254,6 +320,14 @@ mod server_publish_tests {
         })
     }
 
+    fn tenant_user(tenant: &str) -> Option<Principal> {
+        Some(Principal {
+            user_id: format!("u-{tenant}"),
+            tenant_id: Some(tenant.into()),
+            role: None,
+        })
+    }
+
     fn join(hub: &Arc<Hub>, conn: u64, topic: &str) {
         hub.conns
             .lock()
@@ -319,16 +393,17 @@ mod server_publish_tests {
         assert_eq!(err.code(), "JC0404");
     }
 
-    /// A `tenant`-scoped topic is an Err: a server publish carries no principal,
-    /// so it cannot pick a tenant partition, and delivering to all tenants would
-    /// break the isolation the scope promises. Fail loud, never leak.
+    /// A `tenant`-scoped topic is an Err for plain `publish`: it carries no
+    /// principal, so it cannot pick a tenant partition, and delivering to all
+    /// tenants would break the isolation the scope promises. Fail loud, never leak.
+    /// (The supported path is `publish_to`, exercised below.)
     #[tokio::test]
     async fn server_publish_to_a_tenant_scoped_topic_errs() {
         let hub = hub();
         let err = handle(&hub)
             .publish("room", serde_json::json!({}))
             .await
-            .expect_err("a tenant-scoped topic is not server-publishable");
+            .expect_err("a tenant-scoped topic is not un-partitioned-publishable");
         assert_eq!(err.code(), "JC0403");
         // And it must NOT have reached the bus (no partial/leaky publish).
         let mut bus_rx = hub.bus.subscribe();
@@ -336,5 +411,72 @@ mod server_publish_tests {
             bus_rx.try_recv().is_err(),
             "a rejected publish must never touch the bus"
         );
+    }
+
+    /// #104 THE tenant-partitioned publish: `publish_to(A, "room", …)` on a
+    /// `tenant`-scoped topic reaches tenant-A's socket and NEVER tenant-B's — the
+    /// partition key is the event's `tenant_id`, matched against each socket's
+    /// verified `principal.tenant_id` in `deliver_broadcast`. This is the whole
+    /// point of the feature: a server can now broadcast to exactly one tenant's
+    /// workspace. A regression that dropped the partition would deliver B's socket
+    /// too and turn this red — the cross-tenant leak control.
+    #[tokio::test]
+    async fn publish_to_reaches_only_the_target_tenant() {
+        let hub = hub();
+        let mut bus_rx = hub.bus.subscribe();
+        let (a, mut rx_a) = hub.connect(tenant_user("A"));
+        let (b, mut rx_b) = hub.connect(tenant_user("B"));
+        join(&hub, a, "room");
+        join(&hub, b, "room");
+
+        handle(&hub)
+            .publish_to("A", "room", serde_json::json!({ "msg": "for-A" }))
+            .await
+            .expect("publish_to a declared tenant topic succeeds");
+
+        // Pump the one bus message into the local fan-in (as the supervisor does).
+        hub.deliver(bus_rx.recv().await.expect("bus carries the publish"));
+
+        match rx_a.try_recv() {
+            Ok(ServerMsg::Event { channel, payload }) => {
+                assert_eq!(channel, "broadcast:room");
+                assert_eq!(payload["msg"], "for-A");
+            }
+            other => panic!("tenant-A socket must receive its own tenant's publish: {other:?}"),
+        }
+        assert!(
+            rx_b.try_recv().is_err(),
+            "tenant-B socket must receive NOTHING — cross-tenant leak on publish_to"
+        );
+    }
+
+    /// The `publish` ↔ `publish_to` duality: `publish_to` on a `none`/`auth`
+    /// (un-partitioned) topic is a clear JC0403 pointing at `publish`, never a
+    /// silent no-op where the tenant argument is ignored. `events` is auth-scoped.
+    #[tokio::test]
+    async fn publish_to_a_non_tenant_topic_errs() {
+        let hub = hub();
+        let err = handle(&hub)
+            .publish_to("A", "events", serde_json::json!({}))
+            .await
+            .expect_err("publish_to targets a tenant-scoped topic only");
+        assert_eq!(err.code(), "JC0403");
+        // A rejected publish never reaches the bus.
+        let mut bus_rx = hub.bus.subscribe();
+        assert!(
+            bus_rx.try_recv().is_err(),
+            "a rejected publish_to must never touch the bus"
+        );
+    }
+
+    /// `publish_to` shares the topic-existence gate: an unknown name is JC0404.
+    #[tokio::test]
+    async fn publish_to_an_unknown_topic_errs() {
+        let hub = hub();
+        let err = handle(&hub)
+            .publish_to("A", "ghost", serde_json::json!({}))
+            .await
+            .expect_err("an undeclared topic must error");
+        assert_eq!(err.code(), "JC0404");
     }
 }
