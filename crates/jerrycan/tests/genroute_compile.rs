@@ -1413,6 +1413,112 @@ fn db_mode_inline_request_body_app_passes_strict_clippy() {
     );
 }
 
+/// Issue #127 (the LATENT uncompilable case): a NON-tenant param-mount child —
+/// `items` mounted at `/orgs/{org_id}`, NO `tenancy` block — has its parent fk
+/// `org_id` dropped from the request DTO by #82. With no `Dep<Tenant>` to resolve
+/// it, the fk was previously UN-injectable: `handler_params` scanned `ep.path`
+/// (`/`) only, so no `Path` param existed, and a handler following the
+/// `server_owned_fk_comment` steer (`inject the _org_id path value`) referenced a
+/// param the framework never generated → it could not compile. The fix binds the
+/// mount-inherited fk as `Path(_org_id)`. This scaffolds the shape, IMPLEMENTS the
+/// create by injecting the path fk (the exact injection the steer names), and
+/// requires the route crate to build under strict clippy — the acceptance proof
+/// that the once-uncompilable case now compiles.
+const NON_TENANT_PARAM_MOUNT: &str = r#"{
+    "name": "shop-api", "contract_version": 1, "dependencies": ["db"],
+    "modules": [
+        { "name": "orgs",
+          "entities": [{ "name": "Org", "fields": [
+              { "name": "id", "type": "integer" },
+              { "name": "name", "type": "string" } ]}],
+          "endpoints": [{ "operation_id": "list_orgs", "method": "GET", "path": "/",
+              "success": { "status": 200, "entity": "Org", "list": true } }] },
+        { "name": "items", "mount": "/orgs/{org_id}",
+          "entities": [{ "name": "Item",
+              "belongs_to": [{ "entity": "Org" }],
+              "fields": [{ "name": "id", "type": "integer" },
+                         { "name": "label", "type": "string" }] }],
+          "endpoints": [{ "operation_id": "create_item", "method": "POST", "path": "/",
+              "request_body": { "entity": "Item" },
+              "success": { "status": 201, "entity": "Item" } }] }
+    ]
+}"#;
+
+#[test]
+#[ignore = "scaffolds a non-tenant param-mount app and invokes cargo on it; run with --include-ignored"]
+fn non_tenant_param_mount_child_injects_path_fk_and_compiles() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("shop-api");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, NON_TENANT_PARAM_MOUNT);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(
+        status.success(),
+        "jerrycan new must scaffold the non-tenant param-mount app"
+    );
+
+    // The generated stub now binds the mount-inherited fk as a Path param — the
+    // thing that did NOT exist before the fix.
+    let handlers_path = app.join("crates/routes/items/src/handlers.rs");
+    let handlers = fs::read_to_string(&handlers_path).expect("read items handlers");
+    assert!(
+        handlers.contains("Path(_org_id): Path<i64>"),
+        "the non-tenant param-mount create must bind the mount fk `_org_id` as a Path:\n{handlers}"
+    );
+    assert!(
+        handlers.contains("inject the `_org_id` path"),
+        "the steer must name the now-generated Path param:\n{handlers}"
+    );
+
+    // Follow the steer: inject `_org_id` (the path fk the DTO dropped) when building
+    // the Item. This is exactly what was previously impossible — no such param
+    // existed. If it compiles, the latent case is fixed.
+    let implemented = handlers.replace(
+        "    Err(Error::internal(\n        \"create_item not implemented — replace this stub\",\n    ))",
+        "    let id = _repo\n        .insert(Item { id: _body.id, org_id: _org_id, label: _body.label.clone() })\n        .await?;\n    Ok(Created(Item { id, org_id: _org_id, label: _body.label }))",
+    );
+    assert_ne!(
+        implemented, handlers,
+        "the create_item stub must be replaced with a real path-fk injection"
+    );
+    write(&handlers_path, &implemented);
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "route-items",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "non-tenant param-mount app failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");
