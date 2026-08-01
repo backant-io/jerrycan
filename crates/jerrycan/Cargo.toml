@@ -50,6 +50,16 @@ realtime = ["dep:jerrycan-realtime", "db"]
 # Multi-node realtime fan-out over Redis (mirrors jobs-redis).
 realtime-redis = ["realtime", "jerrycan-realtime/realtime-redis"]
 
+# 0.7.3 (#216): under the (non-default) `realtime` feature this facade re-exports
+# `jerrycan::realtime::ChangeChannelSpec`/`ChangeEvent`, now `#[non_exhaustive]`
+# (see crates/jerrycan-realtime/Cargo.toml). The one-time exhaustive→non_exhaustive
+# transition trips `struct_marked_non_exhaustive`; scope-allow it here too so a
+# feature-enabled `cargo semver-checks -p jerrycan` stays a clean minor. Removable
+# once 0.7.3 is the published baseline. The default-feature gate (realtime off)
+# never surfaces these types, so CI's default-feature semver check is unaffected.
+[package.metadata.cargo-semver-checks.lints]
+struct_marked_non_exhaustive = "allow"
+
 [[bin]]
 name = "jerrycan"
 required-features = ["cli"]

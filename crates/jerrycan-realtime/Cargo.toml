@@ -34,6 +34,18 @@ redis = { workspace = true, optional = true }
 [features]
 realtime-redis = ["dep:redis"]
 
+# 0.7.3 (#216): `ChangeChannelSpec` and `ChangeEvent` are now `#[non_exhaustive]`
+# so future scope-key field-adds (owner_column was the first) stay a non-breaking
+# minor. `ChangeChannelSpec` is literal-built ONLY by realtimegen-generated
+# downstream code, which this release converts to the `ChangeChannelSpec::new(..)`
+# builder in lockstep — no external consumer literal-constructs either struct.
+# The ONE-TIME exhaustive→non_exhaustive transition trips
+# `struct_marked_non_exhaustive` (a 0.x-major lint); scope-allow it for this
+# release only. Once 0.7.3 is the published baseline the structs are already
+# non_exhaustive, the lint can never fire again, and this allow can be removed.
+[package.metadata.cargo-semver-checks.lints]
+struct_marked_non_exhaustive = "allow"
+
 [dev-dependencies]
 jerrycan-core = { workspace = true }
 jerrycan-db = { workspace = true }

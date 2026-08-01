@@ -221,6 +221,12 @@ impl RowChange {
             Some(col) => (get(&self.new, col), get(&self.old, col)),
             None => (None, None),
         };
+        // #216: the owner (identity fk) key, new-or-old like the pk, so a delete
+        // (no new tuple) still carries the OLD row's owner for the scope filter.
+        let owner_id = match &spec.owner_column {
+            Some(col) => get(&self.new, col).or_else(|| get(&self.old, col)),
+            None => None,
+        };
         Some(ChangeEvent {
             entity: spec.entity.clone(),
             op: self.op,
@@ -228,6 +234,7 @@ impl RowChange {
             row: self.new,
             tenant_id,
             old_tenant_id,
+            owner_id,
         })
     }
 }
@@ -395,6 +402,7 @@ mod tests {
             table: "lead".into(),
             pk_column: "id".into(),
             tenant_column: Some("workspace_id".into()),
+            owner_column: None,
             hidden_columns: Vec::new(),
         };
         let row = RowChange {
@@ -408,5 +416,42 @@ mod tests {
         assert_eq!(ev.tenant_id.as_deref(), Some("7"));
         assert_eq!(ev.old_tenant_id.as_deref(), Some("3"));
         assert_eq!(ev.row.as_ref().unwrap()["workspace_id"], "7");
+    }
+
+    /// #216: a per-user (owner_column set) entity extracts `owner_id` new-or-old
+    /// from the tuple — so an insert/update takes the NEW owner and a DELETE
+    /// (no new tuple) falls back to the OLD row's owner. This is what lets the
+    /// owner-scope filter deliver a delete to its owner and to no one else.
+    #[test]
+    fn per_user_row_change_extracts_owner_new_or_old() {
+        let spec = ChangeChannelSpec {
+            entity: "Note".into(),
+            table: "notes".into(),
+            pk_column: "id".into(),
+            tenant_column: None,
+            owner_column: Some("user_id".into()),
+            hidden_columns: Vec::new(),
+        };
+        // Insert: owner from the NEW row.
+        let ins = RowChange {
+            table: "notes".into(),
+            op: ChangeOp::Insert,
+            old: None,
+            new: Some(serde_json::json!({"id": "7", "user_id": "u1"})),
+        };
+        assert_eq!(
+            ins.into_event(&spec).unwrap().owner_id.as_deref(),
+            Some("u1")
+        );
+        // Delete: no new tuple ⇒ owner falls back to the OLD row.
+        let del = RowChange {
+            table: "notes".into(),
+            op: ChangeOp::Delete,
+            old: Some(serde_json::json!({"id": "7", "user_id": "u1"})),
+            new: None,
+        };
+        let ev = del.into_event(&spec).unwrap();
+        assert_eq!(ev.owner_id.as_deref(), Some("u1"));
+        assert!(ev.tenant_id.is_none(), "per-user entity has no tenant key");
     }
 }

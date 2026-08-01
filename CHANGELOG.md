@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.7.3 — 2026-08-01
+
+### Security
+- **Per-user realtime `changes` are owner-scoped (#216).** A `changes` channel on a per-user
+  (identity-owned, non-tenant) entity — e.g. `Note belongs_to User` — broadcast **every** user's
+  rows to **every** authenticated subscriber: the channel was left unscoped
+  (`tenant_column: None`) and the delivery filter treated unscoped as world-visible, while the
+  REST repo for the same entity emitted only owner-scoped `get_for`/`all_for`. Now `changes_spec`
+  derives an `owner_column` (the #150-aware identity fk, e.g. `user_id`) for a per-user changes
+  entity, and `change_visible` delivers a per-user event **only to the row's owner**
+  (`ev.owner_id == principal.user_id`) — exactly matching what the subscriber could have GET'd.
+  The owner key is extracted new-or-old (both CDC paths), so a delete still reaches its owner.
+  Tenant-scoped and genuinely auth-only changes channels are **byte-identical**.
+
+### Fixed
+- **Trigger-DDL failure now fails loud (#212).** When the trigger-fallback change source could
+  not install its `CREATE FUNCTION`/`TRIGGER` DDL (a privilege-restricted Postgres), it logged
+  the error but spawned the `LISTEN` adapter anyway — admitting `changes:` subscribers to a feed
+  that could never `NOTIFY` (a silent dead feed). It now sets `changes_unavailable` and does not
+  spawn the adapter, so a `changes:` join is refused with **JC0530**, mirroring the other
+  change-source failure branches.
+
+### Changed
+- **`ChangeChannelSpec` is now built via `ChangeChannelSpec::new(entity, table, pk).tenant_column(..).owner_column(..).hidden_columns(..)`.**
+  The struct (and `changes::ChangeEvent`) became `#[non_exhaustive]` so future scope-key
+  field-adds stay a non-breaking minor; the generated realtime wiring emits the builder chain.
+  A minor, additive release.
+
 ## 0.7.2 — 2026-08-01
 
 ### Added

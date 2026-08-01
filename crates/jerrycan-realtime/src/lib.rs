@@ -37,14 +37,31 @@ pub enum TopicScope {
 
 /// One subscribable entity: the generated wiring supplies table/pk/tenant
 /// column so the adapters can build DDL and extract scope keys.
+///
+/// `#[non_exhaustive]` + the [`ChangeChannelSpec::new`] builder (0.7.3): the
+/// generated realtime wiring (realtimegen) constructs this DOWNSTREAM, so a
+/// struct literal would make every field-add a breaking change. The builder
+/// keeps field-adds a non-breaking minor forever — `owner_column` (#216) was
+/// the first such add. The defining crate still literal-constructs it (in-crate
+/// literals are exempt from `#[non_exhaustive]`), so the unit/DDL tests below
+/// keep their literals; only cross-crate callers must use the builder.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ChangeChannelSpec {
     pub entity: String,
     pub table: String,
     pub pk_column: String,
-    /// The tenant fk column when the entity is tenant-owned; None ⇒ delivery
-    /// to every authenticated subscriber.
+    /// The tenant fk column when the entity is tenant-owned; None ⇒ the entity
+    /// is not tenant-scoped (see `owner_column` for the per-user case).
     pub tenant_column: Option<String>,
+    /// The identity fk column (e.g. `user_id`) when the entity is per-user
+    /// owned (#79/#216) and NOT tenant-scoped; None ⇒ genuinely auth-only.
+    /// Set only when `tenant_column` is None: a per-user `changes` event is
+    /// delivered ONLY to the row's owner (`ev.owner_id == principal.user_id`),
+    /// mirroring the REST `get_for`/`all_for` owner-scoping. Without it, a
+    /// per-user entity's changes broadcast every user's rows to every
+    /// authenticated subscriber — the cross-user leak #216 closes.
+    pub owner_column: Option<String>,
     /// Column names stripped from the broadcast row before it reaches any
     /// subscriber — the entity's `write_only`/`password_hash` columns (#167).
     /// Empty ⇒ the full row is broadcast (byte-identical to pre-0.6.18). The
@@ -53,6 +70,46 @@ pub struct ChangeChannelSpec {
     /// which is the security guarantee that lets a `write_only` column coexist
     /// with a `changes` channel.
     pub hidden_columns: Vec<String>,
+}
+
+impl ChangeChannelSpec {
+    /// Start a spec from the three required identifiers (entity/table/pk); scope
+    /// keys and hidden columns default to none. The cross-crate constructor
+    /// (`#[non_exhaustive]` forbids struct literals downstream) — chain
+    /// `.tenant_column(..)`, `.owner_column(..)`, `.hidden_columns(..)` as needed.
+    pub fn new(
+        entity: impl Into<String>,
+        table: impl Into<String>,
+        pk_column: impl Into<String>,
+    ) -> Self {
+        Self {
+            entity: entity.into(),
+            table: table.into(),
+            pk_column: pk_column.into(),
+            tenant_column: None,
+            owner_column: None,
+            hidden_columns: Vec::new(),
+        }
+    }
+
+    /// Set the tenant fk column (the entity is tenant-owned). Mutually exclusive
+    /// with `owner_column` in practice — realtimegen sets at most one.
+    pub fn tenant_column(mut self, column: Option<String>) -> Self {
+        self.tenant_column = column;
+        self
+    }
+
+    /// Set the identity fk column (the entity is per-user owned, #216).
+    pub fn owner_column(mut self, column: Option<String>) -> Self {
+        self.owner_column = column;
+        self
+    }
+
+    /// Set the columns stripped from the broadcast row before delivery (#167).
+    pub fn hidden_columns(mut self, columns: Vec<String>) -> Self {
+        self.hidden_columns = columns;
+        self
+    }
 }
 
 /// The hub's static channel configuration (from the design, via realtimegen).
@@ -515,6 +572,7 @@ impl Hub {
         let view = ChangeEventView {
             tenant_id: ev.tenant_id.clone(),
             old_tenant_id: ev.old_tenant_id.clone(),
+            owner_id: ev.owner_id.clone(),
         };
         let op_str = match ev.op {
             ChangeOp::Insert => "insert",
@@ -629,7 +687,16 @@ async fn start_change_source(hub: &Arc<Hub>, shutdown: tokio::sync::watch::Recei
             eprintln!("jerrycan-realtime: changes source = triggers + LISTEN/NOTIFY");
             let specs = hub.config.changes.clone();
             if let Err(e) = changes::triggers::ensure_triggers(&db, &specs).await {
-                eprintln!("jerrycan-realtime: trigger DDL reconcile failed: {e}");
+                // #212 (fail loud): a privilege-restricted Postgres can deny the
+                // trigger/function DDL. Spawning the LISTEN adapter anyway would
+                // admit `changes:` subscribers to a feed that can never NOTIFY —
+                // a silent dead feed. Mirror the sibling failure branches: mark
+                // changes unavailable so a join answers JC0530, and do NOT spawn.
+                eprintln!(
+                    "jerrycan-realtime: trigger DDL reconcile failed: {e} — changes channels answer JC0530"
+                );
+                hub.changes_unavailable.store(true, Ordering::Relaxed);
+                return;
             }
             let (etx, mut erx) = tokio::sync::mpsc::channel::<changes::ChangeEvent>(1024);
             let url = db.url().to_string();
@@ -664,6 +731,7 @@ mod tests {
                 table: "lead".into(),
                 pk_column: "id".into(),
                 tenant_column: Some("workspace_id".into()),
+                owner_column: None,
                 hidden_columns: Vec::new(),
             })
             .broadcast("room", TopicScope::Tenant)
@@ -716,6 +784,7 @@ mod delivery_tests {
                 table: "lead".into(),
                 pk_column: "id".into(),
                 tenant_column: Some("workspace_id".into()),
+                owner_column: None,
                 hidden_columns: hidden,
             }],
             ..Default::default()
@@ -767,6 +836,7 @@ mod delivery_tests {
             row: Some(serde_json::json!({"id":"42","workspace_id":"t2","secret":"x"})),
             tenant_id: Some("t2".into()),
             old_tenant_id: None,
+            owner_id: None,
         });
 
         match rx2.try_recv() {
@@ -800,6 +870,7 @@ mod delivery_tests {
             row: Some(serde_json::json!({"id":"42","workspace_id":"t2","secret":"s"})),
             tenant_id: Some("t2".into()),
             old_tenant_id: Some("t1".into()),
+            owner_id: None,
         });
 
         match rx1.try_recv() {
@@ -847,6 +918,7 @@ mod delivery_tests {
                 row: Some(full_row.clone()),
                 tenant_id: Some("t2".into()),
                 old_tenant_id: None,
+                owner_id: None,
             });
             match rx2.try_recv() {
                 Ok(ServerMsg::Event { channel, payload }) => {
@@ -863,5 +935,110 @@ mod delivery_tests {
                 other => panic!("subscriber must receive the projected row: {other:?}"),
             }
         }
+    }
+
+    /// A per-user (identity-owned, non-tenant) changes hub: `tenant_column: None,
+    /// owner_column: Some("user_id")`. The #216 shape — its events must reach
+    /// ONLY the row's owner.
+    fn hub_with_note() -> Arc<Hub> {
+        let config = RealtimeConfig {
+            changes: vec![ChangeChannelSpec {
+                entity: "Note".into(),
+                table: "notes".into(),
+                pk_column: "id".into(),
+                tenant_column: None,
+                owner_column: Some("user_id".into()),
+                hidden_columns: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        Arc::new(Hub {
+            config,
+            node_id: 1,
+            bus: bus::AnyBus::Local(bus::LocalBus::new()),
+            db: None,
+            conns: Mutex::new(HashMap::new()),
+            presence: Mutex::new(presence::PresenceMap::default()),
+            changes_unavailable: std::sync::atomic::AtomicBool::new(false),
+            next_conn: AtomicU64::new(1),
+        })
+    }
+
+    fn user(id: &str) -> Option<Principal> {
+        Some(Principal {
+            user_id: id.into(),
+            tenant_id: None,
+            role: None,
+        })
+    }
+
+    fn join_note(hub: &Arc<Hub>, conn: u64) {
+        hub.conns
+            .lock()
+            .unwrap()
+            .get_mut(&conn)
+            .unwrap()
+            .channels
+            .insert(ChannelId::Changes("Note".into()));
+    }
+
+    /// #216 (SECURITY) — THE per-user negative control at the delivery seam: a
+    /// Note owned by u1 reaches u1's socket and NEVER u2's, on insert AND on
+    /// delete (delete carries the owner from the OLD row). A regression that
+    /// drops the owner filter — the pre-0.7.3 `(None, _) => true` world-visible
+    /// arm — turns this red: it is the exact cross-user leak #216 closes.
+    #[test]
+    fn deliver_change_per_user_delivers_only_to_the_owner() {
+        let hub = hub_with_note();
+        let (c1, mut rx1) = hub.connect(user("u1"));
+        let (c2, mut rx2) = hub.connect(user("u2"));
+        join_note(&hub, c1);
+        join_note(&hub, c2);
+
+        // Insert of u1's Note: the owner receives it, the other user nothing.
+        hub.deliver_change(&ChangeEvent {
+            entity: "Note".into(),
+            op: ChangeOp::Insert,
+            pk: "7".into(),
+            row: Some(serde_json::json!({"id":"7","user_id":"u1","body":"hi"})),
+            tenant_id: None,
+            old_tenant_id: None,
+            owner_id: Some("u1".into()),
+        });
+        match rx1.try_recv() {
+            Ok(ServerMsg::Event { channel, payload }) => {
+                assert_eq!(channel, "changes:Note");
+                assert_eq!(payload["type"], "insert");
+                assert_eq!(payload["row"]["user_id"], "u1");
+            }
+            other => panic!("u1 must receive its own Note insert: {other:?}"),
+        }
+        assert!(
+            rx2.try_recv().is_err(),
+            "u2 must receive NOTHING — cross-user leak at the seam (#216)"
+        );
+
+        // Delete of u1's Note: owner_id comes from the OLD row (no new row),
+        // and the owner still receives the delete-shaped view; u2 nothing.
+        hub.deliver_change(&ChangeEvent {
+            entity: "Note".into(),
+            op: ChangeOp::Delete,
+            pk: "7".into(),
+            row: None,
+            tenant_id: None,
+            old_tenant_id: None,
+            owner_id: Some("u1".into()),
+        });
+        match rx1.try_recv() {
+            Ok(ServerMsg::Event { payload, .. }) => {
+                assert_eq!(payload["type"], "delete");
+                assert_eq!(payload["pk"], "7");
+            }
+            other => panic!("u1 must receive its own Note delete: {other:?}"),
+        }
+        assert!(
+            rx2.try_recv().is_err(),
+            "u2 must never see u1's delete either (#216)"
+        );
     }
 }

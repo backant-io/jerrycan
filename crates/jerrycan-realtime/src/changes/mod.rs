@@ -16,7 +16,13 @@ pub enum ChangeOp {
 
 /// One decoded row change, scope keys pre-extracted (all text — see
 /// Principal's string rationale).
+///
+/// `#[non_exhaustive]` (0.7.3, #216): this is a public event type on the bus
+/// wire, constructed only inside this crate (the CDC adapters). Marking it
+/// non_exhaustive keeps future scope-key additions — `owner_id` was the first —
+/// a non-breaking minor; the defining crate still literal-constructs it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ChangeEvent {
     pub entity: String,
     pub op: ChangeOp,
@@ -27,6 +33,10 @@ pub struct ChangeEvent {
     pub tenant_id: Option<String>,
     /// The OLD row's tenant (update/delete) — drives the tenant-move routing.
     pub old_tenant_id: Option<String>,
+    /// The row's identity-fk (owner) value for a per-user entity (#216),
+    /// extracted new-or-old (so a delete carries the OLD row's owner). None for
+    /// tenant-scoped and auth-only entities. Drives the owner-scope filter.
+    pub owner_id: Option<String>,
 }
 
 /// The one publication realtime owns. Fixed name: reconcile, don't multiply.
@@ -81,6 +91,10 @@ pub(crate) struct NotifyPayload {
     pub(crate) tenant_id: Option<String>,
     #[serde(rename = "to", skip_serializing_if = "Option::is_none", default)]
     pub(crate) old_tenant_id: Option<String>,
+    /// The owner (identity-fk) value for a per-user entity (#216), carried
+    /// new-or-old so a delete's owner survives. Absent for tenant/auth-only.
+    #[serde(rename = "ow", skip_serializing_if = "Option::is_none", default)]
+    pub(crate) owner_id: Option<String>,
 }
 
 impl NotifyPayload {
@@ -92,6 +106,7 @@ impl NotifyPayload {
             row: None, // the trigger adapter refetches for insert/update
             tenant_id: self.tenant_id,
             old_tenant_id: self.old_tenant_id,
+            owner_id: self.owner_id,
         }
     }
 }
@@ -110,6 +125,14 @@ pub(crate) fn notify_function_sql(spec: &ChangeChannelSpec) -> String {
         Some(c) => format!("CASE WHEN TG_OP <> 'INSERT' THEN OLD.\"{c}\"::text END"),
         None => "NULL".to_string(),
     };
+    // #216: the owner (identity fk) is IMMUTABLE, so a single new-or-old key
+    // suffices — NEW for insert/update, OLD for delete — mirroring the pk above.
+    let owner = match &spec.owner_column {
+        Some(c) => {
+            format!("CASE WHEN TG_OP = 'DELETE' THEN OLD.\"{c}\"::text ELSE NEW.\"{c}\"::text END")
+        }
+        None => "NULL".to_string(),
+    };
     format!(
         "CREATE OR REPLACE FUNCTION jc_notify_change_{table}() RETURNS trigger AS $$\n\
          BEGIN\n\
@@ -118,7 +141,8 @@ pub(crate) fn notify_function_sql(spec: &ChangeChannelSpec) -> String {
          \x20   'o', lower(TG_OP),\n\
          \x20   'id', CASE WHEN TG_OP = 'DELETE' THEN OLD.\"{pk}\"::text ELSE NEW.\"{pk}\"::text END,\n\
          \x20   'tn', {tenant_new},\n\
-         \x20   'to', {tenant_old}\n\
+         \x20   'to', {tenant_old},\n\
+         \x20   'ow', {owner}\n\
          \x20 )::text);\n\
          \x20 RETURN NULL;\n\
          END;\n\
@@ -240,6 +264,7 @@ mod tests {
             table: "lead".into(),
             pk_column: "id".into(),
             tenant_column: Some("workspace_id".into()),
+            owner_column: None,
             hidden_columns: Vec::new(),
         }
     }
@@ -301,6 +326,7 @@ mod tests {
             pk: "42".into(),
             tenant_id: Some("7".into()),
             old_tenant_id: Some("3".into()),
+            owner_id: None,
         };
         let s = serde_json::to_string(&p).unwrap();
         // Compact keys: NOTIFY payloads are capped at 8000 bytes.
@@ -323,11 +349,41 @@ mod tests {
             pk: "42".into(),
             tenant_id: None,
             old_tenant_id: Some("3".into()),
+            owner_id: Some("u9".into()),
         };
         let ev = p.into_event("Lead");
         assert_eq!(ev.op, ChangeOp::Delete);
         assert_eq!(ev.pk, "42");
         assert_eq!(ev.old_tenant_id.as_deref(), Some("3"));
+        // #216: the delete's owner (from the OLD row) rides through NOTIFY so the
+        // owner-scope filter can deliver the delete to its owner.
+        assert_eq!(ev.owner_id.as_deref(), Some("u9"));
         assert!(ev.row.is_none());
+    }
+
+    /// #216: a per-user (owner_column set) entity's NOTIFY function emits the
+    /// owner key `ow` as a single new-or-old value (NEW for insert/update, OLD
+    /// for delete — the fk is immutable). A tenant-scoped entity emits `NULL`.
+    #[test]
+    fn notify_function_emits_owner_key_for_a_per_user_entity() {
+        let per_user = ChangeChannelSpec {
+            entity: "Note".into(),
+            table: "notes".into(),
+            pk_column: "id".into(),
+            tenant_column: None,
+            owner_column: Some("user_id".into()),
+            hidden_columns: Vec::new(),
+        };
+        let f = notify_function_sql(&per_user);
+        assert!(f.contains("'ow',"), "the owner key must be emitted: {f}");
+        assert!(
+            f.contains(
+                "CASE WHEN TG_OP = 'DELETE' THEN OLD.\"user_id\"::text ELSE NEW.\"user_id\"::text END"
+            ),
+            "owner is new-or-old (immutable fk): {f}"
+        );
+        // A tenant-scoped entity carries no owner key (NULL), byte-compatible.
+        let tenant = notify_function_sql(&lead());
+        assert!(tenant.contains("'ow', NULL"), "{tenant}");
     }
 }
