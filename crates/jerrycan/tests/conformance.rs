@@ -93,6 +93,75 @@ fn reset_pg_public_schema(pg_url: &str) {
     );
 }
 
+/// Recursively collect every `.rs` file under `dir`.
+fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_rs(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Issue #218 (make-impossible guard): a fresh jobs+realtime scaffold
+/// (reference-slice) must be a `rustfmt` fixpoint — EVERY generated `.rs`
+/// (tool-owned AND agent-owned stubs) formats to itself, so `jerrycan new` never
+/// emits code `cargo fmt` would rewrite. The emitters produce
+/// byte-identical-to-rustfmt output by construction (#128/#165/#201/#218); this
+/// locks it so a future emitter that drifts turns RED. FAST (scaffold + `rustfmt
+/// --check` per file — no cargo build), so it runs in the per-PR gate and is NOT
+/// `#[ignore]`d. It needs only `rustfmt`, which CI already has.
+#[test]
+fn scaffold_is_a_rustfmt_fixpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = tmp.path().join("design.json");
+    std::fs::write(&design, REFERENCE).unwrap();
+    let app = tmp.path().join("reference-slice");
+    let dep = format!(
+        "jerrycan = {{ path = \"{}\", default-features = false }}",
+        repo_root().join("crates/jerrycan").display()
+    );
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design)
+        .status()
+        .unwrap();
+    assert!(st.success(), "jerrycan new must scaffold reference-slice");
+
+    let mut files = Vec::new();
+    collect_rs(&app, &mut files);
+    files.sort();
+    assert!(!files.is_empty(), "the scaffold must contain .rs files");
+
+    let mut drift = Vec::new();
+    for f in &files {
+        let out = Command::new("rustfmt")
+            .args(["--edition", "2024", "--check"])
+            .arg(f)
+            .output()
+            .unwrap();
+        if !out.status.success() {
+            drift.push(format!(
+                "--- {} ---\n{}{}",
+                f.strip_prefix(&app).unwrap().display(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            ));
+        }
+    }
+    assert!(
+        drift.is_empty(),
+        "every generated .rs must be a rustfmt fixpoint (issue #218); {} file(s) drifted:\n{}",
+        drift.len(),
+        drift.join("\n")
+    );
+}
+
 #[test]
 #[ignore = "heavy: db-mode golden app must build and pass the full gate"]
 fn db_mode_scaffold_passes_jerrycan_check() {

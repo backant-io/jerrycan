@@ -251,11 +251,22 @@ fn fixture_json(
 /// `fixture_value`). Optional fields are omitted — they carry `#[serde(default)]`
 /// in the generated `{Op}Request`, so a minimal body still deserializes. No fk
 /// columns and no entity lookup — an inline body is not a table row.
-fn inline_fixture_json(fields: &[Field]) -> String {
+///
+/// `overrides` replaces a named required field's literal (issue #217): the reject
+/// probe corrupts ONE field to an out-of-range value — mirroring `fixture_json`'s
+/// override discipline — so the ONLY reason for a 422 is that field. An override on
+/// an absent (optional/omitted) field is inert, exactly as on the entity path.
+fn inline_fixture_json(fields: &[Field], overrides: &[(&str, &str)]) -> String {
     let cols = fields
         .iter()
         .filter(|f| f.required)
-        .map(|f| format!("\"{}\": {}", f.name, fixture_value(f)))
+        .map(|f| {
+            let value = match overrides.iter().find(|(name, _)| *name == f.name) {
+                Some((_, literal)) => (*literal).to_string(),
+                None => fixture_value(f),
+            };
+            format!("\"{}\": {}", f.name, value)
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!("{{{cols}}}")
@@ -582,8 +593,9 @@ fn request_expr(
                     // matches `{Entity}UpdateRequest` (issue #85 D1); a create omits them.
                     ep.method.is_update(),
                 ),
-                // An inline-DTO body (issue #122) builds from its own fields.
-                None => inline_fixture_json(&rb.fields),
+                // An inline-DTO body (issue #122) builds from its own fields; an
+                // override corrupts one field for the #217 reject probe.
+                None => inline_fixture_json(&rb.fields, overrides),
             })
             .unwrap_or_else(|| "{}".to_string())
     };
@@ -792,6 +804,9 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                     design, out, unit, ep, &full_path, guarded, field, &literal,
                 );
             }
+            // #217: an inline-DTO custom action (`rb.entity == None`) rejects an
+            // out-of-range inline field too (no-op for entity/bodyless endpoints).
+            push_inline_reject_test(design, out, unit, ep, &full_path, guarded);
         } else if param_count(ep) == 1 && seed_creator_is_skipped(unit, ep) {
             // Issue #68: the creator that would seed this `/{id}` probe is marked
             // `probe: skip` — a hand-written validator on it rejects the generated
@@ -861,6 +876,10 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                         &literal,
                     );
                 }
+                // #217: an inline-DTO custom action at `/{id}/…` rejects an
+                // out-of-range inline field too (the 422 precedes any id lookup, so
+                // the concrete seeded path suffices). No-op for entity bodies.
+                push_inline_reject_test(design, out, unit, ep, &seeded_path, guarded);
             } else {
                 out.todos.push(format!(
                     "// AGENT TODO: {fn_base} ({:?} {full_path}) has no creator route to seed its {{id}} — encode its success case in your own test file.",
@@ -1172,6 +1191,50 @@ fn push_constraint_reject_test(
     out.reject += 1;
 }
 
+/// Issue #217: the inline-DTO twin of the entity reject probes. An inline-DTO
+/// custom action (issue #122) validates its `{Op}Request` fields with the SAME
+/// #80/#47 machinery as an entity body — but the entity reject probes key on
+/// `rb.entity`, so an inline body (`rb.entity == None`) got a happy-path test yet
+/// NO boundary reject, leaving a declared inline constraint UNVERIFIED by `check`.
+/// This emits ONE reject probe against the inline body: a #80 constraint violation
+/// when a required inline field has a derivable one, else an out-of-range enum
+/// value. It reuses `push_constraint_reject_test`/`push_enum_reject_test`, so it
+/// corrupts exactly that field (`request_expr` threads the override into
+/// `inline_fixture_json`), threads the credential when guarded, asserts 422, and
+/// counts toward `out.reject` (the 422 precedes the stub). Emits NOTHING when no
+/// required inline field is rejectable — byte-identical for unconstrained inline
+/// designs and for every entity-body / bodyless endpoint (`rb` not inline).
+///
+/// The reject field must be a REQUIRED inline field: `inline_fixture_json` puts
+/// only required fields on the wire, so an override on an optional (omitted) field
+/// would be inert. A defaulted field is skipped for the same reason as the entity
+/// helpers' `default.is_none()` gate.
+fn push_inline_reject_test(
+    design: &Design,
+    out: &mut TestOut,
+    unit: &ModuleDesign,
+    ep: &Endpoint,
+    path: &str,
+    guarded: bool,
+) {
+    let Some(rb) = ep.request_body.as_ref().filter(|rb| rb.is_inline()) else {
+        return;
+    };
+    // Prefer a #80 constraint reject (mirrors `first_constraint_reject`'s ordering);
+    // an enum field rides the sentinel probe instead.
+    if let Some((field, literal)) = rb.fields.iter().find_map(|f| {
+        (f.required && f.default.is_none())
+            .then(|| constraint_reject_literal(f).map(|lit| (f.name.as_str(), lit)))
+            .flatten()
+    }) {
+        push_constraint_reject_test(design, out, unit, ep, path, guarded, field, &literal);
+    } else if let Some(field) = rb.fields.iter().find_map(|f| {
+        (f.required && f.values.is_some() && f.default.is_none()).then_some(f.name.as_str())
+    }) {
+        push_enum_reject_test(design, out, unit, ep, path, guarded, field);
+    }
+}
+
 /// "{id}" as it appears inside the full path (the literal brace token).
 fn regex_free_param(path: &str) -> String {
     let start = path.find('{').expect("parameterized path");
@@ -1317,6 +1380,20 @@ fn collect_workspace_migration_items(design: &Design, current: &ModuleDesign, ou
 /// (testgen) is at `crates/routes/<m>/tests/` (own module `..`, others `../../<m>`),
 /// while the jobs harness (jobsgen) is at `crates/jobs/tests/` (every module
 /// `../../routes/<m>`). Shared so both harnesses migrate the same tables (issue #84).
+/// One `{field}: include_str!("{path}"),` line at column 12, pre-wrapped exactly as
+/// the pinned rustfmt does (issue #218): once the single-line form exceeds
+/// `max_width` (100), rustfmt breaks the `include_str!` string arg onto its own line
+/// at column 16, closing `),` back at column 12. A shorter line stays as-is
+/// (byte-identical for short module paths).
+fn migration_include_line(field: &str, path: &str) -> String {
+    let one_line = format!("            {field}: include_str!(\"{path}\"),");
+    if one_line.chars().count() <= 100 {
+        format!("{one_line}\n")
+    } else {
+        format!("            {field}: include_str!(\n                \"{path}\"\n            ),\n")
+    }
+}
+
 pub(crate) fn migration_items(
     design: &Design,
     prefix_for: impl Fn(&str) -> String,
@@ -1326,8 +1403,16 @@ pub(crate) fn migration_items(
         let prefix = prefix_for(&m.name);
         let m_snake = m.name.replace('-', "_");
         if !m.entities.is_empty() {
+            let sqlite = migration_include_line(
+                "sqlite",
+                &format!("{prefix}/migrations/sqlite/0001_create_tables.sql"),
+            );
+            let postgres = migration_include_line(
+                "postgres",
+                &format!("{prefix}/migrations/postgres/0001_create_tables.sql"),
+            );
             out.push_str(&format!(
-                "        jerrycan::db::Migration {{\n            name: \"{m_snake}_0001_create_tables\",\n            sqlite: include_str!(\"{prefix}/migrations/sqlite/0001_create_tables.sql\"),\n            postgres: include_str!(\"{prefix}/migrations/postgres/0001_create_tables.sql\"),\n        }},\n"
+                "        jerrycan::db::Migration {{\n            name: \"{m_snake}_0001_create_tables\",\n{sqlite}{postgres}        }},\n"
             ));
         }
         collect_subroute_migration_items(m, &m_snake, &prefix, out);
@@ -1347,8 +1432,16 @@ fn collect_subroute_migration_items(
     for sub in &module.subroutes {
         if !sub.entities.is_empty() {
             let s = sub.name.replace('-', "_");
+            let sqlite = migration_include_line(
+                "sqlite",
+                &format!("{prefix}/migrations/sqlite/0001_create_tables_{s}.sql"),
+            );
+            let postgres = migration_include_line(
+                "postgres",
+                &format!("{prefix}/migrations/postgres/0001_create_tables_{s}.sql"),
+            );
             out.push_str(&format!(
-                "        jerrycan::db::Migration {{\n            name: \"{top_snake}_0001_create_tables_{s}\",\n            sqlite: include_str!(\"{prefix}/migrations/sqlite/0001_create_tables_{s}.sql\"),\n            postgres: include_str!(\"{prefix}/migrations/postgres/0001_create_tables_{s}.sql\"),\n        }},\n"
+                "        jerrycan::db::Migration {{\n            name: \"{top_snake}_0001_create_tables_{s}\",\n{sqlite}{postgres}        }},\n"
             ));
         }
         collect_subroute_migration_items(sub, top_snake, prefix, out);
@@ -2679,4 +2772,161 @@ pub fn write_all_acceptance(
 /// How many #[tokio::test] functions a generated file contains.
 pub fn test_count(generated: &str) -> usize {
     generated.matches("#[tokio::test]").count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #217: an inline-DTO custom action (`request_body: {fields:[…]}`) whose
+    /// required inline field carries a #80 constraint gets a boundary REJECT probe —
+    /// it corrupts that field to an out-of-range value and asserts 422, so a
+    /// regression that drops the inline `{Op}Request` validator turns the suite RED.
+    /// The probe 422s before the handler, so it counts toward `reject` (subtracted
+    /// from the RED-on-stubs baseline).
+    #[test]
+    fn inline_dto_constrained_action_gets_a_422_reject_probe() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "checkout",
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/",
+                      "request_body": { "fields": [
+                          { "name": "quantity", "type": "integer", "max": 100 } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let (content, reject) = render_acceptance(&d, &d.modules[0]);
+        // The reject probe exists, corrupts `quantity` to max+1 (101), and asserts 422.
+        assert!(
+            content.contains("async fn checkout_rejects_out_of_range_quantity()"),
+            "inline constraint reject probe must be generated:\n{content}"
+        );
+        assert!(
+            content.contains("\"quantity\": 101"),
+            "the probe must send the out-of-range value (max + 1):\n{content}"
+        );
+        assert!(
+            content.contains("as_u16(), 422"),
+            "the probe must assert a 422 boundary reject:\n{content}"
+        );
+        // It 422s before the stub, so it is subtracted from expected_failing.
+        assert_eq!(
+            reject, 1,
+            "the inline reject must count toward `reject` (excluded from RED-on-stubs):\n{content}"
+        );
+    }
+
+    /// Issue #217: an inline-DTO action whose required field carries a
+    /// non-defaulted enum `values` set gets an out-of-range enum reject probe
+    /// (the sentinel) asserting 422.
+    #[test]
+    fn inline_dto_enum_action_gets_a_422_reject_probe() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "checkout",
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/",
+                      "request_body": { "fields": [
+                          { "name": "tier", "type": "string", "values": ["free", "pro"] } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let (content, reject) = render_acceptance(&d, &d.modules[0]);
+        assert!(
+            content.contains("async fn checkout_rejects_out_of_range_tier()"),
+            "inline enum reject probe must be generated:\n{content}"
+        );
+        assert!(
+            content.contains(ENUM_REJECT_SENTINEL),
+            "the enum probe must send the out-of-range sentinel:\n{content}"
+        );
+        assert!(
+            content.contains("as_u16(), 422"),
+            "must assert 422:\n{content}"
+        );
+        assert_eq!(reject, 1, "the inline enum reject counts toward `reject`");
+    }
+
+    /// Issue #217 (skip-when-unrejectable): an inline-DTO action whose fields carry
+    /// NO #80 constraint and NO non-defaulted enum emits the happy-path test but NO
+    /// reject probe — a probe would assert a 422 the validator never produces. The
+    /// output is byte-identical to the pre-#217 generator for such designs.
+    #[test]
+    fn inline_dto_unconstrained_action_emits_no_reject_probe() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "checkout",
+                "endpoints": [
+                    { "operation_id": "checkout", "method": "POST", "path": "/",
+                      "request_body": { "fields": [
+                          { "name": "note", "type": "string" } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let (content, reject) = render_acceptance(&d, &d.modules[0]);
+        // The action IS exercised (happy path present) but nothing is rejectable.
+        assert!(
+            content.contains("async fn checkout_returns_200()"),
+            "the inline happy-path test must still be generated:\n{content}"
+        );
+        assert!(
+            !content.contains("_rejects_out_of_range_"),
+            "no reject probe when no inline field is rejectable:\n{content}"
+        );
+        assert_eq!(reject, 0, "no inline reject ⇒ no `reject` contribution");
+    }
+
+    /// An entity-body endpoint's reject machinery is unchanged by #217: it still
+    /// emits its own constraint reject probe (proving the inline path is additive,
+    /// not a replacement).
+    #[test]
+    fn entity_body_reject_probe_is_unchanged() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "items",
+                "entities": [{ "name": "Item", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "qty", "type": "integer", "max": 100 } ] }],
+                "endpoints": [
+                    { "operation_id": "create_item", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Item" },
+                      "success": { "status": 201, "entity": "Item" } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let content = acceptance_rs(&d, &d.modules[0]);
+        assert!(
+            content.contains("async fn create_item_rejects_out_of_range_qty()"),
+            "entity-body reject probe still fires:\n{content}"
+        );
+    }
 }
