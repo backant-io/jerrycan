@@ -22,6 +22,17 @@ use std::time::Duration;
 /// key — all are documented project-reserved keys ("jcRTLDR1").
 pub const REALTIME_LEADER_ADVISORY_KEY: i64 = 0x6A63_5254_4C44_5231;
 
+/// #234 recovery-convergence heartbeat interval. While the leader is CONNECTED
+/// and streaming (the source is demonstrably healthy), it re-publishes
+/// `ChangesHealth{false}` this often so a follower that MISSED the one-shot
+/// recovery `false` — a Redis pump reconnect (pub/sub has no replay) or a fan-in
+/// `broadcast` `Lagged` drop — converges to admitting `changes:` joins within one
+/// interval instead of answering JC0530 forever. Chosen to match the 30s max
+/// backoff so onset (`true` each backoff iteration) and recovery (`false` each
+/// heartbeat) converge on the same cadence. Bounded: at most one message per
+/// interval per leader (only the leader streams) — no publish storm.
+const HEARTBEAT: Duration = Duration::from_secs(30);
+
 /// A parsed Postgres connection string (the fields pgwire-replication needs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PgConn {
@@ -246,6 +257,49 @@ impl LeaderGate {
     }
 }
 
+/// Aborts a spawned task when dropped — used to bound the recovery heartbeat to a
+/// single streaming session so it never outlives (and never heartbeats "healthy"
+/// past) the connection it belongs to, on ANY of `stream_once`'s return paths.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// #234 recovery-convergence heartbeat loop: re-publish `ChangesHealth{false}` on
+/// the `health` channel every `interval` until shutdown (or the forwarding task
+/// drops the receiver). `stream_once` spawns this ONLY after the replication
+/// socket is attached and aborts it (via [`AbortOnDrop`]) when the session ends,
+/// so it fires ONLY while genuinely connected — a down source never heartbeats
+/// "healthy". Symmetric to onset, which re-publishes `true` each backoff
+/// iteration; a follower converges to the leader's true state within
+/// `max(backoff, HEARTBEAT)` regardless of which one-shot it missed. Factored out
+/// (Rule 9) so the tick cadence is unit-testable without a live Postgres.
+async fn run_health_heartbeat(
+    health: tokio::sync::mpsc::Sender<bool>,
+    interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Consume the immediate first tick of a fresh interval so the first heartbeat
+    // fires one full interval AFTER connect (the swap-transition publish already
+    // covers the moment of recovery — the heartbeat is the additional floor).
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tick.tick() => {
+                if health.send(false).await.is_err() {
+                    return; // forwarding task gone
+                }
+            }
+        }
+    }
+}
+
 /// One streaming session: connect, decode each XLogData into ChangeEvents, and
 /// confirm the applied LSN continuously. Returns Ok(()) on clean shutdown, Err
 /// (with the message) to trigger the supervisor's backoff.
@@ -253,6 +307,9 @@ pub(crate) async fn stream_once(
     conn: &PgConn,
     specs: &[ChangeChannelSpec],
     events: &tokio::sync::mpsc::Sender<crate::changes::ChangeEvent>,
+    // #234: the recovery heartbeat publishes `false` here while streaming (same
+    // channel `run_supervised` uses for the swap-transition publish).
+    health: &tokio::sync::mpsc::Sender<bool>,
     connected: &mut bool,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> jerrycan_core::Result<()> {
@@ -265,6 +322,15 @@ pub(crate) async fn stream_once(
     // so a subsequent mid-stream drop is treated as a transient reconnect (#228),
     // NOT a first-connect failure that must fail loud.
     *connected = true;
+    // #234: while THIS session is alive (source demonstrably healthy), heartbeat
+    // `ChangesHealth{false}` on a bounded interval so a follower that missed the
+    // one-shot recovery converges. Aborted on every return path (AbortOnDrop), so
+    // it stops the instant the stream drops — it never heartbeats a dead source.
+    let _heartbeat = AbortOnDrop(tokio::spawn(run_health_heartbeat(
+        health.clone(),
+        HEARTBEAT,
+        shutdown.clone(),
+    )));
     let mut cache = RelationCache::default();
     loop {
         let ev = tokio::select! {
@@ -348,7 +414,15 @@ pub(crate) async fn run_supervised(
             eprintln!("jerrycan-realtime: replication DDL reconcile failed: {e}");
         }
         let mut connected_now = false;
-        let outcome = stream_once(&conn, &specs, &events, &mut connected_now, &mut shutdown).await;
+        let outcome = stream_once(
+            &conn,
+            &specs,
+            &events,
+            &health,
+            &mut connected_now,
+            &mut shutdown,
+        )
+        .await;
         if connected_now {
             // A successful attach proves the source is provisioned: lift any
             // earlier fail-loud so joins are admitted again (e.g. a mis-
@@ -572,6 +646,47 @@ mod tests {
             Some(true),
             "#232: the failure must be published so followers also fail loud"
         );
+    }
+
+    /// #234 (Rule 9): the recovery heartbeat re-publishes `ChangesHealth{false}`
+    /// on the health channel MORE THAN ONCE while connected — closing the #232
+    /// asymmetry where recovery was published EXACTLY ONCE (on the true→false
+    /// swap) and a follower that missed it stayed stuck on JC0530 forever. WHY it
+    /// matters: a follower's admission is driven SOLELY by bus health; without a
+    /// repeating healthy heartbeat one dropped `false` (Redis reconnect / fan-in
+    /// `Lagged`) strands it though the source is healthy. Driven with a short
+    /// interval and the REAL `run_health_heartbeat` loop (no live PG); asserts ≥2
+    /// `false` emissions, then that shutdown stops it (a down source must never
+    /// heartbeat "healthy"). RED if the heartbeat fires once, emits `true`, or
+    /// never fires.
+    #[tokio::test]
+    async fn health_heartbeat_republishes_false_more_than_once_while_connected() {
+        let (htx, mut hrx) = tokio::sync::mpsc::channel::<bool>(16);
+        let (stx, srx) = tokio::sync::watch::channel(false);
+        let hb = tokio::spawn(run_health_heartbeat(htx, Duration::from_millis(10), srx));
+
+        // Two distinct heartbeat ticks (the immediate first tick is consumed)
+        // must EACH publish a recovery `false` — proof recovery is not a one-shot.
+        let first = tokio::time::timeout(Duration::from_secs(1), hrx.recv())
+            .await
+            .expect("first heartbeat within 1s")
+            .expect("channel open");
+        assert!(
+            !first,
+            "the heartbeat must publish ChangesHealth{{false}} (recovery)"
+        );
+        let second = tokio::time::timeout(Duration::from_secs(1), hrx.recv())
+            .await
+            .expect("second heartbeat within 1s — recovery is NOT a one-shot")
+            .expect("channel open");
+        assert!(!second, "every heartbeat re-publishes recovery `false`");
+
+        // Shutdown stops the heartbeat: a disconnected source must not heartbeat.
+        let _ = stx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), hb)
+            .await
+            .expect("heartbeat stops within 1s of shutdown")
+            .expect("heartbeat task joins cleanly");
     }
 
     // -------------------------------------------------------------------

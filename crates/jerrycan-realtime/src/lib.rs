@@ -405,7 +405,18 @@ impl Hub {
                 payload,
                 origin,
             } => self.deliver_broadcast(&topic, tenant_id.as_deref(), &payload, origin),
-            bus::BusMessage::Change(ev) => self.deliver_change(&ev), // Task 17
+            bus::BusMessage::Change(ev) => {
+                // #234: a delivered `Change` PROVES the leader read it from a
+                // healthy source, so any node receiving one is safe to admit
+                // `changes:` joins — instantly healing a follower that missed the
+                // one-shot recovery `false` (Redis pump reconnect / fan-in
+                // `Lagged` drop). This complements the heartbeat (which covers an
+                // idle source) with zero extra bus traffic. A `Change` cannot
+                // arrive while the source is down — it only exists if the source
+                // produced it — so this never wrongly clears a genuine outage.
+                self.changes_unavailable.store(false, Ordering::Relaxed);
+                self.deliver_change(&ev); // Task 17
+            }
             bus::BusMessage::PresenceSet {
                 topic,
                 tenant_id,
@@ -936,6 +947,47 @@ mod delivery_tests {
         match rx2.try_recv() {
             Ok(ServerMsg::Joined { channel, .. }) => assert_eq!(channel, "changes:Lead"),
             other => panic!("expected Joined after ChangesHealth{{false}}: {other:?}"),
+        }
+    }
+
+    /// #234 (the instant-heal optimization at the delivery seam): a delivered
+    /// `Change` clears a stuck follower's `changes_unavailable` and re-admits its
+    /// `changes:` joins. WHY it matters: a `Change` only exists if the leader read
+    /// it from a HEALTHY source, so a follower that missed the one-shot recovery
+    /// `false` (Redis reconnect / fan-in `Lagged`) would otherwise answer JC0530
+    /// forever though `Change` events are flowing on this very node — the #234
+    /// dead-feed. This heals it on the next `Change` (the heartbeat covers an idle
+    /// source). RED if the clear in `Hub::deliver`'s `Change` arm is removed.
+    #[test]
+    fn deliver_change_clears_changes_unavailable_and_readmits_joins() {
+        let hub = hub_with_lead();
+        // A follower stuck after missing the one-shot recovery: it still believes
+        // the source is down and would refuse `changes:` joins with JC0530.
+        hub.changes_unavailable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // A `Change` flows on this node — proof the source is healthy.
+        hub.deliver(bus::BusMessage::Change(ChangeEvent {
+            entity: "Lead".into(),
+            op: ChangeOp::Insert,
+            pk: "1".into(),
+            row: Some(serde_json::json!({"id":"1","workspace_id":"t2"})),
+            tenant_id: Some("t2".into()),
+            old_tenant_id: None,
+            owner_id: None,
+        }));
+        assert!(
+            !hub.changes_unavailable
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a delivered Change must clear the stuck-follower fail-loud flag (#234)"
+        );
+
+        // And a subsequent `changes:` join is now admitted (not JC0530).
+        let (c1, mut rx1) = hub.connect(tenant("t2"));
+        hub.join(c1, "changes:Lead", Some(9));
+        match rx1.try_recv() {
+            Ok(ServerMsg::Joined { channel, .. }) => assert_eq!(channel, "changes:Lead"),
+            other => panic!("join must be admitted after a Change healed the flag: {other:?}"),
         }
     }
 
