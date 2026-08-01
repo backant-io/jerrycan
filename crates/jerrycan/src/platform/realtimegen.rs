@@ -391,28 +391,59 @@ pub fn acceptance_rs(design: &Design) -> String {
     };
     for entity in &rt.changes {
         let snake = Design::to_snake(entity);
-        out.push_str(&format!(
-            "/// A scoped change on `changes:{entity}` reaches its own tenant.\n\
-             #[tokio::test]\n\
-             #[ignore]\n\
-             async fn changes_{snake}_delivers_scoped_event() {{\n\
-             \x20   let _url = std::env::var(\"JERRYCAN_TEST_DATABASE_URL\")\n\
-             \x20       .expect(\"JERRYCAN_TEST_DATABASE_URL for the live realtime acceptance run\");\n\
-             \x20   // Serve the app; log in two users in two tenants; open two WS clients\n\
-             \x20   // that join \"changes:{entity}\"; POST a {snake} as tenant A; assert tenant\n\
-             \x20   // A receives the insert on \"changes:{entity}\" within 10s.\n\
-             }}\n\n\
-             /// NEGATIVE CONTROL: a change in tenant B must never reach a tenant-A socket.\n\
-             #[tokio::test]\n\
-             #[ignore]\n\
-             async fn cross_tenant_change_never_arrives_{snake}() {{\n\
-             \x20   let _url = std::env::var(\"JERRYCAN_TEST_DATABASE_URL\")\n\
-             \x20       .expect(\"JERRYCAN_TEST_DATABASE_URL for the live realtime acceptance run\");\n\
-             \x20   // Insert a {snake} as tenant B; assert tenant A's socket on\n\
-             \x20   // \"changes:{entity}\" stays silent through a heartbeat round-trip.\n\
-             \x20   // A leak turns this test red — the scope filter is the security pillar.\n\
-             }}\n\n"
-        ));
+        // #229: a per-user (owner-scoped) changes entity — `owner_column` Some,
+        // `tenant_column` None (#216) — carries a cross-USER negative control
+        // ("user B"), the twin of the tenant control. A tenant-scoped or
+        // genuinely auth-only entity keeps the cross-tenant framing byte-for-byte.
+        let (_, _, tenant_column, owner_column) = changes_spec(design, entity);
+        let per_user = tenant_column.is_none() && owner_column.is_some();
+        if per_user {
+            out.push_str(&format!(
+                "/// A scoped change on `changes:{entity}` reaches its own owner.\n\
+                 #[tokio::test]\n\
+                 #[ignore]\n\
+                 async fn changes_{snake}_delivers_scoped_event() {{\n\
+                 \x20   let _url = std::env::var(\"JERRYCAN_TEST_DATABASE_URL\")\n\
+                 \x20       .expect(\"JERRYCAN_TEST_DATABASE_URL for the live realtime acceptance run\");\n\
+                 \x20   // Serve the app; log in two users; open two WS clients that join\n\
+                 \x20   // \"changes:{entity}\"; POST a {snake} as user A; assert user A receives\n\
+                 \x20   // the insert on \"changes:{entity}\" within 10s.\n\
+                 }}\n\n\
+                 /// NEGATIVE CONTROL: a change owned by user B must never reach a user-A socket.\n\
+                 #[tokio::test]\n\
+                 #[ignore]\n\
+                 async fn cross_user_change_never_arrives_{snake}() {{\n\
+                 \x20   let _url = std::env::var(\"JERRYCAN_TEST_DATABASE_URL\")\n\
+                 \x20       .expect(\"JERRYCAN_TEST_DATABASE_URL for the live realtime acceptance run\");\n\
+                 \x20   // Insert a {snake} as user B; assert user A's socket on\n\
+                 \x20   // \"changes:{entity}\" stays silent through a heartbeat round-trip.\n\
+                 \x20   // A leak turns this test red — owner-scoping (#216) is the security pillar.\n\
+                 }}\n\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "/// A scoped change on `changes:{entity}` reaches its own tenant.\n\
+                 #[tokio::test]\n\
+                 #[ignore]\n\
+                 async fn changes_{snake}_delivers_scoped_event() {{\n\
+                 \x20   let _url = std::env::var(\"JERRYCAN_TEST_DATABASE_URL\")\n\
+                 \x20       .expect(\"JERRYCAN_TEST_DATABASE_URL for the live realtime acceptance run\");\n\
+                 \x20   // Serve the app; log in two users in two tenants; open two WS clients\n\
+                 \x20   // that join \"changes:{entity}\"; POST a {snake} as tenant A; assert tenant\n\
+                 \x20   // A receives the insert on \"changes:{entity}\" within 10s.\n\
+                 }}\n\n\
+                 /// NEGATIVE CONTROL: a change in tenant B must never reach a tenant-A socket.\n\
+                 #[tokio::test]\n\
+                 #[ignore]\n\
+                 async fn cross_tenant_change_never_arrives_{snake}() {{\n\
+                 \x20   let _url = std::env::var(\"JERRYCAN_TEST_DATABASE_URL\")\n\
+                 \x20       .expect(\"JERRYCAN_TEST_DATABASE_URL for the live realtime acceptance run\");\n\
+                 \x20   // Insert a {snake} as tenant B; assert tenant A's socket on\n\
+                 \x20   // \"changes:{entity}\" stays silent through a heartbeat round-trip.\n\
+                 \x20   // A leak turns this test red — the scope filter is the security pillar.\n\
+                 }}\n\n"
+            ));
+        }
     }
     for t in &rt.broadcast {
         let name = &t.name;
@@ -821,6 +852,47 @@ mod tests {
         );
         assert!(a.contains("changes:Lead"), "{a}");
         assert_eq!(a, acceptance_rs(&rt_design()), "deterministic");
+    }
+
+    /// #229: a per-user (owner-scoped) changes entity gets a cross-USER negative
+    /// control ("user B"), NOT the mislabeled cross-tenant one — so #216's
+    /// owner-scoping boundary is framed by an accurately-named generated control.
+    /// The control stays `#[ignore]`d (Changes need live Postgres); the live gate
+    /// (publish.sh / heavy.yml, #227) plus the pure-filter test
+    /// `channel::per_user_change_is_visible_only_to_its_owner` provide the assertion.
+    #[test]
+    fn per_user_changes_entity_emits_a_cross_user_negative_control() {
+        let d: Design = serde_json::from_str(
+            r#"{
+                "name": "note-app", "contract_version": 2,
+                "auth": { "model": "jwt", "roles": ["member"] },
+                "dependencies": ["db", "auth"],
+                "realtime": { "changes": ["Note"], "broadcast": [], "presence": [] },
+                "modules": [
+                    { "name": "notes",
+                      "entities": [{ "name": "Note",
+                          "belongs_to": [{ "entity": "User" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "body", "type": "string" }] }],
+                      "endpoints": [] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let a = acceptance_rs(&d);
+        assert!(
+            a.contains("async fn cross_user_change_never_arrives_note()"),
+            "a per-user changes entity must emit a cross-USER negative control: {a}"
+        );
+        assert!(
+            a.contains("owned by user B must never reach a user-A socket"),
+            "the control must be framed cross-user (user B), not cross-tenant: {a}"
+        );
+        assert!(
+            !a.contains("cross_tenant"),
+            "a per-user entity must NOT emit the mislabeled cross-tenant control: {a}"
+        );
+        assert_eq!(a, acceptance_rs(&d), "deterministic (JL0003)");
     }
 
     #[test]
