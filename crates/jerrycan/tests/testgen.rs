@@ -167,11 +167,17 @@ fn unsupported_error_cases_become_an_agent_todo_comment() {
     let mut design = golden(false);
     design.modules[0].endpoints[1]
         .errors
-        .push(jerrycan::platform::design::ErrorCase {
-            status: 409,
-            code: Some("JC0409".into()),
-            when: "duplicate title".into(),
-        });
+        // `platform::design` config structs are `#[non_exhaustive]` (#145): a
+        // downstream crate (an integration test is a separate crate) constructs
+        // them via the design contract (serde), never a struct literal.
+        .push(
+            serde_json::from_value(serde_json::json!({
+                "status": 409,
+                "code": "JC0409",
+                "when": "duplicate title",
+            }))
+            .unwrap(),
+        );
     let generated = testgen::acceptance_rs(&design, &design.modules[0].clone());
     assert!(
         generated.contains("// AGENT TODO: design lists 409 (duplicate title)"),

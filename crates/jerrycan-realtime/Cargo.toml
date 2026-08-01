@@ -42,15 +42,3 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sy
 tokio-tungstenite = { workspace = true }
 futures-core.workspace = true
 futures-util = { workspace = true }
-
-# `ChangeChannelSpec` is the generated-wiring contract: realtimegen ALWAYS emits
-# a full struct literal setting every field, so adding an opt-in field to it
-# (0.6.18: `hidden_columns`, #167 — the write_only columns projected out of the
-# changes broadcast) is additive for every real consumer (generated code) yet
-# trips `constructible_struct_adds_field`, which for a 0.x crate would force a
-# spurious 0.x-major bump. A derived `Default` keeps the struct constructible via
-# struct-update. Scope-allow that one lint for this package (mirrors the 0.6.1
-# precedent on `jerrycan`). TRADEOFF (tracked, #145): re-enable once the config
-# structs are `#[non_exhaustive]` (a future 0.x-major).
-[package.metadata.cargo-semver-checks.lints]
-constructible_struct_adds_field = "allow"

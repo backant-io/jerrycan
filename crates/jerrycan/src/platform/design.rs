@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Design {
@@ -50,6 +51,7 @@ pub struct Design {
 /// `CorsConfig`/`CorsOrigins` — no options core can't honor. Serving a cross-origin
 /// SPA (console on one origin, API on another) is declarative here instead of a
 /// hand-edit of the tool-owned main.rs that the next `jerrycan generate` would wipe.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CorsDesign {
@@ -87,6 +89,7 @@ impl CorsDesign {
 /// than hand-editing the tool-owned main.rs (an edit the next `jerrycan generate`
 /// wipes and which trips JL0003) — is the whole point: the wiring becomes
 /// generated, so main.rs stays byte-identical to the tool's output.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitDesign {
@@ -111,6 +114,7 @@ pub struct RateLimitDesign {
 /// The `realtime` block (contract v2): row-change subscriptions (scope-filtered
 /// by owner/tenant), ephemeral broadcast topics, and presence topics, served
 /// over one WebSocket endpoint at `/realtime`.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RealtimeDesign {
@@ -124,6 +128,7 @@ pub struct RealtimeDesign {
     pub presence: Vec<RealtimeTopic>,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RealtimeTopic {
@@ -139,6 +144,7 @@ pub enum RealtimeScope {
     Auth,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
@@ -155,6 +161,7 @@ pub enum AuthModel {
     Jwt,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleDesign {
@@ -174,6 +181,7 @@ pub struct ModuleDesign {
     pub dependencies: Vec<String>,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entity {
@@ -206,6 +214,7 @@ pub struct Entity {
     pub fields: Vec<Field>,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Field {
@@ -303,6 +312,7 @@ impl FieldType {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BelongsTo {
@@ -342,6 +352,7 @@ pub enum OnDelete {
     Restrict,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tenancy {
@@ -402,6 +413,7 @@ impl TenantPath {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobDesign {
@@ -413,6 +425,7 @@ pub struct JobDesign {
 }
 
 /// Contract v2: the top-level `storage` block — design-modeled object buckets.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageDesign {
@@ -436,6 +449,7 @@ impl StorageDesign {
 }
 
 /// One bucket: mounts at `/<name>` with generated guarded endpoints.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BucketDesign {
@@ -471,6 +485,7 @@ pub enum Visibility {
     Private,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
@@ -563,6 +578,7 @@ impl HttpMethod {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestBody {
@@ -589,6 +605,7 @@ impl RequestBody {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Success {
@@ -599,6 +616,7 @@ pub struct Success {
     pub list: bool,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorCase {

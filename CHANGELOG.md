@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.7.0 — 2026-08-01
+
+The first release of the 0.7 major line. Groundwork only — no new design surface.
+
+### Changed (breaking)
+- **Platform config structs are now `#[non_exhaustive]`; the semver lint is re-enabled (#145).**
+  0.6.1 (#105, `public_read`) scope-allowed `constructible_struct_adds_field` crate-wide because
+  adding an opt-in field to a `pub` serde-deserialized `platform` config struct tripped the lint
+  and, for a 0.x crate, forced a spurious major bump. That crate-wide allow also HID a genuinely
+  breaking field-add to any OTHER `platform` struct, narrowing the semver gate. Every public
+  serde-config struct in `platform::design` (`Design`, `CorsDesign`, `RateLimitDesign`,
+  `RealtimeDesign`, `RealtimeTopic`, `Auth`, `ModuleDesign`, `Entity`, `Field`, `BelongsTo`,
+  `Tenancy`, `JobDesign`, `StorageDesign`, `BucketDesign`, `Endpoint`, `RequestBody`, `Success`,
+  `ErrorCase`) is now `#[non_exhaustive]`, so a downstream crate can no longer construct it with a
+  struct literal — it must go through serde / the design contract. `#[non_exhaustive]` blocks only
+  DOWNSTREAM literals; the defining crate still constructs its own structs by literal, so all
+  in-crate construction (the migrator, defaults, tests) is unchanged and every design.json
+  round-trips byte-identically. With the structs sealed, the `constructible_struct_adds_field =
+  "allow"` is removed from both `crates/jerrycan/Cargo.toml` and `crates/jerrycan-realtime/Cargo.toml`
+  (realtime needed no struct marked — its constructible specs are literal-built by generated code,
+  and no field is being added, so the lint passes clean). Adding a field to any of these structs is
+  now a clean non-breaking minor, and a genuinely breaking change is caught by the gate again.
+
 ## 0.6.35 — 2026-08-01
 
 ### Fixed
