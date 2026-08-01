@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.4 — 2026-08-01
+
+### Fixed
+- **Inline-DTO custom actions now get a 422 reject probe (#217).** A custom action with an inline
+  request body (`request_body: {fields: […]}`) got a happy-path generated test but no rejection
+  probe, so a `min`/`max`/`min_len`/`max_len` (#80) or enum (`values`) constraint declared on an
+  inline field — enforced by the generated validator and advertised in OpenAPI — was left
+  **unverified** by `check`: the request boundary could stop answering 422 and the suite stayed
+  green. `gen-tests` now emits a 422 probe (an out-of-range value in a required inline field),
+  mirroring the entity-body path and counted correctly against the honest-red baseline. Entity-body
+  suites are byte-identical.
+- **A fresh scaffold is a `cargo fmt` fixpoint (#218).** The jobs stub/registry/acceptance, realtime
+  acceptance, and route `lib.rs`/`model.rs` emitters produced code the pinned rustfmt would rewrite,
+  so a freshly scaffolded app failed `cargo fmt --check` out of the box (24 drift hunks on a
+  jobs+realtime app; the queue-job registry/acceptance drifted for ordinary job names too). The
+  emitters now pre-wrap exactly as the pinned rustfmt formats them (extending the #128/#165/#201
+  discipline), and a new non-ignored conformance guard (`scaffold_is_a_rustfmt_fixpoint`, covering a
+  cron and a queue design) locks it — a future emitter that drifts turns the gate red. Whitespace
+  only: generated code compiles and runs identically. (Residual dbgen/cron edge-case fixpoint gaps
+  are tracked in #221.)
+
 ## 0.7.3 — 2026-08-01
 
 ### Security
