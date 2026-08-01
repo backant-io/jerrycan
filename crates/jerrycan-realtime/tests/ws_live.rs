@@ -203,13 +203,10 @@ async fn presence_join_sync_track_and_leave() {
 async fn changes_channel_on_sqlite_answers_jc0530() {
     let db = jerrycan_db::Db::connect("sqlite::memory:").await.unwrap();
     let rt = Realtime::new(db)
-        .changes(jerrycan_realtime::ChangeChannelSpec {
-            entity: "Lead".into(),
-            table: "lead".into(),
-            pk_column: "id".into(),
-            tenant_column: Some("workspace_id".into()),
-            hidden_columns: Vec::new(),
-        })
+        .changes(
+            jerrycan_realtime::ChangeChannelSpec::new("Lead", "lead", "id")
+                .tenant_column(Some("workspace_id".into())),
+        )
         .principal(header_resolver());
     let (port, shutdown, task) = serve(rt).await;
     // Give the supervisor a beat to run detection and mark changes unavailable.

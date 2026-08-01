@@ -43,6 +43,10 @@ impl ChannelId {
 pub(crate) struct ChangeEventView {
     pub(crate) tenant_id: Option<String>,
     pub(crate) old_tenant_id: Option<String>,
+    /// The row's identity-fk (owner) value — populated only for a per-user
+    /// entity (`spec.owner_column` Some). Extracted new-or-old, so a delete
+    /// carries the owner from the OLD row (#216).
+    pub(crate) owner_id: Option<String>,
 }
 
 /// May this principal join this channel? Err carries the protocol error text.
@@ -102,10 +106,16 @@ pub(crate) fn change_visible(
 ) -> bool {
     let Some(p) = principal else { return false };
     match (&spec.tenant_column, &ev.tenant_id) {
-        (None, _) => true, // authenticated-only entity: any principal
         (Some(_), Some(t)) => p.tenant_id.as_deref() == Some(t.as_str()),
-        // A scoped entity with no extractable tenant key: fail CLOSED.
+        // A tenant-scoped entity with no extractable tenant key: fail CLOSED.
         (Some(_), None) => false,
+        // Not tenant-scoped: a per-user (identity-owned) entity delivers ONLY to
+        // the row's owner (#216); a genuinely auth-only entity to any principal.
+        (None, _) => match (&spec.owner_column, &ev.owner_id) {
+            (None, _) => true, // auth-only entity (no tenant, no owner)
+            (Some(_), Some(o)) => p.user_id.as_str() == o.as_str(), // per-user: owner only
+            (Some(_), None) => false, // owner-scoped, no extractable owner key: fail CLOSED
+        },
     }
 }
 
@@ -139,6 +149,7 @@ mod tests {
                 table: "lead".into(),
                 pk_column: "id".into(),
                 tenant_column: Some("workspace_id".into()),
+                owner_column: None,
                 hidden_columns: Vec::new(),
             }],
             broadcast: vec![
@@ -242,6 +253,7 @@ mod tests {
         let ev = ChangeEventView {
             tenant_id: Some("t2".into()),
             old_tenant_id: None,
+            owner_id: None,
         };
         assert!(!change_visible(spec, &ev, Some(&principal("t1"))));
         assert!(change_visible(spec, &ev, Some(&principal("t2"))));
@@ -265,6 +277,7 @@ mod tests {
         let ev = ChangeEventView {
             tenant_id: Some("t2".into()),
             old_tenant_id: Some("t1".into()),
+            owner_id: None,
         };
         assert!(
             change_visible(spec, &ev, Some(&principal("t2"))),
@@ -282,5 +295,78 @@ mod tests {
             !delete_view_for_old_tenant(spec, &ev, Some(&principal("t3"))),
             "third tenant sees nothing"
         );
+    }
+
+    fn per_user_spec() -> ChangeChannelSpec {
+        ChangeChannelSpec {
+            entity: "Note".into(),
+            table: "notes".into(),
+            pk_column: "id".into(),
+            tenant_column: None,
+            owner_column: Some("user_id".into()),
+            hidden_columns: Vec::new(),
+        }
+    }
+
+    fn owner(user_id: &str) -> Principal {
+        Principal {
+            user_id: user_id.into(),
+            tenant_id: None,
+            role: None,
+        }
+    }
+
+    /// #216 (SECURITY): a per-user (identity-owned, non-tenant) changes event is
+    /// visible ONLY to the row's owner. This is the pure-filter twin of the REST
+    /// `get_for`/`all_for` owner-scoping: `ev.owner_id == principal.user_id`. The
+    /// pre-0.7.3 filter mapped `(None, _) => true`, so EVERY authenticated
+    /// principal saw EVERY user's rows — the cross-user leak. A regression to
+    /// that world-visible arm turns this red.
+    #[test]
+    fn per_user_change_is_visible_only_to_its_owner() {
+        let spec = per_user_spec();
+        let ev = ChangeEventView {
+            tenant_id: None,
+            old_tenant_id: None,
+            owner_id: Some("u1".into()),
+        };
+        assert!(
+            change_visible(&spec, &ev, Some(&owner("u1"))),
+            "the owner sees their own row"
+        );
+        assert!(
+            !change_visible(&spec, &ev, Some(&owner("u2"))),
+            "another user must NEVER see u1's row — the #216 cross-user leak"
+        );
+        // Anonymous never sees a per-user change.
+        assert!(!change_visible(&spec, &ev, None));
+        // Owner-scoped but no extractable owner key: fail CLOSED (not world-visible).
+        let no_key = ChangeEventView {
+            owner_id: None,
+            ..ev.clone()
+        };
+        assert!(
+            !change_visible(&spec, &no_key, Some(&owner("u1"))),
+            "owner_column set but owner_id missing must fail closed, never deliver"
+        );
+    }
+
+    /// A genuinely auth-only entity (no tenant, no owner column) is unchanged by
+    /// #216: any authenticated principal receives it (the `(None, None)` arm).
+    #[test]
+    fn auth_only_change_is_visible_to_any_principal() {
+        let spec = ChangeChannelSpec {
+            owner_column: None,
+            ..per_user_spec()
+        };
+        let ev = ChangeEventView {
+            tenant_id: None,
+            old_tenant_id: None,
+            owner_id: None,
+        };
+        assert!(change_visible(&spec, &ev, Some(&owner("u1"))));
+        assert!(change_visible(&spec, &ev, Some(&owner("u2"))));
+        // Still never anonymous.
+        assert!(!change_visible(&spec, &ev, None));
     }
 }

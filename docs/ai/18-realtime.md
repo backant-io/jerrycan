@@ -30,13 +30,13 @@ use jerrycan::realtime::{ChangeChannelSpec, Realtime, TopicScope};
 
 fn wire(db: jerrycan::db::Db) -> Realtime {
     Realtime::new(db)
-        .changes(ChangeChannelSpec {
-            entity: "Lead".into(),
-            table: "lead".into(),
-            pk_column: "id".into(),
-            tenant_column: Some("workspace_id".into()),
-            hidden_columns: vec![],
-        })
+        // A tenant-owned entity is scoped to the tenant; a per-user entity
+        // (`.owner_column(Some("user_id".to_string()))`) is scoped to its owner —
+        // you only receive a change you could have GET'd.
+        .changes(
+            ChangeChannelSpec::new("Lead", "leads", "id")
+                .tenant_column(Some("workspace_id".to_string())),
+        )
         .broadcast("deal_room", TopicScope::Tenant)
         .presence("editors", TopicScope::Tenant)
 }

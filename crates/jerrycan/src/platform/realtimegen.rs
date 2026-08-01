@@ -37,11 +37,21 @@ fn find_entity<'a>(design: &'a Design, name: &str) -> Option<&'a Entity> {
     design.modules.iter().find_map(|m| walk(m, name))
 }
 
-/// Derive `(table, pk_column, tenant_column)` for a changes entity: the table is
-/// `snake_case(Entity)`, the pk is always `id`, and the tenant column is the
-/// tenancy fk when the entity `belongs_to` the tenancy entity, the pk itself
-/// when the entity IS the tenancy entity, else None.
-fn changes_spec(design: &Design, entity: &str) -> (String, String, Option<String>) {
+/// An `Option<String>` as a Rust source literal: `Some("x".to_string())` / `None`.
+fn opt_string_lit(v: &Option<String>) -> String {
+    match v {
+        Some(c) => format!("Some(\"{c}\".to_string())"),
+        None => "None".to_string(),
+    }
+}
+
+/// Derive `(table, pk_column, tenant_column, owner_column)` for a changes entity:
+/// the table is `snake_case(Entity)`, the pk is always `id`, the tenant column is
+/// the tenancy fk when the entity `belongs_to` the tenancy entity (the pk itself
+/// when the entity IS the tenancy entity, else None), and — ONLY when the entity
+/// is not tenant-scoped — the owner (identity fk) column when the entity is
+/// per-user owned (#216), else None.
+fn changes_spec(design: &Design, entity: &str) -> (String, String, Option<String>, Option<String>) {
     // The change-capture table name MUST match the migration/schema table name,
     // so it goes through the SAME `Design::table_name` (snake_case + proper
     // pluralization, honoring any `table` override) — `Lead` → `leads`,
@@ -66,7 +76,20 @@ fn changes_spec(design: &Design, entity: &str) -> (String, String, Option<String
             .filter(|e| e.belongs_to.iter().any(|b| b.entity == t.entity))
             .map(|_| Design::fk_column(&t.entity))
     });
-    (table, pk, tenant_column)
+    // #216: a per-user (identity-owned, non-tenant) changes entity is
+    // owner-scoped. Only when the entity is NOT tenant-scoped AND is per-user
+    // owned (auth + identity fk + no tenant path) does the channel carry the
+    // identity fk column (#150-aware, e.g. `user_id`) so `change_visible`
+    // delivers each row only to its owner. Tenant-scoped and genuinely
+    // auth-only changes entities keep `owner_column: None` (byte-identical).
+    let owner_column = if tenant_column.is_none() {
+        find_entity(design, entity)
+            .filter(|e| design.entity_is_per_user_owned(e))
+            .map(|_| design.identity_fk_column())
+    } else {
+        None
+    };
+    (table, pk, tenant_column, owner_column)
 }
 
 /// The `hidden_columns` literal for a changes entity: the DB column name (the
@@ -293,14 +316,16 @@ pub fn wiring_rs(design: &Design) -> String {
             r.changes
                 .iter()
                 .map(|entity| {
-                    let (table, pk, tenant) = changes_spec(design, entity);
-                    let tenant_lit = match tenant {
-                        Some(c) => format!("Some(\"{c}\".to_string())"),
-                        None => "None".to_string(),
-                    };
+                    let (table, pk, tenant, owner) = changes_spec(design, entity);
+                    let tenant_lit = opt_string_lit(&tenant);
+                    let owner_lit = opt_string_lit(&owner);
                     let hidden_lit = hidden_columns_lit(design, entity);
+                    // #216: emit the BUILDER chain (not a struct literal) — the
+                    // spec is `#[non_exhaustive]` since 0.7.3, so a cross-crate
+                    // literal no longer compiles, and the builder keeps future
+                    // field-adds a non-breaking minor.
                     format!(
-                        "        .changes(jerrycan::realtime::ChangeChannelSpec {{ entity: \"{entity}\".to_string(), table: \"{table}\".to_string(), pk_column: \"{pk}\".to_string(), tenant_column: {tenant_lit}, hidden_columns: {hidden_lit} }})\n"
+                        "        .changes(jerrycan::realtime::ChangeChannelSpec::new(\"{entity}\", \"{table}\", \"{pk}\").tenant_column({tenant_lit}).owner_column({owner_lit}).hidden_columns({hidden_lit}))\n"
                     )
                 })
                 .collect()
@@ -459,18 +484,24 @@ mod tests {
             a.contains("pub fn realtime(db: jerrycan::db::Db) -> jerrycan::realtime::Realtime"),
             "{a}"
         );
-        // Lead belongs_to Workspace (the tenancy entity) ⇒ tenant filter on workspace_id.
-        assert!(a.contains(r#"entity: "Lead".to_string()"#), "{a}");
-        // The change-capture table is the MIGRATION table name — lowercased +
-        // pluralized (`Lead` → `leads`), NOT snake_case. `table: "lead"` names a
-        // non-existent relation and the replication/trigger DDL fails at runtime.
-        assert!(a.contains(r#"table: "leads".to_string()"#), "{a}");
-        assert!(!a.contains(r#"table: "lead".to_string()"#), "{a}");
-        assert!(a.contains(r#"pk_column: "id".to_string()"#), "{a}");
+        // Lead belongs_to Workspace (the tenancy entity) ⇒ tenant filter on
+        // workspace_id, emitted through the #216 BUILDER chain (the spec is
+        // #[non_exhaustive] since 0.7.3). The change-capture table is the
+        // MIGRATION table name — lowercased + pluralized (`Lead` → `leads`), NOT
+        // snake_case; a singular `"lead"` names a non-existent relation.
         assert!(
-            a.contains(r#"tenant_column: Some("workspace_id".to_string())"#),
+            a.contains(
+                r#".changes(jerrycan::realtime::ChangeChannelSpec::new("Lead", "leads", "id")"#
+            ),
             "{a}"
         );
+        assert!(!a.contains(r#""lead","#), "{a}");
+        assert!(
+            a.contains(r#".tenant_column(Some("workspace_id".to_string()))"#),
+            "{a}"
+        );
+        // Lead is tenant-scoped, so no owner scoping (byte-identical to pre-#216).
+        assert!(a.contains(".owner_column(None)"), "{a}");
         assert!(
             a.contains(r#".broadcast("deal_room", jerrycan::realtime::TopicScope::Tenant)"#),
             "{a}"
@@ -482,8 +513,8 @@ mod tests {
         // #167: an entity with no write_only column emits an empty projection set
         // — the realtime broadcast stays byte-identical (full row).
         assert!(
-            a.contains("hidden_columns: vec![] })"),
-            "no write_only column ⇒ hidden_columns: vec![]: {a}"
+            a.contains(".hidden_columns(vec![]))"),
+            "no write_only column ⇒ hidden_columns(vec![]): {a}"
         );
     }
 
@@ -514,7 +545,7 @@ mod tests {
         let wired = wiring_rs(&leak);
         assert!(
             wired.contains(
-                r#"hidden_columns: vec!["api_token".to_string(), "password_hash".to_string()] })"#
+                r#".hidden_columns(vec!["api_token".to_string(), "password_hash".to_string()]))"#
             ),
             "write_only + password_hash columns must be projected out via hidden_columns, in \
              declaration order: {wired}"
@@ -683,14 +714,18 @@ mod tests {
         let mut owned = rt_design();
         owned.modules[1].entities[0].belongs_to.clear();
         let w = wiring_rs(&owned);
-        assert!(w.contains("tenant_column: None"), "{w}");
+        // Lead no longer belongs_to Workspace and carries no identity fk ⇒ neither
+        // tenant- nor owner-scoped.
+        assert!(w.contains(".tenant_column(None)"), "{w}");
+        assert!(w.contains(".owner_column(None)"), "{w}");
 
         let mut d = rt_design();
         d.tenancy = None;
         d.auth.as_mut().unwrap().model = crate::platform::design::AuthModel::Session;
         d.modules[1].entities[0].belongs_to.clear();
         let a = wiring_rs(&d);
-        assert!(a.contains("tenant_column: None"), "{a}");
+        assert!(a.contains(".tenant_column(None)"), "{a}");
+        assert!(a.contains(".owner_column(None)"), "{a}");
         assert!(a.contains("shared::CurrentUser"), "{a}");
         assert!(!a.contains("shared::Tenant"), "{a}");
     }
@@ -713,7 +748,7 @@ mod tests {
         let a = wiring_rs(&d);
         assert!(
             a.contains(
-                r#"entity: "Workspace".to_string(), table: "workspaces".to_string(), pk_column: "id".to_string(), tenant_column: Some("id".to_string())"#
+                r#".changes(jerrycan::realtime::ChangeChannelSpec::new("Workspace", "workspaces", "id").tenant_column(Some("id".to_string()))"#
             ),
             "{a}"
         );
@@ -721,14 +756,53 @@ mod tests {
         // pk branch fires ONLY for the tenant entity itself.
         assert!(
             a.contains(
-                r#"entity: "Lead".to_string(), table: "leads".to_string(), pk_column: "id".to_string(), tenant_column: Some("workspace_id".to_string())"#
+                r#".changes(jerrycan::realtime::ChangeChannelSpec::new("Lead", "leads", "id").tenant_column(Some("workspace_id".to_string()))"#
             ),
             "{a}"
         );
         assert!(
-            !a.contains("tenant_column: None"),
+            !a.contains(".tenant_column(None)"),
             "no unscoped channel may remain in this tenancy design: {a}"
         );
+    }
+
+    /// #216 (SECURITY): a per-user (identity-owned, non-tenant) changes entity
+    /// derives `owner_column: Some(identity_fk)` so the runtime delivers each row
+    /// only to its owner. Before the fix its channel was unscoped
+    /// (`owner_column: None` didn't exist) and `change_visible` treated it as
+    /// world-visible — every user received every user's rows. A tenant-scoped or
+    /// genuinely auth-only entity keeps `owner_column(None)` (byte-identical).
+    #[test]
+    fn per_user_changes_entity_derives_owner_column() {
+        // A jwt design with NO tenancy: `Note belongs_to User` is per-user owned
+        // (identity fk `user_id`, no tenant path), so its changes channel is
+        // owner-scoped.
+        let d: Design = serde_json::from_str(
+            r#"{
+                "name": "note-app", "contract_version": 2,
+                "auth": { "model": "jwt", "roles": ["member"] },
+                "dependencies": ["db", "auth"],
+                "realtime": { "changes": ["Note"], "broadcast": [], "presence": [] },
+                "modules": [
+                    { "name": "notes",
+                      "entities": [{ "name": "Note",
+                          "belongs_to": [{ "entity": "User" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "body", "type": "string" }] }],
+                      "endpoints": [] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let a = wiring_rs(&d);
+        assert!(
+            a.contains(
+                r#".changes(jerrycan::realtime::ChangeChannelSpec::new("Note", "notes", "id").tenant_column(None).owner_column(Some("user_id".to_string()))"#
+            ),
+            "a per-user changes entity must be owner-scoped on the identity fk: {a}"
+        );
+        // Determinism (JL0003).
+        assert_eq!(a, wiring_rs(&d), "owner derivation is deterministic");
     }
 
     #[test]
