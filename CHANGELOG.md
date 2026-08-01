@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.1 — 2026-08-01
+
+### Added
+- **Opt-in `auth.identity` generalizes per-user owner-scoping (#150).** Per-user owner-scoping,
+  the #34 server-injected fk, and `public_read` (#105) all detected ownership by the LITERAL
+  derived column `user_id`, so an identity entity named anything but `User` (e.g. `Account`, fk
+  `account_id`) SILENTLY got no owner-scoping AND kept its fk client-writable — spoofable ownership
+  behind a green `check`. `Auth` now carries an opt-in `identity: Option<String>` (default `"User"`);
+  the identity-fk DETECTION column is resolved per-design as `snake(auth.identity)_id` through the
+  single `Design::identity_fk_column()`, threaded through every consumer (owner-scoped repo methods,
+  the request-DTO fk omission + server-inject steer, testgen seeds/probes, the OpenAPI request
+  schema, and the JC0540/JC0549/JC0560 validators + the JL0006 classifier). The membership-table
+  PRINCIPAL column stays the fixed `user_id` (it stores the session principal, not the identity
+  entity's fk). A non-existent `auth.identity` is refused with **JC0540** (identity == tenant org)
+  or the new **JC0566** (identity names no declared entity). Additive on the now-`#[non_exhaustive]`
+  `Auth` (0.7.0/#145): the default `"User"` resolves to `user_id`, so every existing design is
+  byte-identical — the new behavior is opt-in only.
+
 ## 0.7.0 — 2026-08-01
 
 The first release of the 0.7 major line. Groundwork only — no new design surface.

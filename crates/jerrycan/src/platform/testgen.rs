@@ -210,7 +210,7 @@ fn fixture_json(
     let fks = e
         .belongs_to
         .iter()
-        .filter(|b| !(omit_identity_fk && Design::is_identity_fk(b)))
+        .filter(|b| !(omit_identity_fk && design.is_identity_fk(b)))
         .filter(|b| !path_fks.contains(&b.fk_column()))
         .map(|b| {
             format!(
@@ -419,7 +419,7 @@ fn seed_parents(
 ) {
     let tenancy = design.tenancy.as_ref().map(|t| t.entity.as_str());
     for b in &entity.belongs_to {
-        if Design::is_identity_fk(b)
+        if design.is_identity_fk(b)
             || Some(b.entity.as_str()) == tenancy
             || seen.contains(&b.entity)
         {

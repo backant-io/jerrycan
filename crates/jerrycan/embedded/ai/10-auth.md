@@ -167,38 +167,50 @@ assert_eq!(
 # }); }
 ```
 
-## The auth identity entity MUST be named `User`
+## The auth identity entity (`auth.identity`, default `User`)
 
-There is no `auth.identity` design field yet (#150 will add an opt-in one) — the
-generator resolves the identity by the LITERAL derived column `user_id`
-(`snake_case("User") + "_id"`). Three security behaviors key on exactly that
-column, for an entity whose `belongs_to` targets the `User` entity:
+The authenticated session principal maps to ONE entity — the "identity" entity.
+By default it is `User`, so the generator resolves the identity by the derived
+column `user_id` (`snake_case("User") + "_id"`). Set `auth.identity` to opt into
+a different name (issue #150):
+
+```json
+{ "auth": { "model": "session", "identity": "Account" } }
+```
+
+Now the identity fk is `account_id` (`snake_case("Account") + "_id"`). Three
+security behaviors key on that derived column, for an entity whose `belongs_to`
+targets the identity entity:
 
 - **Per-user owner-scoping** — the generated repo is owner-scoped
   (`all_for`/`get_for`/`update_for`/`remove_for`, keyed on the session user), so
   one user can never read, update, or delete another user's rows.
-- **The server-injected fk (the `user_id` convention)** — `user_id` is dropped
-  from the guarded request DTO and injected from the session on create, so a client
-  cannot write a row as someone else (see 00-designing.md, "Server-owned fields").
-  Name the convention when you author: the framework keys this auto-omission on the
-  LITERAL column `user_id` (design.rs `AUTH_IDENTITY_FK_COLUMN = "user_id"`), which
-  only an UN-aliased `belongs_to User` derives (`snake_case("User") + "_id"`). An
-  ALIASED `belongs_to` the identity — `as: "sender"` → `sender_id` (#119) — is
-  deliberately NOT the owner fk: it stays a plain, client-writable reference (a
-  message's sender/recipient), with no owner-scoping and no session injection. (An
-  `as` alias that would itself derive `user_id` on a non-identity target is refused,
-  `JC0560`.)
+- **The server-injected fk** — the identity fk is dropped from the guarded
+  request DTO and injected from the session on create, so a client cannot write a
+  row as someone else (see 00-designing.md, "Server-owned fields"). The framework
+  keys this auto-omission on the DERIVED identity column (`snake(auth.identity)_id`
+  — `Design::identity_fk_column()`), which only an UN-aliased `belongs_to` the
+  identity entity derives. An ALIASED `belongs_to` the identity — `as: "sender"` →
+  `sender_id` (#119) — is deliberately NOT the owner fk: it stays a plain,
+  client-writable reference (a message's sender/recipient), with no owner-scoping
+  and no session injection. (An `as` alias that would itself derive the identity fk
+  on a non-identity target is refused, `JC0560`.)
 - **`public_read`** — the public-read / owner-write split resolves the owner
-  through the same `user_id` column.
+  through the same identity column.
 
-Name the identity entity anything else — `Account`, `Member`, `Profile` — and
-NONE of this fires, SILENTLY: the design still validates and `jerrycan check`
-stays green, but the owned entities get NO owner-scoping (every authenticated
-user reads and deletes every row) and the fk (`account_id`, …) stays
-CLIENT-WRITABLE — any caller can create rows "owned" by any other user simply by
-sending a different id in the body. That is spoofable ownership, a security
-hole, not a naming nit. Until #150 lands, always name the auth identity entity
-`User`.
+`auth.identity` must name a DECLARED entity (`JC0566`) — a typo'd or absent
+identity would resolve to a fk column no entity carries and SILENTLY disable all
+three behaviors behind a green `check`: the owned entities get NO owner-scoping
+(every authenticated user reads and deletes every row) and the fk stays
+CLIENT-WRITABLE — spoofable ownership, a security hole, not a naming nit. The
+default `User` is exempt: a design may use auth without declaring a `User` entity
+(e.g. an external identity provider).
+
+The membership-table principal column stays `user_id` regardless of
+`auth.identity` — it stores the raw session principal, not the identity entity's
+fk. So a tenancy design keeps its `{tenant}_members.user_id` column even when the
+identity is `Account`, and `auth.identity` cannot BE the tenancy entity (`JC0540`:
+a user cannot be their own tenant org).
 
 ## Variations
 - Passwords: `jerrycan::auth::hash_password(pw)` → `Result<String>` (a PHC

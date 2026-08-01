@@ -417,9 +417,10 @@ fn check_field_shape(f: &Field, fptr: &str, wants_db: bool, qs: &mut Vec<Questio
     }
 }
 
-// The fixed `user_id` identity linkage (AUTH_IDENTITY_FK_COLUMN) lives in
-// `design.rs` — shared with the server-owned-FK emission rule (issue #34).
-// It reaches this module through the `use super::design::*` glob above.
+// The fixed membership-principal column `user_id` (`MEMBERSHIP_PRINCIPAL_COLUMN`)
+// and the DESIGN-AWARE identity-fk resolution (`Design::identity_fk_column`, #150)
+// both live in `design.rs`. They reach this module through the
+// `use super::design::*` glob above.
 
 /// A fatal design-shape conflict caught before any scaffolding — distinct from
 /// the completeness questions `validate` returns (which a field edit can
@@ -432,26 +433,57 @@ pub struct DesignConflict {
     pub hint: String,
 }
 
-/// Reject a design that cannot be generated regardless of completeness. One rule
-/// today (#27): `tenancy.entity` must not BE the auth identity entity. When it
+/// Reject a design that cannot be generated regardless of completeness. Rules:
+/// (JC0566, #150) an explicit `auth.identity` must name a declared entity; and
+/// (JC0540, #27) `tenancy.entity` must not BE the auth identity entity — when it
 /// is, the tenant's derived fk column equals the membership table's fixed
 /// `user_id` column, so the auth_0001 migration declares `user_id` twice and
 /// dies with `duplicate column name: user_id` — mid-scaffold, on a half-written
-/// tree. Catch it up front instead. Shared by the CLI and MCP so they can't drift.
+/// tree. Catch them up front instead. Shared by the CLI and MCP so they can't drift.
 pub fn design_conflict(d: &Design) -> Option<DesignConflict> {
-    if let Some(tenancy) = &d.tenancy
-        && Design::fk_column(&tenancy.entity) == AUTH_IDENTITY_FK_COLUMN
+    // JC0566 (#150): an explicit `auth.identity` must name a DECLARED entity —
+    // owner-scoping, the #34 server-injected fk, and public_read all detect
+    // ownership by this entity's derived fk column, so a typo'd/absent identity
+    // would resolve to a fk NO entity carries and silently disable owner-scoping
+    // everywhere behind a green check. The default `"User"` is exempt (a design
+    // may use auth without declaring a `User` entity — e.g. an external identity
+    // provider), so only an explicitly-set identity is validated.
+    if let Some(identity) = d.auth.as_ref().and_then(|a| a.identity.as_deref())
+        && d.find_entity(identity).is_none()
     {
-        let entity = &tenancy.entity;
         return Some(DesignConflict {
-            code: "JC0540",
+            code: "JC0566",
             message: format!(
-                "tenancy.entity `{entity}` is the auth identity entity — its derived foreign key column `{AUTH_IDENTITY_FK_COLUMN}` collides with the membership table's authenticated-user column, so scaffolding would die with `duplicate column name: {AUTH_IDENTITY_FK_COLUMN}`. A user cannot be their own tenant org. For per-user data, drop the `tenancy` block and give each owned entity a `belongs_to` `{entity}` plus tenant-scoped guard methods (all_for/get_for); for orgs/teams, point tenancy.entity at a separate tenant entity (e.g. Org or Workspace). See `jerrycan docs tenancy` / `jerrycan explain JC0540`."
+                "auth.identity `{identity}` names no declared entity — per-user owner-scoping, the server-injected identity fk (#34), and public_read all detect ownership by the derived column `{}`, so an identity that maps to no entity silently disables owner-scoping (every authenticated caller reads and writes every row) behind a green `check`. Declare an entity named `{identity}`, or drop `auth.identity` to use the default `User`. See `jerrycan explain JC0566`.",
+                d.identity_fk_column()
             ),
             hint: format!(
-                "per-user data → `belongs_to` `{entity}` + scoped guard methods; orgs/teams → a separate tenant entity (Org/Workspace)"
+                "declare an entity named `{identity}` (the auth identity), or omit `auth.identity` (defaults to `User`)"
             ),
         });
+    }
+    // JC0540: tenancy.entity must not derive a fk that collides in the members
+    // table. Two collisions, both fatal: (a) it equals the DESIGN identity fk
+    // (`snake(auth.identity)_id`, default `user_id`, #150) — the identity entity
+    // cannot also be the tenant org (a user cannot be their own org); (b) it
+    // equals the FIXED membership-principal `user_id` — the members DDL already
+    // declares that column, so scaffolding dies with `duplicate column name`.
+    // For the default `"User"` identity the two coincide (byte-identical); a
+    // non-`User` identity keeps BOTH guards.
+    if let Some(tenancy) = &d.tenancy {
+        let tenant_fk = Design::fk_column(&tenancy.entity);
+        if tenant_fk == d.identity_fk_column() || tenant_fk == MEMBERSHIP_PRINCIPAL_COLUMN {
+            let entity = &tenancy.entity;
+            return Some(DesignConflict {
+                code: "JC0540",
+                message: format!(
+                    "tenancy.entity `{entity}` is the auth identity entity — its derived foreign key column `{tenant_fk}` collides with the membership table's authenticated-user column, so scaffolding would die with `duplicate column name: {tenant_fk}`. A user cannot be their own tenant org. For per-user data, drop the `tenancy` block and give each owned entity a `belongs_to` `{entity}` plus tenant-scoped guard methods (all_for/get_for); for orgs/teams, point tenancy.entity at a separate tenant entity (e.g. Org or Workspace). See `jerrycan docs tenancy` / `jerrycan explain JC0540`."
+                ),
+                hint: format!(
+                    "per-user data → `belongs_to` `{entity}` + scoped guard methods; orgs/teams → a separate tenant entity (Org/Workspace)"
+                ),
+            });
+        }
     }
     // JC0548 (#107): with tenancy, `member_roles` backs the generated member-
     // management surface — `member_roles[0]` is the admin role, and every role
@@ -1525,7 +1557,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
                     ),
                 ));
             }
-            if !Design::has_identity_fk(e) {
+            if !d.has_identity_fk(e) {
                 qs.push(q(
                     format!("{ptr}/entities/{i}"),
                     format!(
@@ -1894,15 +1926,17 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 }
                 let col = b.fk_column();
                 // (4) #119 Finding 1: reject an alias that lands on a reserved fk the
-                // target doesn't own — hijacking identity/tenant scoping.
-                if auth_active
-                    && col == AUTH_IDENTITY_FK_COLUMN
-                    && Design::fk_column(&b.entity) != AUTH_IDENTITY_FK_COLUMN
+                // target doesn't own — hijacking identity/tenant scoping. The identity
+                // fk is DESIGN-AWARE (#150): `snake(auth.identity)_id` (default
+                // `user_id`), so an alias that hijacks a non-`User` identity's fk is
+                // refused too.
+                let identity_fk = d.identity_fk_column();
+                if auth_active && col == identity_fk && Design::fk_column(&b.entity) != identity_fk
                 {
                     qs.push(q(
                         bptr.clone(),
                         format!(
-                            "Entity `{}` belongs_to `{}` with `as` deriving fk column `{col}` — that is the reserved identity fk (the authenticated user's column); only `belongs_to` the identity entity may own `{AUTH_IDENTITY_FK_COLUMN}`. Choose a different `as` alias. See `jerrycan explain JC0560`.",
+                            "Entity `{}` belongs_to `{}` with `as` deriving fk column `{col}` — that is the reserved identity fk (the authenticated user's column); only `belongs_to` the identity entity may own `{identity_fk}`. Choose a different `as` alias. See `jerrycan explain JC0560`.",
                             e.name, b.entity
                         ),
                     ));
@@ -3752,6 +3786,105 @@ mod tests {
         // No tenancy at all: nothing to conflict.
         let plain: Design = serde_json::from_str(MINIMAL).unwrap();
         assert!(design_conflict(&plain).is_none());
+    }
+
+    /// #150: an explicit `auth.identity` that names no declared entity is a fatal
+    /// conflict (JC0566) — owner-scoping, the #34 server-injected fk, and
+    /// public_read all detect ownership by the identity's derived fk column, so an
+    /// identity mapping to no entity silently disables owner-scoping everywhere
+    /// behind a green `check`. `design_conflict` must refuse it up front.
+    #[test]
+    fn auth_identity_naming_a_non_entity_is_refused_jc0566() {
+        const D: &str = r#"{
+            "name": "ghost-api", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin"], "identity": "Ghost" },
+            "dependencies": ["db", "auth"],
+            "modules": [{ "name": "accounts",
+                "entities": [{ "name": "Account", "fields": [
+                    { "name": "email", "type": "string" } ]}],
+                "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Account", "list": true } }] }]
+        }"#;
+        let d: Design = serde_json::from_str(D).unwrap();
+        let conflict = design_conflict(&d).expect("a non-existent auth.identity must conflict");
+        assert_eq!(conflict.code, "JC0566");
+        // The message names the missing identity and the derived fk it would resolve to.
+        assert!(
+            conflict.message.contains("Ghost") && conflict.message.contains("ghost_id"),
+            "{}",
+            conflict.message
+        );
+        assert!(!conflict.hint.is_empty());
+    }
+
+    /// #150: JC0540 collides the CONFIGURED identity's fk, not the literal
+    /// `user_id`. With `auth.identity: "Account"`, a `tenancy.entity: "Account"`
+    /// derives `account_id` == the identity fk — the identity entity cannot also be
+    /// the tenant org — so it is refused (generalized from the default `user_id`).
+    #[test]
+    fn auth_identity_colliding_with_tenancy_is_refused_jc0540() {
+        const D: &str = r#"{
+            "name": "acct-tenant", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin"], "identity": "Account" },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Account", "member_roles": ["admin"] },
+            "modules": [{ "name": "accounts",
+                "entities": [{ "name": "Account", "fields": [
+                    { "name": "email", "type": "string" } ]}],
+                "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/",
+                    "auth_required": true,
+                    "success": { "status": 200, "entity": "Account", "list": true } }] }]
+        }"#;
+        let d: Design = serde_json::from_str(D).unwrap();
+        let conflict = design_conflict(&d).expect("identity == tenant must conflict");
+        assert_eq!(conflict.code, "JC0540");
+        // The message names the DERIVED identity fk (`account_id`), not `user_id`.
+        assert!(
+            conflict.message.contains("account_id") && !conflict.message.contains("user_id"),
+            "{}",
+            conflict.message
+        );
+    }
+
+    /// #150: a valid non-`User` identity (`Account` declared, per-user-owned child
+    /// `Note belongs_to Account`, no tenant collision) is CLEAN — the opt-in is
+    /// accepted, not refused.
+    #[test]
+    fn valid_non_user_auth_identity_is_not_a_conflict() {
+        const D: &str = r#"{
+            "name": "acct-ok", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin"], "identity": "Account" },
+            "dependencies": ["db", "auth"],
+            "modules": [
+                { "name": "accounts",
+                  "entities": [{ "name": "Account", "fields": [
+                      { "name": "email", "type": "string" } ]}],
+                  "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/",
+                      "auth_required": true,
+                      "success": { "status": 200, "entity": "Account", "list": true } }] },
+                { "name": "notes",
+                  "entities": [{ "name": "Note",
+                      "belongs_to": [{ "entity": "Account", "on_delete": "cascade" }],
+                      "fields": [{ "name": "title", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_note", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Note" },
+                      "success": { "status": 201, "entity": "Note" } }] }
+            ]
+        }"#;
+        let d: Design = serde_json::from_str(D).unwrap();
+        assert!(
+            design_conflict(&d).is_none(),
+            "a valid Account identity must not conflict: {:?}",
+            design_conflict(&d).map(|c| c.message)
+        );
+        // And the completeness pass is clean too (the opt-in is fully wired).
+        assert!(
+            validate(&d).is_empty(),
+            "valid Account-identity design must be complete: {:?}",
+            validate(&d)
+        );
     }
 
     /// JC0553 (#141): with tenancy, jerrycan reserves `{tenant}_members` (the
