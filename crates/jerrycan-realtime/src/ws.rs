@@ -296,7 +296,7 @@ mod anon_scope_none_tests {
             db: None,
             conns: Mutex::new(HashMap::new()),
             presence: Mutex::new(PresenceMap::default()),
-            changes_unavailable: AtomicBool::new(false),
+            changes_unavailable: Arc::new(AtomicBool::new(false)),
             next_conn: AtomicU64::new(1),
         })
     }

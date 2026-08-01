@@ -13,6 +13,8 @@ use jerrycan_db::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use pgwire_replication::{
     Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent, SslMode, TlsConfig,
 };
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// The reserved advisory-lock key for the replication leader. Distinct from
@@ -251,12 +253,18 @@ pub(crate) async fn stream_once(
     conn: &PgConn,
     specs: &[ChangeChannelSpec],
     events: &tokio::sync::mpsc::Sender<crate::changes::ChangeEvent>,
+    connected: &mut bool,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> jerrycan_core::Result<()> {
     let cfg = conn.replication_config(crate::changes::PUBLICATION);
     let mut client = ReplicationClient::connect(cfg)
         .await
         .map_err(|e| replication_error(&e.to_string()))?;
+    // The replication socket is attached: the source is provably provisioned
+    // (wal_level, wal_senders, slot, pgoutput all usable). Signal the supervisor
+    // so a subsequent mid-stream drop is treated as a transient reconnect (#228),
+    // NOT a first-connect failure that must fail loud.
+    *connected = true;
     let mut cache = RelationCache::default();
     loop {
         let ev = tokio::select! {
@@ -302,11 +310,18 @@ pub(crate) async fn run_supervised(
     specs: Vec<ChangeChannelSpec>,
     events: tokio::sync::mpsc::Sender<crate::changes::ChangeEvent>,
     resync: tokio::sync::mpsc::Sender<()>,
+    changes_unavailable: Arc<AtomicBool>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let url = db.url().to_string();
     let Some(conn) = PgConn::parse(&url) else {
-        eprintln!("jerrycan-realtime: replication disabled — cannot parse database url");
+        // A url the replication client can never parse is a permanent
+        // first-connect failure: fail loud (#228) so a `changes:` join answers
+        // JC0530 rather than admitting a feed that will never stream.
+        eprintln!(
+            "jerrycan-realtime: replication disabled — cannot parse database url — changes channels answer JC0530"
+        );
+        changes_unavailable.store(true, Ordering::Relaxed);
         return;
     };
     // Elect the single replication leader (multi-node: exactly one owns the slot).
@@ -314,6 +329,12 @@ pub(crate) async fn run_supervised(
         return; // shutdown before we became leader
     };
     let mut backoff = Duration::from_secs(1);
+    // #228: distinguish NEVER-CONNECTED-ONCE (permanent-ish mis-provisioning:
+    // max_wal_senders=0, slot exhaustion, pgoutput unavailable) from a
+    // DROP-AFTER-CONNECT (transient). Until the first successful attach, a
+    // failing attempt marks the source unavailable; once attached, later drops
+    // stay transient (retry silently, as before).
+    let mut connected_ever = false;
     loop {
         if *shutdown.borrow() {
             return;
@@ -321,7 +342,17 @@ pub(crate) async fn run_supervised(
         if let Err(e) = ensure_replication(&db, &specs).await {
             eprintln!("jerrycan-realtime: replication DDL reconcile failed: {e}");
         }
-        match stream_once(&conn, &specs, &events, &mut shutdown).await {
+        let mut connected_now = false;
+        let outcome = stream_once(&conn, &specs, &events, &mut connected_now, &mut shutdown).await;
+        if connected_now {
+            // A successful attach proves the source is provisioned: lift any
+            // earlier fail-loud so joins are admitted again (e.g. a mis-
+            // provisioned PG that was fixed), and mark the source connected so
+            // subsequent drops are transient.
+            connected_ever = true;
+            changes_unavailable.store(false, Ordering::Relaxed);
+        }
+        match outcome {
             Ok(()) => {
                 if *shutdown.borrow() {
                     return;
@@ -344,10 +375,32 @@ pub(crate) async fn run_supervised(
                 }
             }
         }
+        // #228 (fail loud): if we have NEVER attached the replication socket,
+        // this is a first-connect failure — mark changes unavailable so a
+        // `changes:` join answers JC0530 instead of looping silently into a
+        // dead feed while `may_join` admits subscribers. A no-op once attached.
+        mark_unavailable_if_never_connected(&changes_unavailable, connected_ever);
         tokio::select! {
             _ = shutdown.changed() => return,
             _ = tokio::time::sleep(backoff) => {}
         }
+    }
+}
+
+/// #228 fail-loud decision (factored out for a gated unit test): mark the
+/// changes source unavailable when the replication supervisor has NEVER attached
+/// the replication socket (`connected_ever == false`). A permanently mis-
+/// provisioned Postgres (max_wal_senders=0, slot exhaustion, pgoutput
+/// unavailable) would otherwise retry forever while `Hub::join` admits `changes:`
+/// subscribers to a feed that never delivers; setting the flag makes a join
+/// answer JC0530 instead. Once a connect has succeeded this is a no-op, so a
+/// drop after a good first connect stays transient.
+pub(crate) fn mark_unavailable_if_never_connected(
+    changes_unavailable: &AtomicBool,
+    connected_ever: bool,
+) {
+    if !connected_ever {
+        changes_unavailable.store(true, Ordering::Relaxed);
     }
 }
 
@@ -402,6 +455,32 @@ mod tests {
         assert!(!is_slot_invalid("connection reset by peer"));
     }
 
+    /// #228 (Rule 9) — the fail-loud decision the replication supervisor uses on
+    /// a first-connect failure. WHY it matters: a permanently mis-provisioned
+    /// replication PG (max_wal_senders=0, slot exhaustion, pgoutput unavailable)
+    /// never attaches the socket, so without this a `changes:` join would be
+    /// admitted to a feed that never delivers. This test turns RED if the
+    /// `store(true)` is removed — the guarantee is that a never-connected source
+    /// fails loud (JC0530) rather than looping into a silent dead feed. A source
+    /// that connected once stays available across transient drops.
+    #[test]
+    fn first_connect_failure_marks_changes_unavailable_but_a_connected_source_does_not() {
+        // Never attached once ⇒ mark unavailable (join answers JC0530).
+        let never = AtomicBool::new(false);
+        mark_unavailable_if_never_connected(&never, false);
+        assert!(
+            never.load(Ordering::Relaxed),
+            "a first-connect replication failure must mark changes unavailable so joins answer JC0530"
+        );
+        // Attached at least once ⇒ a later drop is transient — never mark.
+        let connected = AtomicBool::new(false);
+        mark_unavailable_if_never_connected(&connected, true);
+        assert!(
+            !connected.load(Ordering::Relaxed),
+            "a source that connected once must stay available across transient drops"
+        );
+    }
+
     // -------------------------------------------------------------------
     // Live logical-replication test — needs a wal_level=logical Postgres:
     //
@@ -452,7 +531,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let (rtx, _rrx) = tokio::sync::mpsc::channel(4);
         let (stx, srx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(run_supervised(db.clone(), specs, tx, rtx, srx));
+        let unavail = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(run_supervised(db.clone(), specs, tx, rtx, unavail, srx));
 
         // Give the leader/stream a moment to attach, then insert.
         tokio::time::sleep(Duration::from_millis(500)).await;

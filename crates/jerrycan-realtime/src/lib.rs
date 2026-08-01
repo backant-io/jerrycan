@@ -226,9 +226,12 @@ pub struct Hub {
     pub(crate) db: Option<jerrycan_db::Db>,
     pub(crate) conns: Mutex<HashMap<u64, Subscriber>>,
     pub(crate) presence: Mutex<presence::PresenceMap>,
-    /// Set when Changes detection failed (sqlite / no db): a join on a
-    /// `changes:` channel then answers JC0530. Wired in Task 17.
-    pub(crate) changes_unavailable: std::sync::atomic::AtomicBool,
+    /// Set when the Changes source is unavailable — detection failed (sqlite /
+    /// no db), the trigger DDL was denied (#212), OR the replication source
+    /// never attached on first connect (#228). A join on a `changes:` channel
+    /// then answers JC0530. `Arc` so the spawned replication supervisor shares
+    /// the exact flag `Hub::join` reads (it flips it on a first-connect failure).
+    pub(crate) changes_unavailable: Arc<std::sync::atomic::AtomicBool>,
     next_conn: AtomicU64,
 }
 
@@ -458,7 +461,7 @@ impl jerrycan_core::Extension for Realtime {
             db: self.db.clone(),
             conns: Mutex::new(HashMap::new()),
             presence: Mutex::new(presence::PresenceMap::default()),
-            changes_unavailable: std::sync::atomic::AtomicBool::new(false),
+            changes_unavailable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next_conn: AtomicU64::new(1),
         });
         let handle = RealtimeHandle {
@@ -666,6 +669,10 @@ async fn start_change_source(hub: &Arc<Hub>, shutdown: tokio::sync::watch::Recei
                 specs,
                 etx,
                 rtx,
+                // #228: the supervisor flips this on a first-connect failure so a
+                // permanently mis-provisioned replication PG fails loud (JC0530)
+                // instead of admitting `changes:` joins to a silent dead feed.
+                hub.changes_unavailable.clone(),
                 shutdown.clone(),
             ));
             let hub2 = hub.clone();
@@ -796,7 +803,7 @@ mod delivery_tests {
             db: None,
             conns: Mutex::new(HashMap::new()),
             presence: Mutex::new(presence::PresenceMap::default()),
-            changes_unavailable: std::sync::atomic::AtomicBool::new(false),
+            changes_unavailable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next_conn: AtomicU64::new(1),
         })
     }
@@ -817,6 +824,42 @@ mod delivery_tests {
             .unwrap()
             .channels
             .insert(ChannelId::Changes("Lead".into()));
+    }
+
+    /// #228 (Rule 9) fail-loud CONTRACT: when the Changes source is unavailable
+    /// (`changes_unavailable` set — by sqlite/no-db detection, the #212 trigger-
+    /// DDL denial, or the #228 replication first-connect failure), a `changes:`
+    /// join is REFUSED with JC0530 rather than admitting the socket to a feed
+    /// that never delivers. This test turns RED if the refusal in `Hub::join` is
+    /// removed — the payoff of every branch that sets the flag. No live PG needed.
+    #[test]
+    fn changes_join_is_refused_jc0530_when_source_unavailable() {
+        let hub = hub_with_lead();
+        hub.changes_unavailable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (c1, mut rx1) = hub.connect(tenant("t1"));
+        hub.join(c1, "changes:Lead", Some(7));
+        match rx1.try_recv() {
+            Ok(ServerMsg::Error { code, r#ref, .. }) => {
+                assert_eq!(
+                    code, "JC0530",
+                    "an unavailable changes source must answer JC0530"
+                );
+                assert_eq!(r#ref, Some(7), "the error echoes the join ref");
+            }
+            other => panic!("a changes join on an unavailable source must be refused: {other:?}"),
+        }
+        // The refusal must NOT have joined the channel (no silent membership).
+        assert!(
+            !hub.conns
+                .lock()
+                .unwrap()
+                .get(&c1)
+                .unwrap()
+                .channels
+                .contains(&ChannelId::Changes("Lead".into())),
+            "a refused join must not add channel membership"
+        );
     }
 
     /// THE socket-level negative control: an insert in tenant t2 reaches a t2
@@ -959,7 +1002,7 @@ mod delivery_tests {
             db: None,
             conns: Mutex::new(HashMap::new()),
             presence: Mutex::new(presence::PresenceMap::default()),
-            changes_unavailable: std::sync::atomic::AtomicBool::new(false),
+            changes_unavailable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next_conn: AtomicU64::new(1),
         })
     }
