@@ -978,9 +978,16 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
     if m.entities.is_empty() && inline.is_empty() {
         return None;
     }
-    let mut out = String::from(
-        "//! Entities and DTOs for this module.\nuse serde::{Deserialize, Serialize};\n\n",
-    );
+    // The `use serde::{Deserialize, Serialize};` import is consumed ONLY by the
+    // entity structs' unqualified `#[derive(…, Serialize, Deserialize)]`. The inline
+    // DTO struct and every validator use fully-qualified `serde::` paths, so an
+    // entity-LESS inline-DTO module (issue #224) must NOT emit the import — it would
+    // be an unused import that fails the generated app's `-D warnings` clippy gate.
+    let mut out = String::from("//! Entities and DTOs for this module.\n");
+    if !m.entities.is_empty() {
+        out.push_str("use serde::{Deserialize, Serialize};\n");
+    }
+    out.push('\n');
     for e in &m.entities {
         out.push_str("#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct ");
         out.push_str(&e.name);
@@ -3830,8 +3837,16 @@ fn mod_decls(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     if emits_member_surface(m, mode, design) {
         out.push_str("mod members;\n");
     }
+    // `mod model;` is emitted whenever `model.rs`/`model_rs_db` is (issue #224):
+    // that file exists for a module with entities OR an inline-DTO body (issue
+    // #122), so `handlers.rs`'s `use super::model::*;` resolves in an entity-less
+    // inline-DTO module too. `mod repo;` stays entity-gated — no entity, no repo.
+    // (`model` precedes `repo` alphabetically, so `reorder_modules` stays a no-op.)
+    if !m.entities.is_empty() || !module_inline_bodies(m).is_empty() {
+        out.push_str("mod model;\n");
+    }
     if !m.entities.is_empty() {
-        out.push_str("mod model;\nmod repo;\n");
+        out.push_str("mod repo;\n");
     }
     if !m.subroutes.is_empty() {
         out.push_str("mod subroutes;\n");
