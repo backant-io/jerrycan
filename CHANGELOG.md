@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.2 — 2026-08-01
+
+### Added
+- **Tenant-partitioned realtime broadcast + membership-verified WS tenant-select (#104).**
+  Multi-tenant realtime was unbuildable on three fronts, now closed:
+  - **`RealtimeHandle::publish_to(tenant_id, topic, payload)`** — the partitioned twin of
+    `publish`. It stamps the event with the tenant, so a `tenant`-scoped topic delivers to
+    **only that tenant's** sockets (`publish_to(A, …)` can never reach tenant B). The two methods
+    are a clean duality: `publish` for `none`/`auth` topics (unchanged; still **JC0403** on a
+    `tenant` topic, now pointing at `publish_to`), `publish_to` for `tenant` topics (**JC0403** on
+    a `none`/`auth` topic, where the tenant argument would be silently ignored; **JC0404** on an
+    unknown topic). The generator wires `_rt: Dep<RealtimeHandle>` + a `publish_to(_tenant.id()…)`
+    stub onto a **path-scoped** tenant write handler (which already binds `Dep<Tenant>`), the
+    partitioned twin of the #50 `publish` wiring.
+  - **Membership-verified WS tenant-select.** The generated `/realtime` principal resolver no
+    longer binds an arbitrary first-membership tenant. It reads an optional `?tenant=<id>` from
+    the connect query (same channel as `?token=`) and **verifies** it against `{tenant}_members`
+    — a non-member **refuses the upgrade (403)**, so a socket can never scope to a tenant the user
+    is not a verified member of. Absent `?tenant=`, it resolves the sole membership
+    (behavior-identical to before); zero or multiple memberships resolve to **no tenant** (connect,
+    reaching only `none`/`auth` topics) instead of the old hard 403 — a zero-membership user is no
+    longer locked off `/realtime`, and a multi-membership user chooses their tenant explicitly.
+  - Docs (`18-realtime.md`): `publish_to`, `?tenant=` tenant-select, and the within-tenant
+    client-filter workaround for per-room fan-out (dynamic per-entity topics remain a future
+    enhancement — they are not a security boundary since all recipients share the tenant).
+
 ## 0.7.1 — 2026-08-01
 
 ### Added

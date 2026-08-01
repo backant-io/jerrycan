@@ -999,6 +999,23 @@ impl Design {
             .map(|t| t.name.as_str())
     }
 
+    /// The first `tenant`-scoped broadcast topic a SERVER handler may publish to
+    /// via `RealtimeHandle::publish_to(tenant_id, …)` (issue #104): the partitioned
+    /// twin of [`server_publishable_broadcast`](Self::server_publishable_broadcast).
+    /// A tenant-scoped topic delivers ONLY to the named tenant's sockets, so a
+    /// server publish CAN target it — but the handler must supply the tenant id,
+    /// which the generated stub takes from a path-scoped `Dep<Tenant>` guard
+    /// (`_tenant.id()`). `None` when the design declares no tenant-scoped broadcast,
+    /// which keeps handlers with only `none`/`auth` (or no) broadcasts byte-identical.
+    pub fn server_publishable_tenant_broadcast(&self) -> Option<&str> {
+        self.realtime
+            .as_ref()?
+            .broadcast
+            .iter()
+            .find(|t| matches!(t.scope, RealtimeScope::Tenant))
+            .map(|t| t.name.as_str())
+    }
+
     /// "5MB" → bytes. Uppercase B/KB/MB/GB suffixes (binary multiples); a bare
     /// number is bytes. None = unparseable (a validation question).
     pub fn parse_size(s: &str) -> Option<u64> {

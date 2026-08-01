@@ -91,11 +91,57 @@ async fn create_note(rt: Dep<RealtimeHandle>) -> Result<NoContent> {
 # let _ = create_note;
 ```
 
-`publish` enforces the same gate as the client `publish` op: `topic` must name a **declared** broadcast topic, so an unknown name or a `changes`/`presence` channel returns a clear `Err` (**JC0404**), never a silent drop. A server publish carries no connection identity, so it is un-partitioned and reaches **every** subscriber of the topic — which means publishing to a `tenant`-scoped topic is a **JC0403** `Err` (delivering to all tenants would break the isolation the scope promises). Declare the topic scope `none` or `auth` to publish it from a handler. (Per-tenant server publishing lands with dynamic topics — tracked in the realtime roadmap.)
+`publish` enforces the same gate as the client `publish` op: `topic` must name a **declared** broadcast topic, so an unknown name or a `changes`/`presence` channel returns a clear `Err` (**JC0404**), never a silent drop. A server publish carries no connection identity, so it is un-partitioned and reaches **every** subscriber of the topic — which means publishing to a `tenant`-scoped topic via `publish` is a **JC0403** `Err` (delivering to all tenants would break the isolation the scope promises). Declare the topic scope `none` or `auth` to publish it with `publish`.
+
+### Publishing to one tenant (`publish_to`)
+
+For a `tenant`-scoped topic — where "workspace A's members see A's messages, not B's" — use `publish_to(tenant_id, topic, payload)`. It is the partitioned twin of `publish`: it stamps the event with the tenant, so delivery reaches **only that tenant's** sockets (a socket receives it exactly when its verified `principal.tenant_id` equals `tenant_id`). Another tenant can never receive it.
+
+```rust
+use jerrycan::prelude::*;
+use jerrycan::realtime::RealtimeHandle;
+
+// The generator adds `_rt: Dep<RealtimeHandle>` and a `publish_to` stub comment to a
+// PATH-SCOPED tenant write handler (one that already takes `Dep<Tenant>`) whenever the
+// design declares a `tenant`-scoped broadcast topic. In a real handler the tenant id is
+// `_tenant.id()` (the membership-verified tenant the write acted on); here it is a param.
+async fn after_write(rt: Dep<RealtimeHandle>, tenant_id: String) -> Result<()> {
+    // ... the handler just wrote a Lead in this tenant ...
+    rt.publish_to(&tenant_id, "deal_room", serde_json::json!({ "type": "created" }))
+        .await?;
+    Ok(())
+}
+# let _ = after_write;
+```
+
+The two methods are a clean duality: `publish` for `none`/`auth` topics, `publish_to` for `tenant` topics. `publish_to` on a `none`/`auth` topic is a **JC0403** `Err` (those are un-partitioned, so the tenant argument would be silently ignored — use `publish`), and an unknown topic is **JC0404** just like `publish`.
+
+## Choosing a tenant on the WebSocket (`?tenant=`)
+
+The socket's principal carries a **verified** tenant, and it is chosen at connect time:
+
+- A user who belongs to **exactly one** tenant gets that tenant automatically — nothing to pass.
+- A user in **several** tenants passes `?tenant=<id>` on the connect URL to pick which one the socket scopes to. The membership is **verified**: if the user is not a member of that tenant, the upgrade is refused (**403**) — a socket can never scope to a tenant the user is not in.
+- A user in **no** tenant (or one who omits `?tenant=` while in several) connects with **no tenant**. They can join `none`/`auth` topics but not `tenant` topics (a `tenant` topic rejects a tenant-less principal at JOIN). This is why an account with zero memberships is no longer refused off `/realtime`.
+
+`?tenant=` travels on the same query string as `?token=` (browsers cannot set headers on a WebSocket): `wss://…/realtime?token=<jwt>&tenant=<workspace-id>`.
 
 ## Delivery is scope-filtered (you only receive what you could GET)
 
 Every event passes the same tenant/owner check your REST endpoints use, **before** it leaves the server. If a row moves from tenant A to tenant B, the old tenant receives a `delete`-shaped event and the new tenant an `update` — nobody else sees anything. This is the security pillar; the generated acceptance tests include a cross-tenant negative control that fails if a change ever leaks.
+
+## Per-room isolation *within* a tenant
+
+The security boundary is the **tenant**: a `tenant`-scoped topic plus `publish_to(tenant, …)` isolates one workspace's messages from another's, and that is enforced server-side. Splitting a tenant into finer per-room channels (a topic per chat thread, per document, per board) is **not** a security boundary — every recipient is already a member of the same tenant. So there is no dynamic-topic primitive; do per-room fan-out with a room tag in the payload and a client-side filter:
+
+```text
+// publish (server or client): tag the room
+{"op":"publish","channel":"broadcast:deal_room","payload":{"room":"lead-42","msg":"hi"}}
+
+// each client joins broadcast:deal_room once and ignores payloads whose room isn't theirs
+```
+
+Everyone in the tenant receives the frame; each client keeps only the rooms it cares about. True dynamic per-entity topics are a future ergonomic enhancement — they would not change what any tenant member is allowed to see.
 
 ## Two change sources, identical behavior
 
