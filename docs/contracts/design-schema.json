@@ -508,11 +508,25 @@
         "request_body": {
           "type": "object",
           "additionalProperties": false,
+          "description": "The endpoint's input body. EXACTLY one shape (JC0561 refuses both-set or neither-set): an entity reference OR an inline ad-hoc DTO. `entity` binds the named table entity as the body; `fields` (issue #122) mints a plain `{Pascal(operation_id)}Request` struct for a custom action whose body is NOT a table row, deserialized as Json<{Op}Request> and never persisted.",
           "properties": {
             "entity": {
-              "type": "string"
+              "type": "string",
+              "description": "Bind the named entity (declared in this module) as the request body. Mutually exclusive with `fields`."
+            },
+            "fields": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/entity/properties/fields/items"
+              },
+              "description": "Inline ad-hoc DTO fields (issue #122): each has the SAME shape and per-field validators as an entity field (type, required, values for a #47 enum, min/max/min_len/max_len for #80 range/length). No belongs_to/fk/default-drop machinery — an inline body is not a table row. Mutually exclusive with `entity`; requires the endpoint to carry an operation_id (it names the generated `{Pascal(operation_id)}Request` struct)."
             }
-          }
+          },
+          "oneOf": [
+            { "required": ["entity"] },
+            { "required": ["fields"] }
+          ]
         },
         "success": {
           "type": "object",

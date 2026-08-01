@@ -307,10 +307,17 @@ Every entity has an `id` primary key; you usually do NOT declare it:
   `_without_auth_is_401` test — `skip` drops only the success probe, never the
   auth-guard assertion. An unguarded `skip` endpoint (a login, a signed webhook) has no
   generated guard test, so write its 401/403 rejection test yourself too.
-- `request_body?` — `{ "entity": "<Name>" }` ONLY. The body is the named entity; the
-  entity must be declared in THIS module. There is no narrower/custom input DTO in the
-  design — for an endpoint that takes untrusted public input, defend it IN-HANDLER
-  (parse a hand-written input type, validate, then map to the entity).
+- `request_body?` — EXACTLY ONE of two shapes (JC0561 refuses both-set or neither-set):
+  - `{ "entity": "<Name>" }` — the body IS the named entity (declared in THIS module).
+  - `{ "fields": [ { "name": …, "type": …, … } ] }` — an inline ad-hoc DTO (issue #122)
+    for a custom action whose body is NOT a table row (`POST /checkout { coupon, total }`).
+    The generator mints a plain `{Pascal(operation_id)}Request` struct the handler
+    deserializes as `Json<{Op}Request>`; nothing is persisted. Each field takes the SAME
+    shape and per-field validators as an entity field (`type`, `required?`, `values?` for
+    a #47 enum, `min`/`max`/`min_len`/`max_len` for #80 range/length) — an out-of-range
+    inline field is refused at the request boundary (422) exactly like an entity field. No
+    `belongs_to`/fk/`default`-drop machinery applies (an inline body is not a row). The
+    operation needs an `operation_id` (it names the struct).
   - **Server-owned fields → a `{Entity}Request` DTO.** When the body entity has a field
     the SERVER owns, the generated body type is a trimmed `{Entity}Request` DTO (the
     OpenAPI request schema and the happy-path probe body drop the same fields); the
@@ -411,9 +418,11 @@ auth + a public route · jobs/cron · a signed webhook. Lift one as a starting p
   entity that `belongs_to` the tenancy entity gets scoped repos. A grandchild reached
   across modules must be tenant-scoped in-handler, and its `on_delete` is enforced by
   your code, not the DB.
-- **`request_body` is entity-only.** No custom input DTO exists in the design. For
-  untrusted public input, parse + validate a hand-written type in the handler before
-  touching the entity.
+- **`request_body` is an entity ref OR an inline DTO.** `{ "entity": "<Name>" }` binds a
+  table row; `{ "fields": [...] }` mints an ad-hoc `{Pascal(operation_id)}Request` for a
+  custom action whose body is not a row (issue #122) — exactly one, never both (JC0561).
+  Inline fields get the same #47/#80 boundary validators as entity fields, but no
+  persistence: the handler owns what the DTO does.
 - **A non-entity / custom success → hand-written `Json<serde_json::Value>`.** Leave
   `success.entity` out and you own the response type and its body.
 - **id/PK rules:** omit `id` (synthetic `i64` autoincrement) for most entities; declare
