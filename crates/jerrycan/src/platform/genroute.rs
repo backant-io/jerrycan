@@ -817,18 +817,22 @@ fn server_owned_fk_comment(
         // The stub wording references `_tenant` only when the handler actually has
         // that param — i.e. a path-scoped guard; a flat handler has `_user`.
         let tenant_owned = endpoint_uses_tenant_guard(m, ep, design);
+        // The identity fk the DTO omits — `user_id` by default, `{snake(identity)}_id`
+        // when `auth.identity` names a non-`User` entity (#150). Naming the ACTUAL
+        // omitted column keeps the steer correct (byte-identical for the default).
+        let fk = design.identity_fk_column();
         out.push_str(&match (is_create, tenant_owned) {
             (true, true) => format!(
-                "    // server-owned fk: `{dto}` has NO `user_id` — the server injects the\n    // session user's id. Add a `user: CurrentUser` param and use `user.0.id` (the\n    // stringified user pk; parse it for an integer fk) when building the {entity}.\n"
+                "    // server-owned fk: `{dto}` has NO `{fk}` — the server injects the\n    // session user's id. Add a `user: CurrentUser` param and use `user.0.id` (the\n    // stringified user pk; parse it for an integer fk) when building the {entity}.\n"
             ),
             (true, false) => format!(
-                "    // server-owned fk: `{dto}` has NO `user_id` — the server injects the\n    // session user's id. Use `_user.0.id` (the stringified user pk; parse it for an\n    // integer fk) when building the {entity}.\n"
+                "    // server-owned fk: `{dto}` has NO `{fk}` — the server injects the\n    // session user's id. Use `_user.0.id` (the stringified user pk; parse it for an\n    // integer fk) when building the {entity}.\n"
             ),
             (false, true) => format!(
-                "    // server-owned fk: `{dto}` has NO `user_id` — on UPDATE, PRESERVE the\n    // existing row's owner. Do NOT reassign `user_id`; scope the update through the\n    // membership (`_tenant`) so a non-owner can't take the row.\n"
+                "    // server-owned fk: `{dto}` has NO `{fk}` — on UPDATE, PRESERVE the\n    // existing row's owner. Do NOT reassign `{fk}`; scope the update through the\n    // membership (`_tenant`) so a non-owner can't take the row.\n"
             ),
             (false, false) => format!(
-                "    // server-owned fk: `{dto}` has NO `user_id` — on UPDATE, PRESERVE the\n    // existing row's owner. Do NOT reassign `user_id` to `_user.0.id`; scope the\n    // UPDATE to the owner (e.g. WHERE user_id = _user.0.id) so a non-owner can't take it.\n"
+                "    // server-owned fk: `{dto}` has NO `{fk}` — on UPDATE, PRESERVE the\n    // existing row's owner. Do NOT reassign `{fk}` to `_user.0.id`; scope the\n    // UPDATE to the owner (e.g. WHERE {fk} = _user.0.id) so a non-owner can't take it.\n"
             ),
         });
     }
@@ -1403,7 +1407,7 @@ fn request_dto_rs(e: &Entity, design: &Design, for_update: bool) -> String {
     let path_fks = design.entity_path_fk_columns(entity);
     let mut fields = String::new();
     for b in e.belongs_to.iter().filter(|b| {
-        !(omit_identity && Design::is_identity_fk(b)) && !path_fks.contains(&b.fk_column())
+        !(omit_identity && design.is_identity_fk(b)) && !path_fks.contains(&b.fk_column())
     }) {
         let col = b.fk_column();
         let ty = design.target_key_rust_type(&b.entity);
@@ -1435,7 +1439,7 @@ fn request_dto_rs(e: &Entity, design: &Design, for_update: bool) -> String {
             fields.push_str(&format!("    pub {ident}: Option<{base}>,\n"));
         }
     }
-    let doc = request_dto_doc(e, &path_fks, omit_identity, for_update);
+    let doc = request_dto_doc(e, design, &path_fks, omit_identity, for_update);
     format!(
         "{doc}#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\npub struct {struct_name} {{\n{id_default}    pub id: {key},\n{fields}}}\n\n"
     )
@@ -1449,6 +1453,7 @@ fn request_dto_rs(e: &Entity, design: &Design, for_update: bool) -> String {
 /// are settable here, unlike on create (issue #85 D1).
 fn request_dto_doc(
     e: &Entity,
+    design: &Design,
     path_fks: &[String],
     omit_identity: bool,
     for_update: bool,
@@ -1456,7 +1461,7 @@ fn request_dto_doc(
     let mut reasons = Vec::new();
     for b in &e.belongs_to {
         let col = b.fk_column();
-        if omit_identity && Design::is_identity_fk(b) {
+        if omit_identity && design.is_identity_fk(b) {
             reasons.push(format!("`{col}` (the authenticated session user's id)"));
         } else if path_fks.contains(&col) {
             reasons.push(format!("`{col}` (from the request path)"));
@@ -2601,13 +2606,15 @@ fn owner_scoped_methods(e: &Entity, mode: GenMode, design: &Design) -> String {
     if !entity_is_per_user_owned(e, mode, design) {
         return String::new();
     }
-    let Some(identity) = e.belongs_to.iter().find(|b| Design::is_identity_fk(b)) else {
+    let Some(identity) = e.belongs_to.iter().find(|b| design.is_identity_fk(b)) else {
         return String::new();
     };
     let entity = &e.name;
     let snake = Design::to_snake(entity);
     // #119: derive from the belongs_to itself so it agrees with the Model column
-    // (byte-identical — is_identity_fk pins `fk_column() == user_id`).
+    // (byte-identical — is_identity_fk pins `fk_column() == identity_fk_column()`,
+    // `user_id` for the default `"User"` identity, `{snake(identity)}_id` for a
+    // non-`User` `auth.identity`, #150).
     let fk_col = identity.fk_column();
     let fk_pascal = col_pascal(&fk_col);
     let fk_ty = design.target_key_rust_type(&identity.entity);
@@ -5091,6 +5098,110 @@ pub(crate) mod tests {
         assert!(
             !users.contains("pub async fn all_for("),
             "User is not owner-scoped: {users}"
+        );
+    }
+
+    /// A design carrying an opt-in `auth.identity` (issue #150): the identity
+    /// entity is `Account`, so the identity fk is the DERIVED column `account_id`
+    /// (not the literal `user_id`). `Note belongs_to Account` must get the SAME
+    /// owner-scoping treatment #79 gives a `belongs_to User` entity — keyed on
+    /// `account_id` — and its guarded request DTO must OMIT `account_id` (the #34
+    /// server-injected fk) while the Model keeps it. This is the make-impossible
+    /// half of #150: a non-`User` identity previously lost owner-scoping SILENTLY
+    /// because every consumer hardcoded `user_id`. The default-`User` path is
+    /// unchanged (proved by SERVER_FK's `user_id` assertions above + determinism).
+    #[test]
+    fn non_user_auth_identity_owner_scopes_on_derived_fk() {
+        const ACCOUNT_IDENTITY: &str = r#"{
+            "name": "acct-api", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin"], "identity": "Account" },
+            "dependencies": ["db", "auth"],
+            "modules": [
+                { "name": "accounts",
+                  "entities": [{ "name": "Account", "fields": [
+                      { "name": "email", "type": "string" } ]}],
+                  "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/",
+                      "auth_required": true,
+                      "success": { "status": 200, "entity": "Account", "list": true } }] },
+                { "name": "notes",
+                  "entities": [{ "name": "Note",
+                      "belongs_to": [{ "entity": "Account", "on_delete": "cascade" }],
+                      "fields": [{ "name": "title", "type": "string" }] }],
+                  "endpoints": [
+                      { "operation_id": "create_note", "method": "POST", "path": "/",
+                        "auth_required": true,
+                        "request_body": { "entity": "Note" },
+                        "success": { "status": 201, "entity": "Note" } },
+                      { "operation_id": "list_notes", "method": "GET", "path": "/",
+                        "auth_required": true,
+                        "success": { "status": 200, "entity": "Note", "list": true } }
+                  ] }
+            ]
+        }"#;
+        let d: Design = serde_json::from_str(ACCOUNT_IDENTITY).unwrap();
+        assert_eq!(d.identity_fk_column(), "account_id");
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+
+        // (1) Owner-scoping keys on the DERIVED identity fk `account_id`, and the
+        //     unscoped leaky methods are suppressed (the #79 make-impossible shape).
+        let notes = repo_rs(&d.modules[1], mode, &d).unwrap();
+        assert!(
+            notes.contains("pub async fn all_for(&self, account_id: i64) -> Result<Vec<Note>>"),
+            "owner-scoped all_for keyed on account_id: {notes}"
+        );
+        assert!(
+            notes.contains(
+                "pub async fn get_for(&self, account_id: i64, id: i64) -> Result<Option<Note>>"
+            ),
+            "owner-scoped get_for keyed on account_id: {notes}"
+        );
+        assert!(
+            notes.contains("Column::AccountId.eq(account_id)"),
+            "owner-scoped filter keys on the derived identity fk column: {notes}"
+        );
+        assert!(
+            !notes.contains("pub async fn all(&self)"),
+            "unscoped all() must NOT be generated for the account-owned entity: {notes}"
+        );
+
+        // (2) The guarded request DTO OMITS the server-injected identity fk
+        //     `account_id`, while the Model keeps it (responses + DB carry it).
+        let model = model_rs_db(&d.modules[1], &d, true).unwrap();
+        let dto = model
+            .split("pub struct NoteRequest {")
+            .nth(1)
+            .expect("NoteRequest emitted")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            !dto.contains("account_id"),
+            "guarded DTO must omit the server-injected account_id: {dto}"
+        );
+        assert!(dto.contains("pub title: String,"), "{dto}");
+        assert!(
+            model.contains("pub account_id: i64,"),
+            "the Model keeps the identity fk column (server writes it): {model}"
+        );
+
+        // (3) The stub steer names the ACTUAL omitted column (`account_id`), so the
+        //     #34 guidance is correct for a non-`User` identity, not misleadingly `user_id`.
+        let h = handlers_rs(&d.modules[1], mode, &d);
+        assert!(
+            h.contains("has NO `account_id`") && !h.contains("has NO `user_id`"),
+            "server-owned-fk steer must name account_id: {h}"
+        );
+
+        // (4) Account itself is NOT owner-scoped (it carries no identity fk) — it
+        //     keeps its unscoped `all()`, exactly as the `User` entity does by default.
+        let accounts = repo_rs(&d.modules[0], mode, &d).unwrap();
+        assert!(
+            accounts.contains("pub async fn all(&self) -> Result<Vec<Account>>")
+                && !accounts.contains("pub async fn all_for("),
+            "the identity entity itself is not owner-scoped: {accounts}"
         );
     }
 

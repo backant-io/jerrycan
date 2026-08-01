@@ -1207,6 +1207,207 @@ fn guarded_identity_fk_scaffold_accepts_bodies_without_user_id() {
     }
 }
 
+/// The #150 make-impossible half: the LinkVault shape under an OPT-IN
+/// `auth.identity: "Account"` (identity entity `Account`, fk `account_id`). Before
+/// #150 every consumer hardcoded `user_id`, so a non-`User` identity silently lost
+/// owner-scoping AND kept its fk client-writable (spoofable ownership behind a
+/// green check). This design's `Note belongs_to Account` must instead get the full
+/// per-user treatment keyed on `account_id`. Proves the non-`User` path end to end.
+const ACCOUNTVAULT: &str = r#"{
+    "name": "accountvault",
+    "contract_version": 1,
+    "auth": { "model": "session", "roles": ["admin"], "identity": "Account" },
+    "dependencies": ["db", "auth"],
+    "modules": [
+        { "name": "accounts",
+          "entities": [{ "name": "Account", "fields": [
+              { "name": "email", "type": "string" } ]}],
+          "endpoints": [
+              { "operation_id": "list_accounts", "method": "GET", "path": "/",
+                "auth_required": true,
+                "success": { "status": 200, "entity": "Account", "list": true } }
+          ] },
+        { "name": "notes",
+          "entities": [{ "name": "Note",
+              "belongs_to": [{ "entity": "Account", "on_delete": "cascade" }],
+              "fields": [{ "name": "title", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "create_note", "method": "POST", "path": "/",
+                "auth_required": true,
+                "request_body": { "entity": "Note" },
+                "success": { "status": 201, "entity": "Note" } },
+              { "operation_id": "list_notes", "method": "GET", "path": "/",
+                "auth_required": true,
+                "success": { "status": 200, "entity": "Note", "list": true } }
+          ] }
+    ]
+}"#;
+
+/// The agent's side of the non-`User` identity e2e: `create_note` INJECTS the
+/// session principal into the DERIVED `account_id` (the body has no `account_id`),
+/// and reads go through the owner-scoped `*_for(account_id)` accessors — exactly
+/// what the generated stub comment (`has NO account_id`) instructs.
+const ACCOUNTVAULT_HANDLERS: &str = r#"//! E2E fixture: implemented handlers for the notes module (auth.identity=Account).
+use super::model::*;
+use super::repo::*;
+use jerrycan::prelude::*;
+use shared::CurrentUser;
+
+pub(crate) async fn create_note(
+    repo: Dep<NoteRepo>,
+    user: CurrentUser,
+    Json(body): Json<NoteRequest>,
+) -> Result<Created<Note>> {
+    // server-owned fk: the session, not the client, decides account_id.
+    let account_id: i64 = user
+        .0
+        .id
+        .parse()
+        .map_err(|_| Error::internal("session id is not an integer"))?;
+    let id = repo
+        .insert(Note { id: body.id, account_id, title: body.title })
+        .await?;
+    // Owner-scoped read: the per-user repo emits only *_for(account_id) accessors
+    // (the unscoped get/all are not generated — #79/#150 make-impossible).
+    let row = repo.get_for(account_id, id).await?.ok_or_else(Error::not_found)?;
+    Ok(Created(row))
+}
+
+pub(crate) async fn list_notes(
+    repo: Dep<NoteRepo>,
+    user: CurrentUser,
+) -> Result<Json<Vec<Note>>> {
+    let account_id: i64 = user
+        .0
+        .id
+        .parse()
+        .map_err(|_| Error::internal("session id is not an integer"))?;
+    Ok(Json(repo.all_for(account_id).await?))
+}
+"#;
+
+/// THE #150 non-`User` identity gate: scaffold the ACCOUNTVAULT shape, generate its
+/// acceptance battery, and require the whole workspace to pass strict clippy. This
+/// PROVES the opt-in `auth.identity: "Account"` path end to end: (a) it COMPILES
+/// under `-D warnings`, (b) the guarded `NoteRequest` DTO OMITS `account_id` (the
+/// #34 server-injected fk) — asserted on the emitted model + probe bodies, then
+/// compiled, and (c) reads are OWNER-SCOPED via the `account_id` accessor (the repo
+/// emits `all_for`/`get_for` keyed on `account_id`; the implemented handlers call
+/// them and compile). The acceptance battery is compiled (all-targets) but not run
+/// — a non-`User` identity table is not auto-seeded by the session harness (out of
+/// scope for #150, whose contract is owner-scoping DETECTION, not test seeding).
+#[test]
+#[ignore = "scaffolds an app and invokes cargo on it; run with --include-ignored"]
+fn opt_in_account_identity_scaffold_owner_scopes_and_omits_account_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("accountvault");
+
+    let design: Design = serde_json::from_str(ACCOUNTVAULT).expect("ACCOUNTVAULT parses");
+    assert!(
+        design.wants_auth() && design.wants_db(),
+        "auth + db mode (opt-in Account identity)"
+    );
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, ACCOUNTVAULT);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(status.success(), "jerrycan new must scaffold accountvault");
+
+    // Generate the acceptance battery for the owned module (probe bodies omit the fk).
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .args(["gen-tests", "--module", "notes"])
+        .output()
+        .expect("run jerrycan gen-tests");
+    assert!(
+        out.status.success(),
+        "gen-tests failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let read =
+        |rel: &str| fs::read_to_string(app.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+
+    // (b) The guarded DTO omits account_id; the Model keeps it.
+    let model = read("crates/routes/notes/src/model.rs");
+    let dto = model
+        .split("pub struct NoteRequest {")
+        .nth(1)
+        .expect("NoteRequest emitted")
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(
+        !dto.contains("account_id"),
+        "guarded DTO must omit the server-injected account_id:\n{dto}"
+    );
+    assert!(
+        model.contains("pub account_id: i64,"),
+        "the Model keeps account_id (server writes it):\n{model}"
+    );
+
+    // (c) The repo owner-scopes on account_id (the unscoped all()/get() are gone).
+    let repo = read("crates/routes/notes/src/repo.rs");
+    assert!(
+        repo.contains("pub async fn all_for(&self, account_id: i64) -> Result<Vec<Note>>")
+            && repo.contains("Column::AccountId.eq(account_id)"),
+        "repo must owner-scope on account_id:\n{repo}"
+    );
+
+    // The stub steer names the ACTUAL omitted column, and the probe bodies omit it.
+    let handlers = read("crates/routes/notes/src/handlers.rs");
+    assert!(
+        handlers.contains("has NO `account_id`") && !handlers.contains("has NO `user_id`"),
+        "stub steer must name account_id:\n{handlers}"
+    );
+    let acceptance = read("crates/routes/notes/tests/acceptance.rs");
+    assert!(
+        !acceptance.contains("\"account_id\""),
+        "generated probe bodies must omit account_id:\n{acceptance}"
+    );
+
+    // Implement the handlers the way the stub comment instructs.
+    write(
+        &app.join("crates/routes/notes/src/handlers.rs"),
+        ACCOUNTVAULT_HANDLERS,
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // (a) The gate: the whole workspace (DTO, owner-scoped repo, implemented
+    // handlers, generated acceptance bodies) compiles under strict clippy.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "accountvault workspace failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 /// The 0.6.5 T2 review battery (#80): every constrained-field shape that broke
 /// a freshly scaffolded app, in one module — a required range int (`quantity`),
 /// an OPTIONAL SINGLE-BOUND string (`note`, max_len only → the

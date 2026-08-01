@@ -75,6 +75,10 @@
           "items": {
             "type": "string"
           }
+        },
+        "identity": {
+          "type": "string",
+          "description": "Opt-in (#150): the entity the authenticated session principal maps to — the 'identity' entity. Per-user owner-scoping, the #34 server-injected fk, and public_read detect ownership by this entity's derived fk column (snake(identity)_id). Must name a declared entity (JC0566). Absent => the default 'User' => user_id, so every existing design is byte-identical. The membership-table principal column stays 'user_id' regardless (it stores the session principal, not this entity's fk); auth.identity cannot be the tenancy entity (JC0540)."
         }
       },
       "required": [

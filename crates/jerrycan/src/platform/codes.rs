@@ -376,6 +376,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs storage",
     },
     CodeInfo {
+        code: "JC0566",
+        title: "auth.identity names no declared entity",
+        cause: "the design's `auth.identity` (issue #150) names an entity that is not declared anywhere in the module tree — but per-user owner-scoping, the #34 server-injected fk, and `public_read` all DETECT ownership by the identity's derived fk column (`snake(auth.identity)_id`), so an identity mapping to no entity resolves to a fk column no entity carries: every owned entity silently loses owner-scoping (any authenticated caller reads and writes every row) and the fk stays client-writable, behind a green `check`",
+        fix: "declare an entity named exactly `auth.identity` (the entity the authenticated session principal maps to; owned entities `belongs_to` it), or drop `auth.identity` to use the default `User` — the membership-table principal column stays `user_id` either way",
+        doc: "jerrycan docs auth",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",
@@ -445,6 +452,25 @@ mod tests {
         );
         assert!(
             info.fix.contains("belongs_to") && info.fix.contains("tenant entity"),
+            "fix must name both remedies: {}",
+            info.fix
+        );
+    }
+
+    #[test]
+    fn jc0566_explains_the_missing_auth_identity_entity() {
+        // WHY: JC0566 (#150) is the agent's stop after `check` rejects a design
+        // whose `auth.identity` names no declared entity — the registry must state
+        // the SILENT-owner-scoping-loss cause and BOTH remedies (declare the entity
+        // or drop the field for the default `User`).
+        let info = lookup("JC0566").unwrap();
+        assert!(
+            info.cause.contains("owner-scoping") && info.cause.contains("not declared"),
+            "cause must name the silent owner-scoping loss: {}",
+            info.cause
+        );
+        assert!(
+            info.fix.contains("declare an entity") && info.fix.contains("User"),
             "fix must name both remedies: {}",
             info.fix
         );

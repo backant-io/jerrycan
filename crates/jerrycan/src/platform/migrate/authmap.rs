@@ -115,6 +115,9 @@ pub fn build_auth(member_roles: &[String], providers: &[String]) -> AuthOutput {
         auth: Auth {
             model: AuthModel::Jwt,
             roles,
+            // Supabase migration maps to the default `User` identity (#150): the
+            // migrated auth entity IS `User`, so leave the identity fk as `user_id`.
+            identity: None,
         },
         dependencies,
         users_module,

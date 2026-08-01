@@ -151,6 +151,16 @@ pub struct Auth {
     pub model: AuthModel,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+    /// The entity the authenticated session PRINCIPAL maps to (issue #150) — the
+    /// "identity" entity. Per-user owner-scoping, the #34 server-injected fk, and
+    /// `public_read` all detect ownership by this entity's derived fk column
+    /// (`snake(identity)_id`; see [`Design::identity_fk_column`]). Absent ⇒ the
+    /// default `"User"` ⇒ `user_id`, so every existing design is byte-identical;
+    /// this field is opt-in only. The membership-table PRINCIPAL column stays the
+    /// fixed `user_id` regardless (see [`MEMBERSHIP_PRINCIPAL_COLUMN`]) — it stores
+    /// the session principal, not this entity's fk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -655,14 +665,19 @@ impl ModuleDesign {
     }
 }
 
-/// The fixed column the generated `{tenant}_members` table and the `Tenant`
+/// The FIXED column the generated `{tenant}_members` table and the `Tenant`
 /// guard use for the authenticated principal: the membership DDL emits a
 /// `user_id` column (see `genroute` `write_module_migrations`) and the guard
 /// factory queries `WHERE user_id = ?` (see `scaffold::shared_tenancy_types`).
-/// It is a FIXED name, not a design-named identity entity, so identity checks
-/// (JC0540's tenancy collision, the server-owned-FK rule) compare a derived fk
-/// column against it rather than against a hardcoded `User` string.
-pub(crate) const AUTH_IDENTITY_FK_COLUMN: &str = "user_id";
+/// It stores the SESSION PRINCIPAL, unrelated to the design's identity entity
+/// name — so it stays `user_id` even when `auth.identity` names a non-`User`
+/// entity (issue #150 non-goal: the membership principal column never changes).
+/// The identity-fk DETECTION column (does an entity `belongs_to` the auth
+/// identity?) is DERIVED per design from `auth.identity` — see
+/// [`Design::identity_fk_column`] — NOT this constant. The tenancy collision
+/// (JC0540) still compares a tenant's derived fk against this fixed principal so
+/// the members table can't declare `user_id` twice.
+pub(crate) const MEMBERSHIP_PRINCIPAL_COLUMN: &str = "user_id";
 
 /// How an endpoint binds the tenant, so an ownership guard (issues #78/#79) knows
 /// WHAT to verify before touching a row. Derived from the endpoint's resolved path
@@ -865,6 +880,28 @@ impl Design {
             .as_ref()
             .map(|a| a.model)
             .unwrap_or(AuthModel::None)
+    }
+
+    /// The entity name the authenticated session principal maps to (issue #150):
+    /// `auth.identity` when set, else the default `"User"`. Owner-scoping, the #34
+    /// server-injected fk, and `public_read` detect ownership by THIS entity's fk.
+    pub(crate) fn auth_identity(&self) -> &str {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.identity.as_deref())
+            .unwrap_or("User")
+    }
+
+    /// The fk column that marks an entity as owned by the authenticated principal
+    /// (issue #150): `snake(auth_identity)_id`. Default identity `"User"` ⇒
+    /// `user_id`, so every existing design is byte-identical. This is the SINGLE
+    /// source of truth for identity-fk DETECTION — every consumer (owner-scoping,
+    /// the #34 fk omission, `public_read`, JC0540/JC0549/JC0560, the JL0006 scan)
+    /// resolves through here, so a non-`User` identity cannot silently lose
+    /// owner-scoping. Distinct from the fixed membership-principal `user_id`
+    /// (see [`MEMBERSHIP_PRINCIPAL_COLUMN`]).
+    pub(crate) fn identity_fk_column(&self) -> String {
+        Self::fk_column(self.auth_identity())
     }
 
     /// The HTTP header the GENERATED acceptance tests thread the test credential
@@ -1363,27 +1400,30 @@ impl Design {
     }
 
     /// True when this belongs_to targets the AUTH IDENTITY entity: its derived
-    /// fk column is the fixed `user_id` linkage the membership table and the
-    /// session guard key on (see `AUTH_IDENTITY_FK_COLUMN`). Identity is a
-    /// COLUMN-name fact, not an entity-name one — the same resolution JC0540
-    /// uses. Keys on `b.fk_column()`, so an ALIASED `belongs_to` the identity
-    /// entity (issue #119, e.g. `as: "sender"` → `sender_id`) is correctly NOT
-    /// the owner fk — a message's sender/recipient is a plain reference, not the
-    /// authenticated owner; only an un-aliased `belongs_to User` → `user_id` is.
-    pub(crate) fn is_identity_fk(b: &BelongsTo) -> bool {
-        b.fk_column() == AUTH_IDENTITY_FK_COLUMN
+    /// fk column equals the design's identity fk (`snake(auth.identity)_id`;
+    /// default `"User"` ⇒ `user_id` — see [`Self::identity_fk_column`]). Identity
+    /// is a COLUMN-name fact, not an entity-name one — the same resolution
+    /// JC0540 uses. Keys on `b.fk_column()`, so an ALIASED `belongs_to` the
+    /// identity entity (issue #119, e.g. `as: "sender"` → `sender_id`) is
+    /// correctly NOT the owner fk — a message's sender/recipient is a plain
+    /// reference, not the authenticated owner; only an un-aliased `belongs_to`
+    /// the identity entity derives the identity fk. Design-aware (issue #150),
+    /// so a non-`User` identity is detected instead of silently ignored.
+    pub(crate) fn is_identity_fk(&self, b: &BelongsTo) -> bool {
+        b.fk_column() == self.identity_fk_column()
     }
 
     /// True when the entity carries an identity FK (a belongs_to aimed at the
-    /// auth identity entity). Such an entity's GUARDED request bodies omit
-    /// `user_id` — the server injects the session user's id (issue #34).
-    pub(crate) fn has_identity_fk(e: &Entity) -> bool {
-        e.belongs_to.iter().any(Self::is_identity_fk)
+    /// auth identity entity). Such an entity's GUARDED request bodies omit the
+    /// identity fk — the server injects the session user's id (issue #34).
+    pub(crate) fn has_identity_fk(&self, e: &Entity) -> bool {
+        e.belongs_to.iter().any(|b| self.is_identity_fk(b))
     }
 
     /// True when `e` is OWNER-scoped by the AUTHENTICATED USER (issue #79): an
-    /// auth design, an identity fk (`user_id` — a belongs_to aimed at the auth
-    /// identity entity, the same COLUMN-name resolution JC0540/#34 use), and NOT
+    /// auth design, an identity fk (`snake(auth.identity)_id` — a belongs_to
+    /// aimed at the auth identity entity, the same COLUMN-name resolution
+    /// JC0540/#34 use; default identity `"User"` ⇒ `user_id`), and NOT
     /// tenant-owned — directly OR transitively (issue #102): an entity with a
     /// tenant path is scoped by the TENANT (via `scoped_methods`), never
     /// per-user. THE single per-user classifier (#105 §F): repo emission
@@ -1392,7 +1432,7 @@ impl Design {
     /// all resolve through this ONE method, so the mirror sites cannot drift
     /// apart — mirror drift is exactly how the #102-class holes shipped.
     pub(crate) fn entity_is_per_user_owned(&self, e: &Entity) -> bool {
-        self.wants_auth() && Self::has_identity_fk(e) && self.tenant_path(&e.name).is_none()
+        self.wants_auth() && self.has_identity_fk(e) && self.tenant_path(&e.name).is_none()
     }
 
     /// The public-read/owner-write classifier (issue #105): entity `entity`
@@ -1440,7 +1480,8 @@ impl Design {
     /// The server-owned-FK rule (issue #34), design-level: a GUARDED endpoint
     /// whose request-body entity carries an identity FK omits that FK from the
     /// wire contract — the generated probe bodies and the OpenAPI request
-    /// schema drop `user_id`, and the handler injects the authenticated session
+    /// schema drop the identity fk (`snake(auth.identity)_id`, default `user_id`),
+    /// and the handler injects the authenticated session
     /// user's id. Unguarded endpoints keep the field (no session to inject);
     /// every other belongs_to FK stays required client input.
     pub(crate) fn endpoint_omits_identity_fk(&self, m: &ModuleDesign, ep: &Endpoint) -> bool {
@@ -1451,7 +1492,7 @@ impl Design {
                     m.entities
                         .iter()
                         .find(|e| &e.name == ent)
-                        .is_some_and(Self::has_identity_fk)
+                        .is_some_and(|e| self.has_identity_fk(e))
                 })
             })
     }
