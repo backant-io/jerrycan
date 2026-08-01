@@ -1354,20 +1354,19 @@ fn module_provides_tenant_dep(design: &Design, module: &ModuleDesign) -> bool {
 /// cross-include used). sqlite-memory schema is cheap, so migrating everything
 /// is the simplest correct default. Deterministic: document order, skipping
 /// entity-less modules (which have no migration file).
-fn collect_workspace_migration_items(design: &Design, current: &ModuleDesign, out: &mut String) {
+fn collect_workspace_migration_items(
+    design: &Design,
+    current: &ModuleDesign,
+) -> Vec<MigrationItem> {
     // The current module reaches its own files by `..` (from its own tests dir);
     // every other module by the cross-crate `../../{module}` path.
-    migration_items(
-        design,
-        |name| {
-            if name == current.name {
-                "..".to_string()
-            } else {
-                format!("../../{name}")
-            }
-        },
-        out,
-    );
+    collect_migration_items(design, |name| {
+        if name == current.name {
+            "..".to_string()
+        } else {
+            format!("../../{name}")
+        }
+    })
 }
 
 /// Emit a `jerrycan::db::Migration { … include_str!(…) }` item for every route
@@ -1380,43 +1379,59 @@ fn collect_workspace_migration_items(design: &Design, current: &ModuleDesign, ou
 /// (testgen) is at `crates/routes/<m>/tests/` (own module `..`, others `../../<m>`),
 /// while the jobs harness (jobsgen) is at `crates/jobs/tests/` (every module
 /// `../../routes/<m>`). Shared so both harnesses migrate the same tables (issue #84).
-/// One `{field}: include_str!("{path}"),` line at column 12, pre-wrapped exactly as
-/// the pinned rustfmt does (issue #218): once the single-line form exceeds
-/// `max_width` (100), rustfmt breaks the `include_str!` string arg onto its own line
-/// at column 16, closing `),` back at column 12. A shorter line stays as-is
-/// (byte-identical for short module paths).
-fn migration_include_line(field: &str, path: &str) -> String {
-    let one_line = format!("            {field}: include_str!(\"{path}\"),");
+/// One `{field}: include_str!("{path}"),` line at column `indent`, pre-wrapped exactly
+/// as the pinned rustfmt does (issue #218): once the single-line form exceeds
+/// `max_width` (100), rustfmt breaks the `include_str!` string arg onto its own line at
+/// column `indent + 4`, closing `),` back at column `indent`. A shorter line stays
+/// as-is (byte-identical for short module paths). `indent` is 12 for the MULTI-line
+/// migration array (item body one level below the `jerrycan::db::Migration {`) and 8
+/// for rustfmt's single-element HUG, where the sole struct de-indents one level (#221).
+fn migration_include_line(indent: usize, field: &str, path: &str) -> String {
+    let pad = " ".repeat(indent);
+    let one_line = format!("{pad}{field}: include_str!(\"{path}\"),");
     if one_line.chars().count() <= 100 {
         format!("{one_line}\n")
     } else {
-        format!("            {field}: include_str!(\n                \"{path}\"\n            ),\n")
+        let pad4 = " ".repeat(indent + 4);
+        format!("{pad}{field}: include_str!(\n{pad4}\"{path}\"\n{pad}),\n")
     }
 }
 
-pub(crate) fn migration_items(
+/// One workspace create-tables migration: the migration NAME literal and the two
+/// per-backend `include_str!` paths. Collected structurally (issue #221) so the
+/// `db.migrate(&[…])` array can be rendered either MULTI-line (≥ 2 items) or as
+/// rustfmt's single-element HUG (exactly 1 item), which de-indents the sole struct one
+/// level. The earlier string-only collector always emitted the multi-line form, so a
+/// SINGLE-route-module design drifted under `cargo fmt`.
+pub(crate) struct MigrationItem {
+    name: String,
+    sqlite_path: String,
+    postgres_path: String,
+}
+
+/// Collect every route module (and subroute) create-tables migration in the design, in
+/// document order (entity-less modules skipped — they have no migration file). This is
+/// the FULL workspace schema `App::build` applies. `prefix_for(module_name)` yields the
+/// `include_str!` path prefix to that module's `migrations/` dir — it differs by caller
+/// because their harness files sit at different depths.
+pub(crate) fn collect_migration_items(
     design: &Design,
     prefix_for: impl Fn(&str) -> String,
-    out: &mut String,
-) {
+) -> Vec<MigrationItem> {
+    let mut items = Vec::new();
     for m in &design.modules {
         let prefix = prefix_for(&m.name);
         let m_snake = m.name.replace('-', "_");
         if !m.entities.is_empty() {
-            let sqlite = migration_include_line(
-                "sqlite",
-                &format!("{prefix}/migrations/sqlite/0001_create_tables.sql"),
-            );
-            let postgres = migration_include_line(
-                "postgres",
-                &format!("{prefix}/migrations/postgres/0001_create_tables.sql"),
-            );
-            out.push_str(&format!(
-                "        jerrycan::db::Migration {{\n            name: \"{m_snake}_0001_create_tables\",\n{sqlite}{postgres}        }},\n"
-            ));
+            items.push(MigrationItem {
+                name: format!("{m_snake}_0001_create_tables"),
+                sqlite_path: format!("{prefix}/migrations/sqlite/0001_create_tables.sql"),
+                postgres_path: format!("{prefix}/migrations/postgres/0001_create_tables.sql"),
+            });
         }
-        collect_subroute_migration_items(m, &m_snake, &prefix, out);
+        collect_subroute_migration_items(m, &m_snake, &prefix, &mut items);
     }
+    items
 }
 
 /// Subroute create-tables migrations for one top-level module (recursive). A
@@ -1427,25 +1442,58 @@ fn collect_subroute_migration_items(
     module: &ModuleDesign,
     top_snake: &str,
     prefix: &str,
-    out: &mut String,
+    items: &mut Vec<MigrationItem>,
 ) {
     for sub in &module.subroutes {
         if !sub.entities.is_empty() {
             let s = sub.name.replace('-', "_");
-            let sqlite = migration_include_line(
-                "sqlite",
-                &format!("{prefix}/migrations/sqlite/0001_create_tables_{s}.sql"),
-            );
-            let postgres = migration_include_line(
-                "postgres",
-                &format!("{prefix}/migrations/postgres/0001_create_tables_{s}.sql"),
-            );
-            out.push_str(&format!(
-                "        jerrycan::db::Migration {{\n            name: \"{top_snake}_0001_create_tables_{s}\",\n{sqlite}{postgres}        }},\n"
-            ));
+            items.push(MigrationItem {
+                name: format!("{top_snake}_0001_create_tables_{s}"),
+                sqlite_path: format!("{prefix}/migrations/sqlite/0001_create_tables_{s}.sql"),
+                postgres_path: format!("{prefix}/migrations/postgres/0001_create_tables_{s}.sql"),
+            });
         }
-        collect_subroute_migration_items(sub, top_snake, prefix, out);
+        collect_subroute_migration_items(sub, top_snake, prefix, items);
     }
+}
+
+/// Render the `db.migrate(&[ … ]).await.expect("{expect_msg}");` block (at fn-body
+/// indent 4) EXACTLY as the pinned rustfmt formats it (issue #221). rustfmt HUGS a
+/// single-element array — the sole `jerrycan::db::Migration { … }` opens on the
+/// `db.migrate(&[` line and its body de-indents one level (fields at column 8, include
+/// paths width-checked at column 8) — but keeps a ≥ 2-element array multi-line (each
+/// item at column 8, fields at column 12). Empty `items` yields the empty string (the
+/// jobs harness omits the route-migrate call when there are no route tables). Byte-
+/// identical to the previous multi-line output whenever `items.len() >= 2`.
+pub(crate) fn migrate_call_block(items: &[MigrationItem], expect_msg: &str) -> String {
+    let array = match items {
+        [] => return String::new(),
+        [only] => {
+            // Single-element HUG: struct body at column 8; `db.migrate(&[STRUCT])`.
+            let sqlite = migration_include_line(8, "sqlite", &only.sqlite_path);
+            let postgres = migration_include_line(8, "postgres", &only.postgres_path);
+            format!(
+                "&[jerrycan::db::Migration {{\n        name: \"{}\",\n{sqlite}{postgres}    }}]",
+                only.name
+            )
+        }
+        many => {
+            // Multi-line: item body at column 8, fields at column 12 (pre-#221 layout).
+            let body: String = many
+                .iter()
+                .map(|it| {
+                    let sqlite = migration_include_line(12, "sqlite", &it.sqlite_path);
+                    let postgres = migration_include_line(12, "postgres", &it.postgres_path);
+                    format!(
+                        "        jerrycan::db::Migration {{\n            name: \"{}\",\n{sqlite}{postgres}        }},\n",
+                        it.name
+                    )
+                })
+                .collect();
+            format!("&[\n{body}    ]")
+        }
+    };
+    format!("    db.migrate({array})\n    .await\n    .expect(\"{expect_msg}\");\n")
 }
 
 /// The seed statements that put the test user (id 1) into a tenant: insert one
@@ -2349,8 +2397,10 @@ fn member_surface_tests(design: &Design, module: &ModuleDesign) -> String {
     let add_role = second.unwrap_or(admin);
     let hk = design.test_auth_header();
     let (cols, vals) = tenant_row_cols_vals(entity, "1", 1);
-    let mut migration_items = String::new();
-    collect_workspace_migration_items(design, module, &mut migration_items);
+    let migrate_block = migrate_call_block(
+        &collect_workspace_migration_items(design, module),
+        "migrations",
+    );
     let auth_extend = format!(".extend(jerrycan::auth::Auth::with_secret(\"{TEST_SECRET}\"))");
     let (_, ext_extends) = extension_wiring(design);
     let second_seed = second
@@ -2362,7 +2412,7 @@ fn member_surface_tests(design: &Design, module: &ModuleDesign) -> String {
         .unwrap_or_default();
 
     let mut t = format!(
-        "/// #107 member surface: TOOL-OWNED routes with REAL generated handlers, so\n/// these tests pass on a fresh scaffold and turn RED only if the generated\n/// surface (admin gate, last-admin lockout, self-removal, role allow-list)\n/// breaks. Seeded via raw SQL — the HTTP surface under test is exactly what\n/// removes that need from application code.\nasync fn member_app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant row\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (1, 1, '{admin}')\")\n        .await\n        .expect(\"seed admin membership\");\n{second_seed}    App::new(){auth_extend}{ext_extends}.extend(db).provide_dep(shared::tenant).mount(\"{mount}\", module()).into_test()\n}}\n\n"
+        "/// #107 member surface: TOOL-OWNED routes with REAL generated handlers, so\n/// these tests pass on a fresh scaffold and turn RED only if the generated\n/// surface (admin gate, last-admin lockout, self-removal, role allow-list)\n/// breaks. Seeded via raw SQL — the HTTP surface under test is exactly what\n/// removes that need from application code.\nasync fn member_app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n{migrate_block}    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{table}\\\" ({cols}) VALUES ({vals})\")\n        .await\n        .expect(\"seed tenant row\");\n    db.conn()\n        .execute_unprepared(\"INSERT INTO \\\"{members}\\\" (user_id, {fk}, role) VALUES (1, 1, '{admin}')\")\n        .await\n        .expect(\"seed admin membership\");\n{second_seed}    App::new(){auth_extend}{ext_extends}.extend(db).provide_dep(shared::tenant).mount(\"{mount}\", module()).into_test()\n}}\n\n"
     );
 
     // list: any member sees the roster (the membership guard is the whole gate).
@@ -2576,8 +2626,10 @@ fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool, emit_app
         // table the Tenant guard queries is now always present). Tenancy still
         // needs (b) a seeded membership row so the guard resolves a tenant (not
         // 403) and (c) the `tenant` factory registered so `Dep<Tenant>` resolves.
-        let mut migration_items = String::new();
-        collect_workspace_migration_items(design, module, &mut migration_items);
+        let migrate_block = migrate_call_block(
+            &collect_workspace_migration_items(design, module),
+            "migrations",
+        );
         let seed = tenant_seed(design, module);
         let tenant_dep = if module_provides_tenant_dep(design, module) {
             ".provide_dep(shared::tenant)"
@@ -2623,7 +2675,7 @@ fn preamble(design: &Design, module: &ModuleDesign, uses_cookies: bool, emit_app
         // validation is not needed). See the harness comment emitted below.
         let (ext_comment, ext_extends) = extension_wiring(design);
         format!(
-            "{seed_use}{auth_login}{second_seed_fn}{ext_comment}async fn app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n    db.migrate(&[\n{migration_items}    ])\n    .await\n    .expect(\"migrations\");\n{seed}{second_seed_call}    App::new(){auth_extend}{ext_extends}.extend(db){tenant_dep}.mount(\"{mount}\", module()).into_test()\n}}\n"
+            "{seed_use}{auth_login}{second_seed_fn}{ext_comment}async fn app() -> TestApp {{\n    let db = jerrycan::db::Db::connect(\"sqlite::memory:\").await.expect(\"test db\");\n{migrate_block}{seed}{second_seed_call}    App::new(){auth_extend}{ext_extends}.extend(db){tenant_dep}.mount(\"{mount}\", module()).into_test()\n}}\n"
         )
     } else {
         format!(
@@ -2777,6 +2829,45 @@ pub fn test_count(generated: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mig(name: &str, prefix: &str) -> MigrationItem {
+        MigrationItem {
+            name: format!("{name}_0001_create_tables"),
+            sqlite_path: format!("{prefix}/migrations/sqlite/0001_create_tables.sql"),
+            postgres_path: format!("{prefix}/migrations/postgres/0001_create_tables.sql"),
+        }
+    }
+
+    /// Issue #221 (residual D): rustfmt HUGS a single-element `db.migrate(&[…])` array —
+    /// the sole `Migration { … }` opens on the `db.migrate(&[` line and its body
+    /// de-indents one level (fields at col 8) — but keeps a ≥ 2-element array multi-line
+    /// (item body at col 8, fields at col 12). `migrate_call_block` must reproduce both,
+    /// or the jobs AND route `tests/acceptance.rs` drift under `cargo fmt` for a single-
+    /// route-module design. Empty items ⇒ the empty string (the jobs harness omits the
+    /// route-migrate call entirely rather than emit `db.migrate(&[])`).
+    #[test]
+    fn migrate_call_block_hugs_single_element_and_expands_many() {
+        let single = migrate_call_block(
+            std::slice::from_ref(&mig("customers", "../../routes/customers")),
+            "route migrations",
+        );
+        assert_eq!(
+            single,
+            "    db.migrate(&[jerrycan::db::Migration {\n        name: \"customers_0001_create_tables\",\n        sqlite: include_str!(\"../../routes/customers/migrations/sqlite/0001_create_tables.sql\"),\n        postgres: include_str!(\"../../routes/customers/migrations/postgres/0001_create_tables.sql\"),\n    }])\n    .await\n    .expect(\"route migrations\");\n"
+        );
+        // Two items ⇒ the pre-#221 multi-line layout (byte-identical to before).
+        let two = migrate_call_block(&[mig("a", ".."), mig("b", "../../b")], "migrations");
+        assert!(
+            two.starts_with("    db.migrate(&[\n        jerrycan::db::Migration {\n"),
+            "≥ 2 items stay multi-line: {two}"
+        );
+        assert!(
+            two.contains("        },\n        jerrycan::db::Migration {\n"),
+            "each of the two items sits at col 8: {two}"
+        );
+        // No items ⇒ omit the call.
+        assert_eq!(migrate_call_block(&[], "migrations"), "");
+    }
 
     /// Issue #217: an inline-DTO custom action (`request_body: {fields:[…]}`) whose
     /// required inline field carries a #80 constraint gets a boundary REJECT probe —

@@ -1,0 +1,53 @@
+{
+  "name": "cron-name-wrap-fixpoint",
+  "contract_version": 2,
+  "description": "Issue #221 guard fixture (residual F, registry): CRON job names span every regime of rustfmt's NON-MONOTONIC wrap of the registry closure body `Box::pin({name}::{name}(ctx))` — 26/30 (one line), 27/28 (inner call breaks), 32/34 (outer Box::pin breaks), 35/36 (both break). ALL names are <= 36 chars ON PURPOSE: a name >= 37 emits a >100-col line that makes rustfmt BAIL on reformatting the whole `pub fn jobs` chain (leaving every closure as-emitted), which would mask this drift — so the give-up regime is guarded separately by cron-longname-stub-fixpoint. Two multi-field route modules keep the migration array multi-line (clear of residual D) and their ActiveModels multi-line (clear of residual E), isolating F.",
+  "auth": { "model": "none" },
+  "dependencies": ["db"],
+  "jobs": [
+    { "name": "expire_abandoned_carts_now", "schedule": "0 * * * *" },
+    { "name": "reconcile_daily_ledger_rows", "schedule": "5 * * * *" },
+    { "name": "reconcile_daily_ledger_total", "schedule": "10 * * * *" },
+    { "name": "expire_abandoned_shopping_cart", "schedule": "15 * * * *" },
+    { "name": "recompute_search_index_documents", "schedule": "20 * * * *" },
+    { "name": "reconcile_external_ledger_balances", "schedule": "25 * * * *" },
+    { "name": "synchronize_external_billing_ledger", "schedule": "30 * * * *" },
+    { "name": "synchronize_external_billing_ledgers", "schedule": "35 * * * *" }
+  ],
+  "modules": [
+    {
+      "name": "customers",
+      "entities": [
+        { "name": "Customer", "fields": [
+          { "name": "id", "type": "integer" },
+          { "name": "email", "type": "string", "unique": true },
+          { "name": "name", "type": "string" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_customers", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Customer", "list": true } },
+        { "operation_id": "create_customer", "method": "POST", "path": "/",
+          "request_body": { "entity": "Customer" },
+          "success": { "status": 201, "entity": "Customer" } }
+      ]
+    },
+    {
+      "name": "invoices",
+      "entities": [
+        { "name": "Invoice", "fields": [
+          { "name": "id", "type": "integer" },
+          { "name": "number", "type": "string", "unique": true },
+          { "name": "amount_cents", "type": "integer" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_invoices", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Invoice", "list": true } },
+        { "operation_id": "create_invoice", "method": "POST", "path": "/",
+          "request_body": { "entity": "Invoice" },
+          "success": { "status": 201, "entity": "Invoice" } }
+      ]
+    }
+  ]
+}

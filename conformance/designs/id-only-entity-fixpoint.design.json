@@ -1,0 +1,51 @@
+{
+  "name": "id-only-entity-fixpoint",
+  "contract_version": 2,
+  "description": "Issue #221 guard fixture (residual E): an ID-ONLY (single-field, string pk) entity whose generated repo emits a SINGLE-field `ActiveModel { id: Set(item.id) }` in `insert` and `ActiveModel { id: Set(id) }` in `update`, both of which rustfmt collapses to one line. A SECOND multi-field module keeps the migration array multi-line (clear of residual D) and there are no jobs (clear of residual F), so this exercises E in isolation. The multi-field `Customer` entity keeps its ActiveModels multi-line, proving the collapse fires only for single-field literals.",
+  "auth": { "model": "none" },
+  "dependencies": ["db"],
+  "modules": [
+    {
+      "name": "tokens",
+      "entities": [
+        { "name": "Token", "fields": [
+          { "name": "id", "type": "string" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_tokens", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Token", "list": true } },
+        { "operation_id": "create_token", "method": "POST", "path": "/",
+          "request_body": { "entity": "Token" },
+          "success": { "status": 201, "entity": "Token" } },
+        { "operation_id": "show_token", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Token" },
+          "errors": [{ "status": 404, "when": "unknown id" }] },
+        { "operation_id": "delete_token", "method": "DELETE", "path": "/{id}",
+          "success": { "status": 204 },
+          "errors": [{ "status": 404, "when": "unknown id" }] }
+      ]
+    },
+    {
+      "name": "customers",
+      "entities": [
+        { "name": "Customer", "fields": [
+          { "name": "id", "type": "integer" },
+          { "name": "email", "type": "string", "unique": true },
+          { "name": "name", "type": "string" }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_customers", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Customer", "list": true } },
+        { "operation_id": "create_customer", "method": "POST", "path": "/",
+          "request_body": { "entity": "Customer" },
+          "success": { "status": 201, "entity": "Customer" } },
+        { "operation_id": "update_customer", "method": "PUT", "path": "/{id}",
+          "request_body": { "entity": "Customer" },
+          "success": { "status": 200, "entity": "Customer" },
+          "errors": [{ "status": 404, "when": "unknown id" }] }
+      ]
+    }
+  ]
+}

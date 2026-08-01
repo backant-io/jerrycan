@@ -21,6 +21,27 @@ const REFERENCE: &str = include_str!("../../../conformance/designs/reference-sli
 const QUEUE_JOBS_FIXPOINT: &str =
     include_str!("../../../conformance/designs/queue-jobs-fixpoint.design.json");
 
+/// Issue #221 guard fixtures (residuals D/E/F): three design SHAPES the #218 guards
+/// never scaffolded, each of which a fresh scaffold failed `cargo fmt --check` on.
+/// D — a SINGLE-route-module jobs design: the jobs (and route) `tests/acceptance.rs`
+/// emit a one-element `db.migrate(&[…])` array, which rustfmt HUGS onto one line.
+const SINGLE_MODULE_JOBS_FIXPOINT: &str =
+    include_str!("../../../conformance/designs/single-module-jobs-fixpoint.design.json");
+/// E — an ID-ONLY (single-field, string pk) entity: the repo emits single-field
+/// `ActiveModel { id: Set(…) }` literals in `insert`/`update`, which rustfmt collapses.
+const ID_ONLY_ENTITY_FIXPOINT: &str =
+    include_str!("../../../conformance/designs/id-only-entity-fixpoint.design.json");
+/// F (registry) — CRON names spanning rustfmt's NON-MONOTONIC wrap of the closure body
+/// `Box::pin({name}::{name}(ctx))` AND the `fn_call_width` break of `.cron(…)`. All names
+/// are ≤ 36 cols so rustfmt actually reformats the chain (a ≥ 37 name would make it bail).
+const CRON_NAME_WRAP_FIXPOINT: &str =
+    include_str!("../../../conformance/designs/cron-name-wrap-fixpoint.design.json");
+/// F (task stub) — a CRON name ≥ 39 cols whose agent-owned task-module stub signature
+/// `pub async fn {name}(mut _ctx: TaskContext) -> …` wraps one param per line (the #218
+/// fix wrapped the QUEUE stub but missed the cron stub).
+const CRON_LONGNAME_STUB_FIXPOINT: &str =
+    include_str!("../../../conformance/designs/cron-longname-stub-fixpoint.design.json");
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -132,6 +153,21 @@ fn scaffold_is_a_rustfmt_fixpoint() {
     // multi-field route modules keep the migration/db arrays multi-line, clear of the
     // single-element collapses tracked separately.
     assert_scaffold_is_fixpoint(QUEUE_JOBS_FIXPOINT, "queue-jobs-fixpoint");
+
+    // Issue #221 residuals D/E/F — SHAPES the #218 designs never scaffolded, each kept
+    // distinct so a regression in one cannot be masked by another (a D design with
+    // multi-field entities; an E design with ≥ 2 route modules; F designs with
+    // multi-field entities and ≥ 2 modules). Each was RED before its emitter fix
+    // (verified by reverting the hunk and re-scaffolding).
+    // D: ONE route module ⇒ single-element jobs/route migration array (rustfmt HUGS it).
+    assert_scaffold_is_fixpoint(SINGLE_MODULE_JOBS_FIXPOINT, "single-module-jobs-fixpoint");
+    // E: ID-ONLY entity ⇒ single-field `ActiveModel { id: Set(…) }` (rustfmt collapses it).
+    assert_scaffold_is_fixpoint(ID_ONLY_ENTITY_FIXPOINT, "id-only-entity-fixpoint");
+    // F (registry): CRON names ≤ 36 across every regime of the non-monotonic `Box::pin`
+    // closure-body wrap + the `.cron(…)` fn_call_width break.
+    assert_scaffold_is_fixpoint(CRON_NAME_WRAP_FIXPOINT, "cron-name-wrap-fixpoint");
+    // F (task stub): a CRON name ≥ 39 whose task-module stub signature wraps.
+    assert_scaffold_is_fixpoint(CRON_LONGNAME_STUB_FIXPOINT, "cron-longname-stub-fixpoint");
 }
 
 /// Scaffold `design_json` (wired to the LOCAL framework) into a fresh temp app named
