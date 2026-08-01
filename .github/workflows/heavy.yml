@@ -1,12 +1,15 @@
 name: Heavy suite
 # Real-app conformance: scaffold -> full cargo build -> serve -> drive real HTTP
 # against real Postgres/Redis/MinIO. Deliberately OFF the per-PR path (that gate is
-# fast + hermetic). Run on demand from the Actions "Run workflow" button; flip on
-# the nightly schedule below when ready.
+# fast + hermetic). Runs nightly + on demand from the Actions "Run workflow" button.
+# #215: the nightly schedule was commented out, so the durable-store/Redis/S3
+# behavioral suite (which the fast per-PR gate can't run — no service containers)
+# gated nothing and could rot silently between manual dispatches. Nightly runs
+# surface a durable-store regression within a day.
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: '0 6 * * *'   # nightly 06:00 UTC — uncomment to enable nightly runs
+  schedule:
+    - cron: '0 6 * * *'   # nightly 06:00 UTC
 
 # Least privilege: this workflow only checks out and builds/tests.
 permissions:
@@ -93,7 +96,18 @@ jobs:
         # the Postgres SKIP-LOCKED leasing, the advisory-lock cron leader, or the
         # migrate advisory lock is caught here.
         run: |
-          cargo test -p jerrycan-db --lib tests::concurrent_migrators_do_not_race -- --ignored
+          # #213: run ALL ignored jerrycan-db lib races. The old name-filter
+          # `tests::concurrent_migrators_do_not_race` silently dropped its sibling
+          # `atomic_reservation_beats_the_oversell_race_on_postgres` (the #108
+          # oversell guarantee), so that test ran in no workflow at all.
+          cargo test -p jerrycan-db --lib -- --ignored --test-threads=1
+          # #214: these PG concurrency/capstone guarantees were wired into NO
+          # workflow — the oversell (#108), last-admin (#138), and migrate
+          # capstone (#152) tests only ever ran by hand. Run them here, against
+          # the ephemeral CI Postgres (fresh each run — migrate_e2e needs it).
+          cargo test -p jerrycan --all-features --test reserve_capacity_concurrency -- --ignored --test-threads=1
+          cargo test -p jerrycan --all-features --test last_admin_concurrency -- --ignored --test-threads=1
+          cargo test -p jerrycan --all-features --test migrate_e2e -- --ignored --test-threads=1
           cargo test -p jerrycan-jobs --test postgres_store -- --ignored
           cargo test -p jerrycan-jobs --features jobs-redis --test redis_store -- --ignored
           cargo test -p jerrycan-ratelimit --features rate-limit-redis --test redis_store -- --ignored
