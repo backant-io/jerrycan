@@ -46,6 +46,35 @@ else
   echo "!!! SKIP_EVAL_GATE=1 — skipping the eval gate (emergency republish only) !!!"
 fi
 
+# ---------------------------------------------------------------------------
+# PG BEHAVIORAL GATE (#214/#215) — the security+correctness concurrency
+# guarantees run release-blocking here.
+#
+# The oversell primitive (#108), the last-admin transaction guard (#138), and
+# the jerrycan-db migrator/reservation races are #[ignore]d (they need a live
+# Postgres) and lived ONLY in the manual `heavy.yml`, which is workflow_dispatch
+# + nightly — it gates NO release (#215). A regression in the atomic reserve, the
+# last-admin race, or the migrate advisory lock could therefore ship green. Run
+# them here so a broken concurrency guarantee blocks `cargo publish`.
+#
+# Each of these tests DROP-IF-EXISTS (or uniquely names) its own tables, so they
+# are repeatable against a persistent throwaway test DB — no schema reset needed.
+# (The migrate capstone #152 and the conformance PG TDD loop need a FRESH schema
+# + the full migrator; they stay in heavy.yml's ephemeral-Postgres lane, not
+# here.) Set JERRYCAN_TEST_PG_URL to a throwaway test database. SKIP_PG_GATE=1 is
+# the emergency-republish escape (mirrors SKIP_EVAL_GATE).
+# ---------------------------------------------------------------------------
+if [ "${SKIP_PG_GATE:-0}" != "1" ]; then
+  : "${JERRYCAN_TEST_PG_URL:?the PG behavioral gate needs a live Postgres — set JERRYCAN_TEST_PG_URL to a throwaway test DB, or SKIP_PG_GATE=1 to skip (emergency republish of already-indexed crates only)}"
+  echo "=== PG behavioral gate: oversell #108 + last-admin #138 + jerrycan-db races ==="
+  cargo test -p jerrycan-db --lib -- --ignored --test-threads=1
+  cargo test -p jerrycan --all-features --test reserve_capacity_concurrency -- --ignored --test-threads=1
+  cargo test -p jerrycan --all-features --test last_admin_concurrency -- --ignored --test-threads=1
+  echo "=== PG behavioral gate GREEN ==="
+else
+  echo "!!! SKIP_PG_GATE=1 — skipping the Postgres behavioral gate (emergency republish only) !!!"
+fi
+
 # jerrycan-storage and jerrycan-realtime depend on core+db, so they publish
 # after those and before the facade. They were added in the 0.3.0 line and were
 # missing from this list, so the release pipeline never shipped them (issue #20).
