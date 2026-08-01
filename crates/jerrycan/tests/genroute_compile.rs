@@ -1593,7 +1593,7 @@ mod constraint_roundtrip {
 #[ignore = "scaffolds a db-mode inline-body app and invokes cargo on it; run with --include-ignored"]
 fn db_mode_inline_request_body_app_passes_strict_clippy() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    scaffold_and_strict_clippy(
+    let app = scaffold_and_strict_clippy(
         tmp.path(),
         "inline-db",
         r#"{
@@ -1618,6 +1618,44 @@ fn db_mode_inline_request_body_app_passes_strict_clippy() {
                 ]
             }]
         }"#,
+    );
+
+    // Issue #217 (end-to-end): the inline-DTO action `checkout` carries a #80
+    // constraint (`amount`, `min: 1`), so `gen-tests` must emit a COMPILABLE 422
+    // reject probe that corrupts `amount` to 0 (min - 1). Generate the module's
+    // acceptance tests and require the whole workspace (incl. the generated tests)
+    // to pass strict clippy — proving the inline reject probe is valid Rust.
+    let st = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .args(["gen-tests", "--module", "checkout"])
+        .status()
+        .expect("run gen-tests checkout");
+    assert!(st.success(), "gen-tests checkout must succeed");
+    let acc = fs::read_to_string(app.join("crates/routes/checkout/tests/acceptance.rs"))
+        .expect("read checkout acceptance.rs");
+    assert!(
+        acc.contains("async fn checkout_rejects_out_of_range_amount()") && acc.contains("422"),
+        "the inline-DTO action must gain a 422 reject probe (#217):\n{acc}"
+    );
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo clippy on generated tests");
+    assert!(
+        output.status.success(),
+        "the generated inline reject probe must compile clean under strict clippy\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 

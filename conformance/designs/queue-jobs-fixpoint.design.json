@@ -1,0 +1,57 @@
+{
+  "name": "queue-jobs-fixpoint",
+  "contract_version": 2,
+  "description": "Issue #218 guard fixture: exercises the QUEUE-job scaffold path (Payload struct + 2-arg registry closure + 2-arg acceptance call) with realistic, NON-alphabetical job names spanning every rustfmt wrap regime, plus two multi-field route modules so the migration/db arrays stay multi-line (clear of the single-element collapses tracked separately). Names cover: short (one-line), the `let p:` brace-drop (payload 45-46 cols) and post-`=` break (>=47 cols) regimes, and the acceptance-call value-on-own-line and arg-break regimes.",
+  "auth": { "model": "none" },
+  "dependencies": ["db"],
+  "jobs": [
+    { "name": "send_welcome_emails", "queue": "mailer" },
+    { "name": "sync_external_contacts" },
+    { "name": "process_payment_webhook_retry" },
+    { "name": "resend_receipt" }
+  ],
+  "modules": [
+    {
+      "name": "customers",
+      "entities": [
+        { "name": "Customer", "fields": [
+          { "name": "id", "type": "integer" },
+          { "name": "email", "type": "string", "unique": true },
+          { "name": "name", "type": "string" },
+          { "name": "notes", "type": "string", "required": false }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_customers", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Customer", "list": true } },
+        { "operation_id": "create_customer", "method": "POST", "path": "/",
+          "request_body": { "entity": "Customer" },
+          "success": { "status": 201, "entity": "Customer" } },
+        { "operation_id": "show_customer", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Customer" },
+          "errors": [{ "status": 404, "when": "unknown id" }] }
+      ]
+    },
+    {
+      "name": "invoices",
+      "entities": [
+        { "name": "Invoice", "fields": [
+          { "name": "id", "type": "integer" },
+          { "name": "number", "type": "string", "unique": true },
+          { "name": "amount_cents", "type": "integer" },
+          { "name": "status", "type": "string", "values": ["draft", "sent", "paid"] }
+        ]}
+      ],
+      "endpoints": [
+        { "operation_id": "list_invoices", "method": "GET", "path": "/",
+          "success": { "status": 200, "entity": "Invoice", "list": true } },
+        { "operation_id": "create_invoice", "method": "POST", "path": "/",
+          "request_body": { "entity": "Invoice" },
+          "success": { "status": 201, "entity": "Invoice" } },
+        { "operation_id": "show_invoice", "method": "GET", "path": "/{id}",
+          "success": { "status": 200, "entity": "Invoice" },
+          "errors": [{ "status": 404, "when": "unknown id" }] }
+      ]
+    }
+  ]
+}

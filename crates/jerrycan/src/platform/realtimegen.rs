@@ -387,7 +387,7 @@ pub fn acceptance_rs(design: &Design) -> String {
          #![allow(unused)]\n\n",
     );
     let Some(rt) = design.realtime.as_ref() else {
-        return out;
+        return format!("{}\n", out.trim_end_matches('\n'));
     };
     for entity in &rt.changes {
         let snake = Design::to_snake(entity);
@@ -440,7 +440,9 @@ pub fn acceptance_rs(design: &Design) -> String {
              }}\n\n"
         ));
     }
-    out
+    // The last test block ends with a trailing blank line rustfmt strips (issue
+    // #218); trim to exactly one final newline so the scaffold is a fmt fixpoint.
+    format!("{}\n", out.trim_end_matches('\n'))
 }
 
 /// Write the tool-owned `crates/realtime/` crate — all three files rewritten

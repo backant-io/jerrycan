@@ -1007,7 +1007,10 @@ pub(crate) fn model_rs(m: &ModuleDesign) -> Option<String> {
     for ep in &inline {
         out.push_str(&inline_request_dto_rs(ep));
     }
-    Some(out)
+    // The final entity/validator block ends with a trailing blank line rustfmt
+    // strips (issue #218/#165); trim to exactly one final newline so a fresh
+    // scaffold's model.rs is a `cargo fmt` fixpoint.
+    Some(format!("{}\n", out.trim_end_matches('\n')))
 }
 
 /// serde `rename` (+ sea_orm `column_name` in db mode) attribute line(s) for a
@@ -1095,6 +1098,23 @@ fn constraint_validate_attr(entity: &Entity, f: &Field, indent: &str, path_prefi
 /// `false`) — there the validator must carry the required-variant signature
 /// for BOTH required and optional fields, or the generated app hits E0308
 /// (0.6.5 T2 review, CRITICAL 1; same for the #47 enum validators).
+/// `return Err(<D::Error as serde::de::Error>::custom("{msg}"));` at `indent`,
+/// pre-wrapped exactly as the pinned rustfmt does (issue #218): rustfmt breaks the
+/// string arg onto its own line once the `Err(..)` argument
+/// (`<D::Error …>::custom("…")`) exceeds `fn_call_width` (60). A short message stays
+/// on one line (so short-message validators are byte-identical); a long one wraps.
+/// Ends with a newline.
+fn custom_err_stmt(indent: &str, msg: &str) -> String {
+    let expr = format!("<D::Error as serde::de::Error>::custom(\"{msg}\")");
+    if expr.chars().count() <= 60 {
+        format!("{indent}return Err({expr});\n")
+    } else {
+        format!(
+            "{indent}return Err(<D::Error as serde::de::Error>::custom(\n{indent}    \"{msg}\",\n{indent}));\n"
+        )
+    }
+}
+
 fn constraint_deserialize_fns(entities: &[Entity], optional_is_option: bool) -> String {
     let mut out = String::new();
     for e in entities {
@@ -1109,13 +1129,15 @@ fn constraint_deserialize_fns(entities: &[Entity], optional_is_option: bool) -> 
                 let msg = format!("{} must be one of: {}", f.name, values.join(", "));
                 let name = format!("de_{snake}_{}", f.name);
                 if f.required || !optional_is_option {
+                    let err = custom_err_stmt("        ", &msg);
                     out.push_str(&format!(
-                        "// Enum validator (issue #47): out-of-range `{field}` → serde error → 422.\nfn {name}<'de, D>(de: D) -> std::result::Result<String, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <String as serde::Deserialize>::deserialize(de)?;\n    const ALLOWED: &[&str] = &[{allowed}];\n    if !ALLOWED.contains(&value.as_str()) {{\n        return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n    }}\n    Ok(value)\n}}\n\n",
+                        "// Enum validator (issue #47): out-of-range `{field}` → serde error → 422.\nfn {name}<'de, D>(de: D) -> std::result::Result<String, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <String as serde::Deserialize>::deserialize(de)?;\n    const ALLOWED: &[&str] = &[{allowed}];\n    if !ALLOWED.contains(&value.as_str()) {{\n{err}    }}\n    Ok(value)\n}}\n\n",
                         field = f.name,
                     ));
                 } else {
+                    let err = custom_err_stmt("            ", &msg);
                     out.push_str(&format!(
-                        "// Enum validator (issue #47): checks `{field}` when present (optional).\nfn {name}<'de, D>(de: D) -> std::result::Result<Option<String>, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <Option<String> as serde::Deserialize>::deserialize(de)?;\n    if let Some(ref inner) = value {{\n        const ALLOWED: &[&str] = &[{allowed}];\n        if !ALLOWED.contains(&inner.as_str()) {{\n            return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n        }}\n    }}\n    Ok(value)\n}}\n\n",
+                        "// Enum validator (issue #47): checks `{field}` when present (optional).\nfn {name}<'de, D>(de: D) -> std::result::Result<Option<String>, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{{\n    let value = <Option<String> as serde::Deserialize>::deserialize(de)?;\n    if let Some(ref inner) = value {{\n        const ALLOWED: &[&str] = &[{allowed}];\n        if !ALLOWED.contains(&inner.as_str()) {{\n{err}        }}\n    }}\n    Ok(value)\n}}\n\n",
                         field = f.name,
                     ));
                 }
@@ -1219,9 +1241,8 @@ fn bounds_checks(f: &Field, var: &str, indent: &str) -> String {
     bounds_rules(f, var)
         .iter()
         .map(|(cond, msg)| {
-            format!(
-                "{indent}if {cond} {{\n{indent}    return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n{indent}}}\n"
-            )
+            let err = custom_err_stmt(&format!("{indent}    "), msg);
+            format!("{indent}if {cond} {{\n{err}{indent}}}\n")
         })
         .collect()
 }
@@ -1237,9 +1258,8 @@ fn option_bounds_checks(f: &Field, binding: &str) -> String {
     bounds_rules(f, "inner")
         .iter()
         .map(|(cond, msg)| {
-            format!(
-                "    if let {binding} = value\n        && {cond}\n    {{\n        return Err(<D::Error as serde::de::Error>::custom(\"{msg}\"));\n    }}\n"
-            )
+            let err = custom_err_stmt("        ", msg);
+            format!("    if let {binding} = value\n        && {cond}\n    {{\n{err}    }}\n")
         })
         .collect()
 }
@@ -1426,7 +1446,10 @@ pub use {snake}::Model as {entity};
     for ep in &inline {
         out.push_str(&inline_request_dto_rs(ep));
     }
-    Some(out)
+    // The final entity/validator block ends with a trailing blank line rustfmt
+    // strips (issue #218/#165); trim to exactly one final newline so a fresh
+    // scaffold's model.rs is a `cargo fmt` fixpoint.
+    Some(format!("{}\n", out.trim_end_matches('\n')))
 }
 
 /// The request DTO (issues #34 + #53 + #85): the entity's deserialization shape
@@ -3404,9 +3427,77 @@ pub(crate) fn deps_rs(m: &ModuleDesign) -> String {
     out
 }
 
-/// Route-table lines: endpoints grouped by path (first-seen order), first
-/// method via the free fn, the rest chained.
-fn route_lines(m: &ModuleDesign, indent: &str) -> String {
+/// One argument of a builder call in `deps::configure(...)`. A `Chain` argument is
+/// a method chain (`get(..).post(..)`) that the pinned rustfmt may break onto its
+/// own lines when the enclosing `.route(..)` wraps; a `Leaf` is any other single
+/// expression (a path literal, a repo factory, `subroutes::x::module()`).
+enum CallArg {
+    Leaf(String),
+    /// The chain's head call plus each `.method(..)` continuation, in order.
+    Chain(Vec<String>),
+}
+
+/// One `.method(args)` call chained after `Module::new(name)` in a module's
+/// `deps::configure(...)` builder (`.provide_dep(..)`, `.route(..)`, `.mount(..)`).
+struct BuilderCall {
+    method: &'static str,
+    args: Vec<CallArg>,
+}
+
+impl CallArg {
+    fn inline(&self) -> String {
+        match self {
+            CallArg::Leaf(s) => s.clone(),
+            CallArg::Chain(parts) => parts.concat(),
+        }
+    }
+}
+
+impl BuilderCall {
+    /// `.method(a, b)` on one line.
+    fn inline(&self) -> String {
+        let args = self
+            .args
+            .iter()
+            .map(CallArg::inline)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(".{}({args})", self.method)
+    }
+
+    /// The width of the argument list (`a, b`) — rustfmt wraps the call when this
+    /// exceeds `fn_call_width` (60), independent of the line's own indentation.
+    fn args_width(&self) -> usize {
+        let joined = self
+            .args
+            .iter()
+            .map(CallArg::inline)
+            .collect::<Vec<_>>()
+            .join(", ");
+        joined.chars().count()
+    }
+}
+
+/// The builder calls chained after `Module::new(name)`, in emission order:
+/// per-entity `.provide_dep`/`.provide`, one `.route` per path (endpoints grouped
+/// by first-seen path, methods chained), the tool-owned member routes (#107), then
+/// one `.mount` per subroute. The exact order/content the pre-#218 `module_body`
+/// emitted — only the LINE WRAPPING changes.
+fn builder_calls(m: &ModuleDesign, mode: GenMode, design: &Design) -> Vec<BuilderCall> {
+    let mut calls = Vec::new();
+    for e in &m.entities {
+        let arg = if mode.db {
+            format!("repo::{}_repo", Design::to_snake(&e.name))
+        } else {
+            format!("repo::{}Repo::new()", e.name)
+        };
+        calls.push(BuilderCall {
+            method: if mode.db { "provide_dep" } else { "provide" },
+            args: vec![CallArg::Leaf(arg)],
+        });
+    }
+    // Endpoints grouped by path (first-seen order); first method via the free fn,
+    // the rest chained — the `route_lines` grouping, now as structured chains.
     let mut order: Vec<&str> = Vec::new();
     let mut by_path: std::collections::HashMap<&str, Vec<&Endpoint>> =
         std::collections::HashMap::new();
@@ -3416,24 +3507,139 @@ fn route_lines(m: &ModuleDesign, indent: &str) -> String {
         }
         by_path.entry(&ep.path).or_default().push(ep);
     }
-    let mut out = String::new();
     for path in order {
         let eps = &by_path[path];
-        let mut chain = format!(
+        let mut parts = vec![format!(
             "{}(handlers::{})",
             eps[0].method.builder_fn(),
             eps[0].operation_id
-        );
+        )];
         for ep in &eps[1..] {
-            chain.push_str(&format!(
+            parts.push(format!(
                 ".{}(handlers::{})",
                 ep.method.builder_fn(),
                 ep.operation_id
             ));
         }
-        out.push_str(&format!("{indent}.route(\"{path}\", {chain})\n"));
+        calls.push(BuilderCall {
+            method: "route",
+            args: vec![CallArg::Leaf(format!("\"{path}\"")), CallArg::Chain(parts)],
+        });
     }
+    // The member-management surface (issue #107): path-scoped on the tenant fk.
+    if emits_member_surface(m, mode, design) {
+        let fk = Design::fk_column(&design.tenancy.as_ref().expect("gated").entity);
+        calls.push(BuilderCall {
+            method: "route",
+            args: vec![
+                CallArg::Leaf(format!("\"/{{{fk}}}/members\"")),
+                CallArg::Chain(vec![
+                    "get(members::list_members)".to_string(),
+                    ".post(members::add_member)".to_string(),
+                ]),
+            ],
+        });
+        calls.push(BuilderCall {
+            method: "route",
+            args: vec![
+                CallArg::Leaf(format!("\"/{{{fk}}}/members/{{user_id}}\"")),
+                CallArg::Chain(vec![
+                    "patch(members::set_member_role)".to_string(),
+                    ".delete(members::remove_member)".to_string(),
+                ]),
+            ],
+        });
+    }
+    for sub in &m.subroutes {
+        calls.push(BuilderCall {
+            method: "mount",
+            args: vec![
+                CallArg::Leaf(format!("\"{}\"", sub.effective_mount())),
+                CallArg::Leaf(format!(
+                    "subroutes::{}::module()",
+                    sub.name.replace('-', "_")
+                )),
+            ],
+        });
+    }
+    calls
+}
+
+/// The `deps::configure(Module::new(..)…)` expression for a module's `module()`
+/// body, pre-formatted EXACTLY as the pinned rustfmt (edition 2024, `max_width`
+/// 100, `fn_call_width`/`chain_width` 60) would (issue #218) so a fresh scaffold is
+/// a `cargo fmt` fixpoint. Collapses to one line when the whole call fits in 100;
+/// else lays the builder chain out one call per line (head `Module::new(..)` at
+/// column 8, each `.call(..)` at 12), wrapping a call whose args exceed 60 and
+/// breaking a wrapped `.route(..)`'s method-chain value when it has ≥2
+/// continuations wider than 60. The single chain argument to `deps::configure`
+/// takes the block-arg trailing comma in the multi-line form. Returned WITHOUT a
+/// trailing newline (the caller closes the `fn`).
+fn configure_expr(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
+    let head = format!("Module::new(\"{}\")", m.name);
+    let calls = builder_calls(m, mode, design);
+    let one_line = format!(
+        "deps::configure({head}{})",
+        calls.iter().map(BuilderCall::inline).collect::<String>()
+    );
+    // Collapse when the whole call fits `max_width` at the fn-body indent (4).
+    if 4 + one_line.chars().count() <= 100 {
+        return format!("    {one_line}");
+    }
+    let mut out = String::from("    deps::configure(\n");
+    if calls.is_empty() {
+        // Only `Module::new(..)` — it is itself the block arg, so it takes the comma.
+        out.push_str(&format!("        {head},\n"));
+    } else {
+        out.push_str(&format!("        {head}\n"));
+        let n = calls.len();
+        for (i, c) in calls.iter().enumerate() {
+            out.push_str(&render_builder_call(c, i + 1 == n));
+        }
+    }
+    out.push_str("    )");
     out
+}
+
+/// One builder call in the multi-line form, at column 12. `is_last` gives it the
+/// block-arg trailing comma. Wraps (one arg per line at column 16) when the arg
+/// list exceeds `fn_call_width` (60).
+fn render_builder_call(c: &BuilderCall, is_last: bool) -> String {
+    let comma = if is_last { "," } else { "" };
+    if c.args_width() <= 60 {
+        return format!("            {}{comma}\n", c.inline());
+    }
+    let mut out = format!("            .{}(\n", c.method);
+    for a in &c.args {
+        out.push_str(&render_call_arg(a));
+    }
+    out.push_str(&format!("            ){comma}\n"));
+    out
+}
+
+/// One argument of a wrapped call, at column 16, with rustfmt's trailing comma. A
+/// `Chain` value breaks onto its own lines (head at 16, each continuation at 20)
+/// when it has ≥2 continuations AND is wider than `chain_width` (60); otherwise it
+/// stays on one line.
+fn render_call_arg(a: &CallArg) -> String {
+    match a {
+        CallArg::Leaf(s) => format!("                {s},\n"),
+        CallArg::Chain(parts) => {
+            let inline = parts.concat();
+            let continuations = parts.len().saturating_sub(1);
+            if continuations >= 2 && inline.chars().count() > 60 {
+                let mut out = format!("                {}\n", parts[0]);
+                let cont = &parts[1..];
+                for (j, p) in cont.iter().enumerate() {
+                    let c = if j + 1 == cont.len() { "," } else { "" };
+                    out.push_str(&format!("                    {p}{c}\n"));
+                }
+                out
+            } else {
+                format!("                {inline},\n")
+            }
+        }
+    }
 }
 
 /// True when this module (or subroute) DECLARES the tenancy entity and the mode
@@ -3573,44 +3779,6 @@ pub(crate) async fn remove_member(
     ))
 }
 
-fn module_body(m: &ModuleDesign, indent: &str, mode: GenMode, design: &Design) -> String {
-    let mut body = format!("{indent}Module::new(\"{}\")\n", m.name);
-    for e in &m.entities {
-        if mode.db {
-            body.push_str(&format!(
-                "{indent}    .provide_dep(repo::{}_repo)\n",
-                Design::to_snake(&e.name)
-            ));
-        } else {
-            body.push_str(&format!(
-                "{indent}    .provide(repo::{}Repo::new())\n",
-                e.name
-            ));
-        }
-    }
-    body.push_str(&route_lines(m, &format!("{indent}    ")));
-    // The member-management surface (issue #107): tool-owned routes registered
-    // AFTER the design's own — path-scoped on the tenant fk so the shared guard's
-    // by-name lookup verifies membership in the PATH tenant. The fk param name
-    // agrees with the tenant's own detail routes by construction
-    // (`normalize_tenant_detail_routes` rewrote `{id}` → `{fk}` at load), so the
-    // router's one-param-name-per-position rule holds.
-    if emits_member_surface(m, mode, design) {
-        let fk = Design::fk_column(&design.tenancy.as_ref().expect("gated").entity);
-        body.push_str(&format!(
-            "{indent}    .route(\"/{{{fk}}}/members\", get(members::list_members).post(members::add_member))\n{indent}    .route(\"/{{{fk}}}/members/{{user_id}}\", patch(members::set_member_role).delete(members::remove_member))\n"
-        ));
-    }
-    for sub in &m.subroutes {
-        body.push_str(&format!(
-            "{indent}    .mount(\"{}\", subroutes::{}::module())\n",
-            sub.effective_mount(),
-            sub.name.replace('-', "_"),
-        ));
-    }
-    body
-}
-
 fn mod_decls(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     let mut out = String::from("mod deps;\nmod handlers;\n");
     // `members` (issue #107) sits between handlers and model: `mod` decls are
@@ -3630,19 +3798,19 @@ fn mod_decls(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
 
 pub(crate) fn lib_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     format!(
-        "//! Route module `{name}` — TOOL-OWNED, regenerated by `jerrycan generate`.\n//! The sole public item is `module()`; agent code lives in handlers/model/repo/deps.\n#![forbid(unsafe_code)]\n\n{mods}\nuse jerrycan::prelude::*;\n\n/// Build this module's routes, subroutes, and scoped dependencies.\npub fn module() -> Module {{\n    deps::configure(\n{body}    )\n}}\n",
+        "//! Route module `{name}` — TOOL-OWNED, regenerated by `jerrycan generate`.\n//! The sole public item is `module()`; agent code lives in handlers/model/repo/deps.\n#![forbid(unsafe_code)]\n\n{mods}\nuse jerrycan::prelude::*;\n\n/// Build this module's routes, subroutes, and scoped dependencies.\npub fn module() -> Module {{\n{body}\n}}\n",
         name = m.name,
         mods = mod_decls(m, mode, design),
-        body = module_body(m, "        ", mode, design),
+        body = configure_expr(m, mode, design),
     )
 }
 
 fn subroute_mod_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
     format!(
-        "//! Subroute `{name}` — TOOL-OWNED mod.rs; same fractal shape as a module.\n\n{mods}\nuse jerrycan::prelude::*;\n\npub(crate) fn module() -> Module {{\n    deps::configure(\n{body}    )\n}}\n",
+        "//! Subroute `{name}` — TOOL-OWNED mod.rs; same fractal shape as a module.\n\n{mods}\nuse jerrycan::prelude::*;\n\npub(crate) fn module() -> Module {{\n{body}\n}}\n",
         name = m.name,
         mods = mod_decls(m, mode, design),
-        body = module_body(m, "        ", mode, design),
+        body = configure_expr(m, mode, design),
     )
 }
 
@@ -7117,15 +7285,17 @@ pub(crate) mod tests {
             lib.contains("mod members;\n"),
             "members module declared:\n{lib}"
         );
+        // The member routes' arg lists exceed `fn_call_width` (60), so they are
+        // pre-wrapped one arg per line (issue #218) — exactly as rustfmt formats them.
         assert!(
             lib.contains(
-                ".route(\"/{club_id}/members\", get(members::list_members).post(members::add_member))"
+                ".route(\n                \"/{club_id}/members\",\n                get(members::list_members).post(members::add_member),\n            )"
             ),
             "collection routes on the tenant fk param:\n{lib}"
         );
         assert!(
             lib.contains(
-                ".route(\"/{club_id}/members/{user_id}\", patch(members::set_member_role).delete(members::remove_member))"
+                ".route(\n                \"/{club_id}/members/{user_id}\",\n                patch(members::set_member_role).delete(members::remove_member),\n            )"
             ),
             "item routes on the tenant fk param:\n{lib}"
         );
@@ -7167,9 +7337,14 @@ pub(crate) mod tests {
             !without.contains("members"),
             "stripped design: no members:\n{without}"
         );
+        // The member routes are the LAST builder-chain elements, so removing them
+        // moves the block-arg trailing comma onto the preceding `/` route (issue
+        // #218 wrapping). Deleting the wrapped members block WITHOUT its own trailing
+        // comma reattaches that comma to the `/` route, matching `without` — proving
+        // the ONLY lib.rs delta is the member surface.
         assert_eq!(
             with.replace(
-                "            .route(\"/{club_id}/members\", get(members::list_members).post(members::add_member))\n            .route(\"/{club_id}/members/{user_id}\", patch(members::set_member_role).delete(members::remove_member))\n",
+                "\n            .route(\n                \"/{club_id}/members\",\n                get(members::list_members).post(members::add_member),\n            )\n            .route(\n                \"/{club_id}/members/{user_id}\",\n                patch(members::set_member_role).delete(members::remove_member),\n            )",
                 ""
             )
             .replace("mod members;\n", ""),
@@ -7254,10 +7429,12 @@ pub(crate) mod tests {
         };
 
         // Route table: the router now captures `club_id`, so the guard verifies it.
+        // The route's arg list exceeds `fn_call_width` (60), so it is pre-wrapped
+        // one arg per line (issue #218) — exactly as rustfmt formats it.
         let lib = lib_rs(&d.modules[0], mode, &d);
         assert!(
             lib.contains(
-                ".route(\"/{club_id}\", get(handlers::get_club).delete(handlers::delete_club))"
+                ".route(\n                \"/{club_id}\",\n                get(handlers::get_club).delete(handlers::delete_club),\n            )"
             ),
             "tenant-own detail route must register /{{club_id}}:\n{lib}"
         );

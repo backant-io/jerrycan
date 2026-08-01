@@ -64,6 +64,21 @@ fn shared_tenancy_types(design: &Design) -> String {
             format!("{fk_col}.into()"),
         )
     };
+    // The fallback `Ok(Tenant { id: ... })`'s fk `try_get` chain: pre-wrapped as the
+    // pinned rustfmt does (issue #218). `row.try_get(..).map_err(..)?` has two calls
+    // after the `row` receiver, so rustfmt breaks it onto its own lines once the
+    // chain exceeds `chain_width` (60) — i.e. for a long fk column like
+    // `workspace_id`; a short fk stays on one line (byte-identical).
+    let tenant_id_field = {
+        let chain = format!("row.try_get(\"\", \"{fk_col}\").map_err(jerrycan::db::db_error)?");
+        if chain.chars().count() > 60 {
+            format!(
+                "        id: row\n            .try_get(\"\", \"{fk_col}\")\n            .map_err(jerrycan::db::db_error)?,"
+            )
+        } else {
+            format!("        id: {chain},")
+        }
+    };
     format!(
         r#"
 /// The authenticated tenant context: membership-checked {tenant} + role.
@@ -143,7 +158,7 @@ pub async fn tenant(
         return Err(jerrycan::Error::forbidden());
     }};
     Ok(Tenant {{
-        id: row.try_get("", "{fk_col}").map_err(jerrycan::db::db_error)?,
+{tenant_id_field}
         role: row.try_get("", "role").map_err(jerrycan::db::db_error)?,
     }})
 }}
