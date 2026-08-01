@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.8 — 2026-08-02
+
+### Fixed
+- **Multi-node: change-source health now propagates across nodes (#232, follow-up to #228).** The
+  `changes_unavailable` fail-loud (a mis-provisioned Postgres → `changes:` joins answer JC0530) was set
+  only by the elected replication leader, so in a multi-node deployment FOLLOWER nodes still admitted
+  subscribers to a feed the leader never streamed. A new `ChangesHealth` bus message now carries the
+  change source's health: the node that marks (or lifts) `changes_unavailable` publishes it, and every
+  node applies it — so all nodes answer JC0530 during an outage and re-admit on recovery. `true` is
+  re-published on the leader's backoff cadence (a follower joining mid-outage converges within one
+  backoff cycle); `false` is published only on the real recovery transition (no flap storm).
+  Single-node behavior is unchanged.
+
 ## 0.7.7 — 2026-08-02
 
 ### Fixed

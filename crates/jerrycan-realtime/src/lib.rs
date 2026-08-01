@@ -423,6 +423,15 @@ impl Hub {
                 self.deliver_presence_snapshot(node, entries)
             }
             bus::BusMessage::Resync { entity } => self.deliver_resync(entity),
+            // #232: a peer node (the replication leader) marked/lifted the change
+            // source. Store its health locally so THIS node's `changes:` join
+            // (`Hub::join`) answers JC0530 when the source is down and re-admits
+            // on recovery — closing the multi-node follower dead-feed. On the
+            // in-process LocalBus this is the marking node's own echo re-storing
+            // the value it already set (idempotent).
+            bus::BusMessage::ChangesHealth { unavailable } => self
+                .changes_unavailable
+                .store(unavailable, Ordering::Relaxed),
         }
     }
 
@@ -641,6 +650,18 @@ fn project_row(row: &serde_json::Value, hidden: &[String]) -> serde_json::Value 
     }
 }
 
+/// Broadcast the change-source health to every node (#232). The node that marks
+/// or lifts `changes_unavailable` publishes this so followers — which only
+/// deliver from the bus and never stream from Postgres — set their own flag and
+/// answer `changes:` joins with JC0530 (or re-admit). On the in-process
+/// LocalBus it loops back and idempotently re-stores the value the local node
+/// already set, so single-node behavior is unchanged.
+async fn publish_changes_health(bus: &bus::AnyBus, unavailable: bool) {
+    let _ = bus
+        .publish(bus::BusMessage::ChangesHealth { unavailable })
+        .await;
+}
+
 /// Detect-replication-else-triggers at startup, then spawn the chosen adapter.
 /// Replication path: leader → bus (every node delivers uniformly). Trigger
 /// path: hub-local delivery (Postgres is the bus — no realtime bus, so
@@ -652,23 +673,31 @@ async fn start_change_source(hub: &Arc<Hub>, shutdown: tokio::sync::watch::Recei
     let Some(db) = hub.db.clone() else {
         eprintln!("jerrycan-realtime: JC0530 changes configured without a database");
         hub.changes_unavailable.store(true, Ordering::Relaxed);
+        publish_changes_health(&hub.bus, true).await;
         return;
     };
     match changes::detect(&db).await {
         Err(e) => {
             eprintln!("jerrycan-realtime: {e:?} — changes channels answer JC0530");
             hub.changes_unavailable.store(true, Ordering::Relaxed);
+            publish_changes_health(&hub.bus, true).await;
         }
         Ok(changes::SourceKind::Replication) => {
             eprintln!("jerrycan-realtime: changes source = logical replication (pgoutput)");
             let specs = hub.config.changes.clone();
             let (etx, mut erx) = tokio::sync::mpsc::channel::<changes::ChangeEvent>(1024);
             let (rtx, mut rrx) = tokio::sync::mpsc::channel::<()>(16);
+            // #232: the supervisor sends the change-source health here on every
+            // mark/lift transition (and on each backoff iteration while it has
+            // never connected, for late-joiner convergence); the forwarding task
+            // republishes it across the bus so followers learn.
+            let (htx, mut hrx) = tokio::sync::mpsc::channel::<bool>(16);
             tokio::spawn(changes::replication::run_supervised(
                 db,
                 specs,
                 etx,
                 rtx,
+                htx,
                 // #228: the supervisor flips this on a first-connect failure so a
                 // permanently mis-provisioned replication PG fails loud (JC0530)
                 // instead of admitting `changes:` joins to a silent dead feed.
@@ -685,6 +714,9 @@ async fn start_change_source(hub: &Arc<Hub>, shutdown: tokio::sync::watch::Recei
                         },
                         Some(()) = rrx.recv() => {
                             let _ = hub2.bus.publish(bus::BusMessage::Resync { entity: None }).await;
+                        }
+                        Some(unavailable) = hrx.recv() => {
+                            publish_changes_health(&hub2.bus, unavailable).await;
                         }
                     }
                 }
@@ -703,6 +735,7 @@ async fn start_change_source(hub: &Arc<Hub>, shutdown: tokio::sync::watch::Recei
                     "jerrycan-realtime: trigger DDL reconcile failed: {e} — changes channels answer JC0530"
                 );
                 hub.changes_unavailable.store(true, Ordering::Relaxed);
+                publish_changes_health(&hub.bus, true).await;
                 return;
             }
             let (etx, mut erx) = tokio::sync::mpsc::channel::<changes::ChangeEvent>(1024);
@@ -859,6 +892,68 @@ mod delivery_tests {
                 .channels
                 .contains(&ChannelId::Changes("Lead".into())),
             "a refused join must not add channel membership"
+        );
+    }
+
+    /// #232 (the multi-node fix at the delivery seam): a `ChangesHealth` bus
+    /// message applied via `Hub::deliver` toggles THIS node's `changes:` join
+    /// admission — exactly how a follower learns the replication leader marked
+    /// (or lifted) the source it never streams itself. `{unavailable:true}` must
+    /// make a subsequent join answer JC0530; `{false}` must re-admit it. This is
+    /// the follower-side payoff of every publish site: it turns RED if the
+    /// `deliver` arm ignores the variant (leaving the flag untouched), which is
+    /// the dead-feed regression #232 closes.
+    #[test]
+    fn deliver_changes_health_toggles_changes_join_admission() {
+        let hub = hub_with_lead(); // source starts available
+
+        // Leader reports the source DOWN → this node refuses the join (JC0530).
+        hub.deliver(bus::BusMessage::ChangesHealth { unavailable: true });
+        let (c1, mut rx1) = hub.connect(tenant("t1"));
+        hub.join(c1, "changes:Lead", Some(1));
+        match rx1.try_recv() {
+            Ok(ServerMsg::Error { code, .. }) => assert_eq!(
+                code, "JC0530",
+                "a follower must refuse joins once the leader reports the source down"
+            ),
+            other => panic!("expected JC0530 after ChangesHealth{{true}}: {other:?}"),
+        }
+        assert!(
+            !hub.conns
+                .lock()
+                .unwrap()
+                .get(&c1)
+                .unwrap()
+                .channels
+                .contains(&ChannelId::Changes("Lead".into())),
+            "a refused join must not add channel membership"
+        );
+
+        // Leader reports RECOVERY → this node re-admits the join.
+        hub.deliver(bus::BusMessage::ChangesHealth { unavailable: false });
+        let (c2, mut rx2) = hub.connect(tenant("t2"));
+        hub.join(c2, "changes:Lead", Some(2));
+        match rx2.try_recv() {
+            Ok(ServerMsg::Joined { channel, .. }) => assert_eq!(channel, "changes:Lead"),
+            other => panic!("expected Joined after ChangesHealth{{false}}: {other:?}"),
+        }
+    }
+
+    /// #232: the forwarding glue — `publish_changes_health` must place a
+    /// `ChangesHealth` on the bus verbatim, so under Redis the health reaches
+    /// every peer node's pump. A regression that drops or reshapes the publish
+    /// turns this red.
+    #[tokio::test]
+    async fn publish_changes_health_puts_the_variant_on_the_bus() {
+        let bus = bus::AnyBus::Local(bus::LocalBus::new());
+        let mut rx = bus.subscribe();
+        publish_changes_health(&bus, true).await;
+        assert!(
+            matches!(
+                rx.recv().await.unwrap(),
+                bus::BusMessage::ChangesHealth { unavailable: true }
+            ),
+            "publish_changes_health must emit ChangesHealth{{true}} on the bus"
         );
     }
 

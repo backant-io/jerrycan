@@ -310,6 +310,10 @@ pub(crate) async fn run_supervised(
     specs: Vec<ChangeChannelSpec>,
     events: tokio::sync::mpsc::Sender<crate::changes::ChangeEvent>,
     resync: tokio::sync::mpsc::Sender<()>,
+    // #232: every mark/lift of `changes_unavailable` is also sent here so the
+    // caller republishes it across the bus; followers (which never stream) then
+    // set their own flag and answer `changes:` joins with JC0530 / re-admit.
+    health: tokio::sync::mpsc::Sender<bool>,
     changes_unavailable: Arc<AtomicBool>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -322,6 +326,7 @@ pub(crate) async fn run_supervised(
             "jerrycan-realtime: replication disabled — cannot parse database url — changes channels answer JC0530"
         );
         changes_unavailable.store(true, Ordering::Relaxed);
+        let _ = health.send(true).await; // #232: tell followers
         return;
     };
     // Elect the single replication leader (multi-node: exactly one owns the slot).
@@ -350,7 +355,12 @@ pub(crate) async fn run_supervised(
             // provisioned PG that was fixed), and mark the source connected so
             // subsequent drops are transient.
             connected_ever = true;
-            changes_unavailable.store(false, Ordering::Relaxed);
+            // #232: publish the recovery to followers, but ONLY on the real
+            // true→false transition — not on every reconnect — so a flapping
+            // network cannot storm the bus with `ChangesHealth{false}`.
+            if lift_and_was_transition(&changes_unavailable) {
+                let _ = health.send(false).await;
+            }
         }
         match outcome {
             Ok(()) => {
@@ -380,6 +390,15 @@ pub(crate) async fn run_supervised(
         // `changes:` join answers JC0530 instead of looping silently into a
         // dead feed while `may_join` admits subscribers. A no-op once attached.
         mark_unavailable_if_never_connected(&changes_unavailable, connected_ever);
+        // #232 late-joiner convergence: while we have NEVER attached, re-publish
+        // `ChangesHealth{true}` on EACH backoff iteration so a follower that
+        // joined the bus mid-outage (Redis pub/sub is ephemeral — it missed the
+        // first mark) converges within one backoff cycle. The backoff sleep
+        // below throttles this to the 1s→30s cadence, so there is no unbounded
+        // publish storm.
+        if !connected_ever {
+            let _ = health.send(true).await;
+        }
         tokio::select! {
             _ = shutdown.changed() => return,
             _ = tokio::time::sleep(backoff) => {}
@@ -402,6 +421,17 @@ pub(crate) fn mark_unavailable_if_never_connected(
     if !connected_ever {
         changes_unavailable.store(true, Ordering::Relaxed);
     }
+}
+
+/// #232 recovery-direction mirror of `mark_unavailable_if_never_connected`: clear
+/// the fail-loud flag and report whether this was a real `true→false` transition.
+/// The caller publishes `ChangesHealth{false}` to peers ONLY on a transition, so
+/// a source that reconnects repeatedly (already available) cannot storm the bus
+/// with redundant recovery messages. The end state is always `false` (available),
+/// so on the single-node happy path — where the flag was never set — this clears
+/// nothing and returns `false`, i.e. no bus publish and behavior is unchanged.
+pub(crate) fn lift_and_was_transition(changes_unavailable: &AtomicBool) -> bool {
+    changes_unavailable.swap(false, Ordering::Relaxed)
 }
 
 /// SQLSTATE-ish heuristic: an invalidated/absent slot mentions these. On a
@@ -481,6 +511,69 @@ mod tests {
         );
     }
 
+    /// #232 (recovery direction): the lift reports a `ChangesHealth{false}`
+    /// publish ONLY on the real `true→false` transition. WHY it matters: without
+    /// the transition gate every reconnect of an already-healthy source would
+    /// re-broadcast recovery across the bus (a storm on a flapping network); with
+    /// it, followers hear the recovery exactly once. A regression that publishes
+    /// unconditionally (or never) turns this red.
+    #[test]
+    fn lift_publishes_only_on_the_true_to_false_transition() {
+        // Was unavailable ⇒ lifting is a transition (publish false once).
+        let flag = AtomicBool::new(true);
+        assert!(
+            lift_and_was_transition(&flag),
+            "clearing an unavailable source is a transition — publish recovery"
+        );
+        assert!(!flag.load(Ordering::Relaxed), "the flag must end cleared");
+        // Already available ⇒ a further connect is NOT a transition (no publish).
+        assert!(
+            !lift_and_was_transition(&flag),
+            "an already-available source must not re-publish recovery"
+        );
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    /// #232 (the multi-node fix, END TO END without PG): a first-connect failure
+    /// in `run_supervised` must BOTH set `changes_unavailable` (the #228 local
+    /// fail-loud) AND emit a `ChangesHealth{true}` on the health channel, so the
+    /// forwarding task republishes it and followers refuse `changes:` joins with
+    /// JC0530 instead of admitting a dead feed. Driven with a `sqlite::memory:`
+    /// url — which `PgConn::parse` rejects — so the permanent first-connect
+    /// failure path runs with no live Postgres. A regression that marks the flag
+    /// but forgets to notify peers (the exact #232 blind spot) turns this red.
+    #[tokio::test]
+    async fn first_connect_failure_notifies_peers_over_the_health_channel() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let spec = ChangeChannelSpec {
+            entity: "Lead".into(),
+            table: "lead".into(),
+            pk_column: "id".into(),
+            tenant_column: Some("workspace_id".into()),
+            owner_column: None,
+            hidden_columns: Vec::new(),
+        };
+        let (etx, _erx) = tokio::sync::mpsc::channel(16);
+        let (rtx, _rrx) = tokio::sync::mpsc::channel(16);
+        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
+        let (_stx, srx) = tokio::sync::watch::channel(false);
+        let flag = Arc::new(AtomicBool::new(false));
+
+        // sqlite url ⇒ PgConn::parse returns None ⇒ the permanent first-connect
+        // failure path runs and returns immediately (no leader election, no PG).
+        run_supervised(db, vec![spec], etx, rtx, htx, flag.clone(), srx).await;
+
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "#228: a first-connect failure must fail loud locally (JC0530)"
+        );
+        assert_eq!(
+            hrx.try_recv().ok(),
+            Some(true),
+            "#232: the failure must be published so followers also fail loud"
+        );
+    }
+
     // -------------------------------------------------------------------
     // Live logical-replication test — needs a wal_level=logical Postgres:
     //
@@ -530,9 +623,18 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let (rtx, _rrx) = tokio::sync::mpsc::channel(4);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let (stx, srx) = tokio::sync::watch::channel(false);
         let unavail = Arc::new(AtomicBool::new(false));
-        let handle = tokio::spawn(run_supervised(db.clone(), specs, tx, rtx, unavail, srx));
+        let handle = tokio::spawn(run_supervised(
+            db.clone(),
+            specs,
+            tx,
+            rtx,
+            htx,
+            unavail,
+            srx,
+        ));
 
         // Give the leader/stream a moment to attach, then insert.
         tokio::time::sleep(Duration::from_millis(500)).await;

@@ -42,6 +42,17 @@ pub(crate) enum BusMessage {
     Resync {
         entity: Option<String>,
     },
+    /// Change-source health across nodes (#232). Only the elected replication
+    /// leader streams from Postgres and marks/lifts `changes_unavailable`; a
+    /// follower merely delivers from the bus and would otherwise keep the flag
+    /// `false`, admitting `changes:` subscribers to a feed the leader can never
+    /// fill (the multi-node blind spot the leader-only #228/#212 fail-loud
+    /// misses). The marking node publishes this so EVERY node stores the same
+    /// health and answers a `changes:` join with JC0530 (`unavailable: true`)
+    /// or re-admits it (`false`).
+    ChangesHealth {
+        unavailable: bool,
+    },
 }
 
 const BUS_CAPACITY: usize = 1024;
@@ -144,5 +155,17 @@ mod tests {
         let s = serde_json::to_string(&m).unwrap();
         let back: BusMessage = serde_json::from_str(&s).unwrap();
         assert_eq!(m, back);
+
+        // #232: the cross-node change-source health control message ships over
+        // the exact same Redis pub/sub bytes — it MUST round-trip, and its tag
+        // MUST follow the enum's snake_case convention (`changes_health`) so a
+        // mixed-version fleet mid-deploy decodes it on every node.
+        let h = BusMessage::ChangesHealth { unavailable: true };
+        let hs = serde_json::to_string(&h).unwrap();
+        assert!(
+            hs.contains("\"kind\":\"changes_health\""),
+            "ChangesHealth must carry the snake_case tag: {hs}"
+        );
+        assert_eq!(h, serde_json::from_str::<BusMessage>(&hs).unwrap());
     }
 }
