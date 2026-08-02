@@ -118,18 +118,17 @@ jobs:
           # a realtime CDC regression is caught daily (the triggers + logical
           # replication tests ALSO gate every publish via scripts/publish.sh; the
           # Redis bus test is heavy.yml-only — publish.sh has no Redis).
-          JERRYCAN_TEST_PG="$JERRYCAN_TEST_PG_URL" \
-            cargo test -p jerrycan-realtime --lib \
-              changes::triggers::tests::triggers_install_idempotently_and_stream_insert_update_delete \
-              -- --ignored --test-threads=1
-          JERRYCAN_TEST_PG_LOGICAL="$JERRYCAN_TEST_PG_URL" \
-            cargo test -p jerrycan-realtime --lib \
-              changes::replication::tests::replication_streams_insert_and_reconcile_is_idempotent \
-              -- --ignored --test-threads=1
-          JERRYCAN_REDIS_URL="redis://127.0.0.1:6379" \
-            cargo test -p jerrycan-realtime --features realtime-redis --lib \
-              bus_redis::tests::two_buses_exchange_messages \
-              -- --ignored --test-threads=1
+          # #251: filter by MODULE (`changes::`, `bus_redis::`) + a non-zero-count
+          # drift-guard, NOT exact test-name filters — a renamed/mistyped name
+          # matches nothing and cargo test exits 0 (green), silently gating nothing.
+          cdc_out=$(JERRYCAN_TEST_PG="$JERRYCAN_TEST_PG_URL" JERRYCAN_TEST_PG_LOGICAL="$JERRYCAN_TEST_PG_URL" \
+            cargo test -p jerrycan-realtime --lib changes:: -- --ignored --test-threads=1 2>&1)
+          echo "$cdc_out"
+          echo "$cdc_out" | grep -qE "test result: ok\. [1-9][0-9]* passed" || { echo "ERROR: realtime CDC tests ran 0 (filter drift)"; exit 1; }
+          bus_out=$(JERRYCAN_REDIS_URL="redis://127.0.0.1:6379" \
+            cargo test -p jerrycan-realtime --features realtime-redis --lib bus_redis:: -- --ignored --test-threads=1 2>&1)
+          echo "$bus_out"
+          echo "$bus_out" | grep -qE "test result: ok\. [1-9][0-9]* passed" || { echo "ERROR: realtime bus_redis tests ran 0 (filter drift)"; exit 1; }
       - name: "Storage S3 behavioral tests (real MinIO: single-shot, multipart, presign)"
         # s3_minio.rs is env-gated (it silently no-ops without JERRYCAN_TEST_S3),
         # so the env MUST be set here or the suite never runs. The loopback http
