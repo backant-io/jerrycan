@@ -99,6 +99,18 @@ impl Error {
             "handler timed out",
         )
     }
+    /// Signed download URLs were requested but `JERRYCAN_SECRET` is unset, so the
+    /// app-HMAC key is absent — a known dev-config gap, NOT a server crash. 503
+    /// (the capability is unavailable pending configuration), never a raw 500:
+    /// the security posture stays (the server NEVER signs with an insecure default
+    /// key), but the honest status + message tell the operator what to set.
+    pub fn signing_unconfigured() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "JC0511",
+            "signed URLs are not configured — set JERRYCAN_SECRET to enable them",
+        )
+    }
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "JC0500", message)
     }

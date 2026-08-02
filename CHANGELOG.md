@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.10 — 2026-08-02
+
+### Fixed
+- **An inline `request_body` field can no longer silently invert its contract (#235).** `default` and
+  `write_only` on an inline-DTO field (`request_body: {fields:[…]}`) were ignored by codegen, so a
+  `default:"now"` field became a client-required, back-datable field instead of server-set, and
+  `write_only` was dropped. An inline body is an ad-hoc custom-action struct with no codegen server-set
+  path, so these keys have no meaning there — the design is now refused with **JC0567** (omit the field
+  and set it in the handler). Entity-body and non-inline designs are byte-identical.
+- **Inline-DTO 422 reject probes now emit on a `/{id}` action with no seed-creator (#236).** A
+  constrained inline action on a parameterized path with no creator route emitted only an agent TODO,
+  leaving its declared 422 validators untested; `gen-tests` now emits the constraint and enum reject
+  probes there too (the 422 precedes any id lookup, so no seeded row is needed).
+- **Storage `sign` is honest when signing is unconfigured (#237).** With `JERRYCAN_SECRET` unset (the
+  default dev config), `sign` returned a raw per-request 500. It now logs a one-time warning that signed
+  URLs are disabled and returns a clear **503 JC0511** ("signed URLs are not configured"). The security
+  posture is unchanged — it never signs with the insecure dev key.
+
 ## 0.7.9 — 2026-08-02
 
 ### Fixed
