@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.12 — 2026-08-02
+
+### Fixed
+- **A slow-consumer WS drop no longer leaves a phantom presence member (#241).** When a connection's
+  bounded outbound queue filled, the connection was removed directly and its later `disconnect` early-
+  returned, so its `PresenceClear` leaves were never published — a permanent phantom "online" member
+  (the node-granularity sweep never reclaims a live node's entries). All drop paths now funnel through a
+  shared teardown that publishes the connection's presence leaves.
+- **A sustained post-connect change-source outage now fails loud (#242).** After a successful first
+  connect, a permanent source death (dropped replication slot, decommissioned DB) retried forever while
+  `changes:` subscribers were admitted to a silent dead feed. The supervisor now counts consecutive
+  reconnect failures and, after a bounded threshold (5, ~30s+ over the backoff), re-marks the source
+  unavailable (JC0530 + a `ChangesHealth` broadcast to followers); a successful reconnect resets it, so
+  ordinary network blips still stay transient.
+
 ## 0.7.11 — 2026-08-02
 
 ### Fixed
