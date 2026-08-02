@@ -33,6 +33,18 @@ pub const REALTIME_LEADER_ADVISORY_KEY: i64 = 0x6A63_5254_4C44_5231;
 /// interval per leader (only the leader streams) — no publish storm.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
+/// #242 sustained-outage fail-loud threshold. After the source has attached at
+/// least once (`connected_ever`), a run of this many CONSECUTIVE reconnect
+/// attempts that never re-attach is treated as a permanent post-connect outage
+/// (slot dropped and unrecreatable, DB decommissioned) — not an ordinary blip —
+/// and the supervisor re-marks `changes_unavailable` so `changes:` joins answer
+/// JC0530 instead of streaming from a dead feed. A single successful attach
+/// resets the run to 0. Chosen large enough that ordinary reconnect blips
+/// (which reattach within a few attempts, and reset the counter each time) never
+/// trip it over the 1s→30s backoff schedule — 5 spans ~30s+ of sustained failure
+/// — while a genuinely dead source still fails loud within a couple of minutes.
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+
 /// A parsed Postgres connection string (the fields pgwire-replication needs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PgConn {
@@ -406,6 +418,13 @@ pub(crate) async fn run_supervised(
     // failing attempt marks the source unavailable; once attached, later drops
     // stay transient (retry silently, as before).
     let mut connected_ever = false;
+    // #242: CONSECUTIVE reconnect failures since the last successful attach. A
+    // successful attach resets it to 0; once it reaches MAX_CONSECUTIVE_FAILURES
+    // a source that once connected has suffered a sustained outage and fails loud
+    // (below). Distinct from `connected_ever` (the one-shot #228 first-connect
+    // gate): this catches a PERMANENT death AFTER a good first connect, which
+    // #228 alone never re-flags.
+    let mut consecutive_failures: u32 = 0;
     loop {
         if *shutdown.borrow() {
             return;
@@ -429,12 +448,21 @@ pub(crate) async fn run_supervised(
             // provisioned PG that was fixed), and mark the source connected so
             // subsequent drops are transient.
             connected_ever = true;
+            // #242: a successful attach ends any consecutive-failure run, so an
+            // ordinary reconnect blip never accumulates toward the fail-loud
+            // threshold.
+            consecutive_failures = 0;
             // #232: publish the recovery to followers, but ONLY on the real
             // true→false transition — not on every reconnect — so a flapping
             // network cannot storm the bus with `ChangesHealth{false}`.
             if lift_and_was_transition(&changes_unavailable) {
                 let _ = health.send(false).await;
             }
+        } else {
+            // #242: this attempt never re-attached the socket — a consecutive
+            // reconnect failure. Saturating so a source down for an extreme
+            // duration cannot wrap the counter back below the threshold.
+            consecutive_failures = consecutive_failures.saturating_add(1);
         }
         match outcome {
             Ok(()) => {
@@ -464,6 +492,19 @@ pub(crate) async fn run_supervised(
         // `changes:` join answers JC0530 instead of looping silently into a
         // dead feed while `may_join` admits subscribers. A no-op once attached.
         mark_unavailable_if_never_connected(&changes_unavailable, connected_ever);
+        // #242 (fail loud): a source that DID attach once but has now failed to
+        // reconnect MAX_CONSECUTIVE_FAILURES times in a row is a sustained dead
+        // feed, not an ordinary blip — re-mark unavailable and (mirroring the
+        // never-connected #232 convergence below) republish `ChangesHealth{true}`
+        // each backoff iteration so followers also answer JC0530. A successful
+        // attach resets the run and #234 re-admits, so this never fires on blips.
+        if mark_unavailable_if_sustained_outage(
+            &changes_unavailable,
+            connected_ever,
+            consecutive_failures,
+        ) {
+            let _ = health.send(true).await;
+        }
         // #232 late-joiner convergence: while we have NEVER attached, re-publish
         // `ChangesHealth{true}` on EACH backoff iteration so a follower that
         // joined the bus mid-outage (Redis pub/sub is ephemeral — it missed the
@@ -495,6 +536,30 @@ pub(crate) fn mark_unavailable_if_never_connected(
     if !connected_ever {
         changes_unavailable.store(true, Ordering::Relaxed);
     }
+}
+
+/// #242 fail-loud decision for a SUSTAINED post-connect outage (factored out for
+/// a gated unit test, mirroring [`mark_unavailable_if_never_connected`]). Once
+/// the source has attached at least once (`connected_ever`), a run of
+/// `consecutive_failures` reconnect attempts that reaches
+/// [`MAX_CONSECUTIVE_FAILURES`] without a single successful re-attach is a silent
+/// dead feed (slot dropped and unrecreatable, DB decommissioned), NOT an ordinary
+/// blip — mark the source unavailable so a `changes:` join answers JC0530.
+/// Returns whether this iteration is in the fail-loud regime so the supervisor
+/// republishes `ChangesHealth{true}` to followers. A never-connected source is
+/// deliberately excluded (the #228 `mark_unavailable_if_never_connected` path
+/// already owns it), and a successful attach resets `consecutive_failures` to 0
+/// in the supervisor, so ordinary reconnect blips never trip this.
+pub(crate) fn mark_unavailable_if_sustained_outage(
+    changes_unavailable: &AtomicBool,
+    connected_ever: bool,
+    consecutive_failures: u32,
+) -> bool {
+    let sustained = connected_ever && consecutive_failures >= MAX_CONSECUTIVE_FAILURES;
+    if sustained {
+        changes_unavailable.store(true, Ordering::Relaxed);
+    }
+    sustained
 }
 
 /// #232 recovery-direction mirror of `mark_unavailable_if_never_connected`: clear
@@ -582,6 +647,81 @@ mod tests {
         assert!(
             !connected.load(Ordering::Relaxed),
             "a source that connected once must stay available across transient drops"
+        );
+    }
+
+    /// #242 (Rule 9) — the SUSTAINED post-connect outage fail-loud the supervisor
+    /// uses. WHY it matters: after a good first connect, a PERMANENT mid-stream
+    /// source death (slot dropped and unrecreatable, DB decommissioned) retries
+    /// forever; the #228 first-connect gate is a no-op once `connected_ever`, so
+    /// without this a `changes:` join would be admitted to a silent dead feed
+    /// indefinitely. The guarantee: below the threshold stays transient (ordinary
+    /// blips), at the threshold it fails loud (JC0530). RED if the threshold check
+    /// is removed (the function would stop marking at MAX).
+    #[test]
+    fn sustained_post_connect_outage_fails_loud_only_at_the_threshold() {
+        let flag = AtomicBool::new(false);
+        // A NEVER-connected source is the #228 path, not this one: even a long
+        // failure run must not trip the sustained-outage fail-loud here (that
+        // would double-own what `mark_unavailable_if_never_connected` covers).
+        assert!(
+            !mark_unavailable_if_sustained_outage(&flag, false, MAX_CONSECUTIVE_FAILURES + 5),
+            "a never-connected source is handled by #228, not the sustained-outage path"
+        );
+        assert!(!flag.load(Ordering::Relaxed));
+
+        // Post-connect, BELOW the threshold: an ordinary reconnect blip stays
+        // transient — no fail-loud, `changes:` joins keep being admitted.
+        for failures in 0..MAX_CONSECUTIVE_FAILURES {
+            assert!(
+                !mark_unavailable_if_sustained_outage(&flag, true, failures),
+                "{failures} consecutive reconnect failures is still an ordinary blip"
+            );
+            assert!(
+                !flag.load(Ordering::Relaxed),
+                "no false fail-loud below the threshold"
+            );
+        }
+
+        // AT the threshold: a sustained dead feed fails loud so a join answers
+        // JC0530 instead of streaming from a source that will never deliver.
+        assert!(
+            mark_unavailable_if_sustained_outage(&flag, true, MAX_CONSECUTIVE_FAILURES),
+            "a sustained post-connect outage must re-mark changes unavailable"
+        );
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "the fail-loud flag must be set so a `changes:` join answers JC0530"
+        );
+    }
+
+    /// #242 (the no-false-positive guarantee): a successful reconnect resets the
+    /// consecutive-failure run, so a source that keeps reconnecting never fails
+    /// loud on ordinary blips. Models the supervisor's counter: it fails
+    /// MAX-1 times (still transient), a successful attach resets it to 0, and a
+    /// single later failure is then nowhere near the threshold. RED if the reset
+    /// is dropped (a slowly-flapping source would eventually trip the threshold).
+    #[test]
+    fn a_reconnect_before_the_threshold_prevents_a_premature_fail_loud() {
+        let flag = AtomicBool::new(false);
+        let mut failures = MAX_CONSECUTIVE_FAILURES - 1;
+        assert!(
+            !mark_unavailable_if_sustained_outage(&flag, true, failures),
+            "one short of the threshold is still transient"
+        );
+        // Successful attach: the supervisor resets the run (connected_now ⇒
+        // consecutive_failures = 0) and #234 lifts the flag.
+        failures = 0;
+        let _ = lift_and_was_transition(&flag);
+        // One post-reset reconnect failure is far from the threshold.
+        failures += 1;
+        assert!(
+            !mark_unavailable_if_sustained_outage(&flag, true, failures),
+            "a reconnect that reset the run must prevent a premature fail-loud"
+        );
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "an ordinary reconnecting source must stay available"
         );
     }
 
