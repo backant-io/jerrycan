@@ -103,7 +103,7 @@ fn security_scheme_name(design: &Design) -> Option<&'static str> {
     }
 }
 
-fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
+fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint, full: &str) -> Value {
     let mut op = json!({ "operationId": ep.operation_id, "responses": {} });
 
     // A guarded op requires the design's credential (issue #29): stamp `security`
@@ -130,7 +130,7 @@ fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
         // is a string, not the old hardcoded `int64`. (Mirrors the member-surface
         // param typing; an opaque param names no entity and stays `integer`.)
         let mut out = Vec::new();
-        let mut rest = ep.path.as_str();
+        let mut rest = full;
         while let Some(start) = rest.find('{') {
             let Some(end_rel) = rest[start..].find('}') else {
                 break;
@@ -225,8 +225,12 @@ fn walk_paths(
     let base = format!("{}{}", prefix, m.effective_mount());
     for ep in &m.endpoints {
         let full = format!("{}{}", base.trim_end_matches('/'), ep.path);
-        let entry = paths.entry(full).or_insert_with(|| json!({}));
-        entry[ep.method.builder_fn()] = operation(design, m, ep);
+        // #280: the operation's `parameters` must cover EVERY `{param}` in the resolved
+        // path key — including mount-inherited ones (a module mounted at
+        // `/accounts/{account_id}` puts `account_id` in the key). Pass `full` so
+        // `operation` scans the same string that becomes the key, not just `ep.path`.
+        let op = operation(design, m, ep, &full);
+        paths.entry(full).or_insert_with(|| json!({}))[ep.method.builder_fn()] = op;
     }
     for sub in &m.subroutes {
         walk_paths(design, sub, &base, paths);
@@ -1098,6 +1102,63 @@ mod tests {
             json!({ "type": "integer", "format": "int64" }),
             "an integer-pk entity's id param stays int64: {}",
             d["paths"]["/notes/{id}"]["get"]["parameters"]
+        );
+    }
+
+    /// #280: the operation's `parameters` list covers EVERY `{param}` in the resolved
+    /// path key — including a mount-inherited param. A module mounted at
+    /// `/accounts/{account_id}` puts `account_id` in the key; before this, `operation`
+    /// scanned only `ep.path`, so `account_id` was documented in the path template but
+    /// missing from `parameters` (a required path param the handler binds — violating
+    /// OpenAPI 3.1). Each param types via the shared `path_param_rust_type` (#278): the
+    /// mount fk `account_id` → its referent `Account`'s pk, the leaf `id` → `Contact`'s.
+    #[test]
+    fn mount_inherited_path_params_are_declared() {
+        const D: &str = r#"{
+            "name": "mounted", "contract_version": 1, "dependencies": ["db"],
+            "modules": [
+                { "name": "accounts",
+                  "entities": [{ "name": "Account", "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "name", "type": "string" } ]}],
+                  "endpoints": [] },
+                { "name": "contacts", "mount": "/accounts/{account_id}",
+                  "entities": [{ "name": "Contact", "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "label", "type": "string" } ]}],
+                  "endpoints": [
+                      { "operation_id": "list_contacts", "method": "GET", "path": "/",
+                        "success": { "status": 200, "entity": "Contact", "list": true } },
+                      { "operation_id": "get_contact", "method": "GET", "path": "/{id}",
+                        "success": { "status": 200, "entity": "Contact" } }] }
+            ]
+        }"#;
+        let d = document(&serde_json::from_str::<Design>(D).unwrap());
+        let names = |params: &Value| -> Vec<String> {
+            params
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Collection route under the param mount: the mount param is declared.
+        let list = &d["paths"]["/accounts/{account_id}/"]["get"]["parameters"];
+        assert_eq!(
+            names(list),
+            vec!["account_id"],
+            "mount param declared: {list}"
+        );
+        assert_eq!(
+            list[0]["schema"],
+            json!({ "type": "integer", "format": "int64" })
+        );
+        // Detail route: BOTH the mount param and the leaf `{id}`, in path order.
+        let get = &d["paths"]["/accounts/{account_id}/{id}"]["get"]["parameters"];
+        assert_eq!(
+            names(get),
+            vec!["account_id", "id"],
+            "both the mount param and the leaf id are declared, in path order: {get}"
         );
     }
 

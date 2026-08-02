@@ -104,10 +104,11 @@ pub(crate) async fn update_lead(
 /// caller's MEMBERSHIP role in the ROW's tenant, NOT the session role
 /// (`user.0.role`, a different dimension): `require_membership_role` resolves the
 /// row's workspace, verifies the caller is an `owner` MEMBER of THAT workspace, and
-/// 403s a non-member / wrong-role caller — so a cross-tenant caller (a member of a
-/// different workspace) is 403, never a 404 that would hide the role gate. The
-/// membership-scoped `remove_for_memberships` then deletes only a row in the
-/// caller's set; an unknown id in the caller's own tenant → 404.
+/// 404s a non-member (an INVISIBLE row) while 403ing a MEMBER with the wrong role
+/// (issue #281) — so a cross-tenant caller (a member of a different workspace) is 404,
+/// the same verdict every tenant-isolation path returns, never a 403 that would leak
+/// the row's existence. The membership-scoped `remove_for_memberships` then deletes
+/// only a row in the caller's set; an unknown id in the caller's own tenant → 404.
 pub(crate) async fn delete_lead(
     repo: Dep<LeadRepo>,
     user: CurrentUser,

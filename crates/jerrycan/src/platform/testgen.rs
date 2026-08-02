@@ -1193,23 +1193,19 @@ fn unit_tests(
             }
         }
 
-        // #247 residual: a role-gated FLAT (membership-set) `/{id}` mutation gates on
-        // the caller's MEMBERSHIP role in the ROW's tenant BEFORE any existence check —
-        // `require_membership_role` 403s an empty JOIN, so a MISSING id answers 403, not
-        // 404 (a row nobody owns is a row you are not an owner of). This is the SAME
-        // "the gate precedes the id lookup" reason a credential-`gated` route skips its
-        // `_missing_id_is_404` probe (line above): emitting it here would be un-greenable
-        // against a correct impl. The cross-tenant 403 is already covered by the
-        // isolation test, and a missing id is the same secure 403 — so we neither assert
-        // a 404 (unsatisfiable) nor push the generic "encode 404" TODO (it would mis-steer
-        // toward that un-greenable test).
-        let membership_role_gated = !ep.required_roles.is_empty()
-            && matches!(
-                design.endpoint_tenant_shape(unit, ep),
-                TenantShape::MembershipSet
-            );
+        // A `/{id}` mutation that declares a 404 gets a `_missing_id_is_404` probe —
+        // INCLUDING a role-gated FLAT (membership-set) mutation (issue #281). Its
+        // `require_membership_role` gate runs BEFORE the scoped remove, and now returns
+        // `not_found()` (404) when its JOIN finds no row — a missing id, or a non-member's
+        // invisible row — the SAME verdict every other tenant-isolation path returns
+        // (#78/#240). So a missing id 404s here too, and the probe is satisfiable against
+        // a correct impl. (It was suppressed while the primitive 403'd an empty JOIN; #281
+        // replaced that existence-leaking 403 with a 404, so the probe is now emitted.)
+        // The remaining suppression is `!gated`: a credential-`gated` route (login /
+        // signed webhook / api-key) 401s before any id lookup, so its probe would be
+        // un-greenable.
         for ec in &ep.errors {
-            if ec.status == 404 && param_count(ep) == 1 && !gated && !membership_role_gated {
+            if ec.status == 404 && param_count(ep) == 1 && !gated {
                 let missing_path = full_path.replacen(&regex_free_param(&ep.path), "999999", 1);
                 // Build the probe with the endpoint's REAL method (and body/cookie)
                 // via the same builder the success test uses — a GET probe at a
@@ -1222,7 +1218,7 @@ fn unit_tests(
                     when = ec.when
                 ));
                 out.count += 1;
-            } else if !(ec.status == 404 && membership_role_gated) {
+            } else {
                 out.todos.push(format!(
                     "// AGENT TODO: design lists {} ({}) for {fn_base} — encode it in your own test file.",
                     ec.status, ec.when
@@ -2200,29 +2196,21 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
             "    let listed = t.get_with(\"{cbase}/\", &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(listed.status().as_u16(), 404, \"cross-tenant list must 404 — a non-member can't reach tenant 1's collection (Dep<Tenant> denies the path); body: {{}}\", listed.text());\n",
         ));
     }
-    if let Some(del) = delete_one {
-        // A ROLE-GATED flat delete (issue #247) checks the caller's MEMBERSHIP role in
-        // the ROW's tenant BEFORE the scoped remove: user 2 is a member of tenant 2,
-        // NOT tenant 1, so `require_membership_role` 403s them. This 403 is the honest
-        // membership-vs-session discriminator (Rule 9) — a WRONG session-role check
-        // (`_user.0.role`) would let user 2's minted `owner` session role pass the gate
-        // and only 404 at `remove_for_memberships`, so an implementation that checks the
-        // session role instead of the membership role FAILS this assertion. A
-        // non-role-gated flat delete 404s at the scoped remove (unchanged); a nested
-        // role-gated delete 404s earlier at the `Dep<Tenant>` path guard (unchanged).
-        let (code, why) = if !del.required_roles.is_empty() && !is_nested {
-            (
-                403,
-                "cross-tenant delete on a role-gated flat route must 403 — user 2 is not a member of tenant 1, so require_membership_role denies before the scoped remove (issue #247, NOT the session role)",
-            )
-        } else {
-            (
-                404,
-                "cross-tenant delete must 404 (use remove_for, not remove)",
-            )
-        };
+    if delete_one.is_some() {
+        // Cross-tenant delete: user 2 (a member of tenant 2, NOT tenant 1) must 404 on
+        // tenant 1's row — an INVISIBLE row, the SAME verdict as the cross-tenant get/list
+        // legs (#78/#240). WHY 404 not 403 (Rule 9): a 403 would LEAK the row's existence
+        // to a non-member. A ROLE-GATED FLAT delete (issue #247) checks the caller's
+        // MEMBERSHIP role via `require_membership_role` BEFORE the scoped remove; that
+        // primitive now returns 404 when its JOIN finds no row — a non-member's invisible
+        // row (issue #281 fixed the earlier existence-leaking 403) — so this leg 404s for
+        // BOTH the role-gated and non-role-gated flat shapes, and a nested delete 404s at
+        // the `Dep<Tenant>` path guard. The membership-vs-session distinction the old 403
+        // probed is enforced BY CONSTRUCTION instead: the stub steers to
+        // `require_membership_role`, never `require_role(&_user.0.role, …)` (asserted by
+        // the genroute lib test), so a session-role check can never be emitted.
         t.push_str(&format!(
-            "    let del = t.delete_with(&format!(\"{cbase}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(del.status().as_u16(), {code}, \"{why}; body: {{}}\", del.text());\n",
+            "    let del = t.delete_with(&format!(\"{cbase}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(del.status().as_u16(), 404, \"cross-tenant delete must 404 — user 2 is not a member of tenant 1, so the row is invisible (require_membership_role and remove_for both 404, #247/#281); body: {{}}\", del.text());\n",
         ));
         if get_one.is_some() {
             t.push_str(&format!(
@@ -3806,6 +3794,72 @@ mod tests {
             inline_fixture_json(&rb.fields, &[("tier", "\"__invalid_enum_value__\"")]),
             "{\"note\": \"test-value\", \"tier\": \"__invalid_enum_value__\"}",
             "the reject body must carry the corrupted optional field"
+        );
+    }
+
+    /// #281: a role-gated FLAT (membership-set) `/{id}` mutation NOW emits a
+    /// `_missing_id_is_404` probe — it was SUPPRESSED while `require_membership_role`
+    /// 403'd an empty JOIN (a non-member / missing id), which made the probe
+    /// un-greenable. The primitive now returns 404 for a no-row JOIN (an INVISIBLE
+    /// row), so a missing id 404s and the probe is satisfiable. The SAME fix makes the
+    /// cross-tenant isolation DELETE leg assert 404 (a non-member's invisible row), NOT
+    /// the old existence-leaking 403. WHY (Rule 9): a 403 to a non-member leaks that the
+    /// row exists — every other tenant-isolation path returns 404 (#78/#240).
+    #[test]
+    fn membership_role_gated_id_mutation_emits_missing_id_404_probe() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "crm", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "workspaces",
+                  "entities": [{ "name": "Workspace", "fields": [
+                      { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+                  "endpoints": [{ "operation_id": "create_workspace", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Workspace" },
+                      "success": { "status": 201, "entity": "Workspace" } }] },
+                { "name": "leads",
+                  "entities": [{ "name": "Lead",
+                      "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+                      "fields": [{ "name": "id", "type": "integer" }, { "name": "name", "type": "string" }] }],
+                  "endpoints": [
+                      { "operation_id": "create_lead", "method": "POST", "path": "/",
+                        "auth_required": true, "request_body": { "entity": "Lead" },
+                        "success": { "status": 201, "entity": "Lead" } },
+                      { "operation_id": "delete_lead", "method": "DELETE", "path": "/{id}",
+                        "auth_required": true, "required_roles": ["owner"],
+                        "success": { "status": 204 },
+                        "errors": [ { "status": 403, "when": "not an owner" },
+                                    { "status": 404, "when": "unknown id" } ] } ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        let leads = d.modules.iter().find(|m| m.name == "leads").unwrap();
+        let generated = acceptance_rs(&d, leads);
+        // The missing-id 404 probe is now emitted (was suppressed pre-#281) …
+        assert!(
+            generated.contains("async fn delete_lead_missing_id_is_404("),
+            "a role-gated flat /{{id}} mutation emits the missing-id 404 probe (#281): {generated}"
+        );
+        // … and it issues the endpoint's REAL DELETE, asserting 404.
+        let probe = section(&generated, "delete_lead_missing_id_is_404");
+        assert!(
+            probe.contains("t.delete_with(") && probe.contains("as_u16(), 404"),
+            "the probe issues the real DELETE and asserts 404: {probe}"
+        );
+        // The cross-tenant isolation DELETE leg now asserts 404 (an invisible row for a
+        // non-member), NOT the old existence-leaking 403.
+        let iso = section(&generated, "tenant_a_cannot_read_tenant_b_leads");
+        assert!(
+            iso.contains("cross-tenant delete must 404"),
+            "the role-gated flat isolation delete leg asserts 404 (#281): {iso}"
+        );
+        assert!(
+            !iso.contains("must 403"),
+            "the isolation delete leg must NOT assert 403 (an existence leak, #281): {iso}"
         );
     }
 }

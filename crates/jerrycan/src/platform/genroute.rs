@@ -523,8 +523,9 @@ fn guard_comment(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
         // role in the ROW's tenant — NOT the session role (`_user.0.role`), a DIFFERENT
         // dimension. A tenant owner (membership role `owner`, session role `user`)
         // would be wrongly 403'd by a session-role check. The repo's
-        // `require_membership_role` resolves the row's tenant and 403s a non-member /
-        // wrong-role caller (fail-closed).
+        // `require_membership_role` resolves the row's tenant and 404s a non-member (an
+        // invisible row, consistent with every tenant-isolation path, #281) while 403ing
+        // a member with the wrong role (fail-closed).
         if !path_params(m, ep).is_empty() {
             format!(
                 "    // guard: requires MEMBERSHIP role \"{roles}\" in this row's tenant (issue #247) —\n    // call _repo.require_membership_role(_user.0.id, _id, &[\"{roles}\"]).await? before\n    // proceeding; this checks the TENANT role, NOT the session role `_user.0.role`.\n"
@@ -2152,10 +2153,15 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
     // own tenant. This primitive resolves the row's tenant through its fk / JOIN chain
     // and reads the caller's role from `{members}`, keyed on the ROW's tenant so a
     // membership in a DIFFERENT tenant can never satisfy the gate (no cross-tenant
-    // escalation). A missing row, a non-member of the row's tenant, or a member whose
-    // role is not in `roles` all 403 (fail-CLOSED). Emitted ONLY for a flat
-    // tenant-owned entity that has a `required_roles` route (its role-gated stub is
-    // steered here — `guard_comment`); every other entity stays byte-identical.
+    // escalation). A missing row OR a non-member of the row's tenant answers 404
+    // (`Error::not_found()`) — an invisible row, the SAME verdict every other
+    // tenant-isolation path returns (the `Dep<Tenant>` guard 404s a non-member,
+    // #78/#240; issue #281 fixed the earlier existence-leaking 403 here). Only a
+    // MEMBER whose role is not in `roles` answers 403 (`Error::forbidden()`) — the
+    // caller can see the row but lacks the role (still fail-CLOSED: the JOIN keys on
+    // the ROW's tenant, so no non-member ever reaches the role check). Emitted ONLY
+    // for a flat tenant-owned entity that has a `required_roles` route (its role-gated
+    // stub is steered here — `guard_comment`); every other entity stays byte-identical.
     let membership_role_gate = if entity_is_flat_tenant_owned(e, design)
         && design.entity_has_required_roles_route(entity)
     {
@@ -2175,7 +2181,7 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
             .await
             .map_err(db_error)?;
         let Some(row) = row else {{
-            return Err(Error::forbidden());
+            return Err(Error::not_found());
         }};
         let role: String = row.try_get("", "role").map_err(db_error)?;
         if roles.contains(&role.as_str()) {{
@@ -5434,6 +5440,24 @@ pub(crate) mod tests {
         assert!(
             repo.contains("SELECT workspace_members.role FROM leads JOIN workspace_members ON workspace_members.workspace_id = leads.workspace_id WHERE leads.id = ? AND workspace_members.user_id = ?"),
             "the gate joins the ROW to the members table on the ROW's tenant fk (no cross-tenant escalation): {repo}"
+        );
+        // #281: the no-row branch (a missing id OR a non-member of the row's tenant)
+        // returns 404 `not_found()` — an INVISIBLE row, the same verdict every other
+        // tenant-isolation path returns — NOT the earlier existence-leaking 403. Only a
+        // MEMBER whose role is not in `roles` gets 403 `forbidden()` (wrong-role, fail-closed).
+        assert!(
+            repo.contains("let Some(row) = row else {\n            return Err(Error::not_found());\n        };"),
+            "the empty-JOIN (non-member / missing id) branch must 404 — an invisible row (#281): {repo}"
+        );
+        assert!(
+            !repo.contains(
+                "let Some(row) = row else {\n            return Err(Error::forbidden());"
+            ),
+            "the no-row branch must NOT 403 — a 403 leaks the row's existence to a non-member (#281): {repo}"
+        );
+        assert!(
+            repo.contains("if roles.contains(&role.as_str()) {\n            Ok(())\n        } else {\n            Err(Error::forbidden())\n        }"),
+            "a MEMBER whose role is not in `roles` still 403s (wrong-role, fail-closed): {repo}"
         );
         // The role-gated flat delete stub steers to the membership gate, NOT the session role.
         let h = handlers_rs(&d.modules[1], mode, &d);
