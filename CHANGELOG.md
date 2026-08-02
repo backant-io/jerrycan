@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.14 — 2026-08-02
+
+### Fixed
+- **Generated CREATE/reserve happy-path tests are greenable for FK-alias and tenancy-entity shapes
+  (#248, #249).** Two generated `_returns_2xx` acceptance probes could never pass regardless of handler
+  work (wedging the agent on a red suite): (a) the CREATE success probe seeded no `belongs_to` parents,
+  so a same-module enforced FK — which an fk-alias always is — hit a 500 FK violation; (b) the tenancy
+  entity's own CREATE probe reused pk `1`, colliding with the auto-seeded tenant (409), and the reserve
+  probe seeded the capacity counter with the generic fixture `1` instead of its declared `default`,
+  starting it at capacity (409). `gen-tests` now seeds the enforced same-module parents before the
+  create POST, bumps the tenancy create pk past the auto-seed, and honors a field's `default` when
+  seeding. The generated app was always correct — only the generated tests were un-greenable.
+
 ## 0.7.13 — 2026-08-02
 
 ### Fixed
