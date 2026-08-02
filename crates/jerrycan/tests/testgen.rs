@@ -622,6 +622,54 @@ fn per_user_identity_owned_modules_get_isolation_tests() {
     );
 }
 
+/// #240 Part B: a per-user module with a creator + `PUT /{id}` ONLY (no list, no
+/// `GET /{id}`, no delete) emits NO isolation test. WHY (Rule 9): a `PUT` is not a
+/// read leg, so there is no way to READ another user's row to probe — the previous
+/// setup-only body asserted NOTHING about isolation yet bound `row`/`cookie2`
+/// unused, which `jerrycan check`'s `clippy -D warnings` rejects. A clean omission
+/// is honest; a vacuous `*_cannot_read_*` body is not. The write's own success +
+/// 401 probes still cover it, and genroute's owner-scoped repo is the enforcement.
+#[test]
+fn per_user_create_update_only_module_gets_no_isolation_test() {
+    const NOTES: &str = r#"{
+        "name": "notes-api", "contract_version": 1,
+        "auth": { "model": "session", "roles": ["user"] },
+        "dependencies": ["db", "auth"],
+        "modules": [
+            { "name": "users",
+              "entities": [{ "name": "User", "fields": [{ "name": "email", "type": "string" }] }],
+              "endpoints": [] },
+            { "name": "notes",
+              "entities": [{ "name": "Note",
+                  "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                  "fields": [{ "name": "id", "type": "integer" }, { "name": "body", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "create_note", "method": "POST", "path": "/", "auth_required": true,
+                    "request_body": { "entity": "Note" }, "success": { "status": 201, "entity": "Note" } },
+                  { "operation_id": "update_note", "method": "PUT", "path": "/{id}", "auth_required": true,
+                    "request_body": { "entity": "Note" }, "success": { "status": 200, "entity": "Note" } } ] }
+        ]
+    }"#;
+    let d: Design = serde_json::from_str(NOTES).unwrap();
+    let notes = d.modules.iter().find(|m| m.name == "notes").unwrap();
+    let out = testgen::acceptance_rs(&d, notes);
+    // No isolation test at all — not even a vacuous setup-only negative control.
+    assert!(
+        !out.contains("cannot_read_user_b"),
+        "a read-less per-user module must emit NO isolation test: {out}"
+    );
+    // And no orphaned `cookie2` (the tell of the old setup-only body).
+    assert!(
+        !out.contains("let cookie2 = test_cookie_for(2)"),
+        "no orphaned user-2 credential without a probe to consume it: {out}"
+    );
+    // Sanity: the write endpoints still get their own probes (the suite isn't empty).
+    assert!(
+        out.contains("create_note") && out.contains("update_note"),
+        "the write endpoints still get their success/401 probes: {out}"
+    );
+}
+
 /// The public-read/owner-write feed design (#105): Post is per-user identity-owned
 /// with `public_read: true`; `list_posts` is DECLARED `auth_required` (the entity
 /// flag must override it — the exact shape the blessed fixture uses).
@@ -877,6 +925,99 @@ fn nested_path_scoped_module_gets_isolation_test_with_pinned_tenant() {
         clubs_out.contains("the creator's list MUST contain the new Club")
             && clubs_out.contains("a non-creator's list must NOT contain the new Club"),
         "I1 asserts creator-lists-own + second-user-empty: {clubs_out}"
+    );
+}
+
+/// A NESTED tenant module whose isolation probe carries create + LIST but no
+/// `GET /{id}` shared by the two #240 nested-tenant tests below.
+const NESTED_TENANT_LIST_ONLY: &str = r#"{
+    "name": "orgs-api", "contract_version": 1,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+    "modules": [
+        { "name": "orgs",
+          "entities": [{ "name": "Org", "fields": [
+              { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+          "endpoints": [
+              { "operation_id": "create_org", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Org" }, "success": { "status": 201, "entity": "Org" } } ] },
+        { "name": "events", "mount": "/orgs/{org_id}",
+          "entities": [{ "name": "Event", "belongs_to": [{ "entity": "Org" }],
+              "fields": [{ "name": "id", "type": "integer" }, { "name": "title", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "create_event", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Event" }, "success": { "status": 201, "entity": "Event" } },
+              { "operation_id": "list_events", "method": "GET", "path": "/", "auth_required": true,
+                "success": { "status": 200, "entity": "Event", "list": true } } ] }
+    ]
+}"#;
+
+/// #240 Part A: a NESTED tenant module with a creator + LIST but NO `GET /{id}` gets
+/// a REAL cross-tenant isolation test. The list leg — SUPPRESSED for nested mounts
+/// before, leaving ZERO isolation coverage AND unused `row`/`cookie2` bindings that
+/// broke `clippy -D warnings` — now asserts a 404: user 2, a non-member of tenant 1,
+/// is denied the pinned collection by the `Dep<Tenant>` path guard (proven in
+/// `shared::tenant`). WHY (Rule 9): the negative control must actually ASSERT
+/// isolation, not merely seed a row and bind unused credentials.
+#[test]
+fn nested_tenant_list_only_module_gets_a_cross_tenant_list_404_probe() {
+    let d: Design = serde_json::from_str(NESTED_TENANT_LIST_ONLY).unwrap();
+    let events = d.modules.iter().find(|m| m.name == "events").unwrap();
+    let out = testgen::acceptance_rs(&d, events);
+    assert!(
+        out.contains("async fn tenant_a_cannot_read_tenant_b_events()"),
+        "the nested tenant isolation test is emitted: {out}"
+    );
+    let iso = out
+        .split("async fn tenant_a_cannot_read_tenant_b_events()")
+        .nth(1)
+        .expect("isolation fn present")
+        .split("#[tokio::test]")
+        .next()
+        .unwrap();
+    // The nested list leg carries a REAL 404 assertion at the pinned tenant-1 path.
+    assert!(
+        iso.contains("cross-tenant list must 404") && iso.contains("t.get_with(\"/orgs/1/\""),
+        "the nested list leg asserts 404 at the pinned tenant path: {iso}"
+    );
+    // It consumes user 2's credential (so `cookie2` is not an unused binding)...
+    assert!(
+        iso.contains("&cookie2"),
+        "the probe consumes cookie2: {iso}"
+    );
+    // ...and does NOT bind an unused `row` (a nested-list 404 leg reads neither the
+    // by-id `id` nor the flat-list `id_value` derived from `row`).
+    assert!(
+        !iso.contains("let row"),
+        "a nested-list-only probe must not bind an unused `row`: {iso}"
+    );
+    // NOT the FLAT 200-absent shape — that would false-fail against the guard 404.
+    assert!(
+        !iso.contains("user 2 lists their own"),
+        "the nested list must not use the flat 200-absent assertion: {iso}"
+    );
+}
+
+/// #240 Part B (tenant): a NESTED tenant module with a creator ONLY (no list, no
+/// `GET /{id}`, no delete) emits NO isolation test — there is nothing to probe, so a
+/// setup-only body with unused `row`/`cookie2` is wrong. A clean omission is honest.
+#[test]
+fn nested_tenant_create_only_module_gets_no_isolation_test() {
+    let mut v: serde_json::Value = serde_json::from_str(NESTED_TENANT_LIST_ONLY).unwrap();
+    // Drop the events LIST, leaving events with a creator only.
+    let events_eps = v["modules"][1]["endpoints"].as_array_mut().unwrap();
+    events_eps.retain(|ep| ep["operation_id"] != "list_events");
+    let d: Design = serde_json::from_value(v).unwrap();
+    let events = d.modules.iter().find(|m| m.name == "events").unwrap();
+    let out = testgen::acceptance_rs(&d, events);
+    assert!(
+        !out.contains("cannot_read_tenant_b"),
+        "a read-less nested tenant module must emit NO isolation test: {out}"
+    );
+    assert!(
+        !out.contains("let cookie2 = test_cookie_for(2)"),
+        "no orphaned user-2 credential without a probe to consume it: {out}"
     );
 }
 
