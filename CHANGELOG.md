@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.20 — 2026-08-02
+
+### Fixed
+- **A 204/3xx success that declares an entity no longer advertises a phantom response body (#269).** The
+  OpenAPI response-body schema keyed only on `success.entity`/`list`, ignoring `success.status` — so a route
+  declaring `{status: 204, entity: "X"}` or `{status: 303, entity: "X"}` documented an `X` body while the
+  generated handler is `NoContent`/`Redirect` (empty-bodied). A 204-with-body is invalid per HTTP/OpenAPI,
+  and a client generated from the contract would try to parse an absent body. The response body is now
+  omitted (description-only) for a 204 or 3xx status, matching the empty-body handler. A 200/201/202 success
+  with the same entity keeps its body schema. No existing design shifts (no fixture declared this shape).
+
 ## 0.7.19 — 2026-08-02
 
 ### Fixed

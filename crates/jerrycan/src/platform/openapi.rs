@@ -46,6 +46,14 @@ fn entity_ref(name: &str) -> Value {
 }
 
 fn success_schema(s: &Success) -> Option<Value> {
+    // #269: a 204 (No Content) or a 3xx redirect has an EMPTY body — `return_type`
+    // emits `NoContent`/`Redirect`, so advertise NO response body regardless of a
+    // declared `entity`/`list` (a 204-with-body is invalid HTTP/OpenAPI, and a
+    // generated client SDK would try to parse an absent body). Mirrors the
+    // empty-body arms of `genroute::return_type`.
+    if s.status == 204 || (300..400).contains(&s.status) {
+        return None;
+    }
     let inner = s.entity.as_deref().map(entity_ref)?;
     Some(if s.list {
         json!({ "type": "array", "items": inner })
@@ -613,6 +621,67 @@ mod tests {
             d["paths"]["/posts/drafts"]["get"]["security"],
             json!([{ "cookieAuth": [] }]),
             "a guarded non-public_read GET keeps its stanza"
+        );
+    }
+
+    /// #269: a 204 (No Content) or a 3xx (redirect) success emits NO response body
+    /// in the contract even when the route declares an `entity`/`list`, because the
+    /// generated handler is `NoContent`/`Redirect` (empty-bodied). A 204-with-body is
+    /// invalid per HTTP/OpenAPI, and a client generated from the contract would try to
+    /// parse an absent body. A 200/201 success with the same entity keeps its body
+    /// schema. WHY (Rule 9): before this, `success_schema` keyed only on `entity`/`list`
+    /// — ignoring `success.status` — and advertised a phantom `Thing` body for the
+    /// 204/303 routes while the running handler sends nothing (the doc lied about the
+    /// code). The validator (`questions.rs`) deliberately ALLOWS `{204|3xx, entity}`,
+    /// so this shape is reachable.
+    #[test]
+    fn bodyless_status_success_omits_response_body() {
+        const D: &str = r#"{
+            "name": "statusdoc", "contract_version": 0, "dependencies": [],
+            "modules": [{ "name": "things",
+                "entities": [{ "name": "Thing", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "label", "type": "string" } ]}],
+                "endpoints": [
+                    { "operation_id": "make_thing", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Thing" },
+                      "success": { "status": 201, "entity": "Thing" } },
+                    { "operation_id": "clear_thing", "method": "DELETE", "path": "/{id}",
+                      "success": { "status": 204, "entity": "Thing" } },
+                    { "operation_id": "redir_thing", "method": "GET", "path": "/go/{id}",
+                      "success": { "status": 303, "entity": "Thing", "list": true } },
+                    { "operation_id": "get_thing", "method": "GET", "path": "/{id}",
+                      "success": { "status": 200, "entity": "Thing" } } ] }]
+        }"#;
+        let d = document(&serde_json::from_str::<Design>(D).unwrap());
+        // 204 → NoContent handler: `description` only, no body content, regardless of
+        // the declared entity (a 204-with-body is invalid).
+        let del = &d["paths"]["/things/{id}"]["delete"]["responses"]["204"];
+        assert_eq!(del["description"], "success");
+        assert!(
+            del.get("content").is_none(),
+            "204 success advertises no body: {del}"
+        );
+        // 3xx → Redirect handler: no body even with entity + list.
+        let redir = &d["paths"]["/things/go/{id}"]["get"]["responses"]["303"];
+        assert!(
+            redir.get("content").is_none(),
+            "3xx success advertises no body: {redir}"
+        );
+        // A 201 create keeps its entity body schema (regression guard — the fix must
+        // not suppress bodies on body-bearing statuses).
+        assert_eq!(
+            d["paths"]["/things/"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]
+                ["$ref"],
+            "#/components/schemas/Thing",
+            "a 201 create still advertises its entity body: {}",
+            d["paths"]["/things/"]["post"]["responses"]["201"]
+        );
+        // And a 200 GET keeps its entity body too.
+        assert_eq!(
+            d["paths"]["/things/{id}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+                ["$ref"],
+            "#/components/schemas/Thing"
         );
     }
 
