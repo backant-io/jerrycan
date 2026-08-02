@@ -2532,12 +2532,13 @@ fn validate_module(
     wants_db: bool,
     qs: &mut Vec<Question>,
 ) {
-    // #256: a FLAT tenant-owned (`MembershipSet`) role-gated route's `required_roles`
-    // is checked against the caller's MEMBERSHIP role (`{tenant}_members.role`, whose
-    // domain is `tenancy.member_roles`) by the #247 `require_membership_role` gate —
-    // NOT the session role `_user.0.role` (`auth.roles`). So such a route's roles are
-    // validated against `member_roles` below; a session-role / non-tenant route keeps
-    // validating against `auth.roles` (`declared_roles`).
+    // #256: a TENANT-SCOPED role-gated route's `required_roles` is checked against the
+    // caller's MEMBERSHIP role (`{tenant}_members.role`, whose domain is
+    // `tenancy.member_roles`) — a PATH-SCOPED route via `_tenant.require_role`, a FLAT
+    // (`MembershipSet`) route via the #247 `require_membership_role` gate — NOT the
+    // session role `_user.0.role` (`auth.roles`). So such a route's roles are validated
+    // against `member_roles` below; a session-role / non-tenant route keeps validating
+    // against `auth.roles` (`declared_roles`).
     let member_roles: Vec<&str> = d
         .tenancy
         .as_ref()
@@ -2840,25 +2841,30 @@ fn validate_module(
             }
         }
         // #256: pick the role DOMAIN this endpoint's `required_roles` is checked
-        // against. A flat tenant-owned (`MembershipSet`) role-gated route steers to
-        // the #247 `require_membership_role` gate, which reads `{tenant}_members.role`
-        // (domain `tenancy.member_roles`) — the SAME predicate the generator emits the
-        // gate on (`genroute::entity_is_flat_tenant_owned`). Validating such a route's
-        // roles against `auth.roles` is wrong both ways: a role in `auth.roles` but not
-        // `member_roles` scaffolds an always-403 dead gate (the membership check can
-        // never match — green means safe violated), and a `member_roles` value not in
-        // `auth.roles` is falsely refused. Every other route (session-role / non-tenant)
-        // still validates against `auth.roles`.
-        let membership_role_route = endpoint_repo_entity(m, ep)
-            .and_then(|name| d.find_entity(name))
-            .is_some_and(|e| super::genroute::entity_is_flat_tenant_owned(e, d));
+        // against. A TENANT-SCOPED role-gated route enforces the caller's MEMBERSHIP
+        // role (`{tenant}_members.role`, domain `tenancy.member_roles`), NOT the session
+        // role `_user.0.role` (`auth.roles`) — the SAME split the generated guard uses
+        // (`genroute::guard_comment`): a PATH-SCOPED tenant route checks it via
+        // `_tenant.require_role` (the membership-verified `Dep<Tenant>`), and a FLAT
+        // (`MembershipSet`) tenant route via the #247 `require_membership_role` gate.
+        // Both are exactly `endpoint_tenant_shape` ∈ {`PathScoped`, `MembershipSet`}.
+        // Validating such a route against `auth.roles` is wrong both ways: a role in
+        // `auth.roles` but not `member_roles` scaffolds an always-403 dead gate (the
+        // membership check can never match — green means safe violated), and a
+        // `member_roles` value not in `auth.roles` is falsely refused. A COLLECTION
+        // (tenant create — no membership exists yet) or NON-tenant route is a
+        // session-role gate, so it still validates against `auth.roles`.
+        let membership_role_route = matches!(
+            d.endpoint_tenant_shape(m, ep),
+            TenantShape::PathScoped { .. } | TenantShape::MembershipSet
+        );
         for role in &ep.required_roles {
             if membership_role_route {
                 if !member_roles.contains(&role.as_str()) {
                     qs.push(q(
                         format!("{eptr}/required_roles"),
                         format!(
-                            "Role `{role}` on a tenant-owned (flat) route checks the MEMBERSHIP role (`{{tenant}}_members.role`, issue #247), not the session role `_user.0.role` — `{role}` is not in `tenancy.member_roles`. Add it to `tenancy.member_roles` or fix the reference."
+                            "Role `{role}` on a tenant-scoped route checks the caller's MEMBERSHIP role (`{{tenant}}_members.role`), not the session role `_user.0.role` — `{role}` is not in `tenancy.member_roles`. Add it to `tenancy.member_roles` or fix the reference."
                         ),
                     ));
                 }
@@ -4983,6 +4989,72 @@ mod tests {
         assert!(
             !good.iter().any(|q| q.id == widget_roles),
             "`owner` (a declared auth.role) must be accepted on a non-tenant route: {good:?}"
+        );
+    }
+
+    /// #256 (path-scoped leg): a PATH-SCOPED tenant route (the tenant fk `{workspace_id}`
+    /// is in the resolved path ⇒ `Dep<Tenant>` guard ⇒ `_tenant.require_role`) is ALSO a
+    /// MEMBERSHIP-role check — the same bug class as the flat leg. Its `required_roles`
+    /// must validate against `tenancy.member_roles`, not `auth.roles`: a `member_roles`
+    /// value (`manager`) is accepted, and a role in NEITHER set (`ghost`) is refused with
+    /// the same membership message. `auth.roles` and `member_roles` are disjoint here.
+    #[test]
+    fn path_scoped_tenant_required_role_validates_against_member_roles() {
+        const D: &str = r#"{
+            "name": "crm", "contract_version": 1,
+            "dependencies": ["db", "auth"],
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "tenancy": { "entity": "Workspace", "member_roles": ["manager", "staff"] },
+            "modules": [
+                {
+                    "name": "workspaces",
+                    "entities": [{ "name": "Workspace", "fields": [{ "name": "name", "type": "string" }] }],
+                    "endpoints": [
+                        { "operation_id": "create_workspace", "method": "POST", "path": "/",
+                          "auth_required": true,
+                          "request_body": { "entity": "Workspace" },
+                          "success": { "status": 201, "entity": "Workspace" } }
+                    ]
+                },
+                {
+                    "name": "leads", "mount": "/workspaces/{workspace_id}/leads",
+                    "entities": [{ "name": "Lead",
+                        "belongs_to": [{ "entity": "Workspace" }],
+                        "fields": [{ "name": "title", "type": "string" }] }],
+                    "endpoints": [
+                        { "operation_id": "delete_lead", "method": "DELETE", "path": "/{id}",
+                          "required_roles": ["{ROLE}"],
+                          "success": { "status": 204 } }
+                    ]
+                }
+            ]
+        }"#;
+        let lead_roles = "/modules/1/endpoints/0/required_roles";
+        // Guard: the route really is path-scoped (else this test would prove nothing).
+        let d: Design = serde_json::from_str(&D.replace("{ROLE}", "manager")).unwrap();
+        assert!(
+            matches!(
+                d.endpoint_tenant_shape(&d.modules[1], &d.modules[1].endpoints[0]),
+                TenantShape::PathScoped { .. }
+            ),
+            "fixture must be path-scoped for this test to exercise the path-scoped leg"
+        );
+        // A member_role not in auth.roles is ACCEPTED (the false-refusal fix).
+        assert!(
+            !validate(&d).iter().any(|q| q.id == lead_roles),
+            "`manager` (a member_role) must be accepted on a path-scoped tenant route"
+        );
+        // A role in NEITHER auth.roles nor member_roles is REFUSED with the membership message.
+        let bad = validate(&design(&D.replace("{ROLE}", "ghost")));
+        let hit = bad
+            .iter()
+            .find(|q| q.id == lead_roles)
+            .unwrap_or_else(|| panic!("`ghost` (in neither set) must be refused: {bad:?}"));
+        assert!(
+            hit.question.contains("MEMBERSHIP role")
+                && hit.question.contains("tenancy.member_roles"),
+            "message must name the membership dimension and member_roles domain: {}",
+            hit.question
         );
     }
 
