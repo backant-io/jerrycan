@@ -838,6 +838,19 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                     false,
                 );
             }
+            // #236: an inline-DTO custom action on this `/{id}` path still gets its
+            // 422 reject probes even though the seed creator is `probe: skip` — the
+            // inline 422 precedes any id lookup (needs no seeded row), so the
+            // concrete mount base (its own `{id}` pinned to `1`, as the 401 above)
+            // suffices. No-op for entity/bodyless endpoints.
+            push_inline_reject_test(
+                design,
+                out,
+                unit,
+                ep,
+                &concrete_mount_base(&full_path),
+                guarded,
+            );
         } else if param_count(ep) == 1 {
             // Issue #51: seed the row THIS `/{id}` endpoint addresses via ITS OWN
             // entity's creator (`POST /tasks` for `/tasks/{id}`), walking belongs_to
@@ -905,6 +918,19 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                         false,
                     );
                 }
+                // #236: an inline-DTO custom action on this `/{id}` path with no
+                // creator to seed still gets its 422 reject probes — the inline 422
+                // precedes any id lookup (needs no seeded row), so the concrete mount
+                // base (its own `{id}` pinned to `1`, as the seedless 401 above)
+                // suffices. No-op for entity/bodyless endpoints.
+                push_inline_reject_test(
+                    design,
+                    out,
+                    unit,
+                    ep,
+                    &concrete_mount_base(&full_path),
+                    guarded,
+                );
             }
         } else if param_count(ep) >= 1 {
             out.todos.push(format!(
@@ -2933,6 +2959,58 @@ mod tests {
         assert_eq!(
             reject, 1,
             "the inline reject must count toward `reject` (excluded from RED-on-stubs):\n{content}"
+        );
+    }
+
+    /// #236: an inline-DTO custom action on a `/{id}` path with NO creator to seed
+    /// still gets BOTH its 422 reject probes (constraint + enum) — the inline 422
+    /// precedes any id lookup, so it needs no seeded row. Before the fix this branch
+    /// emitted an AGENT TODO only (`reject == 0`); a declared inline constraint on an
+    /// `/{id}` action went UNVERIFIED by `check`.
+    #[test]
+    fn inline_reject_probes_emit_on_the_id_no_creator_branch() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "shop-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "orders",
+                "endpoints": [
+                    { "operation_id": "apply", "method": "POST", "path": "/{id}/apply",
+                      "request_body": { "fields": [
+                          { "name": "amount", "type": "integer", "min": 1, "max": 100 },
+                          { "name": "tier", "type": "string", "values": ["free", "pro"] } ] },
+                      "success": { "status": 200 } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let (content, reject) = render_acceptance(&d, &d.modules[0]);
+        // No creator at "/" ⇒ the un-seedable success probe is a TODO, but the two
+        // reject probes (which need no seed) are now emitted.
+        assert!(
+            content.contains("async fn apply_rejects_out_of_range_amount()"),
+            "the /{{id}} no-creator inline action must get its CONSTRAINT reject probe:\n{content}"
+        );
+        assert!(
+            content.contains("async fn apply_rejects_out_of_range_tier()"),
+            "the /{{id}} no-creator inline action must get its ENUM reject probe:\n{content}"
+        );
+        assert!(
+            content.contains("as_u16(), 422"),
+            "the probes must assert a 422 boundary reject:\n{content}"
+        );
+        // The success case is still a TODO (no creator), so it does NOT count; both
+        // reject probes 422 before the stub, so they count toward `reject`.
+        assert_eq!(
+            reject, 2,
+            "both inline reject probes count toward `reject` on the /{{id}} no-creator branch:\n{content}"
         );
     }
 
