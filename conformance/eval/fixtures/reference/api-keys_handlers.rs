@@ -126,15 +126,22 @@ fn present_key(headers: &Headers) -> Option<String> {
         .map(str::to_string)
 }
 
-/// DELETE /{id} — owner-only, tenant-scoped revoke. Non-owner → 403;
-/// cross-tenant or unknown id → 404.
+/// DELETE /{id} — owner-only revoke (issue #247). The required "owner" role is the
+/// caller's MEMBERSHIP role in the ROW's tenant, NOT the session role
+/// (`user.0.role`, a different dimension): `require_membership_role` resolves the
+/// key's workspace, verifies the caller is an `owner` MEMBER of THAT workspace, and
+/// 403s a non-member / wrong-role caller — so a cross-tenant caller (a member of a
+/// different workspace) is 403, never a 404 that would hide the role gate. The
+/// membership-scoped `remove_for_memberships` then deletes only a key in the
+/// caller's set; an unknown id in the caller's own tenant → 404.
 pub(crate) async fn revoke_api_key(
     repo: Dep<ApiKeyRepo>,
-    tenant: Dep<Tenant>,
+    user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<NoContent> {
-    tenant.require_role("owner")?;
-    if repo.remove_for(tenant.id(), id).await? {
+    repo.require_membership_role(user.0.id.clone(), id, &["owner"])
+        .await?;
+    if repo.remove_for_memberships(user.0.id, id).await? {
         Ok(NoContent)
     } else {
         Err(Error::not_found())
