@@ -945,6 +945,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
             ));
         }
         validate_module(
+            d,
             m,
             &format!("/modules/{i}"),
             &declared_roles,
@@ -2498,6 +2499,7 @@ pub fn validate(d: &Design) -> Vec<Question> {
 }
 
 fn validate_module(
+    d: &Design,
     m: &ModuleDesign,
     ptr: &str,
     declared_roles: &[&str],
@@ -2505,6 +2507,17 @@ fn validate_module(
     wants_db: bool,
     qs: &mut Vec<Question>,
 ) {
+    // #256: a FLAT tenant-owned (`MembershipSet`) role-gated route's `required_roles`
+    // is checked against the caller's MEMBERSHIP role (`{tenant}_members.role`, whose
+    // domain is `tenancy.member_roles`) by the #247 `require_membership_role` gate —
+    // NOT the session role `_user.0.role` (`auth.roles`). So such a route's roles are
+    // validated against `member_roles` below; a session-role / non-tenant route keeps
+    // validating against `auth.roles` (`declared_roles`).
+    let member_roles: Vec<&str> = d
+        .tenancy
+        .as_ref()
+        .map(|t| t.member_roles.iter().map(String::as_str).collect())
+        .unwrap_or_default();
     if !is_kebab(&m.name) {
         qs.push(q(
             format!("{ptr}/name"),
@@ -2801,8 +2814,30 @@ fn validate_module(
                 }
             }
         }
+        // #256: pick the role DOMAIN this endpoint's `required_roles` is checked
+        // against. A flat tenant-owned (`MembershipSet`) role-gated route steers to
+        // the #247 `require_membership_role` gate, which reads `{tenant}_members.role`
+        // (domain `tenancy.member_roles`) — the SAME predicate the generator emits the
+        // gate on (`genroute::entity_is_flat_tenant_owned`). Validating such a route's
+        // roles against `auth.roles` is wrong both ways: a role in `auth.roles` but not
+        // `member_roles` scaffolds an always-403 dead gate (the membership check can
+        // never match — green means safe violated), and a `member_roles` value not in
+        // `auth.roles` is falsely refused. Every other route (session-role / non-tenant)
+        // still validates against `auth.roles`.
+        let membership_role_route = endpoint_repo_entity(m, ep)
+            .and_then(|name| d.find_entity(name))
+            .is_some_and(|e| super::genroute::entity_is_flat_tenant_owned(e, d));
         for role in &ep.required_roles {
-            if !declared_roles.contains(&role.as_str()) {
+            if membership_role_route {
+                if !member_roles.contains(&role.as_str()) {
+                    qs.push(q(
+                        format!("{eptr}/required_roles"),
+                        format!(
+                            "Role `{role}` on a tenant-owned (flat) route checks the MEMBERSHIP role (`{{tenant}}_members.role`, issue #247), not the session role `_user.0.role` — `{role}` is not in `tenancy.member_roles`. Add it to `tenancy.member_roles` or fix the reference."
+                        ),
+                    ));
+                }
+            } else if !declared_roles.contains(&role.as_str()) {
                 let hint = if auth_declared {
                     "add it to auth.roles or fix the reference"
                 } else {
@@ -2838,6 +2873,7 @@ fn validate_module(
 
     for (i, sub) in m.subroutes.iter().enumerate() {
         validate_module(
+            d,
             sub,
             &format!("{ptr}/subroutes/{i}"),
             declared_roles,
@@ -4686,6 +4722,138 @@ mod tests {
             qs.iter()
                 .any(|q| q.question.contains("JC0560") && q.question.contains("tenancy fk")),
             "`as: workspace` (the tenancy fk) on a non-tenant target must trip JC0560: {qs:?}"
+        );
+    }
+
+    // ---- #256: flat-tenant required_roles validates vs member_roles -------------
+
+    /// A CRM whose flat tenant-owned `Lead` (belongs_to the tenancy `Workspace`,
+    /// mount `/leads`, no tenant fk in the path ⇒ `MembershipSet`) carries a
+    /// role-gated `DELETE /{id}`. `auth.roles` and `tenancy.member_roles` are
+    /// DELIBERATELY DISJOINT so the two role domains can't be confused. `{ROLE}`
+    /// interpolates the role under test.
+    const FLAT_TENANT_ROLE: &str = r#"{
+        "name": "crm", "contract_version": 1,
+        "dependencies": ["db", "auth"],
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "tenancy": { "entity": "Workspace", "member_roles": ["manager", "staff"] },
+        "modules": [
+            {
+                "name": "workspaces",
+                "entities": [{ "name": "Workspace", "fields": [{ "name": "name", "type": "string" }] }],
+                "endpoints": [
+                    { "operation_id": "create_workspace", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Workspace" },
+                      "success": { "status": 201, "entity": "Workspace" } }
+                ]
+            },
+            {
+                "name": "leads", "mount": "/leads",
+                "entities": [{ "name": "Lead",
+                    "belongs_to": [{ "entity": "Workspace" }],
+                    "fields": [{ "name": "title", "type": "string" }] }],
+                "endpoints": [
+                    { "operation_id": "create_lead", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Lead" },
+                      "success": { "status": 201, "entity": "Lead" } },
+                    { "operation_id": "delete_lead", "method": "DELETE", "path": "/{id}",
+                      "required_roles": ["{ROLE}"],
+                      "success": { "status": 204 } }
+                ]
+            }
+        ]
+    }"#;
+
+    const DELETE_LEAD_ROLES: &str = "/modules/1/endpoints/1/required_roles";
+
+    /// #256 bug 1: a flat tenant-owned route's role gate is the #247
+    /// `require_membership_role` check against `{tenant}_members.role` — a role that
+    /// is in `auth.roles` but NOT `tenancy.member_roles` (`owner`) can NEVER match, so
+    /// it would scaffold an always-403 dead endpoint behind a green check. It must be
+    /// refused, pointed at `tenancy.member_roles`.
+    #[test]
+    fn flat_tenant_required_role_outside_member_roles_is_refused() {
+        let d = FLAT_TENANT_ROLE.replace("{ROLE}", "owner");
+        let qs = validate(&design(&d));
+        let hit = qs
+            .iter()
+            .find(|q| q.id == DELETE_LEAD_ROLES)
+            .unwrap_or_else(|| panic!("`owner` (not a member_role) must be refused: {qs:?}"));
+        assert!(
+            hit.question.contains("MEMBERSHIP role")
+                && hit.question.contains("owner")
+                && hit.question.contains("tenancy.member_roles"),
+            "message must name the membership dimension and the member_roles domain: {}",
+            hit.question
+        );
+    }
+
+    /// #256 bug 2 (the false refusal): a `tenancy.member_roles` value (`manager`) that
+    /// is NOT in `auth.roles` is a valid membership-role gate — it must be ACCEPTED,
+    /// not refused against `auth.roles`.
+    #[test]
+    fn flat_tenant_required_role_in_member_roles_is_accepted() {
+        let d = FLAT_TENANT_ROLE.replace("{ROLE}", "manager");
+        let qs = validate(&design(&d));
+        assert!(
+            !qs.iter().any(|q| q.id == DELETE_LEAD_ROLES),
+            "`manager` (a declared member_role) must NOT be refused: {qs:?}"
+        );
+    }
+
+    /// #256: the domain switch is scoped to flat tenant-owned routes ONLY. A
+    /// session-role / non-tenant route still validates against `auth.roles`: a
+    /// `member_roles`-only value (`manager`) on a non-tenant entity must STILL be
+    /// refused (it can't leak into the session-role domain), while an `auth.roles`
+    /// value (`owner`) is accepted.
+    #[test]
+    fn non_tenant_required_role_still_validates_against_auth_roles() {
+        const D: &str = r#"{
+            "name": "crm", "contract_version": 1,
+            "dependencies": ["db", "auth"],
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "tenancy": { "entity": "Workspace", "member_roles": ["manager", "staff"] },
+            "modules": [
+                {
+                    "name": "workspaces",
+                    "entities": [{ "name": "Workspace", "fields": [{ "name": "name", "type": "string" }] }],
+                    "endpoints": [
+                        { "operation_id": "create_workspace", "method": "POST", "path": "/",
+                          "auth_required": true,
+                          "request_body": { "entity": "Workspace" },
+                          "success": { "status": 201, "entity": "Workspace" } }
+                    ]
+                },
+                {
+                    "name": "widgets", "mount": "/widgets",
+                    "entities": [{ "name": "Widget", "fields": [{ "name": "label", "type": "string" }] }],
+                    "endpoints": [
+                        { "operation_id": "delete_widget", "method": "DELETE", "path": "/{id}",
+                          "required_roles": ["{ROLE}"],
+                          "success": { "status": 204 } }
+                    ]
+                }
+            ]
+        }"#;
+        let widget_roles = "/modules/1/endpoints/0/required_roles";
+        // A member_role that is NOT an auth.role must still be refused on a non-tenant route.
+        let bad = validate(&design(&D.replace("{ROLE}", "manager")));
+        let hit = bad
+            .iter()
+            .find(|q| q.id == widget_roles)
+            .unwrap_or_else(|| panic!("`manager` on a non-tenant route must be refused: {bad:?}"));
+        assert!(
+            hit.question.contains("auth.roles"),
+            "a non-tenant route validates against auth.roles: {}",
+            hit.question
+        );
+        // An auth.role is accepted on the same non-tenant route.
+        let good = validate(&design(&D.replace("{ROLE}", "owner")));
+        assert!(
+            !good.iter().any(|q| q.id == widget_roles),
+            "`owner` (a declared auth.role) must be accepted on a non-tenant route: {good:?}"
         );
     }
 
