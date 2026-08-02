@@ -135,7 +135,7 @@ pub(crate) async fn import_leads(
     tenant: Dep<Tenant>,
     headers: Headers,
     body: RawBody,
-) -> Result<Accepted> {
+) -> Result<(jerrycan::http::StatusCode, Json<serde_json::Value>)> {
     use jerrycan::db::sea_orm::{ConnectionTrait, Statement};
 
     let mut csv = String::new();
@@ -185,29 +185,14 @@ pub(crate) async fn import_leads(
             .map_err(jerrycan::db::db_error)?;
         inserted += 1;
     }
-    Accepted::json(serde_json::json!({ "imported": inserted }))
-}
-
-/// A 202 Accepted response carrying a JSON body. The framework ships `Created`
-/// (201) and `NoContent` (204) but no `Accepted`, so we build the response.
-pub(crate) struct Accepted(jerrycan::Response);
-
-impl Accepted {
-    fn json(value: serde_json::Value) -> Result<Self> {
-        use jerrycan::http::{HeaderValue, StatusCode, header};
-        let body = serde_json::to_vec(&value).map_err(|e| Error::internal(e.to_string()))?;
-        let mut res = jerrycan::http::Response::new(jerrycan::JcBody::full(body));
-        *res.status_mut() = StatusCode::ACCEPTED;
-        res.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        Ok(Self(res))
-    }
-}
-
-impl IntoResponse for Accepted {
-    fn into_response(self) -> jerrycan::Response {
-        self.0
-    }
+    // Issue #259: a declared non-200/201/204 2xx status is served by the generated
+    // handler's `(StatusCode, Json<…>)` return type (jerrycan-core impls
+    // `IntoResponse` for the tuple — it renders the JSON body and overwrites the
+    // status). Returning `StatusCode::ACCEPTED` here yields the 202 the design
+    // declares, matching the generated `import_leads_returns_202` probe. No custom
+    // responder needed.
+    Ok((
+        jerrycan::http::StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "imported": inserted })),
+    ))
 }
