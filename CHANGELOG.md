@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.18 — 2026-08-02
+
+### Fixed
+- **A `success.list` create route no longer generates an un-greenable id-echo (#263).** The generated
+  happy-path create probe asserted `body["id"] == 1`, but a `list:true` creator responds with a JSON
+  array (`Json<Vec<X>>`, or the #259 `(StatusCode, Json<Vec<X>>)` tuple), so `body["id"]` string-indexes
+  an array → always `null` → the probe could never pass on a correct handler. The id-echo is now skipped
+  for a list creator (a list response has no single canonical id); single-entity creates are unchanged.
+
 ## 0.7.17 — 2026-08-02
 
 ### Fixed

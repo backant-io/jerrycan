@@ -3549,6 +3549,52 @@ fn create_probe_seeds_enforced_same_module_belongs_to_parents() {
     );
 }
 
+/// #263: a create whose `success.list` is true responds with a JSON ARRAY
+/// (`Json<Vec<X>>`), so the id-echo (`body["id"]`) string-indexes an array → always
+/// `null` → the probe could never green. It must be OMITTED for a list creator, while
+/// a normal single-entity creator keeps it (byte-identity for the common case).
+#[test]
+fn list_create_probe_omits_the_un_greenable_id_echo() {
+    const D: &str = r#"{
+        "name": "batch-api", "contract_version": 0,
+        "auth": { "model": "session", "roles": ["owner"] },
+        "dependencies": ["db", "auth"],
+        "modules": [{
+            "name": "jobs",
+            "entities": [
+                { "name": "Job", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "name", "type": "string" } ] } ],
+            "endpoints": [
+                { "operation_id": "create_job", "method": "POST", "path": "/",
+                  "auth_required": true, "request_body": { "entity": "Job" },
+                  "success": { "status": 201, "entity": "Job" } },
+                { "operation_id": "accept_batch", "method": "POST", "path": "/batch",
+                  "auth_required": true, "request_body": { "entity": "Job" },
+                  "success": { "status": 200, "entity": "Job", "list": true } } ]
+        }]
+    }"#;
+    let d: Design = serde_json::from_str(D).unwrap();
+    assert!(
+        jerrycan::platform::questions::validate(&d).is_empty(),
+        "fixture must validate clean: {:?}",
+        jerrycan::platform::questions::validate(&d)
+    );
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    // The LIST creator's probe must NOT assert body["id"] (the body is a JSON array).
+    let batch = test_body(&generated, "accept_batch_returns_200");
+    assert!(
+        !batch.contains("body[\"id\"]"),
+        "a list-create probe must omit the un-greenable id-echo (array body):\n{batch}"
+    );
+    // Byte-identity: the normal single-entity creator KEEPS the id-echo.
+    let single = test_body(&generated, "create_job_returns_201");
+    assert!(
+        single.contains("body[\"id\"]"),
+        "a normal single-entity create probe must keep the id-echo:\n{single}"
+    );
+}
+
 /// #248 byte-identity: a CROSS-module belongs_to (no in-module creator ⇒ an
 /// UNENFORCED relation whose `1` fixture needs no row) must NOT gain a parent seed —
 /// exactly as the `/{id}` probe already behaves. WHY: seeding a parent that lives in

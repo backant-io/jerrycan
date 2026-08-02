@@ -958,7 +958,12 @@ fn unit_tests(
             // A creator that echoes its entity must echo the id it was given —
             // catches inserts that return a backend default (0) instead. When the pk
             // was bumped (#249) the echo asserts the bumped value, not the fixture.
-            let id_echo = (ep.method == HttpMethod::POST)
+            // #263: skip the id-echo when `success.list` — a list creator responds with
+            // a JSON ARRAY (`Json<Vec<X>>` / the #259 `(StatusCode, Json<Vec<X>>)` tuple),
+            // so `body["id"]` (string-indexing an array) is always `null` and the probe
+            // could never green on a correct handler. A list response has no single
+            // canonical id to echo.
+            let id_echo = (ep.method == HttpMethod::POST && !ep.success.list)
                 .then_some(ep.request_body.as_ref())
                 .flatten()
                 .and_then(|rb| rb.entity.as_deref())
