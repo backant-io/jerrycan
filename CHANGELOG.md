@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.24 — 2026-08-03
+
+### Fixed
+- **A role-gated mutation on a tenant-owned entity now returns 404 (not 403) to a non-member (#281).** The
+  `require_membership_role` primitive (the membership-role gate for a flat tenant-owned entity, #247) answered
+  `403 Forbidden` when its membership JOIN found no row — i.e. for a non-member of the row's tenant (or a
+  non-existent id). That leaked row existence to a non-member and made the generated cross-tenant isolation test
+  (which asserts 404, like every other tenant-isolation path) un-greenable. The primitive now returns
+  `404 Not Found` for an invisible row (non-member or absent), keeping `403 Forbidden` only for a member whose
+  role is not permitted — matching the `Dep<Tenant>` guard's 404 for path-scoped entities. The generated
+  missing-id-404 probe is emitted again for these routes, and the isolation test asserts 404. Only the
+  non-member verdict of a flat role-gated mutation changes; wrong-role stays 403, and non-role-gated / path-scoped
+  routes are unaffected.
+- **OpenAPI declares mount-inherited path parameters (#280).** An operation's `parameters` were built from the
+  endpoint's own path only, so a module mounted at a parameterized path (e.g. `/accounts/{account_id}`) documented
+  `{account_id}` in the path template but omitted it from `parameters` — a required path param the handler binds,
+  violating OpenAPI 3.1. The operation now declares every parameter in the resolved path (typed by the referenced
+  entity's pk, #278). Modules mounted at a static path are unchanged.
+
 ## 0.7.23 — 2026-08-02
 
 ### Fixed
