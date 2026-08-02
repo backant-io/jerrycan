@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.21 — 2026-08-02
+
+### Fixed
+- **The OpenAPI entity component now spells out an entity's `belongs_to` fk columns (#271).** In db mode the
+  component was built from `fields` alone, omitting the fk columns (`{target}_id` / aliased `{as}_id`). Since
+  that component is both the response `$ref` AND — when no `{Entity}Request` DTO is minted — the plain create
+  body, a create that resolves to the plain body advertised a request missing a required NOT-NULL fk. A client
+  generated from the contract then posted a body without it and got `422 missing field {fk}_id`, while the
+  generated acceptance probe (built from the entity model, not the contract) posted the full column set and
+  greened — hiding the mismatch. This bit non-tenant client fks (e.g. `Transfer belongs_to from_account`,
+  acute under fk-alias) and flat tenant-owned entities whose tenant fk is client-supplied-then-membership-
+  verified (`Lead`/`ApiKey belongs_to Workspace`). The component now carries each `belongs_to` fk (target-pk
+  type, required unless `on_delete: set_null`), mirroring `{Entity}Request`. A server-supplied fk (identity,
+  path-redundant, or default) always forces a DTO, so the plain component is never a create body in that case;
+  memory-mode structs carry no fk columns, so memory documents stay byte-identical.
+
 ## 0.7.20 — 2026-08-02
 
 ### Fixed
