@@ -2033,6 +2033,31 @@ pub fn validate(d: &Design) -> Vec<Question> {
                         ),
                     ));
                 }
+                // (5) #257: the belongs_to that ANCHORS an entity to the tenancy entity
+                // must NOT be aliased away from the canonical tenancy fk. `tenant_path`
+                // (design.rs) hardcodes the anchor's `tenant_fk` as the canonical
+                // `fk_column(tenancy.entity)`, and every generated tenant query — the
+                // membership JOIN, `require_membership_role`, the scoped accessors —
+                // references that canonical column. An aliased anchor (`{tent} as "x"`
+                // → `x_id`) gives the anchor table `x_id` while the queries still say
+                // the canonical fk: a grandchild compiles green then fails at runtime
+                // (`no such column: {anchor}.{canonical}`); a direct child is an E0599.
+                // Refuse it loudly at design time (make-impossible). An aliased
+                // INTERMEDIATE link (a belongs_to to a NON-tenant parent) is NOT caught
+                // here (`b.entity != tent`) — its JOIN uses `b.fk_column()`, so it
+                // already scopes correctly and stays valid.
+                if let Some((tfk, tent)) = &tenant_fk
+                    && b.entity == *tent
+                    && col != *tfk
+                {
+                    qs.push(q(
+                        bptr.clone(),
+                        format!(
+                            "Entity `{}` belongs_to `{tent}` with `as` deriving fk column `{col}` — the belongs_to that anchors an entity to the tenancy entity `{tent}` must NOT be aliased: its fk must be the canonical `{tfk}` that every generated tenant query (the membership JOIN, `require_membership_role`, the scoped accessors) references. An aliased anchor breaks all tenant scoping (a runtime `no such column: ...{tfk}` on a grandchild, an E0599 on a direct child). Rename or drop the `as`. See `jerrycan explain JC0560`.",
+                            e.name
+                        ),
+                    ));
+                }
                 // (3) The fk column is generated; a same-named declared field or the
                 // pk `id` would be a duplicate column.
                 if col == "id" || field_names.contains(col.as_str()) {
@@ -4722,6 +4747,110 @@ mod tests {
             qs.iter()
                 .any(|q| q.question.contains("JC0560") && q.question.contains("tenancy fk")),
             "`as: workspace` (the tenancy fk) on a non-tenant target must trip JC0560: {qs:?}"
+        );
+    }
+
+    // ---- #257 (JC0560): aliased tenancy-anchor belongs_to ----------------------
+
+    /// A CRM-shaped design whose flat tenant-owned `Account` anchors to the tenancy
+    /// entity `Org` via a belongs_to that `{ANCHOR_AS}` interpolates. Used to prove
+    /// an ALIASED anchor is refused (#257) while the canonical anchor is inert.
+    const ANCHORED_TENANCY: &str = r#"{
+        "name": "crm", "contract_version": 1,
+        "dependencies": ["db", "auth"],
+        "auth": { "model": "session", "roles": ["owner"] },
+        "tenancy": { "entity": "Org", "member_roles": ["owner"] },
+        "modules": [{
+            "name": "orgs",
+            "entities": [
+                { "name": "Org", "fields": [{ "name": "name", "type": "string" }] },
+                { "name": "Account",
+                  "belongs_to": [{ "entity": "Org"{ANCHOR_AS} }],
+                  "fields": [{ "name": "name", "type": "string" }] }
+            ],
+            "endpoints": [
+                { "operation_id": "create_org", "method": "POST", "path": "/",
+                  "auth_required": true,
+                  "request_body": { "entity": "Org" },
+                  "success": { "status": 201, "entity": "Org" } }
+            ]
+        }]
+    }"#;
+
+    /// #257: aliasing the belongs_to that ANCHORS an entity to the tenancy entity
+    /// breaks all tenant scoping — `tenant_path` hardcodes the canonical `org_id`, so
+    /// the anchor table gets `primary_id` but every generated tenant query says
+    /// `org_id` (a runtime `no such column` on a grandchild, an E0599 on a direct
+    /// child). JC0560 must refuse it loudly at design time.
+    #[test]
+    fn aliased_tenancy_anchor_is_refused_with_jc0560() {
+        let d = ANCHORED_TENANCY.replace("{ANCHOR_AS}", r#", "as": "primary""#);
+        let qs = validate(&design(&d));
+        let hit = qs
+            .iter()
+            .find(|q| {
+                q.question.contains("JC0560")
+                    && q.question
+                        .contains("anchors an entity to the tenancy entity")
+            })
+            .unwrap_or_else(|| panic!("an aliased tenancy anchor must trip JC0560: {qs:?}"));
+        assert!(
+            hit.question.contains("primary_id") && hit.question.contains("org_id"),
+            "message must name the aliased fk and the canonical fk it must be: {}",
+            hit.question
+        );
+    }
+
+    /// #257 byte-identity floor: the SAME design with an UN-aliased (canonical) anchor
+    /// raises no anchor refusal — the new check fires only when the anchor's fk is
+    /// aliased away from the canonical `snake(tenant)_id`, so canonical designs stay
+    /// byte-identical.
+    #[test]
+    fn canonical_tenancy_anchor_raises_no_jc0560() {
+        let d = ANCHORED_TENANCY.replace("{ANCHOR_AS}", "");
+        assert!(
+            !validate(&design(&d))
+                .iter()
+                .any(|q| q.question.contains("JC0560")),
+            "a canonical (un-aliased) tenancy anchor must never trip JC0560"
+        );
+    }
+
+    /// #257: an aliased INTERMEDIATE link (a belongs_to to a NON-tenant parent) is NOT
+    /// refused — its tenant-path JOIN uses `b.fk_column()`, so an aliased grandchild
+    /// link (`Contact belongs_to Account as "primary"` → `primary_id`) already scopes
+    /// correctly. Only the anchor (belongs_to the tenancy entity itself) is reserved.
+    #[test]
+    fn aliased_intermediate_link_raises_no_jc0560() {
+        const D: &str = r#"{
+            "name": "crm", "contract_version": 1,
+            "dependencies": ["db", "auth"],
+            "auth": { "model": "session", "roles": ["owner"] },
+            "tenancy": { "entity": "Org", "member_roles": ["owner"] },
+            "modules": [{
+                "name": "orgs",
+                "entities": [
+                    { "name": "Org", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Account",
+                      "belongs_to": [{ "entity": "Org" }],
+                      "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Contact",
+                      "belongs_to": [{ "entity": "Account", "as": "primary" }],
+                      "fields": [{ "name": "name", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_org", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Org" },
+                      "success": { "status": 201, "entity": "Org" } }
+                ]
+            }]
+        }"#;
+        assert!(
+            !validate(&design(D))
+                .iter()
+                .any(|q| q.question.contains("JC0560")),
+            "an aliased INTERMEDIATE (non-anchor) belongs_to must never trip JC0560"
         );
     }
 
