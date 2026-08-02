@@ -49,7 +49,13 @@ fn return_type(ep: &Endpoint) -> String {
         // A 3xx-success endpoint (issue #46) redirects — it returns a `Redirect`,
         // never a JSON body. `success_body` emits a matching `Ok(Redirect::…)` stub.
         (s, _, _) if (300..400).contains(&s) => "Result<Redirect>".to_string(),
-        (201, Some(e), _) => format!("Result<Created<{e}>>"),
+        // A 201 create that returns a LIST (#265) must serve the ARRAY its OpenAPI
+        // already advertises (`success_schema` emits `type: array` for any `list`,
+        // status-agnostic). `Created<T: Serialize>` accepts `T = Vec<X>`, so a
+        // list rides `Created<Vec<{e}>>` (201 + a JSON array body); a single-entity
+        // 201 stays `Created<{e}>` (byte-identical).
+        (201, Some(e), true) => format!("Result<Created<Vec<{e}>>>"),
+        (201, Some(e), false) => format!("Result<Created<{e}>>"),
         (201, None, _) => "Result<Created<serde_json::Value>>".to_string(),
         // A declared 2xx OTHER than 200/201/204 (issue #259, e.g. 202 Accepted)
         // cannot ride the fixed-200 `Json`/`Json<Vec>` responder — the handler must
@@ -7912,6 +7918,46 @@ pub(crate) mod tests {
         assert!(
             h.matches("not implemented — replace this stub").count() >= 3,
             "the 202 stubs stay the 500 Err (RED until implemented): {h}"
+        );
+    }
+
+    /// Issue #265: a 201 create that returns a LIST must serve the ARRAY its
+    /// OpenAPI already advertises (`success_schema` emits `type: array` for any
+    /// `list`, status-agnostic) — before this the 201 arm ignored `list` and
+    /// emitted the single `Created<{e}>`, a silent contract violation (green
+    /// probe over a wrong-shaped body). A list rides `Created<Vec<{e}>>`; a
+    /// single-entity 201 stays byte-identical.
+    #[test]
+    fn created_list_returns_a_vec_body() {
+        const D: &str = r#"{
+            "name": "items-api", "contract_version": 0, "dependencies": [],
+            "modules": [{ "name": "items",
+                "entities": [{ "name": "Item", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "label", "type": "string" } ]}],
+                "endpoints": [
+                    { "operation_id": "create_items", "method": "POST", "path": "/batch",
+                      "request_body": { "entity": "Item" },
+                      "success": { "status": 201, "entity": "Item", "list": true } },
+                    { "operation_id": "create_item", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Item" },
+                      "success": { "status": 201, "entity": "Item" } } ] }]
+        }"#;
+        let d: Design = serde_json::from_str(D).unwrap();
+        let h = flatten_sigs(&handlers_rs(&d.modules[0], GenMode::default(), &d));
+        // 201 + list → Created over a Vec (the array the OpenAPI already declares).
+        assert!(
+            h.contains(
+                "async fn create_items(_repo: Dep<ItemRepo>, Json(_body): Json<Item>) -> Result<Created<Vec<Item>>>"
+            ),
+            "201 list must return Created<Vec<Item>>: {h}"
+        );
+        // 201 single stays byte-identical (Created<Item>, not a Vec).
+        assert!(
+            h.contains(
+                "async fn create_item(_repo: Dep<ItemRepo>, Json(_body): Json<Item>) -> Result<Created<Item>>"
+            ),
+            "201 single stays Created<Item> (byte-identical): {h}"
         );
     }
 

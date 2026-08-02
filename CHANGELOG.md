@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.19 — 2026-08-02
+
+### Fixed
+- **A `201 + list:true` create now returns (and documents) an array (#265).** The 201 create arm emitted
+  `Created<Item>` (a single object) regardless of `success.list`, so a bulk create returned one object
+  while its OpenAPI (and the generated probe) said array — a silent contract violation the test couldn't
+  catch. The 201 arm now emits `Created<Vec<Item>>` for a list, matching the 200/202 arms.
+- **The generated create id-echo no longer panics on a bodyless success status (#266).** A POST create
+  declaring an entity with an `id` and a 204 or 3xx status generated a probe that parsed `body["id"]`
+  from an empty response body → a panic no correct (empty-bodied) handler could avoid. The id-echo is now
+  emitted only for a body-bearing status (2xx, not 204).
+- **Reject probes on a tenant entity's own path-scoped route now seed a membership (#267).** A constrained
+  or enum route on the tenant entity's own module (e.g. `PUT /orgs/{org_id}`) generated a 422 reject probe
+  with no membership seed, so the membership-verified tenant guard 404'd it before the validator ran — an
+  un-greenable probe. It now seeds the membership the sibling success probe uses, so the reject reaches
+  the 422 boundary. Child-entity and non-tenant reject probes are unchanged.
+
 ## 0.7.18 — 2026-08-02
 
 ### Fixed
