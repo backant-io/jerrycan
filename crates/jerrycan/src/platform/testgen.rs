@@ -999,7 +999,7 @@ fn unit_tests(
                 .and_then(|rb| rb.entity.as_deref())
                 .and_then(|entity| first_enum_field(unit, entity))
             {
-                push_enum_reject_test(design, out, unit, ep, &full_path, guarded, field);
+                push_enum_reject_test(design, out, unit, ep, &full_path, guarded, field, "");
             }
             // #80: a range/length-constrained request body gets one too.
             if let Some((field, literal)) = ep
@@ -1009,12 +1009,14 @@ fn unit_tests(
                 .and_then(|entity| first_constraint_reject(unit, entity))
             {
                 push_constraint_reject_test(
-                    design, out, unit, ep, &full_path, guarded, field, &literal,
+                    design, out, unit, ep, &full_path, guarded, field, &literal, "",
                 );
             }
             // #217: an inline-DTO custom action (`rb.entity == None`) rejects an
             // out-of-range inline field too (no-op for entity/bodyless endpoints).
-            push_inline_reject_test(design, out, unit, ep, &full_path, guarded);
+            // A collection create (`POST /`) is never a path-scoped tenant detail
+            // route, so it needs no #267 membership seed ("").
+            push_inline_reject_test(design, out, unit, ep, &full_path, guarded, "");
         } else if param_count(ep) == 1 && seed_creator_is_skipped(unit, ep) {
             // Issue #68: the creator that would seed this `/{id}` probe is marked
             // `probe: skip` — a hand-written validator on it rejects the generated
@@ -1044,7 +1046,9 @@ fn unit_tests(
             // 422 reject probes even though the seed creator is `probe: skip` — the
             // inline 422 precedes any id lookup (needs no seeded row), so the
             // concrete mount base (its own `{id}` pinned to `1`, as the 401 above)
-            // suffices. No-op for entity/bodyless endpoints.
+            // suffices. No-op for entity/bodyless endpoints. The seed creator is
+            // `probe: skip` here, so there is no reusable membership seed to prepend
+            // (#267) — pass "" (this un-seedable shape is a separate residual).
             push_inline_reject_test(
                 design,
                 out,
@@ -1052,6 +1056,7 @@ fn unit_tests(
                 ep,
                 &concrete_mount_base(&full_path),
                 guarded,
+                "",
             );
         } else if param_count(ep) == 1 {
             // Issue #51: seed the row THIS `/{id}` endpoint addresses via ITS OWN
@@ -1070,6 +1075,26 @@ fn unit_tests(
                 if guarded {
                     push_401_test(design, out, unit, ep, &seeded_path, true);
                 }
+                // #267: on a PATH-SCOPED route of the tenant entity's OWN module —
+                // whose `app()` seeds NO membership (`module_needs_tenant` is false
+                // for the tenant root; a child module's `app()` DOES pre-seed) — the
+                // membership-verified `Dep<Tenant>` guard 404s a non-member BEFORE
+                // body deserialization, so a reject probe would 404 instead of the
+                // 422 validator. Prepend the SAME `seed` the 2xx probe uses (the
+                // create that seeds user 1's membership at `seed_id`), so the reject
+                // body reaches the validator. Empty ("") — hence byte-identical — for
+                // a child module (its `app()` pre-seeds), an unguarded route (no
+                // guard to 404), and every non-tenant / MembershipSet route.
+                let reject_seed: &str = if guarded
+                    && !module_needs_tenant(design, unit)
+                    && matches!(
+                        design.endpoint_tenant_shape(unit, ep),
+                        TenantShape::PathScoped { .. }
+                    ) {
+                    &seed
+                } else {
+                    ""
+                };
                 // Issue #47: update path (PUT/PATCH /{id}) rejects out-of-range too.
                 if let Some(field) = ep
                     .request_body
@@ -1077,7 +1102,16 @@ fn unit_tests(
                     .and_then(|rb| rb.entity.as_deref())
                     .and_then(|entity| first_enum_field(unit, entity))
                 {
-                    push_enum_reject_test(design, out, unit, ep, &seeded_path, guarded, field);
+                    push_enum_reject_test(
+                        design,
+                        out,
+                        unit,
+                        ep,
+                        &seeded_path,
+                        guarded,
+                        field,
+                        reject_seed,
+                    );
                 }
                 // #80: the update path rejects a constraint violation too.
                 if let Some((field, literal)) = ep
@@ -1095,12 +1129,15 @@ fn unit_tests(
                         guarded,
                         field,
                         &literal,
+                        reject_seed,
                     );
                 }
                 // #217: an inline-DTO custom action at `/{id}/…` rejects an
                 // out-of-range inline field too (the 422 precedes any id lookup, so
-                // the concrete seeded path suffices). No-op for entity bodies.
-                push_inline_reject_test(design, out, unit, ep, &seeded_path, guarded);
+                // the concrete seeded path suffices). No-op for entity bodies. The
+                // #267 seed applies here too (a tenant-entity inline action under
+                // `/{tenant_fk}/…` is path-scoped).
+                push_inline_reject_test(design, out, unit, ep, &seeded_path, guarded, reject_seed);
             } else {
                 out.todos.push(format!(
                     "// AGENT TODO: {fn_base} ({:?} {full_path}) has no creator route to seed its {{id}} — encode its success case in your own test file.",
@@ -1124,7 +1161,8 @@ fn unit_tests(
                 // creator to seed still gets its 422 reject probes — the inline 422
                 // precedes any id lookup (needs no seeded row), so the concrete mount
                 // base (its own `{id}` pinned to `1`, as the seedless 401 above)
-                // suffices. No-op for entity/bodyless endpoints.
+                // suffices. No-op for entity/bodyless endpoints. No creator ⇒ no
+                // reusable membership seed to prepend (#267) — pass "".
                 push_inline_reject_test(
                     design,
                     out,
@@ -1132,6 +1170,7 @@ fn unit_tests(
                     ep,
                     &concrete_mount_base(&full_path),
                     guarded,
+                    "",
                 );
             }
         } else if param_count(ep) >= 1 {
@@ -1395,6 +1434,7 @@ fn push_401_test(
 /// precedes the stub), so it is NOT part of the RED-on-stubs baseline: `out.reject`
 /// tracks it so gen-tests can exclude it from `expected_failing`. Guarded endpoints
 /// thread the credential (via `request_expr`) so the guard doesn't 401 first.
+#[allow(clippy::too_many_arguments)]
 fn push_enum_reject_test(
     design: &Design,
     out: &mut TestOut,
@@ -1403,12 +1443,17 @@ fn push_enum_reject_test(
     path: &str,
     guarded: bool,
     field: &str,
+    // #267: a membership seed to PREPEND (or `""`). On a path-scoped tenant route
+    // whose module doesn't pre-seed, the `Dep<Tenant>` guard 404s a non-member
+    // BEFORE deserialization, so the reject probe never reaches the 422 validator;
+    // seeding the caller's membership (the SAME seed the 2xx probe uses) lets it.
+    seed: &str,
 ) {
     let fn_base = &ep.operation_id;
     let sentinel = format!("\"{ENUM_REJECT_SENTINEL}\"");
     let request = request_expr(design, unit, ep, path, guarded, &[(field, &sentinel)]);
     out.code.push_str(&format!(
-        "#[tokio::test]\nasync fn {fn_base}_rejects_out_of_range_{field}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 422, \"design: out-of-range `{field}` enum must 422 at the request boundary, not 500 at the DB CHECK; body: {{}}\", res.text());\n}}\n\n"
+        "#[tokio::test]\nasync fn {fn_base}_rejects_out_of_range_{field}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), 422, \"design: out-of-range `{field}` enum must 422 at the request boundary, not 500 at the DB CHECK; body: {{}}\", res.text());\n}}\n\n"
     ));
     out.count += 1;
     out.reject += 1;
@@ -1431,11 +1476,14 @@ fn push_constraint_reject_test(
     guarded: bool,
     field: &str,
     literal: &str,
+    // #267: see `push_enum_reject_test` — the tenant-membership seed to PREPEND
+    // (or `""` for a non-tenant / pre-seeded route, keeping it byte-identical).
+    seed: &str,
 ) {
     let fn_base = &ep.operation_id;
     let request = request_expr(design, unit, ep, path, guarded, &[(field, literal)]);
     out.code.push_str(&format!(
-        "#[tokio::test]\nasync fn {fn_base}_rejects_out_of_range_{field}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), 422, \"design: out-of-range `{field}` must 422 at the request boundary (the declared min/max/min_len/max_len), not 500 at the DB CHECK; body: {{}}\", res.text());\n}}\n\n"
+        "#[tokio::test]\nasync fn {fn_base}_rejects_out_of_range_{field}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), 422, \"design: out-of-range `{field}` must 422 at the request boundary (the declared min/max/min_len/max_len), not 500 at the DB CHECK; body: {{}}\", res.text());\n}}\n\n"
     ));
     out.count += 1;
     out.reject += 1;
@@ -1471,6 +1519,10 @@ fn push_inline_reject_test(
     ep: &Endpoint,
     path: &str,
     guarded: bool,
+    // #267: the tenant-membership seed threaded down to the entity-reject helpers
+    // (or `""`), so an inline-DTO action on a path-scoped tenant route reaches its
+    // 422 validator instead of the guard's 404. Empty for non-tenant designs.
+    seed: &str,
 ) {
     let Some(rb) = ep.request_body.as_ref().filter(|rb| rb.is_inline()) else {
         return;
@@ -1481,7 +1533,7 @@ fn push_inline_reject_test(
         .iter()
         .find_map(|f| (f.values.is_some() && f.default.is_none()).then_some(f.name.as_str()))
     {
-        push_enum_reject_test(design, out, unit, ep, path, guarded, field);
+        push_enum_reject_test(design, out, unit, ep, path, guarded, field, seed);
     }
     // Constraint reject (issue #80): first inline field with a rejectable bound, no
     // default. `constraint_reject_literal` returns None for an enum/vacuous field, so
@@ -1492,7 +1544,7 @@ fn push_inline_reject_test(
             .then(|| constraint_reject_literal(f).map(|lit| (f.name.as_str(), lit)))
             .flatten()
     }) {
-        push_constraint_reject_test(design, out, unit, ep, path, guarded, field, &literal);
+        push_constraint_reject_test(design, out, unit, ep, path, guarded, field, &literal, seed);
     }
 }
 
@@ -3417,6 +3469,81 @@ mod tests {
         assert!(
             !quiet.contains("echoes its id") && !quiet.contains("expect(\"json body\")"),
             "a 204 create must NOT id-echo (empty NoContent body):\n{quiet}"
+        );
+    }
+
+    /// #267: a reject probe on a PATH-SCOPED route of the tenant entity's OWN
+    /// module — whose `app()` seeds NO membership — must PREPEND the same
+    /// create-seed the 2xx probe uses, or the membership-verified `Dep<Tenant>`
+    /// guard 404s (a non-member) BEFORE the body reaches the 422 validator. A
+    /// tenant-owned CHILD module's reject probe is byte-identical (its `app()`
+    /// pre-seeds the membership).
+    #[test]
+    fn tenant_root_pathscoped_reject_seeds_membership() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "tenant-api", "contract_version": 0,
+            "auth": { "model": "jwt", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "orgs",
+                  "entities": [{ "name": "Org", "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "name", "type": "string", "max_len": 50 } ]}],
+                  "endpoints": [
+                      { "operation_id": "create_org", "method": "POST", "path": "/",
+                        "auth_required": true,
+                        "request_body": { "entity": "Org" },
+                        "success": { "status": 201, "entity": "Org" } },
+                      { "operation_id": "update_org", "method": "PUT", "path": "/{id}",
+                        "auth_required": true,
+                        "request_body": { "entity": "Org" },
+                        "success": { "status": 200, "entity": "Org" } } ] },
+                { "name": "notes",
+                  "entities": [{ "name": "Note",
+                      "belongs_to": [{ "entity": "Org", "on_delete": "cascade" }],
+                      "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "body", "type": "string", "max_len": 50 } ]}],
+                  "endpoints": [
+                      { "operation_id": "create_note", "method": "POST", "path": "/",
+                        "auth_required": true,
+                        "request_body": { "entity": "Note" },
+                        "success": { "status": 201, "entity": "Note" } },
+                      { "operation_id": "update_note", "method": "PUT", "path": "/{id}",
+                        "auth_required": true,
+                        "request_body": { "entity": "Note" },
+                        "success": { "status": 200, "entity": "Note" } } ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        // The tenant entity's OWN module: the update reject probe must seed
+        // membership by prepending the create-seed (`// seed id 1`) before the
+        // reject request, so the guard finds a member and the body reaches 422.
+        let (orgs, _) = render_acceptance(&d, &d.modules[0]);
+        let reject = section(&orgs, "update_org_rejects_out_of_range_name");
+        assert!(
+            reject.contains("// seed id 1") && reject.contains("post_json_with"),
+            "the tenant-root path-scoped reject must PREPEND the membership seed:\n{reject}"
+        );
+        assert!(
+            reject.contains("as_u16(), 422"),
+            "the reject still asserts 422:\n{reject}"
+        );
+        // A tenant-owned CHILD module pre-seeds membership in app(), so its reject
+        // probe is byte-identical to before — NO extra create-seed inside the probe.
+        let (notes, _) = render_acceptance(&d, &d.modules[1]);
+        let child = section(&notes, "update_note_rejects_out_of_range_body");
+        assert!(
+            !child.contains("// seed id 1"),
+            "a child module's reject probe must NOT gain a seed (app() pre-seeds):\n{child}"
         );
     }
 
