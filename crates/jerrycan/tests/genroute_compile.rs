@@ -1415,6 +1415,124 @@ fn opt_in_account_identity_scaffold_owner_scopes_and_omits_account_id() {
     }
 }
 
+/// #245: a tenant-owned entity mounted on a param whose name DIFFERS from the
+/// canonical tenant fk. Tenancy `Organization` derives the fk `organization_id`,
+/// but the `events` module mounts under `/happenings/{org_id}`. Before the fix,
+/// `tenant_owned_isolation_test` pinned only the canonical fk token, so the
+/// non-canonical `{org_id}` survived into the isolation probe URL — and the
+/// `GET /{id}` leg's `format!("/happenings/{org_id}/{id}")` did not even compile
+/// (`org_id` is an undefined named format arg). This scaffolds that exact shape,
+/// generates the acceptance battery, and requires the `events` crate (all targets,
+/// so the generated isolation test) to compile under `-D warnings`. Not run — the
+/// stub handlers `todo!()`, and a nested-mount tenant table is not auto-seeded.
+const CROSS_PREFIX_TENANT: &str = r#"{
+    "name": "orgs-api", "contract_version": 1,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Organization", "member_roles": ["owner", "member"] },
+    "modules": [
+        { "name": "organizations",
+          "entities": [{ "name": "Organization", "fields": [
+              { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+          "endpoints": [
+              { "operation_id": "create_organization", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Organization" }, "success": { "status": 201, "entity": "Organization" } } ] },
+        { "name": "events", "mount": "/happenings/{org_id}",
+          "entities": [{ "name": "Event", "belongs_to": [{ "entity": "Organization" }],
+              "fields": [{ "name": "id", "type": "integer" }, { "name": "title", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "create_event", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Event" }, "success": { "status": 201, "entity": "Event" } },
+              { "operation_id": "list_events", "method": "GET", "path": "/", "auth_required": true,
+                "success": { "status": 200, "entity": "Event", "list": true } },
+              { "operation_id": "get_event", "method": "GET", "path": "/{id}", "auth_required": true,
+                "success": { "status": 200, "entity": "Event" } } ] }
+    ]
+}"#;
+
+#[test]
+#[ignore = "scaffolds an app and invokes cargo on it; run with --include-ignored"]
+fn cross_prefix_tenant_isolation_battery_compiles() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("orgs-app");
+
+    let design: Design =
+        serde_json::from_str(CROSS_PREFIX_TENANT).expect("CROSS_PREFIX_TENANT parses");
+    assert!(design.tenancy.is_some() && design.wants_auth() && design.wants_db());
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, CROSS_PREFIX_TENANT);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(status.success(), "jerrycan new must scaffold the orgs app");
+
+    // Generate the acceptance battery for the cross-prefix-mounted tenant module.
+    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(&app)
+        .args(["gen-tests", "--module", "events"])
+        .output()
+        .expect("run jerrycan gen-tests");
+    assert!(
+        out.status.success(),
+        "gen-tests failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Sanity: the generated isolation probe BODY carries the pinned mount param, never
+    // the literal `{org_id}` (the pre-fix defect the compile gate below also catches).
+    // Scoped to the isolation fn — the `app()` helper legitimately keeps the real
+    // axum route pattern `.mount("/happenings/{org_id}", module())`.
+    let acceptance = fs::read_to_string(app.join("crates/routes/events/tests/acceptance.rs"))
+        .expect("read generated acceptance.rs");
+    let iso = acceptance
+        .split("async fn tenant_a_cannot_read_tenant_b_events()")
+        .nth(1)
+        .expect("isolation fn present")
+        .split("#[tokio::test]")
+        .next()
+        .unwrap();
+    assert!(
+        iso.contains("/happenings/1/") && !iso.contains("{org_id}"),
+        "the cross-prefix isolation probe must pin {{org_id}} to 1:\n{iso}"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // The gate: the events crate (all targets → the generated isolation test) compiles
+    // under strict clippy. Pre-fix the `format!("/happenings/{org_id}/{id}")` get leg
+    // failed here (E0425 undefined `org_id`); post-fix every URL is concrete.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "route-events",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "cross-prefix events crate failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 /// The 0.6.5 T2 review battery (#80): every constrained-field shape that broke
 /// a freshly scaffolded app, in one module — a required range int (`quantity`),
 /// an OPTIONAL SINGLE-BOUND string (`note`, max_len only → the
