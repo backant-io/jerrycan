@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.22 — 2026-08-02
+
+### Fixed
+- **The OpenAPI entity component now includes the synthetic primary key `id` in db mode (#273).** An entity
+  that doesn't declare its own `id` field gets a synthetic `i64` pk, which the generated Model serializes in
+  every response — but the component was built from `fields` alone, so its response schema omitted `id`. A
+  client generated from the contract couldn't read the row's `id` and thus couldn't call any sibling `/{id}`
+  route. The component now spells out the synthetic pk (`integer`, required). A declared `id` still rides the
+  fields loop (no duplication); memory-mode Models carry no synthetic id, so memory documents are unchanged.
+  This is the response-side counterpart to #271.
+- **Nullable columns are now advertised as nullable in db mode (#274).** An optional (`required: false`) field
+  and a `set_null` fk are generated as `Option<T>` — they serialize `None` as an explicit `null` and accept
+  `null` on input — but their schemas advertised a bare scalar (`{"type":"integer"}`), which under OpenAPI 3.1
+  (JSON Schema 2020-12) excludes `null`. A contract-conformant client would reject the `null`. Such columns now
+  advertise `type: [T, "null"]` on both the response component and the request DTO. A required field / cascade
+  fk stays a bare scalar; a JSON field's `{}` already admits null. Memory-mode optional fields are bare `T` with
+  `#[serde(default)]` (a `null` fails to deserialize), so they stay non-nullable — memory documents unchanged.
+
 ## 0.7.21 — 2026-08-02
 
 ### Fixed

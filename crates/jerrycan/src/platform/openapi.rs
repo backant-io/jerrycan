@@ -45,6 +45,36 @@ fn entity_ref(name: &str) -> Value {
     json!({ "$ref": format!("#/components/schemas/{name}") })
 }
 
+/// Convert a scalar type schema to its OpenAPI-3.1 nullable form (#274):
+/// `{"type": "T", …}` becomes `{"type": ["T", "null"], …}`, preserving `format`,
+/// constraints, and `writeOnly`. A schema with no `type` key (a JSON field's `{}`,
+/// which already admits null) is returned unchanged. Applied only to the db-mode
+/// columns generated as `Option<T>` (optional fields, `set_null` fks) — they
+/// serialize `None` as an explicit `null` and accept `null` on input, so a bare
+/// scalar `type` (which excludes null under JSON Schema 2020-12 / OpenAPI 3.1)
+/// would make a contract-conformant client reject the value.
+fn make_nullable(mut schema: Value) -> Value {
+    if let Some(t) = schema.get("type").and_then(Value::as_str) {
+        let t = t.to_string();
+        schema["type"] = json!([t, "null"]);
+    }
+    schema
+}
+
+/// The OpenAPI schema for a `belongs_to` fk column: the target pk's scalar type,
+/// made nullable (#274) when the fk is `set_null` — a nullable `Option<T>` column.
+fn fk_schema(design: &Design, b: &BelongsTo) -> Value {
+    let schema = match design.target_key_rust_type(&b.entity) {
+        "String" => json!({ "type": "string" }),
+        _ => json!({ "type": "integer", "format": "int64" }),
+    };
+    if b.on_delete == OnDelete::SetNull {
+        make_nullable(schema)
+    } else {
+        schema
+    }
+}
+
 fn success_schema(s: &Success) -> Option<Value> {
     // #269: a 204 (No Content) or a 3xx redirect has an EMPTY body — `return_type`
     // emits `NoContent`/`Redirect`, so advertise NO response body regardless of a
@@ -196,30 +226,52 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
     for e in &m.entities {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
+        // #273: a db-mode entity with no declared `id` field gets a synthetic i64
+        // primary key (`model_rs_db` surfaces `pub id`), serialized in every response
+        // and accepted in a plain-body create. The component omitted it (built from
+        // `fields` alone) → a contract client couldn't read the row's `id` and thus
+        // couldn't drive any sibling `/{id}` route (the RESPONSE-side counterpart to
+        // #271). Spell out the synthetic pk (integer, required). A DECLARED `id` rides
+        // the fields loop below; memory-mode Models have no synthetic id, so the
+        // db-gate keeps memory documents identical.
+        if design.wants_db() && !e.fields.iter().any(|f| f.name == "id") {
+            properties.insert("id".into(), json!({ "type": "integer", "format": "int64" }));
+            required.push(Value::String("id".into()));
+        }
         for f in &e.fields {
-            properties.insert(f.name.clone(), field_schema(f));
+            // #274: in db mode an optional field is `Option<T>` — it serializes `None`
+            // as an explicit `null` and accepts `null` — so its schema must admit null.
+            // Memory-mode optional fields are bare `T` with `#[serde(default)]` (a
+            // `null` fails to deserialize), so the db-gate keeps them non-nullable and
+            // every memory document identical. A declared `id` is EXCLUDED: `model_rs_db`
+            // emits the pk as a non-`Option` `pub id` and ignores its `required` flag, so
+            // even a (pathological) `id: required=false` stays a non-null pk — never
+            // nullable in the contract.
+            let schema = if design.wants_db() && !f.required && f.name != "id" {
+                make_nullable(field_schema(f))
+            } else {
+                field_schema(f)
+            };
+            properties.insert(f.name.clone(), schema);
             if f.required {
                 required.push(Value::String(f.name.clone()));
             }
         }
-        // #271: in db mode the entity's `belongs_to` fk columns are real NOT-NULL
-        // columns of the row. The component is the RESPONSE shape (the serialized
-        // Model carries them) AND — when no `{Entity}Request` DTO is minted — the
-        // plain CREATE body (the client MUST send them). Building the component from
-        // `fields` alone advertised a create body missing the fk column(s), so a
-        // client generated from the contract 422'd (`missing field {fk}_id`) while
-        // the generated probe (built from the entity MODEL, not the contract) posted
-        // the full column set and greened. Spell them out — name, target-pk type,
-        // required unless nullable — mirroring `request_schema`. Memory-mode structs
-        // carry no fk columns, so the db-gate keeps every memory document identical.
+        // #271: in db mode the entity's `belongs_to` fk columns are real columns of the
+        // row. The component is the RESPONSE shape (the serialized Model carries them)
+        // AND — when no `{Entity}Request` DTO is minted — the plain CREATE body (the
+        // client MUST send them). Building the component from `fields` alone advertised
+        // a create body missing the fk column(s), so a client generated from the
+        // contract 422'd (`missing field {fk}_id`) while the generated probe (built
+        // from the entity MODEL, not the contract) posted the full column set and
+        // greened. Spell them out via `fk_schema` (target-pk type, nullable when
+        // `set_null` per #274), required unless nullable — mirroring `request_schema`.
+        // Memory-mode structs carry no fk columns, so the db-gate keeps every memory
+        // document identical.
         if design.wants_db() {
             for b in &e.belongs_to {
                 let col = b.fk_column();
-                let schema = match design.target_key_rust_type(&b.entity) {
-                    "String" => json!({ "type": "string" }),
-                    _ => json!({ "type": "integer", "format": "int64" }),
-                };
-                properties.insert(col.clone(), schema);
+                properties.insert(col.clone(), fk_schema(design, b));
                 if b.on_delete != OnDelete::SetNull {
                     required.push(Value::String(col));
                 }
@@ -317,11 +369,8 @@ fn request_schema(design: &Design, e: &Entity, for_update: bool) -> Value {
         !(omit_identity && design.is_identity_fk(b)) && !path_fks.contains(&b.fk_column())
     }) {
         let col = b.fk_column();
-        let schema = match design.target_key_rust_type(&b.entity) {
-            "String" => json!({ "type": "string" }),
-            _ => json!({ "type": "integer", "format": "int64" }),
-        };
-        properties.insert(col.clone(), schema);
+        // #274: a `set_null` fk is a nullable `Option<T>` in the request DTO too.
+        properties.insert(col.clone(), fk_schema(design, b));
         if b.on_delete != OnDelete::SetNull {
             required.push(Value::String(col));
         }
@@ -336,7 +385,15 @@ fn request_schema(design: &Design, e: &Entity, for_update: bool) -> Value {
         .iter()
         .filter(|f| (for_update || f.default.is_none()) && !Design::field_is_now_default(f))
     {
-        properties.insert(f.name.clone(), field_schema(f));
+        // #274: the db request DTO types an optional field as `Option<T>` (it accepts
+        // `null`), so its schema must admit null. `request_schema` is only built in db
+        // mode (gated at the call sites in `walk_schemas`), so this needs no db-check.
+        let schema = if f.required {
+            field_schema(f)
+        } else {
+            make_nullable(field_schema(f))
+        };
+        properties.insert(f.name.clone(), schema);
         if f.required {
             required.push(Value::String(f.name.clone()));
         }
@@ -698,9 +755,14 @@ mod tests {
             d["components"]["schemas"]
         );
         let transfer = &d["components"]["schemas"]["Transfer"];
-        // BOTH aliased fk columns are present and typed as the target pk (integer).
+        // BOTH aliased fk columns are present and typed as the target pk (integer). The
+        // cascade fk is a bare `integer`; the `set_null` fk is nullable per #274
+        // (`Option<T>` column → serializes `null`) so it types as `["integer","null"]`.
         assert_eq!(transfer["properties"]["from_account_id"]["type"], "integer");
-        assert_eq!(transfer["properties"]["to_account_id"]["type"], "integer");
+        assert_eq!(
+            transfer["properties"]["to_account_id"]["type"],
+            json!(["integer", "null"])
+        );
         let required = transfer["required"].as_array().unwrap();
         // A cascade (NOT NULL) fk is required; a set_null (nullable) fk is present
         // but optional — mirrors the request-schema required rule.
@@ -714,6 +776,213 @@ mod tests {
         );
         // The declared fields are still there.
         assert_eq!(transfer["properties"]["amount"]["type"], "integer");
+    }
+
+    /// #273: a db-mode entity that does NOT declare an `id` field gets a synthetic
+    /// i64 primary key (`model_rs_db` surfaces `pub id`), which the handler serializes
+    /// in every response. The entity component must spell it out (integer, required) —
+    /// otherwise a contract client can't read the row's `id` and can't drive any
+    /// sibling `/{id}` route. An entity that DECLARES `id` carries it via its fields
+    /// (no duplication); a memory-mode Model has no synthetic id, so its component
+    /// stays fields-only.
+    #[test]
+    fn db_synthetic_pk_id_is_spelled_out_in_the_component() {
+        const DB: &str = r#"{
+            "name": "synthid", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{ "name": "widgets",
+                "entities": [
+                    { "name": "Widget", "fields": [{ "name": "label", "type": "string" }] },
+                    { "name": "Gadget", "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "label", "type": "string" } ]} ],
+                "endpoints": [
+                    { "operation_id": "get_widget", "method": "GET", "path": "/{id}",
+                      "success": { "status": 200, "entity": "Widget" } } ] }]
+        }"#;
+        let d = document(&serde_json::from_str::<Design>(DB).unwrap());
+        // Synthetic-pk entity: the component gains `id` (integer, required).
+        let widget = &d["components"]["schemas"]["Widget"];
+        assert_eq!(widget["properties"]["id"]["type"], "integer");
+        assert_eq!(widget["properties"]["id"]["format"], "int64");
+        assert!(
+            widget["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "id"),
+            "synthetic id is required: {widget}"
+        );
+        // Declared-id entity: `id` present exactly once (from its field, not doubled).
+        let gadget = &d["components"]["schemas"]["Gadget"];
+        assert_eq!(gadget["properties"]["id"]["type"], "integer");
+        assert_eq!(
+            gadget["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| *v == "id")
+                .count(),
+            1,
+            "declared id is not duplicated: {gadget}"
+        );
+        // Memory mode: no synthetic id → the component stays fields-only.
+        const MEM: &str = r#"{
+            "name": "memsynth", "contract_version": 1, "dependencies": [],
+            "modules": [{ "name": "widgets",
+                "entities": [{ "name": "Widget", "fields": [{ "name": "label", "type": "string" }] }],
+                "endpoints": [
+                    { "operation_id": "get_widget", "method": "GET", "path": "/{id}",
+                      "success": { "status": 200, "entity": "Widget" } } ] }]
+        }"#;
+        let dm = document(&serde_json::from_str::<Design>(MEM).unwrap());
+        assert!(
+            dm["components"]["schemas"]["Widget"]["properties"]
+                .get("id")
+                .is_none(),
+            "memory-mode component carries no synthetic id: {}",
+            dm["components"]["schemas"]["Widget"]
+        );
+    }
+
+    /// #274: in db mode an optional (`required:false`) field and a `set_null` fk are
+    /// `Option<T>` columns — they serialize `None` as an explicit `null` and accept
+    /// `null` on input — so their schemas must admit null (`type: [T, "null"]`) on
+    /// BOTH the response component and the request DTO. A required field / cascade fk
+    /// stays a bare scalar; a JSON field's `{}` already admits null. Memory-mode
+    /// optional fields are bare `T` with `#[serde(default)]` (a `null` fails to
+    /// deserialize), so they stay non-nullable — every memory document byte-identical.
+    #[test]
+    fn db_optional_and_set_null_fields_advertise_nullable() {
+        const DB: &str = r#"{
+            "name": "nulls", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{ "name": "items",
+                "entities": [
+                    { "name": "Cat", "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "name", "type": "string" } ]},
+                    { "name": "Item",
+                      "belongs_to": [
+                          { "entity": "Cat", "as": "primary_cat", "on_delete": "cascade" },
+                          { "entity": "Cat", "as": "backup_cat", "on_delete": "set_null" } ],
+                      "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "title", "type": "string" },
+                        { "name": "note", "type": "string", "required": false },
+                        { "name": "meta", "type": "json", "required": false } ]} ],
+                "endpoints": [
+                    { "operation_id": "make_item", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Item" },
+                      "success": { "status": 201, "entity": "Item" } } ] }]
+        }"#;
+        let item = document(&serde_json::from_str::<Design>(DB).unwrap())["components"]["schemas"]
+            ["Item"]
+            .clone();
+        let props = &item["properties"];
+        // Required scalar stays bare; optional scalar admits null.
+        assert_eq!(props["title"]["type"], "string");
+        assert_eq!(props["note"]["type"], json!(["string", "null"]));
+        // Optional JSON field's `{}` already admits null — no `type` key added.
+        assert!(
+            props["meta"].get("type").is_none(),
+            "json field unchanged: {item}"
+        );
+        // Cascade fk bare; set_null fk nullable.
+        assert_eq!(props["primary_cat_id"]["type"], "integer");
+        assert_eq!(props["backup_cat_id"]["type"], json!(["integer", "null"]));
+        // The optional field is present but NOT required; nullability ≠ optionality.
+        let req = item["required"].as_array().unwrap();
+        assert!(
+            !req.iter().any(|v| v == "note"),
+            "optional not required: {item}"
+        );
+        assert!(
+            req.iter().any(|v| v == "title"),
+            "required stays required: {item}"
+        );
+
+        // Memory mode: the same optional field stays a bare scalar (non-nullable).
+        const MEM: &str = r#"{
+            "name": "memnulls", "contract_version": 1, "dependencies": [],
+            "modules": [{ "name": "items",
+                "entities": [{ "name": "Item", "fields": [
+                    { "name": "title", "type": "string" },
+                    { "name": "note", "type": "string", "required": false } ]}],
+                "endpoints": [
+                    { "operation_id": "make_item", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Item" },
+                      "success": { "status": 201, "entity": "Item" } } ] }]
+        }"#;
+        let mprops = document(&serde_json::from_str::<Design>(MEM).unwrap())["components"]["schemas"]
+            ["Item"]["properties"]
+            .clone();
+        assert_eq!(
+            mprops["note"]["type"], "string",
+            "memory optional stays non-nullable"
+        );
+    }
+
+    /// #274 (request side): a db-mode `{Entity}Request` DTO also types an optional
+    /// field as `Option<T>`, so its schema must admit null. Guarded per-user `Post`
+    /// (identity fk → `PostRequest` minted, omitting `user_id`): its optional
+    /// `subtitle` advertises `["string","null"]` while required `body` stays `string`.
+    #[test]
+    fn db_request_dto_optional_field_is_nullable() {
+        const D: &str = r#"{
+            "name": "reqnull", "contract_version": 1, "dependencies": ["db", "auth"],
+            "auth": { "model": "jwt", "roles": ["user"] },
+            "modules": [{ "name": "posts",
+                "entities": [
+                    { "name": "User", "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "email", "type": "string" } ]},
+                    { "name": "Post",
+                      "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+                      "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "body", "type": "string" },
+                        { "name": "subtitle", "type": "string", "required": false } ]} ],
+                "endpoints": [
+                    { "operation_id": "create_post", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Post" },
+                      "success": { "status": 201, "entity": "Post" } } ] }]
+        }"#;
+        let d = document(&serde_json::from_str::<Design>(D).unwrap());
+        let dto = &d["components"]["schemas"]["PostRequest"];
+        assert!(
+            dto["properties"].get("user_id").is_none(),
+            "identity fk omitted from the request DTO: {dto}"
+        );
+        assert_eq!(dto["properties"]["body"]["type"], "string");
+        assert_eq!(
+            dto["properties"]["subtitle"]["type"],
+            json!(["string", "null"])
+        );
+    }
+
+    /// #274 guard: a declared `id` is NEVER nullable in the component, even if a design
+    /// (pathologically) marks it `required:false`. `model_rs_db` emits the pk as a
+    /// non-`Option` `pub id` and ignores that flag, so the contract must keep it a bare
+    /// non-null scalar — the nullable branch excludes a field named `id`.
+    #[test]
+    fn declared_id_is_never_nullable_even_if_marked_optional() {
+        const D: &str = r#"{
+            "name": "optid", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{ "name": "things",
+                "entities": [{ "name": "Thing", "fields": [
+                    { "name": "id", "type": "integer", "required": false },
+                    { "name": "label", "type": "string" } ]}],
+                "endpoints": [
+                    { "operation_id": "get_thing", "method": "GET", "path": "/{id}",
+                      "success": { "status": 200, "entity": "Thing" } } ] }]
+        }"#;
+        let thing = document(&serde_json::from_str::<Design>(D).unwrap())["components"]["schemas"]
+            ["Thing"]
+            .clone();
+        assert_eq!(
+            thing["properties"]["id"]["type"], "integer",
+            "a declared id stays a non-null pk regardless of its required flag: {thing}"
+        );
     }
 
     /// #269: a 204 (No Content) or a 3xx (redirect) success emits NO response body
