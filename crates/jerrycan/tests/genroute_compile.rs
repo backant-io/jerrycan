@@ -1799,6 +1799,182 @@ fn non_tenant_param_mount_child_injects_path_fk_and_compiles() {
     }
 }
 
+/// Issue #240 (the vacuous / uncompilable isolation test): a NESTED tenant module
+/// whose isolation probe had NO read leg. `events` mounts at `/orgs/{org_id}`
+/// (`Event belongs_to Org`) with a creator + LIST but no `GET /{id}`. The list leg
+/// was SUPPRESSED for nested mounts, so `tenant_owned_isolation_test` bound
+/// `row`/`cookie2` unconditionally yet consumed neither — a setup-only body that
+/// asserted nothing AND left two unused bindings, which `jerrycan check`'s
+/// `cargo clippy --all-targets -- -D warnings` REJECTS in the tool-owned
+/// `acceptance.rs`. The fix gives the nested list leg a real cross-tenant 404 probe
+/// (the `Dep<Tenant>` path guard denies a non-member the pinned collection).
+const NESTED_TENANT_LIST_ONLY: &str = r#"{
+    "name": "orgs-api", "contract_version": 1,
+    "auth": { "model": "session", "roles": ["owner", "member"] },
+    "dependencies": ["db", "auth"],
+    "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+    "modules": [
+        { "name": "orgs",
+          "entities": [{ "name": "Org", "fields": [
+              { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+          "endpoints": [
+              { "operation_id": "create_org", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Org" }, "success": { "status": 201, "entity": "Org" } },
+              { "operation_id": "list_orgs", "method": "GET", "path": "/", "auth_required": true,
+                "success": { "status": 200, "entity": "Org", "list": true } } ] },
+        { "name": "events", "mount": "/orgs/{org_id}",
+          "entities": [{ "name": "Event", "belongs_to": [{ "entity": "Org" }],
+              "fields": [{ "name": "id", "type": "integer" }, { "name": "title", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "create_event", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Event" }, "success": { "status": 201, "entity": "Event" } },
+              { "operation_id": "list_events", "method": "GET", "path": "/", "auth_required": true,
+                "success": { "status": 200, "entity": "Event", "list": true } } ] }
+    ]
+}"#;
+
+/// Issue #240 companion: a PER-USER create+update-only module (`Note belongs_to
+/// User`, `create_note` + `update_note` PUT `/{id}` — no list, no `GET /{id}`, no
+/// delete). Its `per_user_isolation_test` emitted the same setup-only body with
+/// unused `row`/`cookie2`; the fix OMITS the isolation fn entirely (a `PUT` is not a
+/// read leg, so there is nothing to isolation-probe). The `users` module carries a
+/// list so the design scaffolds (an endpoint-less module is refused).
+const PER_USER_CREATE_UPDATE_ONLY: &str = r#"{
+    "name": "notes-api", "contract_version": 1,
+    "auth": { "model": "session", "roles": ["user"] },
+    "dependencies": ["db", "auth"],
+    "modules": [
+        { "name": "users",
+          "entities": [{ "name": "User", "fields": [{ "name": "email", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "list_users", "method": "GET", "path": "/",
+                "success": { "status": 200, "entity": "User", "list": true } } ] },
+        { "name": "notes",
+          "entities": [{ "name": "Note",
+              "belongs_to": [{ "entity": "User", "on_delete": "cascade" }],
+              "fields": [{ "name": "id", "type": "integer" }, { "name": "body", "type": "string" }] }],
+          "endpoints": [
+              { "operation_id": "create_note", "method": "POST", "path": "/", "auth_required": true,
+                "request_body": { "entity": "Note" }, "success": { "status": 201, "entity": "Note" } },
+              { "operation_id": "update_note", "method": "PUT", "path": "/{id}", "auth_required": true,
+                "request_body": { "entity": "Note" }, "success": { "status": 200, "entity": "Note" } } ] }
+    ]
+}"#;
+
+/// Scaffold `design_json` into `app` via the jerrycan BINARY, then run
+/// `jerrycan gen-tests` so the tool-owned `acceptance.rs` (where the issue-#240 bug
+/// lived) is written to disk. Mirrors the scaffold pattern the other gates use.
+fn scaffold_and_gen_tests_240(design_json: &str, tmp: &Path, app: &Path) {
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.join("design.json");
+    write(&design_path, design_json);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(
+        status.success(),
+        "jerrycan new must scaffold the #240 fixture"
+    );
+
+    // Write the tool-owned acceptance suite (the file that carried the vacuous /
+    // uncompilable isolation test); gen-tests reads `app/design.json`.
+    let gen_status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .current_dir(app)
+        .arg("gen-tests")
+        .status()
+        .expect("run jerrycan gen-tests");
+    assert!(
+        gen_status.success(),
+        "jerrycan gen-tests must write the acceptance suite"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+}
+
+/// The exact gate `jerrycan check` runs over a route crate — `clippy --all-targets`
+/// compiles the generated acceptance suite, so an unused-var (or any) warning in
+/// `acceptance.rs` fails it. Shared by the two issue-#240 fixtures.
+fn strict_clippy_route_240(app: &Path, route_pkg: &str) {
+    let output = Command::new(env!("CARGO"))
+        .current_dir(app)
+        .args([
+            "clippy",
+            "-p",
+            route_pkg,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "issue-#240 fixture `{route_pkg}` acceptance suite failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+/// The nested-tenant-list-only shape (issue #240 Part A): the generated isolation
+/// test must carry a REAL cross-tenant 404 list probe (not a setup-only vacuous
+/// body) AND the acceptance suite must compile under strict clippy — RED before the
+/// fix (unused `row`/`cookie2`), GREEN after.
+#[test]
+#[ignore = "scaffolds + gen-tests a nested-tenant app and invokes cargo on it; run with --include-ignored"]
+fn nested_tenant_list_only_isolation_test_compiles_240() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("orgs-api");
+    scaffold_and_gen_tests_240(NESTED_TENANT_LIST_ONLY, tmp.path(), &app);
+
+    // The isolation fn is emitted AND carries the nested list 404 assertion — a real
+    // negative control, not a setup-only body that asserts nothing.
+    let acc = fs::read_to_string(app.join("crates/routes/events/tests/acceptance.rs"))
+        .expect("read events acceptance.rs");
+    assert!(
+        acc.contains("async fn tenant_a_cannot_read_tenant_b_events()"),
+        "the nested tenant isolation test must be emitted:\n{acc}"
+    );
+    assert!(
+        acc.contains("cross-tenant list must 404"),
+        "the nested list read leg must carry a real cross-tenant 404 assertion:\n{acc}"
+    );
+
+    strict_clippy_route_240(&app, "route-events");
+}
+
+/// The per-user create+update-only shape (issue #240 Part B): no read leg → the
+/// isolation fn is OMITTED (never a setup-only vacuous body) and the acceptance
+/// suite compiles under strict clippy — RED before the fix (unused `row`/`cookie2`),
+/// GREEN after.
+#[test]
+#[ignore = "scaffolds + gen-tests a per-user app and invokes cargo on it; run with --include-ignored"]
+fn per_user_create_update_only_isolation_test_compiles_240() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("notes-api");
+    scaffold_and_gen_tests_240(PER_USER_CREATE_UPDATE_ONLY, tmp.path(), &app);
+
+    // A read-less per-user module emits NO isolation test (the fn is omitted) — never
+    // a setup-only body named `*_cannot_read_*` that asserts nothing.
+    let acc = fs::read_to_string(app.join("crates/routes/notes/tests/acceptance.rs"))
+        .expect("read notes acceptance.rs");
+    assert!(
+        !acc.contains("cannot_read_user_b"),
+        "a read-less per-user module must emit NO isolation test:\n{acc}"
+    );
+
+    strict_clippy_route_240(&app, "route-notes");
+}
+
 fn write(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("create_dir_all");
     fs::write(path, content).expect("write file");

@@ -1763,8 +1763,12 @@ fn isolation_test(design: &Design, module: &ModuleDesign) -> String {
 ///   - NESTED path-scoped (`/clubs/{club_id}/books`, the #78 leak with no coverage
 ///     today): the tenant fk in the mount is pinned to tenant 1, and user 2 (a
 ///     member of tenant 2, NOT tenant 1) gets 404 on tenant 1's row. The list leg
-///     is SKIPPED — user 2 can't even reach tenant 1's collection (the guard 404s
-///     the whole path), so a "list 200, absent" assertion would false-fail.
+///     asserts the SAME 404 (issue #240): the `Dep<Tenant>` path guard denies the
+///     pinned collection to a non-member before the list handler runs, so user 2
+///     can't even enumerate tenant 1's rows — a "list 200, absent" assertion (the
+///     FLAT contract) would false-fail. A module with NO readable endpoint (create-
+///     only / create+update-only) has nothing to probe, so it gets NO test rather
+///     than a setup-only body that binds `row`/`cookie2` and asserts nothing.
 fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String {
     let Some(tenancy) = design.tenancy.as_ref() else {
         return String::new();
@@ -1840,15 +1844,32 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
         .endpoints
         .iter()
         .find(|ep| ep.method == HttpMethod::DELETE && param_count(ep) == 1);
-    // The list leg only applies to a FLAT (MembershipSet) route. A nested route's
-    // list is scoped by construction — membership on the parent chain filters the
-    // rows, not a path guard (a grandchild's parent fk is never pinned in the path)
-    // — so there is no cross-tenant list leg to negative-test here.
-    let list = module
+    // The collection LIST endpoint, if any — its cross-tenant probe differs by shape:
+    //   - FLAT (MembershipSet): user 2 lists their OWN (empty) collection — 200 with
+    //     the foreign row absent (`flat_list`, byte-identical to before).
+    //   - NESTED on the tenant fk (`/orgs/{org_id}/…`): user 2, a non-member of
+    //     tenant 1, is 404'd at the `Dep<Tenant>` path guard before the list runs
+    //     (`nested_list`) — previously ZERO coverage (issue #240). Scoped to a mount
+    //     carrying the TENANT fk itself: a GRANDCHILD mount pins only a PARENT fk
+    //     (`/accounts/{account_id}/…`, #102), which the guard does NOT key on (it
+    //     falls back to the caller's own membership — no clean path 404), so its list
+    //     stays uncovered here and the repo's scoped `all_for` is its backstop.
+    let list_ep = module
         .endpoints
         .iter()
-        .find(|ep| ep.method == HttpMethod::GET && param_count(ep) == 0)
-        .filter(|_| !is_nested);
+        .find(|ep| ep.method == HttpMethod::GET && param_count(ep) == 0);
+    let flat_list = list_ep.filter(|_| !is_nested);
+    let nested_list = list_ep.filter(|_| base.contains(&fk_token));
+
+    // A module with NO readable endpoint (create-only, or create + update-only) has
+    // nothing to isolation-probe — no way to READ another tenant's row — so emit NO
+    // test rather than a setup-only body that binds `row`/`cookie2` and asserts
+    // nothing (issue #240; that body also tripped `-D warnings` on the unused
+    // bindings). The write's own success + 401 probes still cover it, and the
+    // `Dep<Tenant>` guard / scoped repo is the runtime enforcement.
+    if get_one.is_none() && delete_one.is_none() && flat_list.is_none() && nested_list.is_none() {
+        return String::new();
+    }
 
     // The credential header follows the auth model (cookie/session, Bearer/jwt —
     // issue #29); `test_cookie_for(n)` returns the matching header value.
@@ -1860,12 +1881,23 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
         entity = entity.name,
     ));
     t.push_str(&format!(
-        "    let created = t.post_json_with(\"{create_path}\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n    let cookie2 = test_cookie_for(2);\n",
+        "    let created = t.post_json_with(\"{create_path}\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n",
         status = create.success.status,
         entity = entity.name,
     ));
-    // The list negative-control compares the created id as a JSON Value.
-    if list.is_some() {
+    // `row` (the parsed create response) is read ONLY to derive the by-id URL (`id`)
+    // or the flat-list absence check (`id_value`); the nested-list 404 leg needs
+    // neither, so bind it only when a leg below consumes it (no unused-var, #240).
+    if flat_list.is_some() || get_one.is_some() || delete_one.is_some() {
+        t.push_str(
+            "    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n",
+        );
+    }
+    // user 2's credential — every remaining probe leg reads it (the early return
+    // above guarantees at least one leg exists here).
+    t.push_str("    let cookie2 = test_cookie_for(2);\n");
+    // The FLAT list negative-control compares the created id as a JSON Value.
+    if flat_list.is_some() {
         t.push_str("    let id_value = row[\"id\"].clone();\n");
     }
     // A by-id URL must carry the RAW id: a string PK's `Value::String` Display
@@ -1882,11 +1914,20 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
             "    let foreign = t.get_with(&format!(\"{cbase}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(foreign.status().as_u16(), 404, \"cross-tenant get must 404 (use get_for, not get); body: {{}}\", foreign.text());\n",
         ));
     }
-    if list.is_some() {
+    if flat_list.is_some() {
         // Always cookied: even an unguarded list is safe to call with a cookie,
         // and a guarded one needs it. user 2 sees only tenant 2's (empty) rows.
         t.push_str(&format!(
             "    let listed = t.get_with(\"{cbase}/\", &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(listed.status().as_u16(), 200, \"user 2 lists their own {plural}; body: {{}}\", listed.text());\n    let rows: serde_json::Value = serde_json::from_str(&listed.text()).expect(\"list json\");\n    let absent = rows.as_array().map(|a| a.iter().all(|r| r[\"id\"] != id_value)).unwrap_or(true);\n    assert!(absent, \"cross-tenant list must NOT contain tenant 1's row (use all_for); body: {{}}\", listed.text());\n",
+        ));
+    }
+    if nested_list.is_some() {
+        // NESTED on the tenant fk: user 2 (a non-member of tenant 1) is 404'd at the
+        // `Dep<Tenant>` path guard before the list handler runs — a non-member can't
+        // even enumerate tenant 1's collection (issue #240; mirrors the nested
+        // `GET /{id}` 404 leg). This closes the previously ZERO-coverage nested list.
+        t.push_str(&format!(
+            "    let listed = t.get_with(\"{cbase}/\", &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(listed.status().as_u16(), 404, \"cross-tenant list must 404 — a non-member can't reach tenant 1's collection (Dep<Tenant> denies the path); body: {{}}\", listed.text());\n",
         ));
     }
     if let Some(_del) = delete_one {
@@ -2051,6 +2092,16 @@ fn per_user_isolation_test(design: &Design, module: &ModuleDesign) -> String {
         .iter()
         .find(|ep| ep.method == HttpMethod::GET && param_count(ep) == 0 && guarded1(ep));
 
+    // A module with NO readable endpoint (create-only, or create + update-only —
+    // a guarded `PUT /{id}` is not a read leg) has nothing to isolation-probe, so
+    // emit NO test rather than a setup-only body that binds `row`/`cookie2` and
+    // asserts nothing (issue #240; that body also tripped `-D warnings` on the
+    // unused bindings). Every probe leg below consumes both bindings, so this one
+    // guard covers them — the write's own success + 401 probes still cover it.
+    if get_one.is_none() && delete_one.is_none() && list.is_none() {
+        return String::new();
+    }
+
     let hk = design.test_auth_header();
     let mut t = String::new();
     t.push_str(&format!(
@@ -2181,10 +2232,18 @@ fn public_read_isolation_test(design: &Design, module: &ModuleDesign) -> String 
         entity = entity.name,
     ));
     t.push_str(&format!(
-        "    let created = t.post_json_with(\"{create_path}\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n",
+        "    let created = t.post_json_with(\"{create_path}\", &serde_json::json!({body}), &[(\"{hk}\", &test_cookie_for(1))]).await;\n    assert_eq!(created.status().as_u16(), {status}, \"setup: user 1 creates a {entity}; body: {{}}\", created.text());\n",
         status = create.success.status,
         entity = entity.name,
     ));
+    // `row` is read ONLY to derive `id_value` (the list-present check) or `id` (the
+    // by-id read/write legs); the always-present anon-create 401 leg needs neither,
+    // so bind it only when a leg below consumes it (no unused-var, #240).
+    if list.is_some() || get_one.is_some() || put_one.is_some() || delete_one.is_some() {
+        t.push_str(
+            "    let row: serde_json::Value = serde_json::from_str(&created.text()).expect(\"created json\");\n",
+        );
+    }
     if list.is_some() {
         t.push_str("    let id_value = row[\"id\"].clone();\n");
     }
