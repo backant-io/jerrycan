@@ -2046,8 +2046,15 @@ pub fn validate(d: &Design) -> Vec<Question> {
                 // INTERMEDIATE link (a belongs_to to a NON-tenant parent) is NOT caught
                 // here (`b.entity != tent`) — its JOIN uses `b.fk_column()`, so it
                 // already scopes correctly and stays valid.
+                //
+                // #261: the tenancy entity's OWN self-referential belongs_to (`Org
+                // belongs_to Org as "parent"`) is EXEMPT (`e.name != *tent`) — the
+                // tenant entity is not tenant-owned (`tenant_path` is `None` for it), so
+                // its self-ref fk is never a tenancy anchor and no generated tenant
+                // query reads it; refusing it was a false positive (0.7.16 regression).
                 if let Some((tfk, tent)) = &tenant_fk
                     && b.entity == *tent
+                    && e.name != *tent
                     && col != *tfk
                 {
                     qs.push(q(
@@ -4857,6 +4864,79 @@ mod tests {
                 .iter()
                 .any(|q| q.question.contains("JC0560")),
             "an aliased INTERMEDIATE (non-anchor) belongs_to must never trip JC0560"
+        );
+    }
+
+    /// #261: the tenancy entity's OWN self-referential aliased belongs_to (`Org
+    /// belongs_to Org as "parent"` → `parent_id`) must NOT be refused — the tenant
+    /// entity is not tenant-owned (`tenant_path` is `None` for it), so its self-ref
+    /// fk is never a tenancy anchor. The 0.7.16 #257 check omitted `e.name != *tent`
+    /// and wrongly refused it (a false positive this test pins closed). A NON-tenant
+    /// child's aliased anchor (`Lead belongs_to Org as "primary"`) is STILL refused —
+    /// the asymmetry is the point.
+    #[test]
+    fn self_referential_tenancy_anchor_raises_no_jc0560() {
+        const D: &str = r#"{
+            "name": "crm", "contract_version": 1,
+            "dependencies": ["db", "auth"],
+            "auth": { "model": "session", "roles": ["owner"] },
+            "tenancy": { "entity": "Org", "member_roles": ["owner"] },
+            "modules": [{
+                "name": "orgs",
+                "entities": [
+                    { "name": "Org",
+                      "belongs_to": [{ "entity": "Org", "as": "parent" }],
+                      "fields": [{ "name": "name", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_org", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Org" },
+                      "success": { "status": 201, "entity": "Org" } }
+                ]
+            }]
+        }"#;
+        assert!(
+            !validate(&design(D))
+                .iter()
+                .any(|q| q.question.contains("JC0560")),
+            "a self-referential aliased belongs_to on the TENANCY entity itself must never trip JC0560 (#261)"
+        );
+    }
+
+    /// #261 asymmetry floor: the SAME `as \"primary\"` alias on a NON-tenant child
+    /// that anchors to the tenancy entity IS still refused — the exemption is scoped
+    /// to the tenant entity's own self-ref, not to every aliased anchor.
+    #[test]
+    fn non_tenant_child_aliased_anchor_still_refused_after_261() {
+        const D: &str = r#"{
+            "name": "crm", "contract_version": 1,
+            "dependencies": ["db", "auth"],
+            "auth": { "model": "session", "roles": ["owner"] },
+            "tenancy": { "entity": "Org", "member_roles": ["owner"] },
+            "modules": [{
+                "name": "orgs",
+                "entities": [
+                    { "name": "Org", "fields": [{ "name": "name", "type": "string" }] },
+                    { "name": "Lead",
+                      "belongs_to": [{ "entity": "Org", "as": "primary" }],
+                      "fields": [{ "name": "name", "type": "string" }] }
+                ],
+                "endpoints": [
+                    { "operation_id": "create_org", "method": "POST", "path": "/",
+                      "auth_required": true,
+                      "request_body": { "entity": "Org" },
+                      "success": { "status": 201, "entity": "Org" } }
+                ]
+            }]
+        }"#;
+        assert!(
+            validate(&design(D)).iter().any(|q| {
+                q.question.contains("JC0560")
+                    && q.question
+                        .contains("anchors an entity to the tenancy entity")
+            }),
+            "a NON-tenant child's aliased tenancy anchor must STILL be refused (#261 asymmetry)"
         );
     }
 
