@@ -461,6 +461,79 @@ fn seed_parents(
     }
 }
 
+/// Seed statements for the enforced same-module `belongs_to` PARENTS of a create
+/// probe's entity (#248), so a same-module DDL FK (an fk-alias #119 is always one)
+/// resolves at INSERT instead of 500-ing the `_returns_201` probe. Mirrors the
+/// `/{id}` probe: reuses `seed_parents`, which excludes the identity fk (handler-
+/// injected) and the tenancy entity (app()-seeded), and skips a cross-module fk
+/// (no in-module creator → an unenforced relation whose `1` fixture needs no row).
+/// Aliased fks (`from_account_id`/`to_account_id`) both target ONE parent entity, so
+/// `seed_parents` seeds it once and both fks resolve to it. Empty (byte-identical)
+/// for a non-create endpoint, a bodyless/inline create, or an entity with no such
+/// parent.
+fn create_probe_parent_seed(
+    design: &Design,
+    unit: &ModuleDesign,
+    base: &str,
+    ep: &Endpoint,
+    auth: bool,
+) -> String {
+    if ep.method != HttpMethod::POST {
+        return String::new();
+    }
+    let Some(entity_name) = ep.request_body.as_ref().and_then(|rb| rb.entity.as_deref()) else {
+        return String::new();
+    };
+    let Some(entity) = unit.entities.iter().find(|e| e.name == entity_name) else {
+        return String::new();
+    };
+    let mut seed = String::new();
+    let mut seen = vec![entity.name.clone()];
+    seed_parents(design, unit, base, entity, auth, &mut seed, &mut seen);
+    seed
+}
+
+/// The distinct pk the tenancy entity's own create probe must post so it doesn't
+/// 409 against the tenant row app() auto-seeds (#249). `app()` seeds the tenant at
+/// id 1 (and id 2 for the isolation second tenant) whenever this module needs the
+/// tenant seed, so a create body reusing the fixture pk `1` collides. Returns
+/// `Some(("id", "3"))` — a pk past BOTH auto-seeded tenants — when: `ep` is a POST
+/// whose body IS the tenancy entity, this module seeds the tenant
+/// (`module_needs_tenant`, the SAME gate that also emits the second-tenant seed),
+/// and the tenancy entity carries an explicit integer `id` the create body posts.
+/// None otherwise — a synthetic-pk tenancy entity autoincrements past the seed for
+/// free, and a non-tenancy create is untouched — so every existing suite stays
+/// byte-identical.
+fn tenancy_create_pk_override(
+    design: &Design,
+    unit: &ModuleDesign,
+    ep: &Endpoint,
+) -> Option<(&'static str, &'static str)> {
+    if ep.method != HttpMethod::POST {
+        return None;
+    }
+    let tenancy = design.tenancy.as_ref()?;
+    let entity_name = ep
+        .request_body
+        .as_ref()
+        .and_then(|rb| rb.entity.as_deref())?;
+    if entity_name != tenancy.entity {
+        return None;
+    }
+    if !module_needs_tenant(design, unit) {
+        return None;
+    }
+    let entity = unit.entities.iter().find(|e| e.name == entity_name)?;
+    // Only when the body carries an explicit integer pk: a synthetic pk
+    // autoincrements past the seed on its own, and the integer-literal tenant seed
+    // (`tenant_row_cols_vals`) already assumes an integer tenancy pk.
+    entity
+        .fields
+        .iter()
+        .any(|f| f.name == "id" && matches!(f.field_type, FieldType::Integer))
+        .then_some(("id", "3"))
+}
+
 /// True when this endpoint's SUCCESS requires a credential/signature the generator
 /// cannot synthesize, so a minimal-body probe can never reach the designed success
 /// status. Two shapes: (a) a signature-authenticated webhook (Stripe-style — a bad
@@ -768,9 +841,24 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 );
             }
         } else if param_count(ep) == 0 {
-            let request = request_expr(design, unit, ep, &full_path, guarded, &[]);
+            // #249: the tenancy entity's own create probe must NOT reuse the pk
+            // app() auto-seeds for the tenant (id 1, and id 2 for the isolation
+            // second tenant) — that would 409 on the PK. Post a distinct pk so the
+            // create reaches its 201. None (byte-identical) for every non-tenancy
+            // create and for a synthetic-pk tenancy entity (whose create
+            // autoincrements past the seed for free).
+            let pk_override = tenancy_create_pk_override(design, unit, ep);
+            let overrides: Vec<(&str, &str)> = pk_override.into_iter().collect();
+            let request = request_expr(design, unit, ep, &full_path, guarded, &overrides);
+            // #248: a create whose body carries an enforced same-module belongs_to fk
+            // (e.g. an fk-alias `Transfer belongs_to Account as from/to`) needs its
+            // parent rows seeded first, or the DDL FK violation 500s the 201 probe —
+            // mirror the /{id} probe (`seed_parents`). Empty (byte-identical) for a
+            // create without such a parent.
+            let seed = create_probe_parent_seed(design, unit, &cbase, ep, auth);
             // A creator that echoes its entity must echo the id it was given —
-            // catches inserts that return a backend default (0) instead.
+            // catches inserts that return a backend default (0) instead. When the pk
+            // was bumped (#249) the echo asserts the bumped value, not the fixture.
             let id_echo = (ep.method == HttpMethod::POST)
                 .then_some(ep.request_body.as_ref())
                 .flatten()
@@ -778,13 +866,18 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                 .filter(|entity| ep.success.entity.as_deref() == Some(entity))
                 .and_then(|entity| unit.entities.iter().find(|e| e.name == entity))
                 .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
-                .map(|f| format!(
-                    "    let body: serde_json::Value = serde_json::from_str(&res.text()).expect(\"json body\");\n    assert_eq!(body[\"id\"], serde_json::json!({}), \"design: created {} echoes its id\");\n",
-                    fixture_value(f), ep.success.entity.as_deref().unwrap_or("entity")
-                ))
+                .map(|f| {
+                    let echoed = pk_override
+                        .map(|(_, v)| v.to_string())
+                        .unwrap_or_else(|| fixture_value(f));
+                    format!(
+                        "    let body: serde_json::Value = serde_json::from_str(&res.text()).expect(\"json body\");\n    assert_eq!(body[\"id\"], serde_json::json!({echoed}), \"design: created {} echoes its id\");\n",
+                        ep.success.entity.as_deref().unwrap_or("entity")
+                    )
+                })
                 .unwrap_or_default();
             out.code.push_str(&format!(
-                "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n{id_echo}}}\n\n"
+                "#[tokio::test]\nasync fn {fn_base}_returns_{status}() {{\n    let t = app().await;\n{seed}    let res = {request};\n    assert_eq!(res.status().as_u16(), {status}, \"design: {fn_base} -> {status}; body: {{}}\", res.text());\n{id_echo}}}\n\n"
             ));
             out.count += 1;
             if guarded {
@@ -2570,10 +2663,33 @@ fn member_surface_tests(design: &Design, module: &ModuleDesign) -> String {
     t
 }
 
+/// The SQL literal for a field's server-owned `default` (#249): a seeded row must
+/// store what the DB actually would — the declared default — not the generic `1`
+/// fixture, or a `reserve_against` counter (`seats_used default:0`) is seeded AT
+/// capacity and its reserve probe 409s (Ok(false) → 409, never the asserted 200).
+/// None when the field has no default, so every non-defaulted field keeps its prior
+/// seed literal → byte-identical for designs without a defaulted seed column.
+fn default_sql_literal(f: &Field) -> Option<String> {
+    Some(match f.default.as_ref()? {
+        serde_json::Value::String(s) => format!("'{s}'"),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        // A json/array/object/null default is unusual in a seed; render its JSON text
+        // as a quoted literal (matching the Json field seed shape).
+        other => format!("'{other}'"),
+    })
+}
+
 /// A SQL literal for seeding a tenant-row column. Enum fields use their first
 /// declared value (so a CHECK constraint passes); other fields use a type-shaped
 /// literal. String/text literals are single-quoted for inline DDL execution.
 fn seed_sql_value(f: &Field) -> String {
+    // #249: a server-owned `default` seeds its declared value (a `default:0` counter
+    // → 0), so a `reserve_against` counter is not seeded AT capacity (its reserve
+    // probe would 409 instead of the asserted 200). Gated on `default` being present.
+    if let Some(lit) = default_sql_literal(f) {
+        return lit;
+    }
     if let Some(values) = &f.values
         && let Some(first) = values.first()
     {
@@ -2627,6 +2743,12 @@ fn seed_sql_value(f: &Field) -> String {
 fn seed_sql_value_n(f: &Field, n: u32) -> String {
     if n == 1 {
         return seed_sql_value(f);
+    }
+    // #249: a defaulted column is the same for EVERY tenant — honor the default for
+    // the Nth tenant too so tenant 1 and tenant 2 stay consistent (byte-identical
+    // for a non-defaulted column).
+    if let Some(lit) = default_sql_literal(f) {
+        return lit;
     }
     if let Some(values) = &f.values
         && let Some(first) = values.first()

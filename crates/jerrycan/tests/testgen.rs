@@ -3474,3 +3474,235 @@ fn composite_unique_skips_with_agent_todo_when_a_competing_group_masks() {
         "each masked composite group must emit an AGENT TODO:\n{generated}"
     );
 }
+
+/// #248: a CREATE success probe for an entity with an enforced SAME-MODULE
+/// belongs_to fk (an fk-alias #119 is always one — same module ⇒ real DDL FK) must
+/// seed its parent row FIRST, or the transfer INSERT trips the FK constraint and
+/// 500s a probe that asserts 201 — an un-greenable happy-path test. WHY (Rule 9):
+/// the `/{id}` probe already seeds parents; the create probe silently did not, so a
+/// correct ledger app was wedged with a permanently-red `create_transfer_returns_201`
+/// no handler work could fix. Aliased fks (`from_account_id`/`to_account_id`) both
+/// target ONE `Account`, so it is seeded ONCE and both fks resolve to id 1.
+#[test]
+fn create_probe_seeds_enforced_same_module_belongs_to_parents() {
+    const FK_ALIAS: &str = r#"{
+        "name": "ledger-api", "contract_version": 0,
+        "auth": { "model": "session", "roles": ["owner"] },
+        "dependencies": ["db", "auth"],
+        "modules": [{
+            "name": "ledger",
+            "entities": [
+                { "name": "Account", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "name", "type": "string" } ] },
+                { "name": "Transfer",
+                  "belongs_to": [
+                    { "entity": "Account", "as": "from_account" },
+                    { "entity": "Account", "as": "to_account" } ],
+                  "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "amount", "type": "integer" } ] } ],
+            "endpoints": [
+                { "operation_id": "create_account", "method": "POST", "path": "/accounts",
+                  "auth_required": true, "request_body": { "entity": "Account" },
+                  "success": { "status": 201, "entity": "Account" } },
+                { "operation_id": "create_transfer", "method": "POST", "path": "/",
+                  "auth_required": true, "request_body": { "entity": "Transfer" },
+                  "success": { "status": 201, "entity": "Transfer" } } ]
+        }]
+    }"#;
+    let d: Design = serde_json::from_str(FK_ALIAS).unwrap();
+    assert!(
+        jerrycan::platform::questions::validate(&d).is_empty(),
+        "fixture must validate clean: {:?}",
+        jerrycan::platform::questions::validate(&d)
+    );
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    let transfer = test_body(&generated, "create_transfer_returns_201");
+    // The parent Account is seeded BEFORE the transfer POST, so both aliased fks
+    // resolve to a real row.
+    assert!(
+        transfer.contains("// seed parent Account id 1"),
+        "the create probe must seed its enforced same-module parent first:\n{transfer}"
+    );
+    let seed_line = transfer
+        .lines()
+        .find(|l| l.contains("seed parent Account id 1"))
+        .unwrap();
+    let post_line = transfer.lines().find(|l| l.contains("/ledger/\"")).unwrap();
+    assert!(
+        generated.find(seed_line).unwrap() < generated.find(post_line).unwrap(),
+        "the parent seed must precede the transfer POST:\n{transfer}"
+    );
+    assert!(
+        transfer.contains("\"from_account_id\": 1") && transfer.contains("\"to_account_id\": 1"),
+        "both aliased fks point at the single seeded Account id 1:\n{transfer}"
+    );
+    // Byte-identity: the PARENT's own create probe (Account has no belongs_to) gains
+    // NO seed line — the fix fires only for an entity WITH an enforced parent.
+    let account = test_body(&generated, "create_account_returns_201");
+    assert!(
+        !account.contains("// seed parent"),
+        "a parentless create probe must be unchanged (no parent seed):\n{account}"
+    );
+}
+
+/// #248 byte-identity: a CROSS-module belongs_to (no in-module creator ⇒ an
+/// UNENFORCED relation whose `1` fixture needs no row) must NOT gain a parent seed —
+/// exactly as the `/{id}` probe already behaves. WHY: seeding a parent that lives in
+/// another module has no creator to call, and the fk is not a real DDL FK, so the
+/// create probe stays byte-identical to the pre-#248 generator.
+#[test]
+fn create_probe_does_not_seed_cross_module_belongs_to() {
+    const CROSS: &str = r#"{
+        "name": "cross-api", "contract_version": 0, "dependencies": ["db"],
+        "modules": [
+            { "name": "authors",
+              "entities": [{ "name": "Author", "fields": [
+                  { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ] }],
+              "endpoints": [
+                  { "operation_id": "create_author", "method": "POST", "path": "/",
+                    "request_body": { "entity": "Author" },
+                    "success": { "status": 201, "entity": "Author" } } ] },
+            { "name": "books",
+              "entities": [{ "name": "Book", "belongs_to": [{ "entity": "Author" }],
+                  "fields": [{ "name": "id", "type": "integer" }, { "name": "title", "type": "string" }] }],
+              "endpoints": [
+                  { "operation_id": "create_book", "method": "POST", "path": "/",
+                    "request_body": { "entity": "Book" },
+                    "success": { "status": 201, "entity": "Book" } } ] }
+        ]
+    }"#;
+    let d: Design = serde_json::from_str(CROSS).unwrap();
+    assert!(
+        jerrycan::platform::questions::validate(&d).is_empty(),
+        "fixture must validate clean: {:?}",
+        jerrycan::platform::questions::validate(&d)
+    );
+    let books = d.modules.iter().find(|m| m.name == "books").unwrap();
+    let generated = testgen::acceptance_rs(&d, books);
+    let create = test_body(&generated, "create_book_returns_201");
+    assert!(
+        !create.contains("// seed parent"),
+        "a cross-module belongs_to has no in-module creator — no parent seed:\n{create}"
+    );
+}
+
+/// #249: the tenancy entity's OWN create probe must not collide with the tenant
+/// row `app()` auto-seeds, and its reserve counter must be seeded at its declared
+/// `default` (not the generic fixture that could equal capacity). WHY (Rule 9): in
+/// a module that also owns a tenant-owned child, `app()` seeds tenant id 1 (and id 2
+/// for the isolation second tenant); a `create_workspace` reusing pk `1` 409s on the
+/// PK, and a `seats_used default:0` counter seeded at the generic `1` is born AT a
+/// `seat_limit` of `1`, so its reserve probe 409s (Ok(false)) instead of the asserted
+/// 200. Both were un-greenable happy-path tests — a green-means-safe inverse.
+#[test]
+fn tenancy_create_and_reserve_probes_are_greenable() {
+    const SEATS: &str = r#"{
+        "name": "seat-api", "contract_version": 0,
+        "auth": { "model": "session", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+        "modules": [{
+            "name": "workspaces",
+            "entities": [
+                { "name": "Workspace", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "name", "type": "string" },
+                    { "name": "seat_limit", "type": "integer" },
+                    { "name": "seats_used", "type": "integer", "default": 0, "reserve_against": "seat_limit" } ] },
+                { "name": "Project", "belongs_to": [{ "entity": "Workspace" }],
+                  "fields": [{ "name": "id", "type": "integer" }, { "name": "title", "type": "string" }] } ],
+            "endpoints": [
+                { "operation_id": "create_workspace", "method": "POST", "path": "/", "auth_required": true,
+                  "request_body": { "entity": "Workspace" },
+                  "success": { "status": 201, "entity": "Workspace" } },
+                { "operation_id": "reserve_seat", "method": "POST", "path": "/{id}/reserve", "auth_required": true,
+                  "success": { "status": 200 } } ]
+        }]
+    }"#;
+    let d: Design = serde_json::from_str(SEATS).unwrap();
+    assert!(
+        jerrycan::platform::questions::validate(&d).is_empty(),
+        "fixture must validate clean: {:?}",
+        jerrycan::platform::questions::validate(&d)
+    );
+    let module = &d.modules[0];
+    let generated = testgen::acceptance_rs(&d, module);
+
+    // (a) app() seeds tenant 1 AND tenant 2 (the isolation second tenant).
+    assert!(
+        generated.contains(
+            "INSERT INTO \\\"workspaces\\\" (id, \\\"name\\\", \\\"seat_limit\\\", \\\"seats_used\\\") VALUES (1, 'test-value', 1, 0)"
+        ),
+        "tenant 1's seat counter must seed at its default 0 (not the generic 1 = capacity):\n{generated}"
+    );
+    assert!(
+        generated.contains(
+            "INSERT INTO \\\"workspaces\\\" (id, \\\"name\\\", \\\"seat_limit\\\", \\\"seats_used\\\") VALUES (2, 'test-value-2', 2, 0)"
+        ),
+        "tenant 2's seat counter must ALSO seed at its default 0:\n{generated}"
+    );
+
+    // (b) the create probe posts a pk PAST both seeded tenants (3), and echoes it.
+    let create = test_body(&generated, "create_workspace_returns_201");
+    assert!(
+        create.contains("\"id\": 3"),
+        "the tenancy create probe must post a non-colliding pk (past tenants 1 and 2):\n{create}"
+    );
+    assert!(
+        create.contains("serde_json::json!(3)"),
+        "the id-echo must assert the bumped pk, not the fixture:\n{create}"
+    );
+    assert!(
+        !create.contains("\"id\": 1"),
+        "the tenancy create probe must NOT reuse the seeded tenant pk 1:\n{create}"
+    );
+
+    // (c) the reserve probe operates on the app-seeded tenant (id 1), whose counter
+    // is now BELOW capacity, so a correct handler reaches 200.
+    let reserve = test_body(&generated, "reserve_seat_returns_200");
+    assert!(
+        reserve.contains("/workspaces/1/reserve"),
+        "the reserve probe hits the app-seeded tenant id 1:\n{reserve}"
+    );
+    assert!(
+        reserve.contains("as_u16(), 200"),
+        "the reserve probe asserts its designed 200:\n{reserve}"
+    );
+}
+
+/// #249 byte-identity: a non-tenancy create with a defaulted field is UNCHANGED —
+/// the pk override fires only for the tenancy entity in a tenant-seeding module, and
+/// the create body still drops the defaulted field (server-owned), so the emission
+/// stays byte-identical to the pre-#249 generator.
+#[test]
+fn non_tenancy_create_with_default_is_unchanged() {
+    const PLAIN: &str = r#"{
+        "name": "plain-api", "contract_version": 0, "dependencies": ["db"],
+        "modules": [{
+            "name": "items",
+            "entities": [{ "name": "Item", "fields": [
+                { "name": "id", "type": "integer" },
+                { "name": "name", "type": "string" },
+                { "name": "active", "type": "boolean", "default": false } ] }],
+            "endpoints": [
+                { "operation_id": "create_item", "method": "POST", "path": "/",
+                  "request_body": { "entity": "Item" },
+                  "success": { "status": 201, "entity": "Item" } } ]
+        }]
+    }"#;
+    let d: Design = serde_json::from_str(PLAIN).unwrap();
+    let generated = testgen::acceptance_rs(&d, &d.modules[0]);
+    let create = test_body(&generated, "create_item_returns_201");
+    // The pk stays the fixture 1 (no tenant to collide with) and the defaulted
+    // `active` is omitted from the create body (server-owned).
+    assert!(
+        create.contains("\"id\": 1") && create.contains("serde_json::json!(1)"),
+        "a non-tenancy create keeps the fixture pk 1:\n{create}"
+    );
+    assert!(
+        !create.contains("active"),
+        "the defaulted field is still dropped from the create body:\n{create}"
+    );
+}
