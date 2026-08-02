@@ -10,7 +10,9 @@
   own workspace. The repo now emits `require_membership_role(user, id, roles)`, which resolves the row's
   tenant and checks the caller's role in `{tenant}_members` — keyed on the row's tenant (fail-closed: a
   non-member, wrong role, or missing row all 403; no cross-tenant escalation). The generated isolation
-  test's role-gated leg now asserts 403, so a regression to the session-role check turns it red.
+  test's role-gated leg now asserts 403, so a regression to the session-role check turns it red. (The
+  membership gate precedes the id lookup, so a missing id answers 403, not 404 — the generic
+  `_missing_id_is_404` probe is suppressed for this shape, mirroring credential-gated routes.)
 - **A non-canonically-named tenant mount param is now refused, not silently decorative (#250).** A
   tenant-owned entity mounted at e.g. `/spaces/{ws_id}` when its fk is `workspace_id` was silently
   classified flat — `{ws_id}` was decorative (`/spaces/1/` and `/spaces/999/` behaved identically),
