@@ -70,9 +70,16 @@ impl LocalBus {
     }
 
     pub(crate) async fn publish(&self, msg: BusMessage) -> jerrycan_core::Result<()> {
-        // No receivers is fine (nothing subscribed yet during startup).
-        let _ = self.tx.send(msg);
+        self.publish_sync(msg);
         Ok(())
+    }
+
+    /// Synchronous publish: a broadcast enqueue is already non-blocking, so a
+    /// caller with no async context (a slow-consumer drop happens inside sync
+    /// fan-out — see [`AnyBus::publish_detached`]) can publish inline. No
+    /// receivers is fine (nothing subscribed yet during startup).
+    pub(crate) fn publish_sync(&self, msg: BusMessage) {
+        let _ = self.tx.send(msg);
     }
 
     pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<BusMessage> {
@@ -84,8 +91,11 @@ impl LocalBus {
 /// registration; the Redis variant connects lazily inside the supervisor.
 pub(crate) enum AnyBus {
     Local(LocalBus),
+    // `Arc` so a synchronous slow-consumer drop can hand a detached publish task
+    // a `'static` handle without threading `Arc<Hub>` into the sync fan-out
+    // functions (see [`AnyBus::publish_detached`]).
     #[cfg(feature = "realtime-redis")]
-    Redis(crate::bus_redis::RedisBus),
+    Redis(std::sync::Arc<crate::bus_redis::RedisBus>),
 }
 
 impl AnyBus {
@@ -94,6 +104,26 @@ impl AnyBus {
             AnyBus::Local(b) => b.publish(msg).await,
             #[cfg(feature = "realtime-redis")]
             AnyBus::Redis(b) => b.publish(msg).await,
+        }
+    }
+
+    /// Publish from a SYNCHRONOUS context. A slow-consumer drop (`send_to`,
+    /// `deliver_change`, `broadcast_presence_diff`) must publish the dropped
+    /// connection's presence leaves (#241) but runs inside sync fan-out that
+    /// cannot `.await`. The in-process `LocalBus` send is already non-blocking,
+    /// so it runs inline; the Redis publish is async network I/O, so it is handed
+    /// to a detached task. Fire-and-forget — the same at-most-once tolerance the
+    /// async `publish` already has (it ignores send errors).
+    pub(crate) fn publish_detached(&self, msg: BusMessage) {
+        match self {
+            AnyBus::Local(b) => b.publish_sync(msg),
+            #[cfg(feature = "realtime-redis")]
+            AnyBus::Redis(b) => {
+                let bus = std::sync::Arc::clone(b);
+                tokio::spawn(async move {
+                    let _ = bus.publish(msg).await;
+                });
+            }
         }
     }
 

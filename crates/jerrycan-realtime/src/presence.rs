@@ -297,6 +297,49 @@ impl crate::Hub {
         }
     }
 
+    /// Remove a connection AND publish a presence leave for every key it still
+    /// owned — the shared teardown funnel for the SYNCHRONOUS slow-consumer drop
+    /// paths (`send_to`, `deliver_change`, `broadcast_presence_diff`). A full or
+    /// closed outbound queue drops the conn from `conns` right here, so the
+    /// per-connection loop's later `disconnect` finds it already gone and
+    /// early-returns; without this its `PresenceClear` leaves would NEVER be
+    /// published and the member would stay "online" forever (the local node
+    /// never expires from `sweep`, which is node-granularity) — the #241 phantom.
+    /// Mirrors `presence_disconnect`'s leave-publishing exactly, but publishes
+    /// via `publish_detached` because the drop happens in a context that cannot
+    /// `.await`. Idempotent: a later `disconnect`/`presence_disconnect` (or a
+    /// second drop) on an already-removed conn returns without publishing, and a
+    /// duplicate `PresenceClear` for an already-cleared key is a no-op
+    /// (`PresenceMap::clear` returns None ⇒ no leave diff).
+    pub(crate) fn drop_connection(&self, cid: u64) {
+        let owned: Vec<(String, Option<String>, String)> = {
+            let mut conns = self.conns.lock().expect("hub mutex");
+            let Some(sub) = conns.remove(&cid) else {
+                return;
+            };
+            sub.tracked
+                .iter()
+                .filter_map(|(id, key)| {
+                    if let ChannelId::Presence(topic) = id {
+                        let tenant_id = self.presence_tenant(topic, sub.principal.as_ref());
+                        Some((topic.clone(), tenant_id, key.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        for (topic, tenant_id, key) in owned {
+            self.bus
+                .publish_detached(crate::bus::BusMessage::PresenceClear {
+                    topic,
+                    tenant_id,
+                    key,
+                    node: self.node_id,
+                });
+        }
+    }
+
     /// Deliver a presence set from the bus: merge, then broadcast the join diff.
     pub(crate) fn deliver_presence_set(
         &self,
@@ -388,8 +431,11 @@ impl crate::Hub {
                 }
             }
         }
+        // Tear down each slow consumer AFTER the iteration (the `conns` lock is
+        // released above), publishing its presence leaves so a queue-full drop
+        // never strands a phantom online member (#241).
         for cid in drop_list {
-            self.conns.lock().expect("hub mutex").remove(&cid);
+            self.drop_connection(cid);
         }
     }
 

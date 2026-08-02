@@ -261,11 +261,20 @@ impl Hub {
 
     /// Send to one connection; a full/closed queue drops the connection.
     pub(crate) fn send_to(&self, conn: u64, msg: crate::protocol::ServerMsg) {
-        let mut conns = self.conns.lock().expect("hub mutex");
-        if let Some(sub) = conns.get(&conn)
-            && sub.tx.try_send(msg).is_err()
-        {
-            conns.remove(&conn); // slow consumer: rx closes, loop ends
+        let failed = {
+            let conns = self.conns.lock().expect("hub mutex");
+            match conns.get(&conn) {
+                Some(sub) => sub.tx.try_send(msg).is_err(),
+                None => false,
+            }
+        };
+        // Slow consumer: drop the conn (rx closes, its loop ends) AND publish its
+        // presence leaves. The conn's own loop will later call `disconnect`, but
+        // it early-returns on the now-removed conn — so this is the only place the
+        // leaves get published (#241). Done after releasing the lock above, since
+        // `drop_connection` re-locks `conns`.
+        if failed {
+            self.drop_connection(conn);
         }
     }
 
@@ -507,7 +516,7 @@ fn build_bus(rt: &Realtime) -> bus::AnyBus {
             .clone()
             .or_else(|| std::env::var("JERRYCAN_REDIS_URL").ok())
         {
-            return bus::AnyBus::Redis(bus_redis::RedisBus::new(url));
+            return bus::AnyBus::Redis(Arc::new(bus_redis::RedisBus::new(url)));
         }
     }
     let _ = rt;
@@ -639,8 +648,11 @@ impl Hub {
                 }
             }
         }
+        // Tear down each slow consumer after the fan-out (the `conns` lock is
+        // released above), publishing its presence leaves so a queue-full drop on
+        // a changes fan-out never strands a phantom online member (#241).
         for cid in drop_list {
-            self.conns.lock().expect("hub mutex").remove(&cid);
+            self.drop_connection(cid);
         }
     }
 }
@@ -1230,5 +1242,113 @@ mod delivery_tests {
             rx2.try_recv().is_err(),
             "u2 must never see u1's delete either (#216)"
         );
+    }
+
+    /// A hub with one auth-scoped presence topic (no tenant partition, so a
+    /// non-tenant principal's key lands in the `None` partition) — the fixture
+    /// for the #241 slow-consumer teardown tests.
+    fn hub_with_presence() -> Arc<Hub> {
+        let config = RealtimeConfig {
+            presence: vec![("editors".into(), TopicScope::Auth)],
+            ..Default::default()
+        };
+        Arc::new(Hub {
+            config,
+            node_id: 1,
+            bus: bus::AnyBus::Local(bus::LocalBus::new()),
+            db: None,
+            conns: Mutex::new(HashMap::new()),
+            presence: Mutex::new(presence::PresenceMap::default()),
+            changes_unavailable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            next_conn: AtomicU64::new(1),
+        })
+    }
+
+    /// Register `cid` as owning presence key `key` on topic `editors`, exactly as
+    /// a successful Track would (channel membership + a `tracked` entry) — without
+    /// needing a running supervisor to round-trip the PresenceSet.
+    fn track_presence(hub: &Arc<Hub>, cid: u64, key: &str) {
+        let id = ChannelId::Presence("editors".into());
+        let mut conns = hub.conns.lock().unwrap();
+        let sub = conns.get_mut(&cid).unwrap();
+        sub.channels.insert(id.clone());
+        sub.tracked.insert((id, key.to_string()));
+    }
+
+    /// #241 (Rule 9) — THE slow-consumer teardown contract at the `send_to` seam:
+    /// a connection dropped because its outbound queue is full/closed must still
+    /// publish its presence leaves. WHY it matters: the drop removes the conn from
+    /// `conns` directly, so the per-connection loop's later `disconnect`
+    /// early-returns on the already-gone conn and never clears the presence keys
+    /// it owned — leaving a phantom "online" member forever (the local node never
+    /// expires from the node-granularity `sweep`). This tracks a key, forces the
+    /// queue-closed drop through `send_to`, and asserts a `PresenceClear` for that
+    /// key reaches the bus. RED if the drop path reverts to a bare `conns.remove`.
+    #[tokio::test]
+    async fn send_to_slow_consumer_drop_publishes_presence_leaves() {
+        let hub = hub_with_presence();
+        let mut bus_rx = hub.bus.subscribe();
+        let (c1, rx1) = hub.connect(user("u1"));
+        track_presence(&hub, c1, "u1");
+        // Close the outbound queue so the next server send fails like a full one.
+        drop(rx1);
+
+        hub.send_to(c1, ServerMsg::HeartbeatAck { r#ref: None });
+
+        // The conn is gone (no phantom membership left in the registry) ...
+        assert!(
+            hub.conns.lock().unwrap().get(&c1).is_none(),
+            "a slow-consumer drop must remove the conn"
+        );
+        // ... AND its presence leave was published to the bus (the #241 fix). A
+        // 1s timeout instead of an unbounded recv so a regression (no publish)
+        // fails RED promptly rather than hanging.
+        match tokio::time::timeout(std::time::Duration::from_secs(1), bus_rx.recv()).await {
+            Ok(Ok(bus::BusMessage::PresenceClear {
+                topic, key, node, ..
+            })) => {
+                assert_eq!(topic, "editors");
+                assert_eq!(key, "u1", "the leave clears the dropped conn's own key");
+                assert_eq!(node, hub.node_id);
+            }
+            other => {
+                panic!("a slow-consumer drop must publish a PresenceClear leave (#241): {other:?}")
+            }
+        }
+    }
+
+    /// #241 at the OTHER drop seam: a presence-diff fan-out (`broadcast_presence_diff`,
+    /// reached here via `deliver_presence_set`) that hits a conn with a
+    /// full/closed queue must tear it down through the SAME funnel and publish its
+    /// leaves. Proves both queue-full drop paths route through `drop_connection`,
+    /// not just `send_to`. RED if `broadcast_presence_diff` reverts to a bare
+    /// `conns.remove`.
+    #[tokio::test]
+    async fn broadcast_presence_diff_slow_consumer_drop_publishes_presence_leaves() {
+        let hub = hub_with_presence();
+        let (c1, rx1) = hub.connect(user("u1"));
+        track_presence(&hub, c1, "u1");
+        drop(rx1); // closed queue
+        let mut bus_rx = hub.bus.subscribe();
+
+        // A join diff for another member fans out to the `editors` (None) partition
+        // — c1 is a subscriber, so its closed queue triggers the drop path. This
+        // call itself puts nothing on the bus; the only bus message is the
+        // PresenceClear that `drop_connection` publishes for c1's own key.
+        hub.deliver_presence_set("editors", None, "u2", 999, serde_json::json!({}));
+
+        assert!(
+            hub.conns.lock().unwrap().get(&c1).is_none(),
+            "the broadcast drop path must remove the slow consumer"
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(1), bus_rx.recv()).await {
+            Ok(Ok(bus::BusMessage::PresenceClear { topic, key, .. })) => {
+                assert_eq!(topic, "editors");
+                assert_eq!(key, "u1");
+            }
+            other => panic!(
+                "a broadcast_presence_diff drop must publish a PresenceClear leave (#241): {other:?}"
+            ),
+        }
     }
 }
