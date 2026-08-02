@@ -171,10 +171,24 @@ impl Storage {
     }
 
     fn sign_key(&self) -> Result<&[u8]> {
-        self.sign_key
-            .as_deref()
-            .map(|v| v.as_slice())
-            .ok_or_else(|| Error::internal("storage: JERRYCAN_SECRET is required for signed URLs"))
+        match self.sign_key.as_deref() {
+            Some(v) => Ok(v.as_slice()),
+            None => {
+                // Honest devex (#237): a missing `JERRYCAN_SECRET` is a known dev
+                // config gap, NOT a crash. Warn ONCE (so the operator learns at
+                // first use, not per failed request) and answer a clear 503
+                // "signing not configured" instead of a raw 500. The security
+                // posture is unchanged — we NEVER sign with an insecure default key.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "jerrycan-storage: signed URLs are DISABLED — JERRYCAN_SECRET is not set. \
+                         Set it to enable app-HMAC download signing; requests for signed URLs return 503 until then."
+                    );
+                });
+                Err(Error::signing_unconfigured())
+            }
+        }
     }
 
     /// Upload: validate key/size/mime, prepend the owner prefix, 409 on a
@@ -984,7 +998,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sign_without_secret_fails_loud() {
+    async fn sign_without_secret_is_honest_503_not_a_raw_500() {
+        // #237: a missing JERRYCAN_SECRET is a known dev-config gap, not a crash.
+        // `sign_object` must answer a clear 503 "signing not configured" (JC0511)
+        // whose message names the env var — NOT a raw 500 that reads as a bug. The
+        // security posture is unchanged (the store still refuses to sign — it never
+        // falls back to an insecure default key).
         let db = db().await;
         let s = Storage::memory(); // no sign secret
         let meta = s
@@ -1003,6 +1022,15 @@ mod tests {
             .sign_object(&db, &INVOICES, &owner("1"), &meta.id, 300, now)
             .await
             .unwrap_err();
-        assert!(err.message().contains("JERRYCAN_SECRET"), "{err}");
+        assert_eq!(
+            err.status().as_u16(),
+            503,
+            "unconfigured signing is a 503, not a raw 500: {err}"
+        );
+        assert_eq!(err.code(), "JC0511", "{err}");
+        assert!(
+            err.message().contains("JERRYCAN_SECRET"),
+            "the message must name the env var to set: {err}"
+        );
     }
 }
