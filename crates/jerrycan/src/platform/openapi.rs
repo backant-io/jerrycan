@@ -202,6 +202,29 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
                 required.push(Value::String(f.name.clone()));
             }
         }
+        // #271: in db mode the entity's `belongs_to` fk columns are real NOT-NULL
+        // columns of the row. The component is the RESPONSE shape (the serialized
+        // Model carries them) AND — when no `{Entity}Request` DTO is minted — the
+        // plain CREATE body (the client MUST send them). Building the component from
+        // `fields` alone advertised a create body missing the fk column(s), so a
+        // client generated from the contract 422'd (`missing field {fk}_id`) while
+        // the generated probe (built from the entity MODEL, not the contract) posted
+        // the full column set and greened. Spell them out — name, target-pk type,
+        // required unless nullable — mirroring `request_schema`. Memory-mode structs
+        // carry no fk columns, so the db-gate keeps every memory document identical.
+        if design.wants_db() {
+            for b in &e.belongs_to {
+                let col = b.fk_column();
+                let schema = match design.target_key_rust_type(&b.entity) {
+                    "String" => json!({ "type": "string" }),
+                    _ => json!({ "type": "integer", "format": "int64" }),
+                };
+                properties.insert(col.clone(), schema);
+                if b.on_delete != OnDelete::SetNull {
+                    required.push(Value::String(col));
+                }
+            }
+        }
         schemas.insert(
             e.name.clone(),
             json!({ "type": "object", "properties": properties, "required": required }),
@@ -624,6 +647,75 @@ mod tests {
         );
     }
 
+    /// #271: the entity component (used as the RESPONSE row AND — when no
+    /// `{Entity}Request` DTO is minted — as the plain CREATE body) must spell out the
+    /// entity's `belongs_to` fk columns in db mode: they are real NOT-NULL columns of
+    /// the row, and a create that resolves to the plain entity body needs them as
+    /// client input. Before this, `walk_schemas` built the component from `fields`
+    /// alone, so a client generated from the contract posting the advertised body got
+    /// a 422 (`missing field {fk}_id`) — while the generated probe (built from the
+    /// entity MODEL, not the contract) posted the full column set and greened, hiding
+    /// it. The `{Entity}Request` DTO path already spelled the fks out; the two
+    /// disagreed. fk-alias makes it acute (two non-identity fks). Memory mode stays
+    /// fields-only (its structs carry no fk columns) — byte-identical.
+    #[test]
+    fn entity_component_spells_out_belongs_to_fk_columns() {
+        const LEDGER: &str = r#"{
+            "name": "ledger", "contract_version": 1, "dependencies": ["db"],
+            "modules": [{ "name": "ledger",
+                "entities": [
+                    { "name": "Account", "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "name", "type": "string" } ]},
+                    { "name": "Transfer",
+                      "belongs_to": [
+                          { "entity": "Account", "as": "from_account", "on_delete": "cascade" },
+                          { "entity": "Account", "as": "to_account", "on_delete": "set_null" } ],
+                      "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "amount", "type": "integer" } ]}
+                ],
+                "endpoints": [
+                    { "operation_id": "create_transfer", "method": "POST", "path": "/transfers",
+                      "request_body": { "entity": "Transfer" },
+                      "success": { "status": 201, "entity": "Transfer" } } ] }]
+        }"#;
+        let design: Design = serde_json::from_str(LEDGER).unwrap();
+        assert!(design.wants_db(), "fixture must be db mode");
+        let d = document(&design);
+        // No DTO is minted (no identity fk / default / path-redundant fk), so the
+        // create body $refs the PLAIN entity — the component MUST carry the fks.
+        assert_eq!(
+            d["paths"]["/ledger/transfers"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                ["$ref"],
+            "#/components/schemas/Transfer",
+            "the create body is the plain entity: {}",
+            d["paths"]["/ledger/transfers"]["post"]
+        );
+        assert!(
+            d["components"]["schemas"].get("TransferRequest").is_none(),
+            "no DTO minted for a plain create: {}",
+            d["components"]["schemas"]
+        );
+        let transfer = &d["components"]["schemas"]["Transfer"];
+        // BOTH aliased fk columns are present and typed as the target pk (integer).
+        assert_eq!(transfer["properties"]["from_account_id"]["type"], "integer");
+        assert_eq!(transfer["properties"]["to_account_id"]["type"], "integer");
+        let required = transfer["required"].as_array().unwrap();
+        // A cascade (NOT NULL) fk is required; a set_null (nullable) fk is present
+        // but optional — mirrors the request-schema required rule.
+        assert!(
+            required.iter().any(|v| v == "from_account_id"),
+            "cascade fk is required: {transfer}"
+        );
+        assert!(
+            !required.iter().any(|v| v == "to_account_id"),
+            "set_null fk is present but optional: {transfer}"
+        );
+        // The declared fields are still there.
+        assert_eq!(transfer["properties"]["amount"]["type"], "integer");
+    }
+
     /// #269: a 204 (No Content) or a 3xx (redirect) success emits NO response body
     /// in the contract even when the route declares an `entity`/`list`, because the
     /// generated handler is `NoContent`/`Redirect` (empty-bodied). A 204-with-body is
@@ -1030,6 +1122,16 @@ mod tests {
             d["components"]["schemas"].get("NoteRequest").is_none(),
             "memory mode mints no request DTO component: {}",
             d["components"]["schemas"]
+        );
+        // #271 gate-lock: the memory-mode `Note` component omits the `belongs_to` fk
+        // columns — the memory Model struct (`model_rs`) carries only `fields`, so the
+        // plain `Json<Note>` body has no `user_id`/`folder_id`. This positively pins
+        // the `wants_db()` gate on the fk emission: if that gate were dropped, this
+        // memory component would gain server-supplied fk columns the struct lacks.
+        let note = &d["components"]["schemas"]["Note"]["properties"];
+        assert!(
+            note.get("user_id").is_none() && note.get("folder_id").is_none(),
+            "memory-mode entity component carries no fk columns: {note}"
         );
     }
 
