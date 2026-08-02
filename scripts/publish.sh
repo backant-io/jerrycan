@@ -79,14 +79,20 @@ if [ "${SKIP_PG_GATE:-0}" != "1" ]; then
   # wal_level=logical, so both point at the same DB. (bus_redis needs Redis →
   # heavy.yml only.)
   echo "=== PG behavioral gate: realtime CDC (triggers + logical replication) ==="
-  JERRYCAN_TEST_PG="$JERRYCAN_TEST_PG_URL" \
-    cargo test -p jerrycan-realtime --lib \
-      changes::triggers::tests::triggers_install_idempotently_and_stream_insert_update_delete \
-      -- --ignored --test-threads=1
-  JERRYCAN_TEST_PG_LOGICAL="$JERRYCAN_TEST_PG_URL" \
-    cargo test -p jerrycan-realtime --lib \
-      changes::replication::tests::replication_streams_insert_and_reconcile_is_idempotent \
-      -- --ignored --test-threads=1
+  # #251: run the WHOLE ignored `changes::` module set (both CDC tests + any
+  # future one), NOT exact test-name filters — a mistyped/renamed name filter
+  # matches nothing and cargo test exits 0 (green), silently gating nothing (the
+  # #213 class). `changes::` excludes `bus_redis` (needs Redis → heavy.yml). Both
+  # env vars are set (triggers read JERRYCAN_TEST_PG, replication JERRYCAN_TEST_PG_LOGICAL;
+  # the local gate DB is wal_level=logical so both point at it). The drift-guard
+  # below FAILS the gate if the filter matched zero tests.
+  cdc_out=$(JERRYCAN_TEST_PG="$JERRYCAN_TEST_PG_URL" JERRYCAN_TEST_PG_LOGICAL="$JERRYCAN_TEST_PG_URL" \
+    cargo test -p jerrycan-realtime --lib changes:: -- --ignored --test-threads=1 2>&1)
+  echo "$cdc_out"
+  if ! echo "$cdc_out" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
+    echo "ERROR: the realtime CDC gate ran 0 tests (filter drift or all skipped) — failing the release."
+    exit 1
+  fi
   echo "=== PG behavioral gate GREEN ==="
 else
   echo "!!! SKIP_PG_GATE=1 — skipping the Postgres behavioral gate (emergency republish only) !!!"
