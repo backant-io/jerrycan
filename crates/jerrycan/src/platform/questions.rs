@@ -2673,6 +2673,33 @@ fn validate_module(
                     }
                     // The SAME #47/#80/default per-field checks as an entity field.
                     check_field_shape(f, &fptr, wants_db, qs);
+                    // JC0567 (#235): an inline field is an ad-hoc custom-action body,
+                    // NOT a table row — there is no codegen server-set path (no entity
+                    // is built, no column is written, no server-set steer is emitted).
+                    // So `default`/`write_only`, which the entity path honors via the
+                    // Model + request-DTO omission, are silently DROPPED on the inline
+                    // path — worse, a REQUIRED defaulted field inverts into a required,
+                    // un-defaulted, client-supplied field (the #110 `now` timestamp
+                    // becomes client-backdatable). Refuse both up front, directing the
+                    // author to omit the field and set/handle it in the handler.
+                    if f.default.is_some() {
+                        qs.push(q(
+                            format!("{fptr}/default"),
+                            format!(
+                                "Inline field `{}` on endpoint `{}` declares a `default` — a `default` is not supported on an inline `request_body` field: an inline DTO is an ad-hoc custom-action body, not a table row, so there is no codegen server-set path to apply it (no entity is built, no DB column is written, no server-set steer is emitted). It would be silently dropped — and a REQUIRED defaulted field would invert into a required, un-defaulted client field (a `now` timestamp, #110, would become client-backdatable). Omit the field from the inline body and set it in the handler. See `jerrycan explain JC0567`.",
+                                f.name, ep.operation_id
+                            ),
+                        ));
+                    }
+                    if Design::field_is_write_only(f) {
+                        qs.push(q(
+                            format!("{fptr}/write_only"),
+                            format!(
+                                "Inline field `{}` on endpoint `{}` is `write_only` (an explicit flag, or the auto-classified `password_hash` name) — `write_only` is not supported on an inline `request_body` field: it response-hides a column on the generated Model (issue #112), but an inline DTO is a custom-action body with no companion response Model, so the flag has nothing to hide and is silently dropped. Omit the flag (rename a `password_hash` inline field); if a value must not appear in a response, don't echo it from the handler. See `jerrycan explain JC0567`.",
+                                f.name, ep.operation_id
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -2850,6 +2877,88 @@ mod tests {
                 .any(|q| q.question.contains("JC0561") && q.question.contains("twice")),
             "duplicate inline field must trip JC0561: {:?}",
             validate(&dup)
+        );
+    }
+
+    /// JC0567 (#235): `default`/`write_only` on an INLINE `request_body` field is
+    /// refused — an inline DTO is an ad-hoc custom-action body with no codegen
+    /// server-set path, so a `default` would silently invert into a required,
+    /// un-defaulted client field (a `now` timestamp becomes client-backdatable) and
+    /// a `write_only` inline field has no companion response Model to hide it on. A
+    /// clean inline body stays question-free, and — critically — the SAME
+    /// `default`/`write_only` on an ENTITY field is NOT refused (the entity path
+    /// honors both), so the refusal targets ONLY the inline path.
+    #[test]
+    fn jc0567_refuses_default_and_write_only_on_inline_fields() {
+        let base = |body: &str| -> Design {
+            serde_json::from_str(&format!(
+                r#"{{ "name": "shop-api", "contract_version": 0, "dependencies": ["db"],
+                    "modules": [{{ "name": "checkout", "endpoints": [
+                        {{ "operation_id": "checkout", "method": "POST", "path": "/apply",
+                          "request_body": {body},
+                          "success": {{ "status": 200 }} }}] }}] }}"#,
+            ))
+            .expect("valid design json")
+        };
+
+        // A `default` on an inline field → JC0567.
+        let dflt =
+            base(r#"{ "fields": [ { "name": "at", "type": "datetime", "default": "now" } ] }"#);
+        assert!(
+            validate(&dflt)
+                .iter()
+                .any(|q| q.question.contains("JC0567") && q.question.contains("default")),
+            "inline default must trip JC0567: {:?}",
+            validate(&dflt)
+        );
+
+        // An explicit `write_only` inline field → JC0567.
+        let wo =
+            base(r#"{ "fields": [ { "name": "secret", "type": "string", "write_only": true } ] }"#);
+        assert!(
+            validate(&wo)
+                .iter()
+                .any(|q| q.question.contains("JC0567") && q.question.contains("write_only")),
+            "inline write_only must trip JC0567: {:?}",
+            validate(&wo)
+        );
+
+        // A `password_hash`-named inline field is AUTO-classified write_only → JC0567
+        // (the silent-drop the fix closes; `f.write_only` alone would miss it).
+        let pw = base(r#"{ "fields": [ { "name": "password_hash", "type": "string" } ] }"#);
+        assert!(
+            validate(&pw).iter().any(|q| q.question.contains("JC0567")),
+            "auto-classified password_hash inline field must trip JC0567: {:?}",
+            validate(&pw)
+        );
+
+        // A clean inline body (no default/write_only) stays question-free.
+        let clean = base(r#"{ "fields": [ { "name": "amount", "type": "integer", "min": 1 } ] }"#);
+        assert!(
+            validate(&clean).is_empty(),
+            "clean inline body must be question-free: {:?}",
+            validate(&clean)
+        );
+
+        // The SAME default/write_only on an ENTITY field is NOT refused — the entity
+        // path drops the default from the DTO and hides write_only on the Model. This
+        // proves JC0567 is scoped to the inline path, not `default`/`write_only` at large.
+        let entity: Design = serde_json::from_str(
+            r#"{ "name": "shop-api", "contract_version": 0, "dependencies": ["db"],
+                "modules": [{ "name": "checkout",
+                  "entities": [{ "name": "Order", "fields": [
+                    { "name": "created_at", "type": "datetime", "default": "now" },
+                    { "name": "token", "type": "string", "write_only": true } ] }],
+                  "endpoints": [
+                    { "operation_id": "create_order", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Order" },
+                      "success": { "status": 201, "entity": "Order" } }] }] }"#,
+        )
+        .expect("valid entity design");
+        assert!(
+            validate(&entity).is_empty(),
+            "entity default/write_only must stay question-free: {:?}",
+            validate(&entity)
         );
     }
 

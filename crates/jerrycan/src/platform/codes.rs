@@ -104,6 +104,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs app",
     },
     CodeInfo {
+        code: "JC0511",
+        title: "signed URLs not configured",
+        cause: "a request asked jerrycan-storage for a signed download URL (`sign`/`sign_object`) but `JERRYCAN_SECRET` is unset, so the app-HMAC signing key is absent — a known dev-config gap, not a server crash. The store never signs with an insecure default key (the security posture stays), so it answers 503 (the capability is unavailable pending configuration) with a one-time boot/first-use warning on stderr, rather than a raw 500 that reads as a bug",
+        fix: "set `JERRYCAN_SECRET` (the same secret the app's auth uses) to enable app-HMAC signed URLs; on an S3 backend native presigning is used instead and needs no `JERRYCAN_SECRET`",
+        doc: "jerrycan docs storage",
+    },
+    CodeInfo {
         code: "JC0510",
         title: "database error",
         cause: "a jerrycan-db query/connection failed",
@@ -381,6 +388,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         cause: "the design's `auth.identity` (issue #150) names an entity that is not declared anywhere in the module tree — but per-user owner-scoping, the #34 server-injected fk, and `public_read` all DETECT ownership by the identity's derived fk column (`snake(auth.identity)_id`), so an identity mapping to no entity resolves to a fk column no entity carries: every owned entity silently loses owner-scoping (any authenticated caller reads and writes every row) and the fk stays client-writable, behind a green `check`",
         fix: "declare an entity named exactly `auth.identity` (the entity the authenticated session principal maps to; owned entities `belongs_to` it), or drop `auth.identity` to use the default `User` — the membership-table principal column stays `user_id` either way",
         doc: "jerrycan docs auth",
+    },
+    CodeInfo {
+        code: "JC0567",
+        title: "default/write_only on an inline request_body field",
+        cause: "an inline `request_body` field (issue #122) declares `default` or `write_only` — but an inline DTO is an ad-hoc custom-action body, NOT a table row, so there is no codegen server-set path the way the entity path has one (no entity is built, no DB column is written, no server-set steer comment is emitted, and there is no companion response Model). The entity path honors `default` by DROPPING the field from `{Entity}Request` and having the handler set it (a `now` timestamp via `now_rfc3339()`, #110), and honors `write_only` with `#[serde(skip_serializing)]` on the Model (#112). On the inline path both were silently DROPPED: a `default` field kept its declared shape, so a REQUIRED defaulted field INVERTED into a required, un-defaulted, client-supplied field — a `default: \"now\"` timestamp became a client-backdatable required input, the exact opposite of the #110 contract — and a `write_only` inline field had no Model to hide it on, leaking if the handler ever echoed the struct",
+        fix: "omit the field from the inline `request_body` and set/handle it in the agent-owned handler: a server timestamp with `now_rfc3339()`, a static default as a literal, a secret read straight from the deserialized body without echoing it in the response. If you need a persisted default, model a table entity and use an `{\"entity\": …}` request body instead of an inline `fields` body",
+        doc: "jerrycan docs designing",
     },
     CodeInfo {
         code: "JC0530",
