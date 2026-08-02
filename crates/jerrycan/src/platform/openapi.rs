@@ -123,18 +123,29 @@ fn operation(design: &Design, m: &ModuleDesign, ep: &Endpoint) -> Value {
     }
 
     let params: Vec<Value> = {
-        // every {x} in route order, integer in v0 (the generator emits i64)
+        // every {x} in route order. #278: type each param by the entity it references
+        // via the SHARED `genroute::path_param_rust_type` — the same resolver the
+        // handler `Path<T>` extractor uses — so the contract can't drift from the code.
+        // A text/uuid-pk entity's `/{id}` route extracts `Path<String>`, so its param
+        // is a string, not the old hardcoded `int64`. (Mirrors the member-surface
+        // param typing; an opaque param names no entity and stays `integer`.)
         let mut out = Vec::new();
         let mut rest = ep.path.as_str();
         while let Some(start) = rest.find('{') {
             let Some(end_rel) = rest[start..].find('}') else {
                 break;
             };
+            let name = &rest[start + 1..start + end_rel];
+            let schema = match crate::platform::genroute::path_param_rust_type(m, ep, design, name)
+            {
+                "String" => json!({ "type": "string" }),
+                _ => json!({ "type": "integer", "format": "int64" }),
+            };
             out.push(json!({
-                "name": rest[start + 1..start + end_rel],
+                "name": name,
                 "in": "path",
                 "required": true,
-                "schema": { "type": "integer", "format": "int64" },
+                "schema": schema,
             }));
             rest = &rest[start + end_rel + 1..];
         }
@@ -235,7 +246,18 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
         // the fields loop below; memory-mode Models have no synthetic id, so the
         // db-gate keeps memory documents identical.
         if design.wants_db() && !e.fields.iter().any(|f| f.name == "id") {
-            properties.insert("id".into(), json!({ "type": "integer", "format": "int64" }));
+            // #277: `readOnly` — the synthetic pk is DB-assigned (`model_rs_db` types it
+            // `#[serde(default)] pub id` with `ActiveValue::NotSet`, so a client `id` on
+            // create is ignored). The component doubles as the plain CREATE body, so
+            // without `readOnly` the contract would demand an `id` the server assigns.
+            // Per OpenAPI 3.1 a `readOnly` + `required` property is required in the
+            // RESPONSE only — present in reads, never sent by the client (symmetric to
+            // `writeOnly` for #112). A DECLARED `id` is client-supplied (e.g. the
+            // reference `create_lead` reads `body.id`) and is NOT marked readOnly.
+            properties.insert(
+                "id".into(),
+                json!({ "type": "integer", "format": "int64", "readOnly": true }),
+            );
             required.push(Value::String("id".into()));
         }
         for f in &e.fields {
@@ -346,7 +368,15 @@ fn inline_request_schema(fields: &[Field]) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
     for f in fields {
-        properties.insert(f.name.clone(), field_schema(f));
+        // #276: an inline-DTO optional field is `#[serde(default)] Option<T>` in EVERY
+        // mode (`inline_request_dto_rs` — unlike a memory-mode ENTITY optional, which is
+        // bare `T`), so it accepts `null` unconditionally and its schema must admit it.
+        let schema = if f.required {
+            field_schema(f)
+        } else {
+            make_nullable(field_schema(f))
+        };
+        properties.insert(f.name.clone(), schema);
         if f.required {
             required.push(Value::String(f.name.clone()));
         }
@@ -804,6 +834,9 @@ mod tests {
         let widget = &d["components"]["schemas"]["Widget"];
         assert_eq!(widget["properties"]["id"]["type"], "integer");
         assert_eq!(widget["properties"]["id"]["format"], "int64");
+        // #277: the synthetic pk is `readOnly` — DB-assigned, so `required` binds the
+        // RESPONSE only and the client never sends it on the plain-body create.
+        assert_eq!(widget["properties"]["id"]["readOnly"], true);
         assert!(
             widget["required"]
                 .as_array()
@@ -812,9 +845,14 @@ mod tests {
                 .any(|v| v == "id"),
             "synthetic id is required: {widget}"
         );
-        // Declared-id entity: `id` present exactly once (from its field, not doubled).
+        // Declared-id entity: `id` present exactly once (from its field, not doubled),
+        // and NOT readOnly — a declared id is client-supplied.
         let gadget = &d["components"]["schemas"]["Gadget"];
         assert_eq!(gadget["properties"]["id"]["type"], "integer");
+        assert!(
+            gadget["properties"]["id"].get("readOnly").is_none(),
+            "a declared id is client-supplied, never readOnly: {gadget}"
+        );
         assert_eq!(
             gadget["required"]
                 .as_array()
@@ -982,6 +1020,84 @@ mod tests {
         assert_eq!(
             thing["properties"]["id"]["type"], "integer",
             "a declared id stays a non-null pk regardless of its required flag: {thing}"
+        );
+    }
+
+    /// #276: an inline-DTO (#122) optional field is `#[serde(default)] Option<T>` in
+    /// EVERY mode (unlike a memory-mode ENTITY optional, which is a bare `T`), so it
+    /// accepts `null` unconditionally and its inline `{Op}Request` schema must advertise
+    /// `[T, "null"]` — in both db and memory mode. A required field stays a bare scalar.
+    #[test]
+    fn inline_dto_optional_field_is_nullable_in_every_mode() {
+        for deps in [r#"["db"]"#, r#"[]"#] {
+            let d = format!(
+                r#"{{
+                "name": "coupons", "contract_version": 1, "dependencies": {deps},
+                "modules": [{{ "name": "checkout",
+                    "endpoints": [
+                        {{ "operation_id": "apply_coupon", "method": "POST", "path": "/apply",
+                          "request_body": {{ "fields": [
+                              {{ "name": "code", "type": "string" }},
+                              {{ "name": "note", "type": "string", "required": false }} ] }},
+                          "success": {{ "status": 200 }} }} ] }}]
+            }}"#
+            );
+            let doc = document(&serde_json::from_str::<Design>(&d).unwrap());
+            let dto = &doc["components"]["schemas"]["ApplyCouponRequest"];
+            assert_eq!(
+                dto["properties"]["code"]["type"], "string",
+                "deps={deps}: {dto}"
+            );
+            assert_eq!(
+                dto["properties"]["note"]["type"],
+                json!(["string", "null"]),
+                "inline optional field is nullable (deps={deps}): {dto}"
+            );
+            assert_eq!(dto["required"], json!(["code"]), "deps={deps}: {dto}");
+        }
+    }
+
+    /// #278: a path `{param}` is typed by the entity it references — NOT a hardcoded
+    /// integer — via the same `genroute::path_param_rust_type` the handler `Path<T>`
+    /// extractor uses. A uuid/string-pk entity's `/{id}` route extracts `Path<String>`,
+    /// so its param advertises `string`; an integer-pk entity's `{id}` stays
+    /// `integer/int64`. (Before this, both were hardcoded `integer`, so a codegen client
+    /// modelled a uuid id as int64 and couldn't call the route.)
+    #[test]
+    fn path_param_types_from_the_referenced_entity_pk() {
+        const D: &str = r#"{
+            "name": "mixed", "contract_version": 1, "dependencies": ["db"],
+            "modules": [
+                { "name": "docs",
+                  "entities": [{ "name": "Doc", "fields": [
+                      { "name": "id", "type": "uuid" },
+                      { "name": "title", "type": "string" } ]}],
+                  "endpoints": [
+                      { "operation_id": "get_doc", "method": "GET", "path": "/{id}",
+                        "success": { "status": 200, "entity": "Doc" } }] },
+                { "name": "notes",
+                  "entities": [{ "name": "Note", "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "body", "type": "string" } ]}],
+                  "endpoints": [
+                      { "operation_id": "get_note", "method": "GET", "path": "/{id}",
+                        "success": { "status": 200, "entity": "Note" } }] }
+            ]
+        }"#;
+        let d = document(&serde_json::from_str::<Design>(D).unwrap());
+        // uuid pk → the `{id}` param is a string (matches `Path<String>`).
+        assert_eq!(
+            d["paths"]["/docs/{id}"]["get"]["parameters"][0]["schema"],
+            json!({ "type": "string" }),
+            "a uuid-pk entity's id param is a string: {}",
+            d["paths"]["/docs/{id}"]["get"]["parameters"]
+        );
+        // integer pk → unchanged bare int64.
+        assert_eq!(
+            d["paths"]["/notes/{id}"]["get"]["parameters"][0]["schema"],
+            json!({ "type": "integer", "format": "int64" }),
+            "an integer-pk entity's id param stays int64: {}",
+            d["paths"]["/notes/{id}"]["get"]["parameters"]
         );
     }
 

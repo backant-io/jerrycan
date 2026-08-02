@@ -158,6 +158,31 @@ fn entity_key_param(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String 
     "id".to_string()
 }
 
+/// The Rust key type a single path param of an endpoint references — the SINGLE
+/// source of truth shared by the handler `Path<T>` extractor (`handler_params`) and
+/// the OpenAPI path-param schema (`openapi::operation`, issue #278), so the two can
+/// never drift (the #278 root cause was OpenAPI hardcoding `i64` while the handler
+/// extracted `Path<String>` for a text/uuid-pk entity). The endpoint's OWN key param
+/// (conventionally `id`, or the tenant fk for a #78-normalized tenant detail route)
+/// types from the route entity's pk (String for a text/uuid pk); every other param
+/// types from the entity it REFERENCES (#85), or `i64` for an opaque param that names
+/// no entity's fk column.
+pub(crate) fn path_param_rust_type(
+    m: &ModuleDesign,
+    ep: &Endpoint,
+    design: &Design,
+    param: &str,
+) -> &'static str {
+    if param == entity_key_param(m, ep, design) {
+        endpoint_repo_entity(m, ep)
+            .and_then(|name| m.entities.iter().find(|e| e.name == name))
+            .map(key_rust_type)
+            .unwrap_or("i64")
+    } else {
+        design.path_param_key_type(param)
+    }
+}
+
 /// The request-DTO rule (issues #34 + #53) at the Rust layer: an endpoint whose
 /// body entity has a field the wire contract drops takes `Json<{Entity}Request>`
 /// (the trimmed DTO — see `request_dto_rs`) instead of `Json<{Entity}>`. Three
@@ -303,26 +328,11 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
         .into_iter()
         .filter(|p| Some(p) != excluded_tenant_fk.as_ref())
         .collect();
-    // The param that keys the endpoint's entity takes that entity's key type
-    // (String for text pks); other params stay i64. Conventionally `id`, but the
-    // tenant entity's OWN detail route is normalized to `/{tenant_fk}` (#78), so
-    // there the tenant fk param — not `id` — is the entity key.
-    let key = endpoint_repo_entity(m, ep)
-        .and_then(|name| m.entities.iter().find(|e| e.name == name))
-        .map(key_rust_type)
-        .unwrap_or("i64");
-    let key_param = entity_key_param(m, ep, design);
-    // The endpoint's own key param takes the entity key type; every OTHER path
-    // param types from the entity it REFERENCES (issue #85) — a `{site_id}` for a
-    // string-pk `Site` is `String`, not a hardcoded `i64` (falls back to `i64` for
-    // an opaque param that names no entity's fk column).
-    let param_type = |p: &str| {
-        if p == key_param.as_str() {
-            key
-        } else {
-            design.path_param_key_type(p)
-        }
-    };
+    // The param that keys the endpoint's entity takes that entity's key type; every
+    // other path param types from the entity it references (#85). Shared with the
+    // OpenAPI path-param schema through `path_param_rust_type` (#278) so the handler
+    // `Path<T>` and the contract can never drift.
+    let param_type = |p: &str| path_param_rust_type(m, ep, design, p);
     match params_in_path.len() {
         0 => {}
         1 => params.push(format!(
