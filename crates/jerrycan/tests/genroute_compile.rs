@@ -1415,16 +1415,15 @@ fn opt_in_account_identity_scaffold_owner_scopes_and_omits_account_id() {
     }
 }
 
-/// #245: a tenant-owned entity mounted on a param whose name DIFFERS from the
+/// #245/#250: a tenant-owned entity mounted on a param whose name DIFFERS from the
 /// canonical tenant fk. Tenancy `Organization` derives the fk `organization_id`,
-/// but the `events` module mounts under `/happenings/{org_id}`. Before the fix,
-/// `tenant_owned_isolation_test` pinned only the canonical fk token, so the
-/// non-canonical `{org_id}` survived into the isolation probe URL — and the
-/// `GET /{id}` leg's `format!("/happenings/{org_id}/{id}")` did not even compile
-/// (`org_id` is an undefined named format arg). This scaffolds that exact shape,
-/// generates the acceptance battery, and requires the `events` crate (all targets,
-/// so the generated isolation test) to compile under `-D warnings`. Not run — the
-/// stub handlers `todo!()`, and a nested-mount tenant table is not auto-seeded.
+/// but the `events` module mounts under `/happenings/{org_id}`. This is exactly the
+/// non-canonical mount shape #250 now REFUSES at design validation (JC0568): the
+/// `{org_id}` param scopes nothing (the guard keys on `{organization_id}`), so the
+/// tenant in the URL is a fiction. The design therefore can no longer scaffold — the
+/// test below asserts the refusal. The #245 test-layer fix (pinning `{org_id}` to 1
+/// in the isolation probe so the generated URL compiled) becomes belt-and-suspenders:
+/// no such design reaches the generator anymore.
 const CROSS_PREFIX_TENANT: &str = r#"{
     "name": "orgs-api", "contract_version": 1,
     "auth": { "model": "session", "roles": ["owner", "member"] },
@@ -1450,87 +1449,30 @@ const CROSS_PREFIX_TENANT: &str = r#"{
     ]
 }"#;
 
+/// #250 (subsumes #245): the non-canonical mount shape is now REFUSED at design
+/// validation with JC0568 — it can no longer scaffold, so the design never reaches
+/// the generator and the #245 test-layer URL-pinning fix is belt-and-suspenders. A
+/// fast unit assertion replaces the former scaffold+clippy battery.
 #[test]
-#[ignore = "scaffolds an app and invokes cargo on it; run with --include-ignored"]
-fn cross_prefix_tenant_isolation_battery_compiles() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let app = tmp.path().join("orgs-app");
-
+fn cross_prefix_noncanonical_mount_is_refused() {
     let design: Design =
         serde_json::from_str(CROSS_PREFIX_TENANT).expect("CROSS_PREFIX_TENANT parses");
     assert!(design.tenancy.is_some() && design.wants_auth() && design.wants_db());
 
-    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
-    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
-    let design_path = tmp.path().join("design.json");
-    write(&design_path, CROSS_PREFIX_TENANT);
-    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
-        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
-        .arg("new")
-        .arg(&app)
-        .arg("--design")
-        .arg(&design_path)
-        .status()
-        .expect("run jerrycan new");
-    assert!(status.success(), "jerrycan new must scaffold the orgs app");
-
-    // Generate the acceptance battery for the cross-prefix-mounted tenant module.
-    let out = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
-        .current_dir(&app)
-        .args(["gen-tests", "--module", "events"])
-        .output()
-        .expect("run jerrycan gen-tests");
-    assert!(
-        out.status.success(),
-        "gen-tests failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    // Sanity: the generated isolation probe BODY carries the pinned mount param, never
-    // the literal `{org_id}` (the pre-fix defect the compile gate below also catches).
-    // Scoped to the isolation fn — the `app()` helper legitimately keeps the real
-    // axum route pattern `.mount("/happenings/{org_id}", module())`.
-    let acceptance = fs::read_to_string(app.join("crates/routes/events/tests/acceptance.rs"))
-        .expect("read generated acceptance.rs");
-    let iso = acceptance
-        .split("async fn tenant_a_cannot_read_tenant_b_events()")
-        .nth(1)
-        .expect("isolation fn present")
-        .split("#[tokio::test]")
-        .next()
-        .unwrap();
-    assert!(
-        iso.contains("/happenings/1/") && !iso.contains("{org_id}"),
-        "the cross-prefix isolation probe must pin {{org_id}} to 1:\n{iso}"
-    );
-
-    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
-    write(&app.join("rust-toolchain.toml"), "");
-
-    // The gate: the events crate (all targets → the generated isolation test) compiles
-    // under strict clippy. Pre-fix the `format!("/happenings/{org_id}/{id}")` get leg
-    // failed here (E0425 undefined `org_id`); post-fix every URL is concrete.
-    let output = Command::new(env!("CARGO"))
-        .current_dir(&app)
-        .args([
-            "clippy",
-            "-p",
-            "route-events",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .env("CARGO_TARGET_DIR", common::shared_app_target())
-        .output()
-        .expect("run cargo clippy");
-    if !output.status.success() {
+    let qs = jerrycan::platform::questions::validate(&design);
+    let hit = qs.iter().find(|q| q.question.contains("JC0568"));
+    let hit = hit.unwrap_or_else(|| {
         panic!(
-            "cross-prefix events crate failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
+            "the non-canonical `/happenings/{{org_id}}` mount (canonical fk `organization_id`) must be refused with JC0568: {:?}",
+            qs.iter().map(|q| &q.question).collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        hit.question.contains("org_id") && hit.question.contains("organization_id"),
+        "the JC0568 refusal must name the offending param `org_id` and the canonical fk `organization_id`: {}",
+        hit.question
+    );
+    assert_eq!(hit.id, "/modules/1/mount", "pointed at the events mount");
 }
 
 /// The 0.6.5 T2 review battery (#80): every constrained-field shape that broke

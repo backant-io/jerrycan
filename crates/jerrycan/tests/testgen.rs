@@ -928,19 +928,16 @@ fn nested_path_scoped_module_gets_isolation_test_with_pinned_tenant() {
     );
 }
 
-/// #245 (the #240 sibling): a tenant-owned entity mounted on a param whose name
-/// DIFFERS from the canonical tenant fk (`/happenings/{org_id}` for tenancy
-/// `Organization`, canonical fk `organization_id`) must still get a CONCRETE
-/// isolation probe. Before the fix, `tenant_owned_isolation_test` pinned only the
-/// canonical fk / join child_fk tokens, so the non-canonical `{org_id}` survived
-/// verbatim into the URL — `/happenings/{org_id}/` — and the cross-tenant negative
-/// control 400'd at setup (`Path<i64>` can't parse `{org_id}`), never greenable. The
-/// fix routes the probe base through `concrete_mount_base`, pinning EVERY `{param}`
-/// to the seeded id 1 (the same helper the per-endpoint tests already use). WHY
-/// (Rule 9): a security negative control that can NEVER go green is worse than none —
-/// the agent deletes it or wedges on it. This is the regression guard.
+/// #250 (subsumes #245): a tenant-owned entity mounted on a param whose name DIFFERS
+/// from the canonical tenant fk (`/happenings/{org_id}` for tenancy `Organization`,
+/// canonical fk `organization_id`) is now REFUSED at design validation with JC0568 —
+/// `{org_id}` scopes nothing (the guard keys on `{organization_id}`), so the tenant in
+/// the URL is a fiction. The design can no longer scaffold, so the non-canonical mount
+/// param never reaches the isolation-probe generator; the #245 URL-pinning fix
+/// (`concrete_mount_base`) becomes belt-and-suspenders (still exercised by CANONICAL /
+/// grandchild mounts, which pin their real fk params and are NOT refused).
 #[test]
-fn tenant_isolation_probe_pins_a_noncanonical_mount_param() {
+fn noncanonical_mount_param_is_refused_jc0568() {
     const HAPPENINGS: &str = r#"{
         "name": "orgs-api", "contract_version": 1,
         "auth": { "model": "session", "roles": ["owner", "member"] },
@@ -966,28 +963,33 @@ fn tenant_isolation_probe_pins_a_noncanonical_mount_param() {
         ]
     }"#;
     let d: Design = serde_json::from_str(HAPPENINGS).unwrap();
-    let events = d.modules.iter().find(|m| m.name == "events").unwrap();
-    let out = testgen::acceptance_rs(&d, events);
-    let iso = out
-        .split("async fn tenant_a_cannot_read_tenant_b_events()")
-        .nth(1)
-        .expect("isolation fn present")
-        .split("#[tokio::test]")
-        .next()
-        .unwrap();
-    // The mount param is pinned to the seeded id 1 in EVERY probe leg (create, get,
-    // list) — `{org_id}` (the non-canonical mount param) is the regression signal:
-    // pre-fix it survived verbatim; the get leg's `format!("/happenings/{org_id}/…")`
-    // would not even compile (`org_id` is an undefined named arg).
+    let qs = jerrycan::platform::questions::validate(&d);
+    let hit = qs
+        .iter()
+        .find(|q| q.question.contains("JC0568"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the non-canonical `/happenings/{{org_id}}` mount must be refused with JC0568: {:?}",
+                qs.iter().map(|q| &q.question).collect::<Vec<_>>()
+            )
+        });
     assert!(
-        !iso.contains("{org_id}"),
-        "the isolation probe must carry NO unsubstituted mount param (#245): {iso}"
+        hit.question.contains("org_id") && hit.question.contains("organization_id"),
+        "the JC0568 refusal names the offending param and the canonical fk: {}",
+        hit.question
     );
+    assert_eq!(hit.id, "/modules/1/mount", "pointed at the events mount");
+
+    // A CANONICAL mount (tenancy `Org` → fk `org_id`, so `/orgs/{org_id}` IS canonical)
+    // is NOT refused — proving the refusal keys on canonicity, not the mere presence of
+    // a mount param. (Its isolation probe still pins `{org_id}` to 1 via #245's fix.)
+    let canonical: Design =
+        serde_json::from_str(&HAPPENINGS.replace("Organization", "Org")).unwrap();
     assert!(
-        iso.contains("t.post_json_with(\"/happenings/1/\"")
-            && iso.contains("t.get_with(\"/happenings/1/\"")
-            && iso.contains("/happenings/1/{id}"),
-        "every isolation probe URL pins the non-canonical mount param to 1: {iso}"
+        !jerrycan::platform::questions::validate(&canonical)
+            .iter()
+            .any(|q| q.question.contains("JC0568")),
+        "a canonical mount param (org_id for tenancy Org) must NOT be refused",
     );
 }
 
