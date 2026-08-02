@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.16 — 2026-08-02
+
+### Fixed
+- **`required_roles` on a tenant-owned route is validated against the membership roles, not the session
+  roles (#256).** A tenant-owned route's `required_roles` is enforced as a *membership* role
+  (`{tenant}_members.role`) — path-scoped via `_tenant.require_role`, flat via #247's
+  `require_membership_role` — but validation checked it against `auth.roles` (session roles). With
+  `tenancy.member_roles` distinct from `auth.roles`, that (a) accepted a role not in `member_roles`,
+  scaffolding an always-403 dead gate the membership check can never match, and (b) falsely refused a
+  valid `member_roles` value. Such routes now validate against `member_roles`; a tenant-create
+  (collection) or non-tenant/session-role route still validates against `auth.roles`.
+- **Aliasing the belongs_to that anchors an entity to the tenancy entity is now refused (#257).** The
+  tenant-scoping fk was assumed canonical (`org_id`), so aliasing the anchor link (`belongs_to Org as
+  "primary"` → `primary_id`) left the table with `primary_id` while every generated tenant query
+  referenced `org_id` — a silent `no such column` at runtime for a grandchild, a compile error for a
+  direct child. **JC0560** now refuses aliasing the anchor→tenant link. Aliased *intermediate* joins
+  (non-anchor) are unaffected.
+
 ## 0.7.15 — 2026-08-02
 
 ### Fixed
