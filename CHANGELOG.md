@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.11 — 2026-08-02
+
+### Fixed
+- **A tenant/per-user isolation test with no read leg no longer compiles-broken or silently vacuous
+  (#240).** For a nested-tenant module with a list but no `GET /{id}` (the list leg was suppressed for
+  nested mounts), or a per-user create/update-only module, the generated `tenant_a_cannot_read_tenant_b_*`
+  / `user_a_cannot_read_user_b_*` test bound `row`/`cookie2` but consumed them only in the absent read
+  legs — so it (1) failed `jerrycan check`'s `clippy -D warnings` (unused variables, wedging the agent in
+  a tool-owned file) and, worse, (2) asserted *nothing* about isolation, a security negative control kept
+  honest only by the unused-variable lint. Now a nested-tenant list gets a real cross-tenant probe (a
+  non-member listing another tenant's collection asserts 404 via the membership guard), and a module with
+  no readable endpoint emits no isolation test at all instead of a vacuous one. A compile fixture locks
+  both shapes. Modules with a `GET /{id}` are byte-identical.
+
 ## 0.7.10 — 2026-08-02
 
 ### Fixed
