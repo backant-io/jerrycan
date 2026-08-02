@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.23 — 2026-08-02
+
+### Fixed
+- **Path parameters are typed by the entity they reference, not a hardcoded integer (#278).** OpenAPI advertised
+  every path `{param}` as `integer/int64`, but the handler `Path<T>` extractor types a text/uuid-pk entity's
+  `/{id}` as `Path<String>` — so a client generated from the contract modelled the id as int64 and couldn't call
+  the route. Both the handler and the document now resolve the type through one shared `path_param_rust_type`
+  (a param that keys the route entity types from its pk, `String` for a text/uuid pk; every other param types
+  from the entity it references, #85; an opaque param stays `integer`), so the two can never drift. Integer-pk
+  designs are unchanged.
+- **The synthetic primary key is marked `readOnly` (#277).** The entity component (added by #273) doubles as the
+  plain create body, but the synthetic `id` is DB-assigned (`ActiveValue::NotSet`), so requiring it there asked
+  the client for a value the server ignores. It's now `readOnly: true` — per OpenAPI 3.1, a `readOnly` + required
+  property is required in the response only, never sent by the client (symmetric to `writeOnly`, #112). A declared
+  `id` is client-supplied and stays as-is.
+- **Inline-DTO optional fields are advertised nullable (#276).** An inline custom-action body (#122) types an
+  optional field as `#[serde(default)] Option<T>` in every mode (unlike a memory-mode entity optional, which is a
+  bare `T`), so it accepts `null` — but its inline `{Op}Request` schema advertised a bare scalar. It now advertises
+  `type: [T, "null"]` unconditionally, matching the #274 fix for the identical entity-DTO shape.
+
 ## 0.7.22 — 2026-08-02
 
 ### Fixed
