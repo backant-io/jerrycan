@@ -375,6 +375,7 @@ fn seed_line(
 /// module-root seed for a one-entity module (collection `"/"`, no such parents).
 fn seed_for_id_probe(
     design: &Design,
+    top: &ModuleDesign,
     unit: &ModuleDesign,
     base: &str,
     ep: &Endpoint,
@@ -391,7 +392,7 @@ fn seed_for_id_probe(
 
     let mut seed = String::new();
     let mut seen = vec![entity.name.clone()];
-    seed_parents(design, unit, base, entity, auth, &mut seed, &mut seen);
+    seed_parents(design, top, unit, base, entity, auth, &mut seed, &mut seen);
     seed.push_str(&seed_line(
         design,
         unit,
@@ -422,11 +423,14 @@ fn seed_creator_is_skipped(unit: &ModuleDesign, ep: &Endpoint) -> bool {
 
 /// Append seed lines for `entity`'s belongs_to PARENTS (grandparents first), so a
 /// dependent row's fk points at a real parent row. Skips the identity fk (the
-/// handler injects it), the tenancy entity (already seeded), a parent with no
-/// creator in this module (a cross-module target is an UNENFORCED relation — the
-/// fk fixture's `1` needs no row), and already-seeded entities (cycle guard).
+/// handler injects it), the tenancy entity (already seeded), and already-seeded
+/// entities (cycle guard). A same-module parent is seeded via its own creator; a
+/// CROSS-unit parent is seeded only when it is on the entity's TENANCY chain
+/// (#260) — a genuinely unenforced cross-module fk still needs no row.
+#[allow(clippy::too_many_arguments)]
 fn seed_parents(
     design: &Design,
+    top: &ModuleDesign,
     unit: &ModuleDesign,
     base: &str,
     entity: &Entity,
@@ -442,37 +446,126 @@ fn seed_parents(
         {
             continue;
         }
-        let (Some(parent_creator), Some(parent)) = (
+        // Same-module parent (the #248 mechanism): its creator lives in THIS unit,
+        // so seed it (grandparents first) via the current base. Byte-identical.
+        if let (Some(parent_creator), Some(parent)) = (
             creator_for_entity(unit, &b.entity),
             unit.entities.iter().find(|e| e.name == b.entity),
-        ) else {
+        ) {
+            seen.push(b.entity.clone());
+            seed_parents(design, top, unit, base, parent, auth, seed, seen);
+            seed.push_str(&seed_line(
+                design,
+                unit,
+                &collection_url(base, &parent_creator.path),
+                parent_creator,
+                auth,
+                &format!("// seed parent {} id 1", parent.name),
+            ));
             continue;
-        };
-        seen.push(b.entity.clone());
-        seed_parents(design, unit, base, parent, auth, seed, seen);
-        seed.push_str(&seed_line(
-            design,
-            unit,
-            &collection_url(base, &parent_creator.path),
-            parent_creator,
-            auth,
-            &format!("// seed parent {} id 1", parent.name),
-        ));
+        }
+        // #260: a CROSS-unit parent on THIS entity's tenancy chain. A flat
+        // tenant-owned GRANDCHILD's `create_for_memberships` verifies the immediate
+        // parent row exists under the caller's membership (`SELECT 1 FROM {parent}
+        // WHERE id=? AND {tenant_fk} IN(memberships)`), so that parent row must be
+        // seeded even though its creator lives in another module/subroute of the
+        // SAME top-level route tree (the only tree `app()` mounts) — via the parent's
+        // OWN creator (itself a flat-tenant create under the same cookie, so its
+        // tenant fk ∈ memberships holds, and its own grandparents seed by recursion).
+        // A genuinely UNENFORCED cross-unit fk (not on the tenancy chain) still needs
+        // no row and is skipped (byte-identical to the pre-#260 continue).
+        if is_tenancy_chain_parent(design, entity, b)
+            && let Some((parent_unit, parent_creator, parent_base)) =
+                find_creator_in_tree(top, &b.entity)
+            && let Some(parent) = parent_unit.entities.iter().find(|e| e.name == b.entity)
+        {
+            seen.push(b.entity.clone());
+            seed_parents(
+                design,
+                top,
+                parent_unit,
+                &parent_base,
+                parent,
+                auth,
+                seed,
+                seen,
+            );
+            seed.push_str(&seed_line(
+                design,
+                parent_unit,
+                &collection_url(&parent_base, &parent_creator.path),
+                parent_creator,
+                auth,
+                &format!("// seed parent {} id 1", parent.name),
+            ));
+        }
     }
 }
 
-/// Seed statements for the enforced same-module `belongs_to` PARENTS of a create
-/// probe's entity (#248), so a same-module DDL FK (an fk-alias #119 is always one)
-/// resolves at INSERT instead of 500-ing the `_returns_201` probe. Mirrors the
-/// `/{id}` probe: reuses `seed_parents`, which excludes the identity fk (handler-
-/// injected) and the tenancy entity (app()-seeded), and skips a cross-module fk
-/// (no in-module creator → an unenforced relation whose `1` fixture needs no row).
-/// Aliased fks (`from_account_id`/`to_account_id`) both target ONE parent entity, so
-/// `seed_parents` seeds it once and both fks resolve to it. Empty (byte-identical)
-/// for a non-create endpoint, a bodyless/inline create, or an entity with no such
-/// parent.
+/// True when `parent` (a `belongs_to` of `entity`) is the IMMEDIATE tenancy-chain
+/// parent whose row a flat tenant-owned GRANDCHILD's `create_for_memberships`
+/// verifies — the parent queried by the membership existence check (`SELECT 1 FROM
+/// {parent} WHERE id=? AND {tenant_fk} IN(memberships)`, genroute.rs). That is the
+/// `belongs_to` whose fk is the entity's tenant-path FIRST hop, and only when the
+/// entity is a FLAT tenant-owned grandchild: a DIRECT child's check reads the body
+/// tenant fk (no parent row → byte-identical), and a PATH-SCOPED entity never emits
+/// this check. Any OTHER cross-unit fk is unenforced and needs no seeded row.
+fn is_tenancy_chain_parent(design: &Design, entity: &Entity, parent: &BelongsTo) -> bool {
+    if !super::genroute::entity_is_flat_tenant_owned(entity, design) {
+        return false;
+    }
+    design
+        .tenant_path(&entity.name)
+        .and_then(|tp| tp.joins.into_iter().next())
+        .is_some_and(|first| first.child_fk == parent.fk_column())
+}
+
+/// Locate the param-count-0 POST creator for `entity` anywhere in `top`'s route
+/// tree (the top-level module + its nested subroutes), returning the declaring
+/// unit, that creator, and the creator's fully-accumulated mount base. Scoped to
+/// `top` on PURPOSE: the generated `app()` mounts ONLY the top-level module under
+/// test, so a cross-unit seed URL must resolve within that one tree.
+fn find_creator_in_tree<'a>(
+    top: &'a ModuleDesign,
+    entity: &str,
+) -> Option<(&'a ModuleDesign, &'a Endpoint, String)> {
+    find_creator_in_unit(top, entity, &top.effective_mount())
+}
+
+fn find_creator_in_unit<'a>(
+    unit: &'a ModuleDesign,
+    entity: &str,
+    base: &str,
+) -> Option<(&'a ModuleDesign, &'a Endpoint, String)> {
+    if unit.entities.iter().any(|e| e.name == entity)
+        && let Some(creator) = creator_for_entity(unit, entity)
+    {
+        return Some((unit, creator, base.to_string()));
+    }
+    for sub in &unit.subroutes {
+        let sub_base = format!("{base}{}", sub.effective_mount());
+        if let Some(hit) = find_creator_in_unit(sub, entity, &sub_base) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// Seed statements for the enforced `belongs_to` PARENTS of a create probe's entity
+/// (#248), so a same-module DDL FK (an fk-alias #119 is always one) resolves at
+/// INSERT instead of 500-ing the `_returns_201` probe — AND (#260) so a flat
+/// tenant-owned GRANDCHILD's intermediate parent row exists for its
+/// `create_for_memberships` membership check (else 403≠201). Mirrors the `/{id}`
+/// probe: reuses `seed_parents`, which excludes the identity fk (handler-injected)
+/// and the tenancy entity (app()-seeded), seeds a same-module parent via its own
+/// creator, seeds a CROSS-unit tenancy-chain parent (in the same top-level tree)
+/// via ITS creator, and still skips a genuinely unenforced cross-module fk. Aliased
+/// fks (`from_account_id`/`to_account_id`) both target ONE parent entity, so it is
+/// seeded once and both fks resolve to it. Empty (byte-identical) for a non-create
+/// endpoint, a bodyless/inline create, or an entity with no such parent.
 fn create_probe_parent_seed(
     design: &Design,
+    top: &ModuleDesign,
     unit: &ModuleDesign,
     base: &str,
     ep: &Endpoint,
@@ -489,7 +582,7 @@ fn create_probe_parent_seed(
     };
     let mut seed = String::new();
     let mut seen = vec![entity.name.clone()];
-    seed_parents(design, unit, base, entity, auth, &mut seed, &mut seen);
+    seed_parents(design, top, unit, base, entity, auth, &mut seed, &mut seen);
     seed
 }
 
@@ -760,7 +853,13 @@ fn concrete_mount_base(base: &str) -> String {
     out
 }
 
-fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOut) {
+fn unit_tests(
+    design: &Design,
+    top: &ModuleDesign,
+    unit: &ModuleDesign,
+    base: &str,
+    out: &mut TestOut,
+) {
     let auth = out.auth;
     // Resolve the FULL path per endpoint against a mount base whose inherited params
     // are pinned to the seeded parent id 1 (issue #81). The RAW `base` still threads
@@ -855,7 +954,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             // parent rows seeded first, or the DDL FK violation 500s the 201 probe —
             // mirror the /{id} probe (`seed_parents`). Empty (byte-identical) for a
             // create without such a parent.
-            let seed = create_probe_parent_seed(design, unit, &cbase, ep, auth);
+            let seed = create_probe_parent_seed(design, top, unit, &cbase, ep, auth);
             // A creator that echoes its entity must echo the id it was given —
             // catches inserts that return a backend default (0) instead. When the pk
             // was bumped (#249) the echo asserts the bumped value, not the fixture.
@@ -951,7 +1050,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             // wrong entity and make the probe 404 on a CORRECT handler. Seeds/probes
             // resolve against the mount-substituted `cbase` (issue #81) so a nested
             // module's seed POST + `/{id}` probe both hit the concrete parent URL.
-            if let Some((seed, seed_id)) = seed_for_id_probe(design, unit, &cbase, ep, auth) {
+            if let Some((seed, seed_id)) = seed_for_id_probe(design, top, unit, &cbase, ep, auth) {
                 let seeded_path = full_path.replacen(&regex_free_param(&ep.path), &seed_id, 1);
                 let request = request_expr(design, unit, ep, &seeded_path, guarded, &[]);
                 out.code.push_str(&format!(
@@ -1085,11 +1184,11 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
 
     // #115: composite / multi-column UNIQUE 409 conflict tests for this unit's
     // entities (appended after the per-endpoint probes, before recursing).
-    push_composite_unique_tests(design, unit, base, out);
+    push_composite_unique_tests(design, top, unit, base, out);
 
     for sub in &unit.subroutes {
         let sub_base = format!("{}{}", base, sub.effective_mount());
-        unit_tests(design, sub, &sub_base, out);
+        unit_tests(design, top, sub, &sub_base, out);
     }
 }
 
@@ -1113,6 +1212,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
 /// group): the 409 could then not be attributed to the composite index alone.
 fn push_composite_unique_tests(
     design: &Design,
+    top: &ModuleDesign,
     unit: &ModuleDesign,
     base: &str,
     out: &mut TestOut,
@@ -1136,7 +1236,7 @@ fn push_composite_unique_tests(
         // both skipped by `seed_parents`).
         let mut seed = String::new();
         let mut seen = vec![e.name.clone()];
-        seed_parents(design, unit, &cbase, e, auth, &mut seed, &mut seen);
+        seed_parents(design, top, unit, &cbase, e, auth, &mut seed, &mut seen);
         let first = request_expr(design, unit, creator, &url, guarded, &[]);
         let snake = Design::to_snake(&e.name);
         let status = creator.success.status;
@@ -2968,7 +3068,7 @@ fn render_acceptance(design: &Design, module: &ModuleDesign) -> (String, usize) 
         reject: 0,
         auth: design.wants_auth(),
     };
-    unit_tests(design, module, &module.effective_mount(), &mut out);
+    unit_tests(design, module, module, &module.effective_mount(), &mut out);
     // Cross-tenant isolation: the security contract for tenant-owned modules.
     // Appended after the per-endpoint tests; counts toward expected_failing
     // (it fails on stubs like every other generated test).

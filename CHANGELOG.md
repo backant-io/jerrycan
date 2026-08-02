@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.17 — 2026-08-02
+
+### Fixed
+- **A declared 202 (or any 2xx other than 200/201/204) success is now served with that status (#259).**
+  `return_type` funneled every non-{200,201,204} success to `Json<…>` (fixed 200), so a route declaring
+  `success.status: 202` served 200 while OpenAPI and the generated `_returns_202` test asserted 202 — a
+  contract violation and an un-greenable test. Such routes now emit `Result<(StatusCode, Json<…>)>` and
+  return the declared status; 200/201/204/3xx are byte-identical.
+- **The generated CREATE probe for a transitive-grandchild flat tenant-owned entity seeds its
+  intermediate parent (#260).** `create_<grandchild>_returns_201` seeded the tenant and membership but
+  not the intermediate parent row, so `create_for_memberships`' parent-existence check failed 403 — an
+  un-greenable happy-path probe (the #248 gap for the grandchild shape). It now seeds the intermediate
+  belongs_to parent up the tenancy chain. Direct-child creates are byte-identical.
+- **JC0560 no longer refuses a self-referential tenant entity's aliased belongs_to (#261).** The 0.7.16
+  aliased-anchor refusal wrongly rejected the tenancy entity's own hierarchy link (e.g.
+  `Org belongs_to Org as "parent"`), which is never a tenancy anchor. Fixed to exclude the tenant
+  entity itself.
+
 ## 0.7.16 — 2026-08-02
 
 ### Fixed

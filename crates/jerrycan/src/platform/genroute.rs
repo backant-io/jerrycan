@@ -51,6 +51,23 @@ fn return_type(ep: &Endpoint) -> String {
         (s, _, _) if (300..400).contains(&s) => "Result<Redirect>".to_string(),
         (201, Some(e), _) => format!("Result<Created<{e}>>"),
         (201, None, _) => "Result<Created<serde_json::Value>>".to_string(),
+        // A declared 2xx OTHER than 200/201/204 (issue #259, e.g. 202 Accepted)
+        // cannot ride the fixed-200 `Json`/`Json<Vec>` responder — the handler must
+        // SET that status. Emit the `(StatusCode, Json<…>)` tuple responder that
+        // jerrycan-core impls `IntoResponse` for; the implemented handler returns
+        // `Ok((StatusCode::ACCEPTED, Json(…)))` (the stub still 500s until then, so
+        // the `_returns_{status}` probe stays RED-then-greenable exactly like a 201).
+        // Fully-qualified `jerrycan::http::StatusCode` so NO `use` line changes for
+        // designs that never hit this arm. 200 falls through to the plain arms below.
+        (s, Some(e), true) if (200..300).contains(&s) && s != 200 => {
+            format!("Result<(jerrycan::http::StatusCode, Json<Vec<{e}>>)>")
+        }
+        (s, Some(e), false) if (200..300).contains(&s) && s != 200 => {
+            format!("Result<(jerrycan::http::StatusCode, Json<{e}>)>")
+        }
+        (s, None, _) if (200..300).contains(&s) && s != 200 => {
+            "Result<(jerrycan::http::StatusCode, Json<serde_json::Value>)>".to_string()
+        }
         (_, Some(e), true) => format!("Result<Json<Vec<{e}>>>"),
         (_, Some(e), false) => format!("Result<Json<{e}>>"),
         (_, None, _) => "Result<Json<serde_json::Value>>".to_string(),
@@ -7827,6 +7844,74 @@ pub(crate) mod tests {
         assert!(
             !follow_stub.contains("not implemented — replace this stub"),
             "redirect stub is not the 500 stub: {follow_stub}"
+        );
+    }
+
+    /// Issue #259: a declared 2xx OTHER than 200/201/204 (here 202 Accepted) must
+    /// emit a return type that CAN set that status — the `(StatusCode, Json<…>)`
+    /// tuple responder — so the implemented handler can return the declared status
+    /// and the generated `_returns_202` probe is greenable (before this the handler
+    /// return type was the fixed-200 `Json`, an un-greenable contract violation).
+    /// The stub stays the 500 `Err` (RED until implemented, exactly like a 201).
+    /// 200/201/204 return types are unaffected (asserted below).
+    #[test]
+    fn non_standard_2xx_status_emits_a_status_setting_return_type() {
+        const D: &str = r#"{
+            "name": "jobs-api", "contract_version": 0, "dependencies": [],
+            "modules": [{ "name": "imports",
+                "entities": [{ "name": "Job", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "state", "type": "string" } ]}],
+                "endpoints": [
+                    { "operation_id": "enqueue_bodyless", "method": "POST", "path": "/enqueue",
+                      "success": { "status": 202 } },
+                    { "operation_id": "accept_job", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Job" },
+                      "success": { "status": 202, "entity": "Job" } },
+                    { "operation_id": "accept_batch", "method": "POST", "path": "/batch",
+                      "request_body": { "entity": "Job" },
+                      "success": { "status": 202, "entity": "Job", "list": true } },
+                    { "operation_id": "make_job", "method": "POST", "path": "/make",
+                      "request_body": { "entity": "Job" },
+                      "success": { "status": 201, "entity": "Job" } },
+                    { "operation_id": "get_job", "method": "GET", "path": "/{id}",
+                      "success": { "status": 200, "entity": "Job" } } ] }]
+        }"#;
+        let d: Design = serde_json::from_str(D).unwrap();
+        let h = flatten_sigs(&handlers_rs(&d.modules[0], GenMode::default(), &d));
+        // 202 no-entity → status-setting tuple over serde_json::Value (only
+        // enqueue_bodyless yields the Value tuple, so this substring pins it).
+        assert!(
+            h.contains(
+                "async fn enqueue_bodyless(_repo: Dep<JobRepo>) -> Result<(jerrycan::http::StatusCode, Json<serde_json::Value>)>"
+            ),
+            "202 bodyless must return a status-setting tuple: {h}"
+        );
+        // 202 with an entity body → the entity is echoed in the tuple.
+        assert!(
+            h.contains("-> Result<(jerrycan::http::StatusCode, Json<Job>)>"),
+            "202 with entity must return a status-setting tuple over the entity: {h}"
+        );
+        // 202 list → Vec inside the tuple.
+        assert!(
+            h.contains("-> Result<(jerrycan::http::StatusCode, Json<Vec<Job>>)>"),
+            "202 list must return a status-setting tuple over a Vec: {h}"
+        );
+        // 201/200 are byte-identical (still the fixed-status responders, no tuple).
+        assert!(
+            h.contains("async fn make_job(_repo: Dep<JobRepo>, Json(_body): Json<Job>) -> Result<Created<Job>>"),
+            "201 stays Created (byte-identical): {h}"
+        );
+        assert!(
+            h.contains(
+                "async fn get_job(_repo: Dep<JobRepo>, Path(_id): Path<i64>) -> Result<Json<Job>>"
+            ),
+            "200 stays plain Json (byte-identical): {h}"
+        );
+        // The 202 stubs are still the RED 500 stub (greenable, not pre-green).
+        assert!(
+            h.matches("not implemented — replace this stub").count() >= 3,
+            "the 202 stubs stay the 500 Err (RED until implemented): {h}"
         );
     }
 

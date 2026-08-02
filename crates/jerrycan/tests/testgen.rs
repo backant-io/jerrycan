@@ -3708,3 +3708,86 @@ fn non_tenancy_create_with_default_is_unchanged() {
         "the defaulted field is still dropped from the create body:\n{create}"
     );
 }
+
+/// #260: the create success probe for a FLAT tenant-owned GRANDCHILD declared in a
+/// SUBROUTE (`Planting belongs_to Bed`, `Bed belongs_to Farm`[tenancy], Bed in the
+/// parent `beds` module, Planting in its `/plantings` subroute) must seed the
+/// intermediate `Bed` row FIRST — the grandchild's `create_for_memberships`
+/// verifies `SELECT 1 FROM beds WHERE beds.id=? AND farm_id IN(memberships)`, which
+/// can't resolve without a Bed. Before the fix the probe posted the Planting with
+/// no Bed seed → 403 ≠ 201 (un-greenable). The seed goes to the parent module's
+/// mount (`/beds/`, not the subroute base) under the SAME cookie, so the seeded
+/// Bed's `farm_id` is in the caller's membership set. WHY (Rule 9): a grandchild
+/// create is only greenable if its immediate tenancy-chain parent exists under the
+/// caller's membership; this pins that the generator seeds it.
+#[test]
+fn grandchild_flat_create_probe_seeds_the_intermediate_parent() {
+    const D: &str = r#"{
+        "name": "orchard", "contract_version": 2,
+        "auth": { "model": "jwt", "roles": ["owner", "member"] },
+        "dependencies": ["db", "auth"],
+        "tenancy": { "entity": "Farm", "member_roles": ["owner", "member"] },
+        "modules": [
+            { "name": "farms",
+              "entities": [{ "name": "Farm", "fields": [
+                  { "name": "id", "type": "integer" },
+                  { "name": "name", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_farm", "method": "POST", "path": "/",
+                    "auth_required": true,
+                    "request_body": { "entity": "Farm" },
+                    "success": { "status": 201, "entity": "Farm" } } ] },
+            { "name": "beds",
+              "entities": [{ "name": "Bed",
+                  "belongs_to": [{ "entity": "Farm" }],
+                  "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "label", "type": "string" } ]}],
+              "endpoints": [
+                  { "operation_id": "create_bed", "method": "POST", "path": "/",
+                    "auth_required": true,
+                    "request_body": { "entity": "Bed" },
+                    "success": { "status": 201, "entity": "Bed" } } ],
+              "subroutes": [
+                  { "name": "plantings", "mount": "/plantings",
+                    "entities": [{ "name": "Planting",
+                        "belongs_to": [{ "entity": "Bed" }],
+                        "fields": [
+                            { "name": "id", "type": "integer" },
+                            { "name": "crop", "type": "string" } ]}],
+                    "endpoints": [
+                        { "operation_id": "create_planting", "method": "POST", "path": "/",
+                          "auth_required": true,
+                          "request_body": { "entity": "Planting" },
+                          "success": { "status": 201, "entity": "Planting" } } ] } ] }
+        ]
+    }"#;
+    let d: Design = serde_json::from_str(D).unwrap();
+    let beds = d.modules.iter().find(|m| m.name == "beds").unwrap();
+    let generated = testgen::acceptance_rs(&d, beds);
+    let create = test_body(&generated, "create_planting_returns_201");
+    // The intermediate parent Bed is seeded at the PARENT module's mount (/beds/),
+    // guarded (same cookie), BEFORE the Planting POST — so `farm_id IN(memberships)`
+    // resolves and the probe can reach 201.
+    assert!(
+        create.contains("t.post_json_with(\"/beds/\",")
+            && create.contains("\"farm_id\": 1")
+            && create.contains("// seed parent Bed id 1"),
+        "the grandchild create probe must seed the intermediate Bed at /beds/:\n{create}"
+    );
+    // The seed line precedes the Planting POST (order matters for the FK check).
+    let seed_at = create.find("// seed parent Bed id 1").unwrap();
+    let planting_post = create.find("\"/beds/plantings/\"").unwrap();
+    assert!(
+        seed_at < planting_post,
+        "the Bed seed must precede the Planting POST:\n{create}"
+    );
+
+    // Byte-identity floor: the DIRECT-child create (create_bed) seeds NO parent —
+    // its fk is the app()-seeded tenant, so it stays unchanged.
+    let create_bed = test_body(&generated, "create_bed_returns_201");
+    assert!(
+        !create_bed.contains("// seed parent"),
+        "a direct-child flat create must seed no parent (byte-identical):\n{create_bed}"
+    );
+}
