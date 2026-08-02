@@ -1801,14 +1801,17 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
     };
     let base = module.effective_mount();
     let base = base.trim_end_matches('/');
-    // A NESTED mount carries an ancestor fk token: pin every one to the seeded id 1
-    // so the probe URLs are concrete, and remember we're nested so the list leg
-    // (user 2 can't reach tenant 1's collection at all) is skipped. A DIRECT child
-    // carries the TENANT fk (`/clubs/{club_id}/…`); a GRANDCHILD carries a PARENT
-    // fk instead (`/accounts/{account_id}/…` — issue #102), pinned to the
-    // intermediate parent seeded in tenant 1. The `joins` loop is empty for a
-    // direct child, so `cbase`/`is_nested` stay byte-identical to before. For a
-    // FLAT mount no token is present, so `cbase == base` and every URL is unchanged.
+    // The `fk_token`/`parent_tokens` still select the list-leg SHAPE: a NESTED mount
+    // carries the TENANT fk (`/clubs/{club_id}/…`, a DIRECT child) or a PARENT fk
+    // (`/accounts/{account_id}/…`, a GRANDCHILD — issue #102), and being nested means
+    // user 2 can't reach tenant 1's collection so the flat list leg is skipped. The
+    // probe URLs, though, pin EVERY `{param}` to the seeded id 1 via
+    // `concrete_mount_base` (the same helper the per-endpoint tests use), not just the
+    // fk/parent tokens: a mount whose param name differs from the canonical fk
+    // (`/happenings/{org_id}` for tenancy `Organization` — issue #245) would otherwise
+    // leave a literal `{org_id}` in the isolation URL that `Path<i64>` can't parse. For
+    // a canonical-fk / grandchild / flat mount the result is byte-identical (those
+    // tokens were already the only params, and were already pinned to 1).
     let fk_token = format!("{{{}}}", Design::fk_column(&tenancy.entity));
     let parent_tokens: Vec<String> = path
         .joins
@@ -1816,10 +1819,7 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
         .map(|j| format!("{{{}}}", j.child_fk))
         .collect();
     let is_nested = base.contains(&fk_token) || parent_tokens.iter().any(|t| base.contains(t));
-    let mut cbase = base.replace(&fk_token, "1");
-    for tok in &parent_tokens {
-        cbase = cbase.replace(tok, "1");
-    }
+    let cbase = concrete_mount_base(base);
     let plural = module.name.replace('-', "_");
     let body = fixture_json(
         design,
@@ -2065,7 +2065,11 @@ fn per_user_isolation_test(design: &Design, module: &ModuleDesign) -> String {
         return String::new();
     };
     let base = module.effective_mount();
-    let base = base.trim_end_matches('/');
+    // Pin every mount `{param}` to the seeded id 1 so the probe URLs are concrete — a
+    // per-user module mounted under a path param (`/orgs/{org_id}/notes`) would else
+    // leave a literal `{param}` no `Path<i64>` can parse (issue #245, the #240 sibling
+    // of `tenant_owned_isolation_test`). Byte-identical for a flat mount (no `{param}`).
+    let base = concrete_mount_base(base.trim_end_matches('/'));
     let plural = module.name.replace('-', "_");
     let body = fixture_json(
         design,
@@ -2182,7 +2186,11 @@ fn public_read_isolation_test(design: &Design, module: &ModuleDesign) -> String 
         return String::new();
     };
     let base = module.effective_mount();
-    let base = base.trim_end_matches('/');
+    // Pin every mount `{param}` to the seeded id 1 so the probe URLs are concrete — a
+    // public_read module mounted under a path param would else leave a literal
+    // `{param}` no `Path<i64>` can parse (issue #245, the #240 sibling of
+    // `tenant_owned_isolation_test`). Byte-identical for a flat mount (no `{param}`).
+    let base = concrete_mount_base(base.trim_end_matches('/'));
     let plural = module.name.replace('-', "_");
     let body = fixture_json(
         design,

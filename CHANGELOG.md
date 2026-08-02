@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.13 — 2026-08-02
+
+### Fixed
+- **Cross-tenant/cross-user isolation tests are greenable for a non-canonically-mounted entity (#245,
+  follow-up to #240).** The generated isolation test built its probe URLs by substituting only the
+  canonical tenancy fk (and join fks), not arbitrary mount params — so a tenant-owned entity mounted on
+  a param whose name differs from its fk column (e.g. `Organization` mounted at `/happenings/{org_id}`)
+  left the literal `{org_id}` in the URL, making the tool-owned `tenant_a_cannot_read_tenant_b_*`
+  negative control un-greenable (a 400 at setup, or an uncompilable `format!`). All three isolation-test
+  generators now build their probe base with `concrete_mount_base`, pinning every `{param}` to the
+  seeded id `1`. Canonically-mounted designs are byte-identical.
+
 ## 0.7.12 — 2026-08-02
 
 ### Fixed
