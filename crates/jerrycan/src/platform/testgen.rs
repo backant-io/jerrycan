@@ -963,7 +963,12 @@ fn unit_tests(
             // so `body["id"]` (string-indexing an array) is always `null` and the probe
             // could never green on a correct handler. A list response has no single
             // canonical id to echo.
-            let id_echo = (ep.method == HttpMethod::POST && !ep.success.list)
+            // #266: also skip when the success status returns NO JSON body — a 204
+            // (`NoContent`) or a 3xx (`Redirect`) has an EMPTY body, so
+            // `from_str(&res.text())` would panic on `""`. Only a 2xx that is not 204
+            // (200/201/202…) carries the JSON the echo reads.
+            let body_bearing = (200..300).contains(&status) && status != 204;
+            let id_echo = (ep.method == HttpMethod::POST && !ep.success.list && body_bearing)
                 .then_some(ep.request_body.as_ref())
                 .flatten()
                 .and_then(|rb| rb.entity.as_deref())
@@ -3340,6 +3345,78 @@ mod tests {
         assert_eq!(
             reject, 2,
             "both inline reject probes count toward `reject` on the /{{id}} no-creator branch:\n{content}"
+        );
+    }
+
+    /// Slice `content` to the body of the `#[tokio::test]` fn named `name`: from the
+    /// `async fn {name}(` line to the next `#[tokio::test]` (or end). Test-only.
+    fn section<'a>(content: &'a str, name: &str) -> &'a str {
+        let needle = format!("async fn {name}(");
+        let start = content
+            .find(&needle)
+            .unwrap_or_else(|| panic!("fn {name} not found in:\n{content}"));
+        let rest = &content[start..];
+        let end = rest[1..]
+            .find("#[tokio::test]")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// #266: a create's id-echo (`from_str(&res.text()).expect("json body")`) reads
+    /// the response body, so it must be emitted ONLY for a body-bearing success
+    /// status. A 204 (`NoContent`) or a 3xx (`Redirect`) has an EMPTY body — the
+    /// echo would panic on `from_str("")`. A 200/201 create keeps the echo
+    /// (byte-identical). Composes with the #263 `!list` gate.
+    #[test]
+    fn create_id_echo_only_for_a_body_bearing_status() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "orders-api", "contract_version": 0,
+            "dependencies": [],
+            "modules": [{
+                "name": "orders",
+                "entities": [{ "name": "Order", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "sku", "type": "string" } ]}],
+                "endpoints": [
+                    { "operation_id": "create_order", "method": "POST", "path": "/",
+                      "request_body": { "entity": "Order" },
+                      "success": { "status": 201, "entity": "Order" } },
+                    { "operation_id": "create_order_redirect", "method": "POST", "path": "/redir",
+                      "request_body": { "entity": "Order" },
+                      "success": { "status": 303, "entity": "Order" } },
+                    { "operation_id": "create_order_quiet", "method": "POST", "path": "/quiet",
+                      "request_body": { "entity": "Order" },
+                      "success": { "status": 204, "entity": "Order" } }
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let (content, _) = render_acceptance(&d, &d.modules[0]);
+        // The 201 create keeps its id-echo (a JSON body to read).
+        let ok = section(&content, "create_order_returns_201");
+        assert!(
+            ok.contains("echoes its id") && ok.contains("expect(\"json body\")"),
+            "a 201 create keeps the id-echo (body-bearing):\n{ok}"
+        );
+        // The 303 create has an EMPTY body — NO id-echo (would panic on from_str("")).
+        let redir = section(&content, "create_order_redirect_returns_303");
+        assert!(
+            !redir.contains("echoes its id") && !redir.contains("expect(\"json body\")"),
+            "a 303 create must NOT id-echo (empty Redirect body):\n{redir}"
+        );
+        // The 204 create likewise has no body — NO id-echo.
+        let quiet = section(&content, "create_order_quiet_returns_204");
+        assert!(
+            !quiet.contains("echoes its id") && !quiet.contains("expect(\"json body\")"),
+            "a 204 create must NOT id-echo (empty NoContent body):\n{quiet}"
         );
     }
 
