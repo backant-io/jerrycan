@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.9 — 2026-08-02
+
+### Fixed
+- **Realtime change-source recovery now converges on every node (#234, follow-up to #232).** The
+  multi-node health propagation re-published the outage signal (`ChangesHealth{true}`) on every backoff
+  iteration but published recovery (`false`) only once, so a follower that missed that one message — via
+  a Redis reconnect or a fan-in lag drop (most likely exactly at recovery, when the leader floods
+  backlogged changes) — stayed `changes_unavailable` forever, answering JC0530 on a healthy node. The
+  leader now re-publishes `ChangesHealth{false}` on a bounded 30s heartbeat while it is connected and
+  streaming (aborted the instant the stream ends, so a down source never heartbeats healthy), and any
+  node that delivers a `Change` clears its own flag (a delivered change proves the source is healthy).
+  A follower converges to the true state within one heartbeat regardless of which message it missed;
+  onset fail-loud and single-node behavior are unchanged.
+
 ## 0.7.8 — 2026-08-02
 
 ### Fixed
