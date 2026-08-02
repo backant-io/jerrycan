@@ -397,6 +397,13 @@ pub const REGISTRY: &[CodeInfo] = &[
         doc: "jerrycan docs designing",
     },
     CodeInfo {
+        code: "JC0568",
+        title: "non-canonical tenant mount param",
+        cause: "a tenant-owned module (issue #250) mounts under a path param whose name is NOT the canonical tenancy fk (`snake(tenancy.entity)_id`, e.g. `workspace_id`) and is NOT a recognized parent child_fk (a grandchild's `/accounts/{account_id}`) — e.g. `events` mounted at `/spaces/{ws_id}` for tenancy `Workspace`. The generated `shared::tenant` guard only scopes by a path param literally named `{canonical_fk}`, so a differently-named param is DECORATIVE: the entity is silently classified flat/membership-set and `{ws_id}` scopes nothing — `/spaces/1/…` and `/spaces/999/…` address the exact same (membership-set) rows. Safe (membership is still enforced) but the URL contract is a LIE, and it is the design-layer twin of the #245 runtime bug where a non-canonical mount param broke the generated isolation-probe URL",
+        fix: "rename the mount param to the canonical tenancy fk so it actually scopes by tenant — `/spaces/{workspace_id}` (the guard then verifies membership in the addressed tenant and 404s outsiders) — OR drop the param and mount the module flat (`/spaces`), which keeps the honest membership-set scoping without a fictional tenant in the URL. A grandchild mount that carries a real parent fk (`/accounts/{account_id}`) is already accepted",
+        doc: "jerrycan docs auth",
+    },
+    CodeInfo {
         code: "JC0530",
         title: "realtime requires postgres",
         cause: "the design declares realtime changes but the app is running on sqlite",

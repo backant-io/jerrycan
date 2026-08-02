@@ -482,6 +482,25 @@ fn guard_comment(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
         format!(
             "    // guard: requires role \"{roles}\" — call _tenant.require_role(\"{roles}\")? before proceeding\n"
         )
+    } else if matches!(
+        design.endpoint_tenant_shape(m, ep),
+        TenantShape::MembershipSet
+    ) {
+        // FLAT tenant-owned (issue #247): the required role is the caller's MEMBERSHIP
+        // role in the ROW's tenant — NOT the session role (`_user.0.role`), a DIFFERENT
+        // dimension. A tenant owner (membership role `owner`, session role `user`)
+        // would be wrongly 403'd by a session-role check. The repo's
+        // `require_membership_role` resolves the row's tenant and 403s a non-member /
+        // wrong-role caller (fail-closed).
+        if !path_params(m, ep).is_empty() {
+            format!(
+                "    // guard: requires MEMBERSHIP role \"{roles}\" in this row's tenant (issue #247) —\n    // call _repo.require_membership_role(_user.0.id, _id, &[\"{roles}\"]).await? before\n    // proceeding; this checks the TENANT role, NOT the session role `_user.0.role`.\n"
+            )
+        } else {
+            format!(
+                "    // guard: requires MEMBERSHIP role \"{roles}\" (issue #247) — this flat create has\n    // no row yet, so check the caller's role in the BODY's tenant via `{{tenant}}_members`,\n    // NOT the session role `_user.0.role` (a tenant owner's session role may differ).\n"
+            )
+        }
     } else {
         format!(
             "    // guard: requires role \"{roles}\" — add `use jerrycan::auth::require_role;` and call require_role(&_user.0.role, \"{roles}\")? before proceeding\n"
@@ -2092,6 +2111,51 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
 "#
         )
     };
+    // Role gate for a FLAT tenant-owned route (issue #247): a flat role-gated route
+    // (MembershipSet — no `Dep<Tenant>` in its handler signature) must check the
+    // caller's MEMBERSHIP role in the ROW's tenant, NOT the session role
+    // (`_user.0.role`) — a DIFFERENT dimension. A workspace owner (membership role
+    // `owner`, session role `user`) would otherwise be 403'd deleting a row in their
+    // own tenant. This primitive resolves the row's tenant through its fk / JOIN chain
+    // and reads the caller's role from `{members}`, keyed on the ROW's tenant so a
+    // membership in a DIFFERENT tenant can never satisfy the gate (no cross-tenant
+    // escalation). A missing row, a non-member of the row's tenant, or a member whose
+    // role is not in `roles` all 403 (fail-CLOSED). Emitted ONLY for a flat
+    // tenant-owned entity that has a `required_roles` route (its role-gated stub is
+    // steered here — `guard_comment`); every other entity stays byte-identical.
+    let membership_role_gate = if entity_is_flat_tenant_owned(e, design)
+        && design.entity_has_required_roles_route(entity)
+    {
+        format!(
+            r#"
+    pub async fn require_membership_role(&self, user_id: String, id: {key}, roles: &[&str]) -> Result<()> {{
+        let row = self
+            .db
+            .conn()
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                self.db.conn().get_database_backend(),
+                self.db.sql(
+                    "SELECT {members}.role FROM {table}{join_sql} JOIN {members} ON {members}.{tenant_fk} = {tenant_col} WHERE {table}.id = ? AND {members}.user_id = ?",
+                ),
+                [id.into(), user_id.into()],
+            ))
+            .await
+            .map_err(db_error)?;
+        let Some(row) = row else {{
+            return Err(Error::forbidden());
+        }};
+        let role: String = row.try_get("", "role").map_err(db_error)?;
+        if roles.contains(&role.as_str()) {{
+            Ok(())
+        }} else {{
+            Err(Error::forbidden())
+        }}
+    }}
+"#
+        )
+    } else {
+        String::new()
+    };
     // The four READS branch on the path: a direct child keeps the typed builder; a
     // transitive child emits a raw-SQL JOIN form scoping on the QUALIFIED tenant
     // column. Only identifiers from `TenantPath` reach the SQL; every value stays a
@@ -2348,7 +2412,7 @@ fn scoped_methods(e: &Entity, design: &Design) -> String {
 {all_for_memberships_method}
 
 {get_for_memberships_method}
-{membership_writes}"#
+{membership_writes}{membership_role_gate}"#
     )
 }
 
@@ -5289,6 +5353,81 @@ pub(crate) mod tests {
         assert!(
             workspace.contains("pub async fn all(&self) -> Result<Vec<Workspace>>"),
             "the tenant root keeps its unscoped all(): {workspace}"
+        );
+    }
+
+    /// #247: a FLAT tenant-owned entity's `required_roles` route must gate on the
+    /// caller's MEMBERSHIP role in the ROW's tenant, NOT the session role
+    /// (`_user.0.role`) — a different dimension: a workspace owner (membership role
+    /// `owner`, session role `user`) would be wrongly 403'd deleting a lead in their
+    /// own workspace. The repo emits `require_membership_role` (resolving the row's
+    /// tenant via the members-table JOIN, fail-closed), and the role-gated flat stub
+    /// steers to it — never to `require_role(&_user.0.role, …)`.
+    #[test]
+    fn flat_tenant_owned_required_roles_checks_membership_role() {
+        const D: &str = r#"{
+            "name": "crm", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "workspaces",
+                  "entities": [{ "name": "Workspace", "fields": [
+                      { "name": "id", "type": "integer" }, { "name": "name", "type": "string" } ]}],
+                  "endpoints": [{ "operation_id": "create_workspace", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Workspace" },
+                      "success": { "status": 201, "entity": "Workspace" } }] },
+                { "name": "leads",
+                  "entities": [{ "name": "Lead",
+                      "belongs_to": [{ "entity": "Workspace", "on_delete": "cascade" }],
+                      "fields": [{ "name": "id", "type": "integer" }, { "name": "name", "type": "string" }] }],
+                  "endpoints": [
+                      { "operation_id": "delete_lead", "method": "DELETE", "path": "/{id}",
+                        "auth_required": true, "required_roles": ["owner"],
+                        "success": { "status": 204 } } ] }
+            ]
+        }"#;
+        let d: Design = serde_json::from_str(D).unwrap();
+        let mode = GenMode {
+            db: true,
+            auth: true,
+        };
+        // The repo emits the fail-closed membership-role gate, keyed on the ROW's tenant.
+        let repo = repo_rs(&d.modules[1], mode, &d).unwrap();
+        assert!(
+            repo.contains("pub async fn require_membership_role("),
+            "the flat role-gated entity's repo emits require_membership_role: {repo}"
+        );
+        assert!(
+            repo.contains("SELECT workspace_members.role FROM leads JOIN workspace_members ON workspace_members.workspace_id = leads.workspace_id WHERE leads.id = ? AND workspace_members.user_id = ?"),
+            "the gate joins the ROW to the members table on the ROW's tenant fk (no cross-tenant escalation): {repo}"
+        );
+        // The role-gated flat delete stub steers to the membership gate, NOT the session role.
+        let h = handlers_rs(&d.modules[1], mode, &d);
+        let stub = h
+            .split("async fn delete_lead")
+            .nth(1)
+            .unwrap()
+            .split("async fn")
+            .next()
+            .unwrap();
+        assert!(
+            stub.contains("_repo.require_membership_role(_user.0.id, _id, &[\"owner\"])"),
+            "the flat role gate steers to the membership-role primitive: {stub}"
+        );
+        assert!(
+            !stub.contains("require_role(&_user.0.role"),
+            "the flat role gate must NOT steer to the SESSION role (issue #247): {stub}"
+        );
+
+        // A non-role-gated flat tenant entity stays byte-identical — no method emitted.
+        let mut d2 = d.clone();
+        d2.modules[1].endpoints[0].required_roles.clear();
+        assert!(
+            !repo_rs(&d2.modules[1], mode, &d2)
+                .unwrap()
+                .contains("require_membership_role"),
+            "a flat tenant entity with no role-gated route must NOT get the gate method"
         );
     }
 

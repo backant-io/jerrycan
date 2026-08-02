@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.15 — 2026-08-02
+
+### Fixed
+- **`required_roles` on a flat tenant-owned entity now checks the tenant MEMBERSHIP role, not the
+  session role (#247).** A route like `DELETE /leads/{id}` with `required_roles: ["owner"]` on a flat
+  (membership-set) tenant-owned entity generated a check against `user.role` — the session/JWT role — so
+  a workspace *owner* (membership role `owner`, session role `user`) was 403'd deleting a lead in their
+  own workspace. The repo now emits `require_membership_role(user, id, roles)`, which resolves the row's
+  tenant and checks the caller's role in `{tenant}_members` — keyed on the row's tenant (fail-closed: a
+  non-member, wrong role, or missing row all 403; no cross-tenant escalation). The generated isolation
+  test's role-gated leg now asserts 403, so a regression to the session-role check turns it red.
+- **A non-canonically-named tenant mount param is now refused, not silently decorative (#250).** A
+  tenant-owned entity mounted at e.g. `/spaces/{ws_id}` when its fk is `workspace_id` was silently
+  classified flat — `{ws_id}` was decorative (`/spaces/1/` and `/spaces/999/` behaved identically),
+  making the tenant in the URL a fiction. This is now refused at design validation with **JC0568**
+  (rename the param to the canonical fk to scope by tenant, or mount flat). Canonical, nested, and
+  grandchild mounts are unaffected.
+
 ## 0.7.14 — 2026-08-02
 
 ### Fixed

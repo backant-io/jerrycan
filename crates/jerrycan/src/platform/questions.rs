@@ -1357,6 +1357,85 @@ pub fn validate(d: &Design) -> Vec<Question> {
             check_mixed_tenant_shape(d, m, &format!("/modules/{i}"), &mut qs);
         }
 
+        // JC0568 (#250): a tenant-owned entity mounted under a path param whose name is
+        // NOT the canonical tenancy fk (nor a recognized parent child_fk) is a
+        // URL-contract LIE. The generated `shared::tenant` guard scopes ONLY by a param
+        // literally named `{canonical_fk}` (or, for a grandchild, its parent child_fk),
+        // so a differently-named `/spaces/{ws_id}` (tenancy `Workspace`, fk
+        // `workspace_id`) is DECORATIVE — the entity is silently classified flat, and
+        // `/spaces/1/…` and `/spaces/999/…` address the exact same membership-set rows.
+        // Safe (membership is still enforced) but the addressed tenant is a fiction. This
+        // subsumes the #245 runtime bug (a non-canonical mount param that broke the
+        // isolation-probe URL) at the design layer: the shape is refused before scaffold.
+        // Canonical (`/{fk}/…`), nested, and grandchild (`/accounts/{account_id}`) mounts
+        // name a fk that DOES scope by tenant, so they pass byte-identically; a flat mount
+        // (no param) has nothing to check.
+        fn mount_params(mount: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut rest = mount;
+            while let Some(open) = rest.find('{') {
+                rest = &rest[open + 1..];
+                let Some(close) = rest.find('}') else { break };
+                out.push(rest[..close].to_string());
+                rest = &rest[close + 1..];
+            }
+            out
+        }
+        fn check_noncanonical_mount_param(
+            d: &Design,
+            canonical_fk: &str,
+            m: &ModuleDesign,
+            ptr: &str,
+            qs: &mut Vec<Question>,
+        ) {
+            // Only a node that owns a tenant-OWNED entity (directly or transitively). The
+            // tenant's OWN module addresses itself by its pk fk — JC0550's domain — so it
+            // is not scanned here (`tenant_path` returns None for the tenant itself).
+            let owned: Vec<&Entity> = m
+                .entities
+                .iter()
+                .filter(|e| d.tenant_path(&e.name).is_some())
+                .collect();
+            if !owned.is_empty() {
+                // Recognized mount params = the canonical tenancy fk + every join child_fk
+                // that scopes an owned entity to a parent on the path (a grandchild mount
+                // `/accounts/{account_id}`). Any OTHER mount param scopes nothing.
+                let mut recognized: Vec<String> = vec![canonical_fk.to_string()];
+                for e in &owned {
+                    if let Some(p) = d.tenant_path(&e.name) {
+                        for j in &p.joins {
+                            recognized.push(j.child_fk.clone());
+                        }
+                    }
+                }
+                let mount = m.effective_mount();
+                for param in mount_params(&mount) {
+                    if !recognized.iter().any(|r| r == &param) {
+                        qs.push(q(
+                            format!("{ptr}/mount"),
+                            format!(
+                                "Module `{}` mounts a tenant-owned entity at `{mount}`, but its path param `{{{param}}}` is not the canonical tenancy fk `{canonical_fk}` (nor a recognized parent child_fk) — the tenant guard scopes only by a param named `{{{canonical_fk}}}`, so `{{{param}}}` is decorative: every value addresses the SAME membership-set rows, making the tenant in the URL a fiction. Rename it to `{{{canonical_fk}}}` to scope by tenant, or drop it and mount flat. See `jerrycan explain JC0568`.",
+                                m.name
+                            ),
+                        ));
+                    }
+                }
+            }
+            for (i, sub) in m.subroutes.iter().enumerate() {
+                check_noncanonical_mount_param(
+                    d,
+                    canonical_fk,
+                    sub,
+                    &format!("{ptr}/subroutes/{i}"),
+                    qs,
+                );
+            }
+        }
+        let canonical_fk = Design::fk_column(&tenancy.entity);
+        for (i, m) in d.modules.iter().enumerate() {
+            check_noncanonical_mount_param(d, &canonical_fk, m, &format!("/modules/{i}"), &mut qs);
+        }
+
         // JC0553 (#141): with tenancy, jerrycan reserves the `{tenant}_members`
         // membership table and the `pub struct {Tenant}Member` row type (issue
         // #107) for the generated member surface. An entity (other than the
@@ -5234,6 +5313,120 @@ mod tests {
         assert!(
             jc0562(&qs).is_empty(),
             "a pure-path-scoped tenant entity must not trip JC0562: {qs:?}"
+        );
+    }
+
+    // ---- #250 (JC0568): non-canonical tenant mount param refusal ---------------
+
+    fn jc0568(qs: &[Question]) -> Vec<&Question> {
+        qs.iter()
+            .filter(|q| q.question.contains("JC0568"))
+            .collect()
+    }
+
+    /// #250: `events` mounts a tenant-owned `Event` under `/happenings/{org_id}`, but
+    /// tenancy `Organization` derives the canonical fk `organization_id`. `{org_id}`
+    /// scopes nothing (the guard keys on `{organization_id}`), so the tenant in the URL
+    /// is a fiction — JC0568 refuses it, naming the offending param and the canonical fk.
+    #[test]
+    fn noncanonical_tenant_mount_param_is_rejected() {
+        const NONCANON: &str = r#"{
+            "name": "orgs-api", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Organization", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "organizations",
+                  "entities": [{ "name": "Organization", "fields": [{ "name": "name", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_organization", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Organization" },
+                      "success": { "status": 201, "entity": "Organization" } }] },
+                { "name": "events", "mount": "/happenings/{org_id}",
+                  "entities": [{ "name": "Event",
+                      "belongs_to": [{ "entity": "Organization" }],
+                      "fields": [{ "name": "title", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_event", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Event" },
+                      "success": { "status": 201, "entity": "Event" } }] }
+            ]
+        }"#;
+        let d: Design = serde_json::from_str(NONCANON).unwrap();
+        let qs = validate(&d);
+        let hits = jc0568(&qs);
+        assert!(
+            hits.iter().any(|q| q.question.contains("org_id")
+                && q.question.contains("organization_id")
+                && q.id == "/modules/1/mount"),
+            "a non-canonical mount param must raise JC0568 naming org_id + organization_id at the events mount: {qs:?}"
+        );
+    }
+
+    /// A CANONICAL mount param (tenancy `Org` → fk `org_id`, so `/orgs/{org_id}` names
+    /// the fk that DOES scope by tenant), a NESTED mount on the tenant fk, and a
+    /// GRANDCHILD mount on a parent child_fk (`/accounts/{account_id}` for
+    /// `Contact belongs_to Account belongs_to Org`) must all stay SILENT — the refusal
+    /// keys on canonicity, not the mere presence of a mount param (byte-identity).
+    #[test]
+    fn canonical_nested_and_grandchild_mounts_do_not_trip_jc0568() {
+        // Canonical: tenancy Org (fk org_id), mount /orgs/{org_id}.
+        const CANON: &str = r#"{
+            "name": "orgs-api", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "orgs",
+                  "entities": [{ "name": "Org", "fields": [{ "name": "name", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_org", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Org" },
+                      "success": { "status": 201, "entity": "Org" } }] },
+                { "name": "events", "mount": "/orgs/{org_id}",
+                  "entities": [{ "name": "Event",
+                      "belongs_to": [{ "entity": "Org" }],
+                      "fields": [{ "name": "title", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_event", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Event" },
+                      "success": { "status": 201, "entity": "Event" } }] }
+            ]
+        }"#;
+        assert!(
+            jc0568(&validate(&serde_json::from_str::<Design>(CANON).unwrap())).is_empty(),
+            "a canonical mount param (org_id for tenancy Org) must NOT trip JC0568"
+        );
+
+        // Grandchild: Contact belongs_to Account belongs_to Org, mounted /accounts/{account_id}.
+        // account_id is the join child_fk, so the mount param is recognized.
+        const GRANDCHILD: &str = r#"{
+            "name": "org-api", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "orgs",
+                  "entities": [{ "name": "Org", "fields": [{ "name": "name", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_org", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Org" },
+                      "success": { "status": 201, "entity": "Org" } }] },
+                { "name": "accounts",
+                  "entities": [{ "name": "Account", "belongs_to": [{ "entity": "Org" }],
+                      "fields": [{ "name": "name", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_account", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Account" },
+                      "success": { "status": 201, "entity": "Account" } }] },
+                { "name": "contacts", "mount": "/accounts/{account_id}",
+                  "entities": [{ "name": "Contact", "belongs_to": [{ "entity": "Account" }],
+                      "fields": [{ "name": "email", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_contact", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Contact" },
+                      "success": { "status": 201, "entity": "Contact" } }] }
+            ]
+        }"#;
+        assert!(
+            jc0568(&validate(
+                &serde_json::from_str::<Design>(GRANDCHILD).unwrap()
+            ))
+            .is_empty(),
+            "a grandchild mount on a parent child_fk (account_id) must NOT trip JC0568"
         );
     }
 
