@@ -2023,9 +2023,29 @@ fn tenant_owned_isolation_test(design: &Design, module: &ModuleDesign) -> String
             "    let listed = t.get_with(\"{cbase}/\", &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(listed.status().as_u16(), 404, \"cross-tenant list must 404 — a non-member can't reach tenant 1's collection (Dep<Tenant> denies the path); body: {{}}\", listed.text());\n",
         ));
     }
-    if let Some(_del) = delete_one {
+    if let Some(del) = delete_one {
+        // A ROLE-GATED flat delete (issue #247) checks the caller's MEMBERSHIP role in
+        // the ROW's tenant BEFORE the scoped remove: user 2 is a member of tenant 2,
+        // NOT tenant 1, so `require_membership_role` 403s them. This 403 is the honest
+        // membership-vs-session discriminator (Rule 9) — a WRONG session-role check
+        // (`_user.0.role`) would let user 2's minted `owner` session role pass the gate
+        // and only 404 at `remove_for_memberships`, so an implementation that checks the
+        // session role instead of the membership role FAILS this assertion. A
+        // non-role-gated flat delete 404s at the scoped remove (unchanged); a nested
+        // role-gated delete 404s earlier at the `Dep<Tenant>` path guard (unchanged).
+        let (code, why) = if !del.required_roles.is_empty() && !is_nested {
+            (
+                403,
+                "cross-tenant delete on a role-gated flat route must 403 — user 2 is not a member of tenant 1, so require_membership_role denies before the scoped remove (issue #247, NOT the session role)",
+            )
+        } else {
+            (
+                404,
+                "cross-tenant delete must 404 (use remove_for, not remove)",
+            )
+        };
         t.push_str(&format!(
-            "    let del = t.delete_with(&format!(\"{cbase}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(del.status().as_u16(), 404, \"cross-tenant delete must 404 (use remove_for, not remove); body: {{}}\", del.text());\n",
+            "    let del = t.delete_with(&format!(\"{cbase}/{{id}}\"), &[(\"{hk}\", &cookie2)]).await;\n    assert_eq!(del.status().as_u16(), {code}, \"{why}; body: {{}}\", del.text());\n",
         ));
         if get_one.is_some() {
             t.push_str(&format!(

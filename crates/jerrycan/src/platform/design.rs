@@ -1416,6 +1416,22 @@ impl Design {
         (saw_path_scoped, saw_flat)
     }
 
+    /// True when ANY endpoint bound to `entity` (across every module and nested
+    /// subroute) declares `required_roles`. Scans with the SAME whole-design walk
+    /// as [`Self::entity_tenant_shapes`], so the `require_membership_role` repo
+    /// primitive (issue #247) is emitted for exactly the flat tenant-owned entities
+    /// whose flat role-gated routes steer to it — and nothing else stays
+    /// byte-identical (a flat tenant-owned entity with no role-gated route gets no
+    /// new method).
+    pub(crate) fn entity_has_required_roles_route(&self, entity: &str) -> bool {
+        fn scan(m: &ModuleDesign, entity: &str) -> bool {
+            m.endpoints.iter().any(|ep| {
+                !ep.required_roles.is_empty() && endpoint_repo_entity(m, ep) == Some(entity)
+            }) || m.subroutes.iter().any(|s| scan(s, entity))
+        }
+        self.modules.iter().any(|m| scan(m, entity))
+    }
+
     /// True when this belongs_to targets the AUTH IDENTITY entity: its derived
     /// fk column equals the design's identity fk (`snake(auth.identity)_id`;
     /// default `"User"` ⇒ `user_id` — see [`Self::identity_fk_column`]). Identity
