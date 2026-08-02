@@ -1045,8 +1045,23 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
             }
         }
 
+        // #247 residual: a role-gated FLAT (membership-set) `/{id}` mutation gates on
+        // the caller's MEMBERSHIP role in the ROW's tenant BEFORE any existence check —
+        // `require_membership_role` 403s an empty JOIN, so a MISSING id answers 403, not
+        // 404 (a row nobody owns is a row you are not an owner of). This is the SAME
+        // "the gate precedes the id lookup" reason a credential-`gated` route skips its
+        // `_missing_id_is_404` probe (line above): emitting it here would be un-greenable
+        // against a correct impl. The cross-tenant 403 is already covered by the
+        // isolation test, and a missing id is the same secure 403 — so we neither assert
+        // a 404 (unsatisfiable) nor push the generic "encode 404" TODO (it would mis-steer
+        // toward that un-greenable test).
+        let membership_role_gated = !ep.required_roles.is_empty()
+            && matches!(
+                design.endpoint_tenant_shape(unit, ep),
+                TenantShape::MembershipSet
+            );
         for ec in &ep.errors {
-            if ec.status == 404 && param_count(ep) == 1 && !gated {
+            if ec.status == 404 && param_count(ep) == 1 && !gated && !membership_role_gated {
                 let missing_path = full_path.replacen(&regex_free_param(&ep.path), "999999", 1);
                 // Build the probe with the endpoint's REAL method (and body/cookie)
                 // via the same builder the success test uses — a GET probe at a
@@ -1059,7 +1074,7 @@ fn unit_tests(design: &Design, unit: &ModuleDesign, base: &str, out: &mut TestOu
                     when = ec.when
                 ));
                 out.count += 1;
-            } else {
+            } else if !(ec.status == 404 && membership_role_gated) {
                 out.todos.push(format!(
                     "// AGENT TODO: design lists {} ({}) for {fn_base} — encode it in your own test file.",
                     ec.status, ec.when
