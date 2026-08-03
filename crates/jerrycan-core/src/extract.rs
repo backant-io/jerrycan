@@ -259,6 +259,58 @@ impl<A: PathParam, B: PathParam, C: PathParam> FromRequest for Path<(A, B, C)> {
     }
 }
 
+impl<A: PathParam, B: PathParam, C: PathParam, D: PathParam> FromRequest for Path<(A, B, C, D)> {
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
+        let [a, b, c, d] = take_params::<4>(ctx)?;
+        Ok(Path((
+            A::parse_param(&a.0, &a.1)?,
+            B::parse_param(&b.0, &b.1)?,
+            C::parse_param(&c.0, &c.1)?,
+            D::parse_param(&d.0, &d.1)?,
+        )))
+    }
+}
+
+impl<A: PathParam, B: PathParam, C: PathParam, D: PathParam, E: PathParam> FromRequest
+    for Path<(A, B, C, D, E)>
+{
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
+        let [a, b, c, d, e] = take_params::<5>(ctx)?;
+        Ok(Path((
+            A::parse_param(&a.0, &a.1)?,
+            B::parse_param(&b.0, &b.1)?,
+            C::parse_param(&c.0, &c.1)?,
+            D::parse_param(&d.0, &d.1)?,
+            E::parse_param(&e.0, &e.1)?,
+        )))
+    }
+}
+
+impl<A: PathParam, B: PathParam, C: PathParam, D: PathParam, E: PathParam, F: PathParam> FromRequest
+    for Path<(A, B, C, D, E, F)>
+{
+    async fn from_request(ctx: &mut RequestCtx) -> Result<Self> {
+        if ctx.is_task {
+            return Err(Error::task_context());
+        }
+        let [a, b, c, d, e, f] = take_params::<6>(ctx)?;
+        Ok(Path((
+            A::parse_param(&a.0, &a.1)?,
+            B::parse_param(&b.0, &b.1)?,
+            C::parse_param(&c.0, &c.1)?,
+            D::parse_param(&d.0, &d.1)?,
+            E::parse_param(&e.0, &e.1)?,
+            F::parse_param(&f.0, &f.1)?,
+        )))
+    }
+}
+
 /// First N captured params, cloned in route order. Fewer than N is a routing
 /// bug (the route declared fewer `{params}` than the handler expects) — 500.
 fn take_params<const N: usize>(ctx: &RequestCtx) -> Result<[(String, String); N]> {
@@ -580,6 +632,39 @@ mod tests {
             )
             .into_test();
         assert_eq!(t.get("/ws/7/leads/42").await.json::<(i64, i64)>(), (7, 42));
+    }
+
+    /// Issue #283: a route nested THREE param-levels deep must bind a 3-tuple that
+    /// reads root→leaf. This is the runtime counterpart of the generator fix: a
+    /// handler under `/accounts/{account_id}/contacts/{contact_id}/notes/{id}` binds
+    /// `Path<(i64,i64,i64)>`, and `take_params::<3>` reads (account_id, contact_id,
+    /// id) POSITIONALLY. Before the generator fix the handler bound only the local
+    /// 2-tuple `(contact_id, id)`, which core resolves to (account_id, contact_id) —
+    /// the leaf id `999` was never read and the route was dead.
+    #[tokio::test]
+    async fn deep_nested_triple_reads_root_to_leaf() {
+        use crate::prelude::*;
+        async fn triple(
+            Path((account_id, contact_id, id)): Path<(i64, i64, i64)>,
+        ) -> Result<Json<(i64, i64, i64)>> {
+            Ok(Json((account_id, contact_id, id)))
+        }
+        let t = App::new()
+            .mount(
+                "/accounts/{account_id}",
+                Module::new("contacts").mount(
+                    "/contacts/{contact_id}",
+                    Module::new("notes").route("/notes/{id}", get(triple)),
+                ),
+            )
+            .into_test();
+        assert_eq!(
+            t.get("/accounts/111/contacts/222/notes/999")
+                .await
+                .json::<(i64, i64, i64)>(),
+            (111, 222, 999),
+            "the 3-tuple must read account_id=111, contact_id=222, id=999 positionally"
+        );
     }
 
     #[tokio::test]

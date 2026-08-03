@@ -90,9 +90,22 @@ fn return_type(ep: &Endpoint) -> String {
 /// carries no `{token}`, so its result is byte-identical to the old `ep.path`-only
 /// scan.
 fn path_params(m: &ModuleDesign, ep: &Endpoint) -> Vec<String> {
+    resolved_path_params("", m, ep)
+}
+
+/// The `{param}` tokens on this endpoint's FULLY-resolved path — the ACCUMULATED
+/// ancestor mount prefix (every grandparent/parent subroute mount, empty at the top
+/// level) plus this module's `effective_mount` plus `ep.path` — in path order. A
+/// subroute's own `effective_mount` only carries ITS mount, so a GRANDPARENT mount
+/// param (a `/accounts/{account_id}` prefix three levels up) is invisible to
+/// `path_params` alone; the handler must still bind it or core's positional tuple
+/// extractor misaligns (issue #283). `ancestor` is the concatenated ancestor mounts
+/// (trailing `/` trimmed per level); `""` reproduces the old `path_params` exactly.
+fn resolved_path_params(ancestor: &str, m: &ModuleDesign, ep: &Endpoint) -> Vec<String> {
     let mount = m.effective_mount();
     let mount = mount.strip_suffix('/').unwrap_or(&mount);
-    let resolved = format!("{mount}{}", ep.path);
+    let ancestor = ancestor.strip_suffix('/').unwrap_or(ancestor);
+    let resolved = format!("{ancestor}{mount}{}", ep.path);
     let mut out = Vec::new();
     let mut rest = resolved.as_str();
     while let Some(start) = rest.find('{') {
@@ -274,7 +287,13 @@ fn endpoint_emits_realtime_publish_to(
 // testgen.rs (401 probe), so the handler, the advertised contract, and the
 // acceptance suite cannot disagree about whether a GET is guarded.
 
-fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Design) -> Vec<String> {
+fn handler_params(
+    ancestor: &str,
+    m: &ModuleDesign,
+    ep: &Endpoint,
+    mode: GenMode,
+    design: &Design,
+) -> Vec<String> {
     let mut params = Vec::new();
     if let Some(e) = endpoint_repo_entity(m, ep) {
         params.push(format!("_repo: Dep<{e}Repo>"));
@@ -302,52 +321,72 @@ fn handler_params(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &Desig
     {
         params.push("_rt: Dep<jerrycan::realtime::RealtimeHandle>".to_string());
     }
-    // Every `{param}` on the RESOLVED path binds as a `Path` (issue #127) so the
-    // handler can inject a mount-inherited parent fk that #82 dropped from the
-    // body — EXCEPT a MOUNT-inherited tenant fk when the endpoint already takes
-    // `Dep<Tenant>` (which resolves the tenant from the same path segment; binding
-    // it again would be a double-bind). The exclusion is narrow: it fires only for
-    // a tenant fk carried by the module MOUNT (a nested `/clubs/{club_id}` prefix),
-    // never one spelled in `ep.path` — so the tenant's OWN detail route `/{club_id}`
-    // keeps its `Path(_club_id)` binding (byte-identical), and a flat/top-level
-    // module (no mount token) is untouched. Every OTHER resolved token — a
-    // grandchild's parent fk `/accounts/{account_id}`, a non-tenant mount param, or
-    // the endpoint's own `{id}` — binds.
-    let has_tenant_dep = mode.auth && ep.is_guarded() && endpoint_uses_tenant_guard(m, ep, design);
-    let mount = m.effective_mount();
-    let excluded_tenant_fk = has_tenant_dep
-        .then(|| {
-            design
-                .tenancy
-                .as_ref()
-                .map(|t| Design::fk_column(&t.entity))
-        })
-        .flatten()
-        .filter(|fk| mount.contains(&format!("{{{fk}}}")));
-    let params_in_path: Vec<String> = path_params(m, ep)
-        .into_iter()
-        .filter(|p| Some(p) != excluded_tenant_fk.as_ref())
-        .collect();
-    // The param that keys the endpoint's entity takes that entity's key type; every
-    // other path param types from the entity it references (#85). Shared with the
-    // OpenAPI path-param schema through `path_param_rust_type` (#278) so the handler
-    // `Path<T>` and the contract can never drift.
+    // Path binding. Core's tuple `Path<(…)>` extractor binds POSITIONALLY from index
+    // 0, while a single `Path<T>` binds `.last()`. At ≤2 RESOLVED path params these
+    // agree (a single Path reads the leaf; a 2-tuple has no ancestor segment to
+    // misalign it), so that regime keeps the historical LOCAL-mount logic
+    // byte-identical — including the mount-tenant-fk exclusion (issue #127: a
+    // `Dep<Tenant>` endpoint resolves the fk from the same path segment, so binding
+    // it again would double-bind; the exclusion fires only for a tenant fk in the
+    // module MOUNT, never one in `ep.path`).
+    //
+    // At ≥3 params — only reachable through NESTED param-carrying mounts (issue
+    // #283: a subroute whose own mount carries `{contact_id}` under a
+    // `/accounts/{account_id}` grandparent) — the LOCAL tuple is a SUFFIX of the
+    // full capture list, so core's index-0 binding grabs the wrong segments (a
+    // grandchild's `Path<(_contact_id, _id)>` reads `account_id`/`contact_id`, and
+    // its own leaf id is never read → dead route / false-green 404 probe). Bind
+    // EVERY resolved param positionally in path order instead. No tenant-fk
+    // exclusion here: dropping a LEADING param would re-misalign the positional
+    // tuple, so a mount tenant fk is bound-but-unused (`_fk`) — harmless, since
+    // `Dep<Tenant>` still resolves membership from the same segment.
     let param_type = |p: &str| path_param_rust_type(m, ep, design, p);
-    match params_in_path.len() {
-        0 => {}
-        1 => params.push(format!(
-            "Path(_{p}): Path<{ty}>",
-            p = params_in_path[0],
-            ty = param_type(&params_in_path[0])
-        )),
-        _ => {
-            let names: Vec<String> = params_in_path.iter().map(|p| format!("_{p}")).collect();
-            let types = params_in_path
-                .iter()
-                .map(|p| param_type(p))
-                .collect::<Vec<_>>()
-                .join(", ");
-            params.push(format!("Path(({})): Path<({})>", names.join(", "), types));
+    let full = resolved_path_params(ancestor, m, ep);
+    if full.len() >= 3 {
+        let names: Vec<String> = full.iter().map(|p| format!("_{p}")).collect();
+        let types = full
+            .iter()
+            .map(|p| param_type(p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        params.push(format!("Path(({})): Path<({})>", names.join(", "), types));
+    } else {
+        let has_tenant_dep =
+            mode.auth && ep.is_guarded() && endpoint_uses_tenant_guard(m, ep, design);
+        let mount = m.effective_mount();
+        let excluded_tenant_fk = has_tenant_dep
+            .then(|| {
+                design
+                    .tenancy
+                    .as_ref()
+                    .map(|t| Design::fk_column(&t.entity))
+            })
+            .flatten()
+            .filter(|fk| mount.contains(&format!("{{{fk}}}")));
+        let params_in_path: Vec<String> = path_params(m, ep)
+            .into_iter()
+            .filter(|p| Some(p) != excluded_tenant_fk.as_ref())
+            .collect();
+        // The param that keys the endpoint's entity takes that entity's key type;
+        // every other path param types from the entity it references (#85). Shared
+        // with the OpenAPI path-param schema through `path_param_rust_type` (#278) so
+        // the handler `Path<T>` and the contract can never drift.
+        match params_in_path.len() {
+            0 => {}
+            1 => params.push(format!(
+                "Path(_{p}): Path<{ty}>",
+                p = params_in_path[0],
+                ty = param_type(&params_in_path[0])
+            )),
+            _ => {
+                let names: Vec<String> = params_in_path.iter().map(|p| format!("_{p}")).collect();
+                let types = params_in_path
+                    .iter()
+                    .map(|p| param_type(p))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                params.push(format!("Path(({})): Path<({})>", names.join(", "), types));
+            }
         }
     }
     if let Some(ref rb) = ep.request_body {
@@ -782,7 +821,25 @@ fn owner_scope_comment(m: &ModuleDesign, ep: &Endpoint, mode: GenMode, design: &
     )
 }
 
+/// Top-level convenience wrapper (no ancestor prefix). Production always emits
+/// through `handlers_rs_at` (via `write_unit_files`); only the unit tests, which
+/// exercise a single module in isolation, use this form — so it is test-only.
+#[cfg(test)]
 pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> String {
+    handlers_rs_at("", m, mode, design)
+}
+
+/// Like [`handlers_rs`], but with the ACCUMULATED ancestor mount prefix threaded in
+/// so a deeply-nested subroute's handler binds every resolved path param — the
+/// grandparent mount tokens `path_params` alone cannot see (issue #283). The
+/// production emitter (`write_subroutes`) passes the real prefix; the plain
+/// [`handlers_rs`] wrapper passes `""` (a top-level module, byte-identical to before).
+pub(crate) fn handlers_rs_at(
+    ancestor: &str,
+    m: &ModuleDesign,
+    mode: GenMode,
+    design: &Design,
+) -> String {
     // Import order is rustfmt's `reorder_imports` order (issue #165), so a fresh
     // scaffold's handlers.rs is a `cargo fmt` fixpoint out of the box: `super::*`
     // (model before repo), then `jerrycan::prelude`, then `shared::*` (CurrentUser
@@ -845,7 +902,7 @@ pub(crate) fn handlers_rs(m: &ModuleDesign, mode: GenMode, design: &Design) -> S
         // one line while it fits max_width (100), else one param per line.
         let sig = handler_signature(
             &ep.operation_id,
-            &handler_params(m, ep, mode, design),
+            &handler_params(ancestor, m, ep, mode, design),
             &return_type(ep),
         );
         out.push_str(&format!(
@@ -4132,9 +4189,12 @@ pub fn write_module_reporting(
         &root,
         &mut dropped,
     )?;
-    write_unit_files(&src, m, mode, design, &mut created, &root)?;
+    // The top-level module carries no ancestor mount prefix (its own mount is
+    // `m.effective_mount`); subroutes accumulate the chain as `write_subroutes`
+    // recurses (issue #283).
+    write_unit_files("", &src, m, mode, design, &mut created, &root)?;
     write_members(&src, m, mode, design, &mut created, &root, &mut dropped)?;
-    write_subroutes(&src, m, mode, design, &mut created, &root, &mut dropped)?;
+    write_subroutes("", &src, m, mode, design, &mut created, &root, &mut dropped)?;
     // db mode: agent-owned create-once migrations for this crate (module + subroutes).
     if mode.db {
         write_module_migrations(&crate_dir, m, &mut created, &root, design)?;
@@ -4142,8 +4202,11 @@ pub fn write_module_reporting(
     Ok((created, dropped))
 }
 
-/// The agent-owned file set shared by modules and subroutes.
+/// The agent-owned file set shared by modules and subroutes. `ancestor` is the
+/// accumulated mount prefix of every enclosing module (empty at the top level), so
+/// a nested subroute's handlers bind every resolved path param (issue #283).
 fn write_unit_files(
+    ancestor: &str,
     dir: &Path,
     m: &ModuleDesign,
     mode: GenMode,
@@ -4153,7 +4216,7 @@ fn write_unit_files(
 ) -> Result<(), String> {
     write_agent_owned(
         &dir.join("handlers.rs"),
-        &handlers_rs(m, mode, design),
+        &handlers_rs_at(ancestor, m, mode, design),
         created,
         root,
     )?;
@@ -4200,7 +4263,13 @@ fn write_members(
     }
 }
 
+/// `ancestor` is the accumulated mount prefix of `m`'s enclosing modules (empty
+/// when `m` is a top-level module). Each child subroute inherits `ancestor +
+/// m.effective_mount()` so its handlers resolve the FULL path-param list (issue
+/// #283) — a grandparent mount token is otherwise invisible to `path_params`.
+#[allow(clippy::too_many_arguments)]
 fn write_subroutes(
+    ancestor: &str,
     src: &Path,
     m: &ModuleDesign,
     mode: GenMode,
@@ -4212,6 +4281,14 @@ fn write_subroutes(
     if m.subroutes.is_empty() {
         return Ok(());
     }
+    // The prefix children inherit: this module's ancestor chain plus its own mount
+    // (trailing `/` trimmed so the concatenation stays a clean path).
+    let mount = m.effective_mount();
+    let child_prefix = format!(
+        "{}{}",
+        ancestor.strip_suffix('/').unwrap_or(ancestor),
+        mount.strip_suffix('/').unwrap_or(&mount)
+    );
     let sub_root = src.join("subroutes");
     let mut decls = String::from("//! TOOL-OWNED: subroute declarations.\n");
     for sub in &m.subroutes {
@@ -4227,9 +4304,18 @@ fn write_subroutes(
             root,
             dropped,
         )?;
-        write_unit_files(&dir, sub, mode, design, created, root)?;
+        write_unit_files(&child_prefix, &dir, sub, mode, design, created, root)?;
         write_members(&dir, sub, mode, design, created, root, dropped)?;
-        write_subroutes(&dir, sub, mode, design, created, root, dropped)?; // arbitrary depth
+        write_subroutes(
+            &child_prefix,
+            &dir,
+            sub,
+            mode,
+            design,
+            created,
+            root,
+            dropped,
+        )?; // arbitrary depth
     }
     Ok(())
 }
@@ -8227,6 +8313,88 @@ pub(crate) mod tests {
             "leaf endpoint under a param mount must stay single-Path: {h}"
         );
         assert!(!h.contains("Path((_"), "no tuple over the mount param: {h}");
+        // Even with the REAL accumulated prefix threaded (the production path), a
+        // 2-resolved-param leaf stays single-Path (core reads `.last()` = the leaf):
+        // ≤2 params keep the historical behavior byte-identical (issue #283).
+        let threaded = handlers_rs_at("/ws/{ws}", sub, GenMode::default(), &demo());
+        assert!(
+            threaded.contains("pub(crate) async fn show_lead(Path(_id): Path<i64>)")
+                && !threaded.contains("Path((_"),
+            "a 2-param leaf stays single-Path even with the ancestor prefix: {threaded}"
+        );
+    }
+
+    /// Issue #283: a subroute nested ≥3 param-levels deep binds EVERY resolved path
+    /// param — the grandparent mount tokens `path_params` alone cannot see. End to
+    /// end through `write_module` (so `write_subroutes` really threads the
+    /// accumulated ancestor prefix): the leaf `notes` handler and the intermediate
+    /// `contacts` handler each bind `Path((_account_id, _contact_id, _id))` in path
+    /// order. Before the fix, `contacts`' `show_contact` emitted `Path((_contact_id,
+    /// _id)): Path<(i64,i64)>`, which core binds positionally to `account_id`,
+    /// `contact_id` — the leaf id is never read and the route is dead. WHY (Rule 9):
+    /// a handler that binds the wrong path segments is a silently broken route the
+    /// generated 404 probe cannot catch (it looked up the mis-bound id).
+    #[test]
+    fn deep_nest_handler_binds_every_ancestor_mount_param() {
+        let d: Design = serde_json::from_str(
+            r#"{
+                "name": "deepnest", "contract_version": 0, "dependencies": [],
+                "modules": [{
+                    "name": "accounts", "mount": "/accounts/{account_id}",
+                    "entities": [{ "name": "Account", "fields": [{ "name": "name", "type": "string" }] }],
+                    "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/",
+                        "success": { "status": 200, "entity": "Account", "list": true } }],
+                    "subroutes": [{
+                        "name": "contacts", "mount": "/contacts/{contact_id}",
+                        "entities": [{ "name": "Contact", "fields": [{ "name": "email", "type": "string" }] }],
+                        "endpoints": [
+                            { "operation_id": "show_contact", "method": "GET", "path": "/{id}",
+                              "success": { "status": 200, "entity": "Contact" } }
+                        ],
+                        "subroutes": [{
+                            "name": "notes", "mount": "/notes",
+                            "entities": [{ "name": "Note", "fields": [{ "name": "body", "type": "string" }] }],
+                            "endpoints": [
+                                { "operation_id": "show_note", "method": "GET", "path": "/{id}",
+                                  "success": { "status": 200, "entity": "Note" } }
+                            ]
+                        }]
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let routes = tmp.path().join("crates/routes");
+        write_module(&routes, &d.modules[0], GenMode::default(), &d).unwrap();
+
+        let read = |rel: &str| {
+            flatten_sigs(
+                &fs::read_to_string(routes.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}")),
+            )
+        };
+        // Intermediate subroute (its own mount carries `{contact_id}`): 3 resolved
+        // params → the full positional tuple, NOT the old suffix `(_contact_id, _id)`.
+        let contacts = read("accounts/src/subroutes/contacts/handlers.rs");
+        assert!(
+            contacts.contains(
+                "pub(crate) async fn show_contact(_repo: Dep<ContactRepo>, Path((_account_id, _contact_id, _id)): Path<(i64, i64, i64)>)"
+            ),
+            "the grandchild subroute must bind ALL three path params in order:\n{contacts}"
+        );
+        assert!(
+            !contacts.contains("Path((_contact_id, _id))"),
+            "the buggy 2-tuple (which core mis-binds to account_id/contact_id) must be gone:\n{contacts}"
+        );
+        // Leaf sub-subroute (own mount has no param): 3 resolved params → also the
+        // full tuple, so the handler can address account_id/contact_id/id positionally.
+        let notes = read("accounts/src/subroutes/contacts/subroutes/notes/handlers.rs");
+        assert!(
+            notes.contains(
+                "pub(crate) async fn show_note(_repo: Dep<NoteRepo>, Path((_account_id, _contact_id, _id)): Path<(i64, i64, i64)>)"
+            ),
+            "the leaf handler must bind ALL three path params in order:\n{notes}"
+        );
     }
 
     #[test]

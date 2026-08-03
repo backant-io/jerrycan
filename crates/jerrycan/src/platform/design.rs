@@ -924,16 +924,31 @@ impl Design {
     /// else the design's first declared `auth.roles`, else `"admin"` only when the
     /// design declares no roles at all (keeps roleless output byte-identical).
     pub(crate) fn test_credential_role(&self) -> &str {
-        fn first_gate(m: &ModuleDesign) -> Option<&str> {
+        // Only a SESSION-role gate counts: a Collection/None route checks
+        // `require_role(&_user.0.role, …)` against the test credential's
+        // `SessionUser.role`, whereas a MembershipSet/PathScoped route's
+        // `required_roles` is a MEMBERSHIP role verified against the caller's tenant
+        // membership (seeded separately, unrelated to the session cookie). Stamping a
+        // membership role (e.g. `"owner"`) into the session mis-credentials a
+        // session-role-gated non-tenant create (needing `"admin"`) → an un-greenable
+        // 403 (issue #285). So `first_gate` skips membership-checked routes.
+        fn first_gate<'a>(design: &'a Design, m: &'a ModuleDesign) -> Option<&'a str> {
             m.endpoints
                 .iter()
-                .find_map(|ep| ep.required_roles.first())
+                .find(|ep| {
+                    !ep.required_roles.is_empty()
+                        && matches!(
+                            design.endpoint_tenant_shape(m, ep),
+                            TenantShape::Collection | TenantShape::None
+                        )
+                })
+                .and_then(|ep| ep.required_roles.first())
                 .map(String::as_str)
-                .or_else(|| m.subroutes.iter().find_map(first_gate))
+                .or_else(|| m.subroutes.iter().find_map(|s| first_gate(design, s)))
         }
         self.modules
             .iter()
-            .find_map(first_gate)
+            .find_map(|m| first_gate(self, m))
             .or_else(|| {
                 self.auth
                     .as_ref()
@@ -2946,6 +2961,96 @@ pub(crate) mod tests {
             plain.endpoint_tenant_shape(m, &m.endpoints[0]),
             TenantShape::None
         ));
+    }
+
+    /// Issue #285: the test credential's `SessionUser.role` must come from a
+    /// SESSION-role gate, never a MEMBERSHIP-role gate. Here the FIRST module's
+    /// only role-gated route is a flat tenant-owned (`MembershipSet`) DELETE whose
+    /// `["owner"]` is a MEMBERSHIP role (verified against the caller's tenant
+    /// membership, seeded separately) — stamping it into the session would 403 the
+    /// later non-tenant (`None`) create that genuinely needs the SESSION role
+    /// `"admin"`. `test_credential_role` must skip the membership gate and return
+    /// `"admin"`. WHY (Rule 9): the credential role is the difference between a
+    /// green and an un-greenable 403 on a session-role-gated create.
+    #[test]
+    fn credential_role_skips_membership_gate_for_session_gate() {
+        let d: Design = serde_json::from_str(
+            r#"{ "name": "mixedroles", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["admin", "owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "docs",
+                      "entities": [{ "name": "Doc", "belongs_to": [{ "entity": "Org" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "title", "type": "string" }] }],
+                      "endpoints": [
+                          { "operation_id": "delete_doc", "method": "DELETE", "path": "/{id}",
+                            "auth_required": true, "required_roles": ["owner"],
+                            "success": { "status": 204 } } ] },
+                    { "name": "orgs",
+                      "entities": [{ "name": "Org", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [
+                          { "operation_id": "list_orgs", "method": "GET", "path": "/",
+                            "success": { "status": 200, "entity": "Org", "list": true } } ] },
+                    { "name": "audit",
+                      "entities": [{ "name": "AuditLog", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "message", "type": "string" } ]}],
+                      "endpoints": [
+                          { "operation_id": "create_audit", "method": "POST", "path": "/",
+                            "auth_required": true, "required_roles": ["admin"],
+                            "request_body": { "entity": "AuditLog" },
+                            "success": { "status": 201, "entity": "AuditLog" } } ] }
+                ] }"#,
+        )
+        .unwrap();
+        // The first (docs) MembershipSet `["owner"]` gate is skipped; the audit
+        // module's `None`-shape `["admin"]` gate wins.
+        let docs = &d.modules[0];
+        assert!(matches!(
+            d.endpoint_tenant_shape(docs, &docs.endpoints[0]),
+            TenantShape::MembershipSet
+        ));
+        assert_eq!(
+            d.test_credential_role(),
+            "admin",
+            "must pick the SESSION-role gate, not the membership `owner`"
+        );
+
+        // A design whose ONLY role gates are membership-checked falls back to the
+        // first declared `auth.roles` — never a stray membership role.
+        let only_membership: Design = serde_json::from_str(
+            r#"{ "name": "memonly", "contract_version": 1,
+                "auth": { "model": "session", "roles": ["staff", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+                "modules": [
+                    { "name": "docs",
+                      "entities": [{ "name": "Doc", "belongs_to": [{ "entity": "Org" }],
+                          "fields": [{ "name": "id", "type": "integer" },
+                                     { "name": "title", "type": "string" }] }],
+                      "endpoints": [
+                          { "operation_id": "delete_doc", "method": "DELETE", "path": "/{id}",
+                            "auth_required": true, "required_roles": ["owner"],
+                            "success": { "status": 204 } } ] },
+                    { "name": "orgs",
+                      "entities": [{ "name": "Org", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string" } ]}],
+                      "endpoints": [
+                          { "operation_id": "list_orgs", "method": "GET", "path": "/",
+                            "success": { "status": 200, "entity": "Org", "list": true } } ] }
+                ] }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            only_membership.test_credential_role(),
+            "staff",
+            "no session gate → first declared auth.roles, not the membership `owner`"
+        );
     }
 
     #[test]

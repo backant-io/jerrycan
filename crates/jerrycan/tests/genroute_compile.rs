@@ -1859,6 +1859,113 @@ fn non_tenant_param_mount_child_injects_path_fk_and_compiles() {
     }
 }
 
+/// Issue #283: a subroute nested THREE param-levels deep. `accounts`
+/// (`/accounts/{account_id}`) → subroute `contacts` (`/contacts/{contact_id}`) →
+/// subroute `notes` (`/notes`), each with a `GET /{id}`. Before the fix, a handler's
+/// `Path<…>` extractor bound only its LOCAL mount params — a grandchild's
+/// `Path<(_contact_id, _id)>` that core (index-0 positional) resolves to
+/// `account_id`/`contact_id`, so the leaf id was never read (dead route + false-green
+/// 404 probe). The fix binds EVERY resolved path param in order, so the extractor is
+/// `Path<(i64, i64, i64)>` — which requires core's 3-tuple `FromRequest` impl. This
+/// scaffolds the shape and requires `route-accounts` to build under strict clippy:
+/// the acceptance proof the deep-nest handlers compile against the framework.
+const DEEP_NEST_PARAM_MOUNT: &str = r#"{
+    "name": "deepnest-api", "contract_version": 1, "dependencies": ["db"],
+    "modules": [{
+        "name": "accounts", "mount": "/accounts/{account_id}",
+        "entities": [{ "name": "Account", "fields": [
+            { "name": "id", "type": "integer" },
+            { "name": "name", "type": "string" } ]}],
+        "endpoints": [{ "operation_id": "list_accounts", "method": "GET", "path": "/",
+            "success": { "status": 200, "entity": "Account", "list": true } }],
+        "subroutes": [{
+            "name": "contacts", "mount": "/contacts/{contact_id}",
+            "entities": [{ "name": "Contact", "fields": [
+                { "name": "id", "type": "integer" },
+                { "name": "email", "type": "string" } ]}],
+            "endpoints": [{ "operation_id": "show_contact", "method": "GET", "path": "/{id}",
+                "success": { "status": 200, "entity": "Contact" } }],
+            "subroutes": [{
+                "name": "notes", "mount": "/notes",
+                "entities": [{ "name": "Note", "fields": [
+                    { "name": "id", "type": "integer" },
+                    { "name": "body", "type": "string" } ]}],
+                "endpoints": [{ "operation_id": "show_note", "method": "GET", "path": "/{id}",
+                    "success": { "status": 200, "entity": "Note" } }]
+            }]
+        }]
+    }]
+}"#;
+
+#[test]
+#[ignore = "scaffolds a deeply-nested app and invokes cargo on it; run with --include-ignored"]
+fn deep_nested_subroute_binds_all_path_params_and_compiles_283() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = tmp.path().join("deepnest-api");
+
+    let jerrycan_dir = jerrycan_crate_dir().replace('\\', "/");
+    let dep = format!("jerrycan = {{ path = \"{jerrycan_dir}\", default-features = false }}");
+    let design_path = tmp.path().join("design.json");
+    write(&design_path, DEEP_NEST_PARAM_MOUNT);
+    let status = Command::new(env!("CARGO_BIN_EXE_jerrycan"))
+        .env("JERRYCAN_FRAMEWORK_DEP", &dep)
+        .arg("new")
+        .arg(&app)
+        .arg("--design")
+        .arg(&design_path)
+        .status()
+        .expect("run jerrycan new");
+    assert!(
+        status.success(),
+        "jerrycan new must scaffold the deep-nest app"
+    );
+
+    // The intermediate + leaf handlers each bind the FULL 3-tuple in path order —
+    // NOT the old local suffix that core mis-binds.
+    let contacts =
+        fs::read_to_string(app.join("crates/routes/accounts/src/subroutes/contacts/handlers.rs"))
+            .expect("read contacts handlers");
+    assert!(
+        contacts.contains("Path((_account_id, _contact_id, _id)): Path<(i64, i64, i64)>"),
+        "the grandchild handler must bind all three params in order:\n{contacts}"
+    );
+    let notes = fs::read_to_string(
+        app.join("crates/routes/accounts/src/subroutes/contacts/subroutes/notes/handlers.rs"),
+    )
+    .expect("read notes handlers");
+    assert!(
+        notes.contains("Path((_account_id, _contact_id, _id)): Path<(i64, i64, i64)>"),
+        "the leaf handler must bind all three params in order:\n{notes}"
+    );
+
+    // Avoid inheriting the parent jerrycan workspace; this temp dir is its own root.
+    write(&app.join("rust-toolchain.toml"), "");
+
+    // The 3-tuple `Path<(i64,i64,i64)>` extractor must type-check against core — the
+    // stub crate compiles it in the handler signature, so a clean build IS the proof.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&app)
+        .args([
+            "clippy",
+            "-p",
+            "route-accounts",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .env("CARGO_TARGET_DIR", common::shared_app_target())
+        .output()
+        .expect("run cargo clippy");
+    if !output.status.success() {
+        panic!(
+            "deep-nest app failed `cargo clippy -- -D warnings`\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 /// Issue #240 (the vacuous / uncompilable isolation test): a NESTED tenant module
 /// whose isolation probe had NO read leg. `events` mounts at `/orgs/{org_id}`
 /// (`Event belongs_to Org`) with a creator + LIST but no `GET /{id}`. The list leg
