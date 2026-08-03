@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.26 — 2026-08-03
+
+### Fixed
+- **A tenant-owned entity can be mounted under a real parent fk it also `belongs_to` (#288).** `jerrycan new`
+  refused (`JC0568`) a design where an entity both `belongs_to` the tenancy entity AND `belongs_to` a parent it
+  is mounted under — e.g. `Meter belongs_to [Org, Audit]` mounted at `/audits/{audit_id}` (the schema convention
+  where every table carries a direct `org_id` for scoping AND its parent fk). The entity's direct tenant path ran
+  straight to the anchor with no joins, hiding the parent fk, so `{audit_id}` was seen as a decorative param. The
+  recognized mount params now include every owned entity's `belongs_to` fk columns, so mounting under a genuine
+  parent fk is accepted; a param naming no real fk is still refused. (Fixes a `check` accepts / `new` refuses
+  divergence on the same design.)
+- **`gen-tests` wires the tenant provider and a membership seed for an entity-less module under tenancy (#287).**
+  A module with no entities whose guarded handler used the app-level `Dep<Tenant>` got a generated `app()` that
+  registered neither the `shared::tenant` provider (so the 401 probe 500'd with `JC1001 no provider`) nor an
+  `org_members` seed (so the 404 probe 403'd — the probe user wasn't a member). The provider/seed gates keyed off
+  the module's entities and missed it. An entity-less guarded module under tenancy now gets the provider and a
+  minimal org + membership seed, mirroring the generated `main.rs`. Isolation-test scaffolding is unaffected (it
+  stays keyed on entity ownership), and the tenant module itself is not pre-seeded.
+
 ## 0.7.25 — 2026-08-03
 
 ### Fixed

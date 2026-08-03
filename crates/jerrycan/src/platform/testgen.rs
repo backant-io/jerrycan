@@ -1647,7 +1647,34 @@ fn module_provides_tenant_dep(design: &Design, module: &ModuleDesign) -> bool {
             .iter()
             .any(|s| has_guarded_pathscoped(design, s))
     }
-    module_needs_tenant(design, module) || has_guarded_pathscoped(design, module)
+    module_needs_tenant(design, module)
+        || has_guarded_pathscoped(design, module)
+        || entityless_guarded_under_tenancy(design, module)
+}
+
+/// True when this module is ENTITY-LESS yet carries a GUARDED endpoint under a
+/// tenancy design — directly, or transitively in a subroute (issue #287). Such a
+/// module has NO tenant-owned entity, so both existing gates miss it:
+/// [`module_needs_tenant`] walks `entities` for a `tenant_path` (none exist), and
+/// [`module_provides_tenant_dep`]'s `has_guarded_pathscoped` needs a
+/// `TenantShape::PathScoped` endpoint (an entity-less endpoint has no entity to be
+/// path-scoped against). But an agent that implements the guarded handler with the
+/// shared `Dep<Tenant>` guard (a tenant-scoped custom route on an entity-less
+/// module — the #287 scenario) needs the SAME app() wiring `main.rs` registers
+/// app-wide: (a) the `tenant` DI factory so `Dep<Tenant>` resolves (no JC1001
+/// 500), and (b) a membership row for the probe user (id 1) so the guard resolves
+/// a tenant (404 not 403). It deliberately does NOT drive the second-tenant /
+/// isolation scaffolding (kept on `module_needs_tenant`): an entity-less module has
+/// no entity to isolate, so that scaffolding would be irrelevant/broken.
+fn entityless_guarded_under_tenancy(design: &Design, module: &ModuleDesign) -> bool {
+    if design.tenancy.is_none() {
+        return false;
+    }
+    fn walk(m: &ModuleDesign) -> bool {
+        (m.entities.is_empty() && m.endpoints.iter().any(Endpoint::is_guarded))
+            || m.subroutes.iter().any(walk)
+    }
+    walk(module)
 }
 
 /// A `migrate` entry for the tenant module's tables, referenced from THIS test
@@ -1811,7 +1838,16 @@ pub(crate) fn migrate_call_block(items: &[MigrationItem], expect_msg: &str) -> S
 /// role). Run on the raw connection before `.into_test()` so the `tenant` guard
 /// resolves a membership for every guarded request. Empty when not needed.
 fn tenant_seed(design: &Design, module: &ModuleDesign) -> String {
-    if !module_needs_tenant(design, module) {
+    // An entity-less guarded module under tenancy (#287) also needs the membership
+    // seed so its shared `Dep<Tenant>` guard resolves a tenant (404 not 403) — but
+    // NOT the tenant module itself: the tenant module creates its own rows in-test
+    // (its POST `/` create probe posts id 1), so a pre-seeded tenant id 1 would
+    // 409-collide. `module_needs_tenant` is false for the tenant module, so this
+    // exclusion only guards the entity-less-subroute edge; a top-level entity-less
+    // module is never the tenant module (it holds no entity).
+    let is_tenant_module = tenant_module(design).is_some_and(|t| t.name == module.name);
+    let entityless_seed = entityless_guarded_under_tenancy(design, module) && !is_tenant_module;
+    if !module_needs_tenant(design, module) && !entityless_seed {
         return String::new();
     }
     let Some(tenancy) = design.tenancy.as_ref() else {
@@ -3532,6 +3568,125 @@ mod tests {
         assert!(
             !child.contains("// seed id 1"),
             "a child module's reject probe must NOT gain a seed (app() pre-seeds):\n{child}"
+        );
+    }
+
+    /// #287: an ENTITY-LESS module whose guarded handler uses the app-level
+    /// `Dep<Tenant>` guard (a tenant-scoped custom route) must get the SAME app()
+    /// wiring `main.rs` registers app-wide — the `tenant` factory (so `Dep<Tenant>`
+    /// resolves, no JC1001 500) AND a membership row for the probe user (so the
+    /// guard resolves a tenant, 404 not 403) — WITHOUT pulling in the second-tenant
+    /// / isolation scaffolding (there is no entity to isolate). Before the fix both
+    /// gates missed the entity-less module: the 401 probe 500'd (no provider) and,
+    /// after hand-adding the provider, the 404 probe 403'd (no membership seed).
+    #[test]
+    fn entityless_guarded_module_under_tenancy_gets_provider_and_membership_seed() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "tenant-api", "contract_version": 0,
+            "auth": { "model": "jwt", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "orgs",
+                  "entities": [{ "name": "Org", "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "name", "type": "string", "max_len": 50 } ]}],
+                  "endpoints": [
+                      { "operation_id": "create_org", "method": "POST", "path": "/",
+                        "auth_required": true,
+                        "request_body": { "entity": "Org" },
+                        "success": { "status": 201, "entity": "Org" } } ] },
+                { "name": "measures",
+                  "entities": [],
+                  "endpoints": [
+                      { "operation_id": "update_measure", "method": "PATCH", "path": "/{measure_id}",
+                        "auth_required": true,
+                        "success": { "status": 200 } } ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        // The ENTITY-LESS guarded module (`measures`) gains BOTH the provider and
+        // the membership seed, but NOT the isolation scaffolding.
+        let (measures, _) = render_acceptance(&d, &d.modules[1]);
+        assert!(
+            measures.contains(".provide_dep(shared::tenant)"),
+            "entity-less guarded module must register the tenant factory:\n{measures}"
+        );
+        assert!(
+            measures
+                .contains("INSERT INTO \\\"org_members\\\" (user_id, org_id, role) VALUES (1, 1,"),
+            "entity-less guarded module must seed a membership row for probe user 1:\n{measures}"
+        );
+        assert!(
+            !measures.contains("seed_second_tenant"),
+            "entity-less module has no entity to isolate — NO second-tenant scaffolding:\n{measures}"
+        );
+        // A NON-tenancy design, an UNGUARDED entity-less module, and an
+        // entities-present module are all UNCHANGED (no provider, no seed added).
+        let non_tenancy: Design = serde_json::from_str(
+            r#"{
+            "name": "plain-api", "contract_version": 0,
+            "auth": { "model": "jwt", "roles": ["member"] },
+            "dependencies": ["db", "auth"],
+            "modules": [
+                { "name": "measures", "entities": [],
+                  "endpoints": [
+                      { "operation_id": "update_measure", "method": "PATCH", "path": "/{measure_id}",
+                        "auth_required": true, "success": { "status": 200 } } ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        let (plain, _) = render_acceptance(&non_tenancy, &non_tenancy.modules[0]);
+        assert!(
+            !plain.contains(".provide_dep(shared::tenant)") && !plain.contains("_members"),
+            "a NON-tenancy entity-less module must be unchanged (no tenant wiring):\n{plain}"
+        );
+
+        // Under the SAME tenancy design, an UNGUARDED entity-less module gets nothing.
+        let unguarded: Design = serde_json::from_str(
+            r#"{
+            "name": "tenant-api", "contract_version": 0,
+            "auth": { "model": "jwt", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "orgs",
+                  "entities": [{ "name": "Org", "fields": [
+                      { "name": "id", "type": "integer" },
+                      { "name": "name", "type": "string", "max_len": 50 } ]}],
+                  "endpoints": [
+                      { "operation_id": "create_org", "method": "POST", "path": "/",
+                        "auth_required": true,
+                        "request_body": { "entity": "Org" },
+                        "success": { "status": 201, "entity": "Org" } } ] },
+                { "name": "pings", "entities": [],
+                  "endpoints": [
+                      { "operation_id": "ping", "method": "GET", "path": "/health",
+                        "success": { "status": 200 } } ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        let (pings, _) = render_acceptance(&unguarded, &unguarded.modules[1]);
+        assert!(
+            !pings.contains(".provide_dep(shared::tenant)") && !pings.contains("_members"),
+            "an UNGUARDED entity-less module under tenancy must be unchanged:\n{pings}"
+        );
+        // The tenant module (`orgs`) creates its own rows — its regular `app()` must
+        // NOT be pre-seeded (`.expect("seed membership")` is the tenant_seed marker;
+        // the #107 `member_app()` surface uses the distinct "seed admin membership").
+        let (orgs, _) = render_acceptance(&unguarded, &unguarded.modules[0]);
+        assert!(
+            !orgs.contains(".expect(\"seed membership\")"),
+            "the tenant module's app() must NOT gain a membership pre-seed (id-1 collision):\n{orgs}"
         );
     }
 
