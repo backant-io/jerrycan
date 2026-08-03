@@ -1408,6 +1408,20 @@ pub fn validate(d: &Design) -> Vec<Question> {
                             recognized.push(j.child_fk.clone());
                         }
                     }
+                    // #288: a tenant-owned entity may ALSO be mounted under a DIRECT
+                    // parent it `belongs_to` — the "Org+parent diamond": `Meter
+                    // belongs_to [Org, Audit]` mounts at `/{audit_id}/meters`, and the
+                    // handler scopes by the path `audit_id` (Meter.audit_id = path). A
+                    // mount param naming ANY of the entity's `belongs_to` fk columns is a
+                    // REAL scoping param, not a decorative one. The `tenant_path` joins
+                    // above only cover a TRANSITIVE tenant child (whose path runs THROUGH
+                    // the parent); a DIRECTLY tenant-owned entity's path goes straight to
+                    // the anchor with no joins, hiding its parent fk — so JC0568 wrongly
+                    // refused the diamond. (Truly decorative params — naming no fk at all
+                    // — are still caught.)
+                    for b in &e.belongs_to {
+                        recognized.push(b.fk_column());
+                    }
                 }
                 let mount = m.effective_mount();
                 for param in mount_params(&mount) {
@@ -5876,6 +5890,43 @@ mod tests {
             ))
             .is_empty(),
             "a grandchild mount on a parent child_fk (account_id) must NOT trip JC0568"
+        );
+
+        // #288 diamond: `Meter belongs_to [Org, Audit]` is DIRECTLY tenant-owned (its
+        // `tenant_path` runs straight to Org, joins empty) AND has a parent `Audit`.
+        // Mounted `/audits/{audit_id}`, the handler scopes by the path `audit_id`
+        // (Meter.audit_id) — a REAL parent fk, not decorative — so JC0568 must stay
+        // SILENT even though `audit_id` is not a `tenant_path` join child_fk. (This is
+        // the schema convention where every table carries both a direct `org_id` and
+        // its parent fk; before #288, JC0568 wrongly refused it.)
+        const DIAMOND: &str = r#"{
+            "name": "ees", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "orgs",
+                  "entities": [{ "name": "Org", "fields": [{ "name": "name", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_org", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Org" },
+                      "success": { "status": 201, "entity": "Org" } }] },
+                { "name": "audits",
+                  "entities": [{ "name": "Audit", "belongs_to": [{ "entity": "Org" }],
+                      "fields": [{ "name": "name", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_audit", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Audit" },
+                      "success": { "status": 201, "entity": "Audit" } }] },
+                { "name": "meters", "mount": "/audits/{audit_id}",
+                  "entities": [{ "name": "Meter", "belongs_to": [{ "entity": "Org" }, { "entity": "Audit" }],
+                      "fields": [{ "name": "reading", "type": "integer" }] }],
+                  "endpoints": [{ "operation_id": "create_meter", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Meter" },
+                      "success": { "status": 201, "entity": "Meter" } }] }
+            ]
+        }"#;
+        assert!(
+            jc0568(&validate(&serde_json::from_str::<Design>(DIAMOND).unwrap())).is_empty(),
+            "an Org+parent diamond mount on a real parent fk (audit_id) must NOT trip JC0568"
         );
     }
 
