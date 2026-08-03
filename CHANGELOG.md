@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.25 — 2026-08-03
+
+### Fixed
+- **A deeply-nested subroute handler now binds every path parameter (#283).** A subroute whose own mount
+  carried a parameter (e.g. `/contacts/{contact_id}`) with a `/{id}` endpoint, itself nested under a
+  parameterized mount (`/accounts/{account_id}`), generated a handler that omitted the grandparent parameter
+  (`Path<(i64, i64)>` instead of `Path<(i64, i64, i64)>`). Because the path extractor binds a tuple positionally
+  from the first segment, the handler read the wrong ids and the leaf id was never read — a dead route (and a
+  400 if an ancestor mount used a uuid). Subroute emission now threads the accumulated ancestor mount prefix so a
+  handler binds every resolved path parameter, in path order, typed by the referent entity's pk. Routes nested
+  two levels or shallower are byte-identical. (`jerrycan-core` gains `Path` extractors for 4–6-tuples so deeper
+  nesting compiles.)
+- **The OpenAPI member-management routes declare ancestor mount parameters (#284).** When the tenant module is
+  mounted under a parameterized ancestor (e.g. `/orgs/{org_id}/workspaces`), the generated `#107` member routes
+  advertised only the tenant fk, omitting `{org_id}` from `parameters` — an OpenAPI 3.1 violation (the #280 fix
+  covered ordinary endpoints but not the member surface). They now declare every ancestor parameter (typed by
+  the referent pk) ahead of the tenant fk. Static mounts are unchanged.
+- **The generated test credential picks a session role, not a membership role (#285).** `test_credential_role`
+  chose the first endpoint's `required_roles` globally and stamped it into the test `SessionUser.role`. When
+  that first gate was a tenant-owned membership role (checked against tenant membership, not the session), a
+  later session-role-gated non-tenant route (needing e.g. `admin` from `auth.roles`) got the wrong credential
+  and its probes could never pass. It now considers only session-role-gated routes when choosing the credential
+  role. Designs whose `auth.roles` equal their `member_roles` (e.g. the reference slice) are unchanged.
+
 ## 0.7.24 — 2026-08-03
 
 ### Fixed
