@@ -504,6 +504,45 @@ fn member_surface_paths(design: &Design, paths: &mut serde_json::Map<String, Val
     });
     let fk_param = json!({ "name": fk, "in": "path", "required": true, "schema": fk_schema });
     let user_param = json!({ "name": "user_id", "in": "path", "required": true, "schema": { "type": "string" } });
+    // #284: when the tenant module mounts under a PARAMETERIZED ancestor (e.g.
+    // `/orgs/{org_id}/workspaces`), the resolved `base` carries the ancestor
+    // param(s) — but the member routes hardcoded only `[fk_param]`/`[fk_param,
+    // user_param]`, so a client could not build the URL (OpenAPI 3.1 requires every
+    // `{param}` be declared). #280 fixed this for `operation()` by scanning the
+    // resolved path; do the same here. `base` EXCLUDES the tenant fk (the member
+    // route appends `/{fk}/members`), so its `{param}`s are exactly the ancestor
+    // params, in path order — they go BEFORE the tenant fk. Each types via the
+    // shared `path_param_key_type` (integer/int64 or string, mirroring `fk_schema`).
+    let ancestor_params: Vec<Value> = {
+        let mut out = Vec::new();
+        let mut rest = base.as_str();
+        while let Some(start) = rest.find('{') {
+            let Some(end_rel) = rest[start..].find('}') else {
+                break;
+            };
+            let name = &rest[start + 1..start + end_rel];
+            let schema = match design.path_param_key_type(name) {
+                "String" => json!({ "type": "string" }),
+                _ => json!({ "type": "integer", "format": "int64" }),
+            };
+            out.push(json!({ "name": name, "in": "path", "required": true, "schema": schema }));
+            rest = &rest[start + end_rel + 1..];
+        }
+        out
+    };
+    // The member routes' `parameters`, in path order: ancestor mount params, then
+    // the tenant fk, then (on the `/{user_id}` routes) `user_id`.
+    let params_fk = || {
+        let mut v = ancestor_params.clone();
+        v.push(fk_param.clone());
+        Value::Array(v)
+    };
+    let params_fk_user = || {
+        let mut v = ancestor_params.clone();
+        v.push(fk_param.clone());
+        v.push(user_param.clone());
+        Value::Array(v)
+    };
     let security = security_scheme_name(design).map(|scheme| json!([{ scheme: [] }]));
     let not_member = format!("caller is not a member of this {snake} (membership guard)");
     let not_admin = format!("caller does not hold the admin role `{admin}`");
@@ -511,7 +550,7 @@ fn member_surface_paths(design: &Design, paths: &mut serde_json::Map<String, Val
 
     let mut list = json!({
         "operationId": format!("list_{snake}_members"),
-        "parameters": [fk_param.clone()],
+        "parameters": params_fk(),
         "responses": {
             "200": {
                 "description": "success",
@@ -523,7 +562,7 @@ fn member_surface_paths(design: &Design, paths: &mut serde_json::Map<String, Val
     });
     let mut add = json!({
         "operationId": format!("add_{snake}_member"),
-        "parameters": [fk_param.clone()],
+        "parameters": params_fk(),
         "requestBody": {
             "required": true,
             "content": { "application/json": { "schema": add_schema.clone() } },
@@ -541,7 +580,7 @@ fn member_surface_paths(design: &Design, paths: &mut serde_json::Map<String, Val
     });
     let mut set_role = json!({
         "operationId": format!("set_{snake}_member_role"),
-        "parameters": [fk_param.clone(), user_param.clone()],
+        "parameters": params_fk_user(),
         "requestBody": {
             "required": true,
             "content": { "application/json": { "schema": {
@@ -560,7 +599,7 @@ fn member_surface_paths(design: &Design, paths: &mut serde_json::Map<String, Val
     });
     let mut remove = json!({
         "operationId": format!("remove_{snake}_member"),
-        "parameters": [fk_param, user_param],
+        "parameters": params_fk_user(),
         "responses": {
             "204": { "description": "success" },
             "403": {
@@ -1709,6 +1748,63 @@ mod tests {
                 v, &with_paths[k],
                 "shared path `{k}` must be identical with/without tenancy"
             );
+        }
+    }
+
+    /// Issue #284: when the tenant module mounts under a PARAMETERIZED ancestor
+    /// (`/orgs/{org_id}/workspaces`), the resolved member-route paths carry
+    /// `{org_id}` — so the member ops' `parameters` MUST declare it (before the
+    /// tenant fk), else the contract is an OpenAPI 3.1 violation: a required path
+    /// param the URL needs but the operation never declares, so a generated client
+    /// can't build the URL. #280 fixed this for regular endpoints; the member
+    /// surface was missed.
+    #[test]
+    fn member_surface_declares_ancestor_mount_params() {
+        let design: Design = serde_json::from_str(
+            r#"{ "name": "nested-tenant", "contract_version": 1,
+                "auth": { "model": "jwt", "roles": ["owner", "member"] },
+                "dependencies": ["db", "auth"],
+                "tenancy": { "entity": "Workspace", "member_roles": ["owner", "member"] },
+                "modules": [{
+                    "name": "workspaces", "mount": "/orgs/{org_id}/workspaces",
+                    "entities": [{ "name": "Workspace", "fields": [
+                        { "name": "id", "type": "integer" },
+                        { "name": "name", "type": "string" } ]}],
+                    "endpoints": [
+                        { "operation_id": "create_workspace", "method": "POST", "path": "/",
+                          "request_body": { "entity": "Workspace" },
+                          "success": { "status": 201, "entity": "Workspace" } },
+                        { "operation_id": "list_workspaces", "method": "GET", "path": "/",
+                          "success": { "status": 200, "entity": "Workspace", "list": true } } ]
+                }] }"#,
+        )
+        .unwrap();
+        let d = document(&design);
+
+        // The collection route (list/add) declares [org_id, workspace_id], in path order.
+        let list =
+            &d["paths"]["/orgs/{org_id}/workspaces/{workspace_id}/members"]["get"]["parameters"];
+        assert_eq!(list[0]["name"], "org_id", "ancestor param first: {list}");
+        assert_eq!(list[0]["in"], "path");
+        assert_eq!(list[0]["schema"]["type"], "integer");
+        assert_eq!(list[1]["name"], "workspace_id", "tenant fk second: {list}");
+        assert!(list[2].is_null(), "exactly the two path params: {list}");
+        // add mirrors list.
+        let add =
+            &d["paths"]["/orgs/{org_id}/workspaces/{workspace_id}/members"]["post"]["parameters"];
+        assert_eq!(add[0]["name"], "org_id");
+        assert_eq!(add[1]["name"], "workspace_id");
+        assert!(add[2].is_null());
+
+        // The item routes (set-role/remove) declare [org_id, workspace_id, user_id].
+        let item = "/orgs/{org_id}/workspaces/{workspace_id}/members/{user_id}";
+        for method in ["patch", "delete"] {
+            let ps = &d["paths"][item][method]["parameters"];
+            assert_eq!(ps[0]["name"], "org_id", "{method} ancestor first: {ps}");
+            assert_eq!(ps[1]["name"], "workspace_id", "{method} fk second: {ps}");
+            assert_eq!(ps[2]["name"], "user_id", "{method} user_id last: {ps}");
+            assert_eq!(ps[2]["schema"]["type"], "string");
+            assert!(ps[3].is_null(), "{method}: exactly three params: {ps}");
         }
     }
 
