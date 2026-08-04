@@ -163,15 +163,26 @@ fn constrained_seed_string_n(f: &Field, n: u32) -> String {
     fit_string(&base, f.min_len, f.max_len)
 }
 
-/// The fixture literal for a belongs_to fk column, valued at the SEEDED tenant
-/// (id 1): "1" for an integer/synthetic key, the string fixture for a text key.
-/// Mirrors the seed in `tenant_seed` so the generated body points at a row the
-/// guard can actually resolve.
-fn fk_fixture_value(design: &Design, target: &str) -> &'static str {
-    match design.target_key_rust_type(target) {
-        "String" => "\"1\"",
-        _ => "1",
-    }
+/// The create-body fk fixture literal for a belongs_to `target`, valued to MATCH
+/// the id its parent row is seeded with (#295). The parent's create seed sets its
+/// `id` via `fixture_value`, so a fk that reuses the SAME fixture agrees with the
+/// seeded row by construction: a uuid-pk parent seeds the uuid fixture, a
+/// string-pk parent `"test-value"`, an integer or synthetic (autoincrement) pk
+/// `1`. Before #295 this returned the constant `1`/`"1"` and consulted the pk type
+/// ONLY to decide quoting — coincidentally correct for an integer pk (whose seed
+/// id is also `1`), but for a uuid/string-pk parent the seeded id is NOT `1`, so
+/// the child fk dangled, the same-module DDL FOREIGN KEY rejected the insert with
+/// a `500` (`JC0510`), and the create probe — plus every probe seeding a row
+/// through it — was un-greenable. Mirrors `target_key_rust_type`'s id-field
+/// lookup; the pk is unconstrained (JC0552), so `fixture_value` reduces to the
+/// plain type literal here. A synthetic pk (no declared `id`) or an unknown target
+/// falls back to `1` (byte-identical for every existing integer/synthetic design).
+fn fk_fixture_value(design: &Design, target: &str) -> String {
+    design
+        .find_entity(target)
+        .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
+        .map(fixture_value)
+        .unwrap_or_else(|| "1".to_string())
 }
 
 /// The server-owned-FK omission (issue #34), db-gated (issue #43) so all three
@@ -221,8 +232,8 @@ fn fixture_json(
             // un-greenable. The minimal body sends `null` (deserializes to `None`),
             // which never violates the fk. A required (cascade/restrict) fk keeps its
             // seeded fixture id — its parent IS seeded (#248).
-            let value: &str = if b.on_delete == OnDelete::SetNull {
-                "null"
+            let value: String = if b.on_delete == OnDelete::SetNull {
+                "null".to_string()
             } else {
                 fk_fixture_value(design, &b.entity)
             };
@@ -3654,6 +3665,65 @@ mod tests {
         assert!(
             create.contains("/catalog/genres") && !create.contains("/catalog/moods"),
             "the create seed must seed the required parent Genre, not the unseedable Mood:\n{create}"
+        );
+    }
+
+    /// #295: a create-body belongs_to fk must carry the value its parent's id is
+    /// SEEDED with. `Category` has a uuid pk (seeded via `fixture_value` →
+    /// `"f47ac10b-…"`); `Product belongs_to Category`, so `create_product` must
+    /// send `category_id: "f47ac10b-…"` to point at the seeded row. Before #295 it
+    /// sent the constant `"1"`, which dangled against the seeded uuid parent →
+    /// same-module `FOREIGN KEY` 500 (`JC0510`) → un-greenable. An integer-pk parent
+    /// is byte-identical (its seeded id is also `1`).
+    #[test]
+    fn create_body_fk_matches_a_uuid_pk_parents_seeded_id() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "catalog-api", "contract_version": 0,
+            "dependencies": ["db"],
+            "modules": [
+                { "name": "catalog",
+                  "entities": [
+                      { "name": "Category", "fields": [
+                          { "name": "id", "type": "uuid" },
+                          { "name": "name", "type": "string", "max_len": 50 } ] },
+                      { "name": "Product",
+                        "belongs_to": [ { "entity": "Category", "on_delete": "cascade" } ],
+                        "fields": [
+                            { "name": "id", "type": "integer" },
+                            { "name": "title", "type": "string", "max_len": 50 } ] } ],
+                  "endpoints": [
+                      { "operation_id": "create_category", "method": "POST", "path": "/categories",
+                        "request_body": { "entity": "Category" },
+                        "success": { "status": 201, "entity": "Category" } },
+                      { "operation_id": "create_product", "method": "POST", "path": "/products",
+                        "request_body": { "entity": "Product" },
+                        "success": { "status": 201, "entity": "Product" } } ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let (catalog, _) = render_acceptance(&d, &d.modules[0]);
+        let create = section(&catalog, "create_product_returns_201");
+        // The fk carries the uuid-pk parent's SEEDED id (the uuid fixture), not "1".
+        assert!(
+            create.contains("\"category_id\": \"f47ac10b-58cc-4372-a567-0e02b2c3d479\""),
+            "a uuid-pk parent's fk must carry the seeded uuid fixture:\n{create}"
+        );
+        assert!(
+            !create.contains("\"category_id\": \"1\"") && !create.contains("\"category_id\": 1"),
+            "the fk must NOT be the constant 1 for a uuid-pk parent (it would dangle):\n{create}"
+        );
+        // The seed creates the parent Category with the SAME uuid id — consistency.
+        assert!(
+            create.contains("/catalog/categories")
+                && create.contains("\"id\": \"f47ac10b-58cc-4372-a567-0e02b2c3d479\""),
+            "the parent seed must set the same uuid id the fk points at:\n{create}"
         );
     }
 

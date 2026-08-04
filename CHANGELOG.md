@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.29 — 2026-08-04
+
+### Fixed
+- **Generated acceptance tests point a `belongs_to` fk at the value its parent is actually seeded with (#295).**
+  The create-probe fk fixture was the constant `1`/`"1"`, consulting the parent's pk type only to decide quoting —
+  never the value. That coincidentally matched an **integer**-pk parent (whose seed id is also `1`), which is why it
+  went unnoticed. But when a same-module `belongs_to` parent has a **uuid or string** pk, the parent is seeded with a
+  uuid/string fixture, so the child fk `"1"` dangled, the same-module DDL `FOREIGN KEY` rejected the insert with a
+  `500` (`JC0510`), and the happy-path `create_*_returns_201` probe — plus every probe seeding a row through it —
+  became un-greenable. The fk fixture now reuses the parent's declared-id `fixture_value` (uuid → the uuid fixture,
+  string → `"test-value"`, integer/synthetic → `1`), so it agrees with the seeded row by construction. Byte-identical
+  for every existing integer/synthetic-pk design.
+- **A foreign-key violation from client input is a 422, not a 500 (#296).** `jerrycan-db::db_error` mapped a UNIQUE
+  violation to `409` but let a FOREIGN KEY violation fall through to `500 JC0510`. A client POSTing a `belongs_to` fk
+  that references a nonexistent parent (e.g. `{"carrier_id": 999}`) therefore surfaced a server error for a client
+  fault — polluting 5xx alerting, contrary to the mapping's own rationale. A FK violation now maps to `422 JC0422`
+  ("references a record that does not exist"), mirroring how the request validator reports a value it cannot process;
+  the underlying detail still goes to stderr for the operator, and the client message leaks no internals.
+
 ## 0.7.28 — 2026-08-04
 
 ### Fixed
