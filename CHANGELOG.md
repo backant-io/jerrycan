@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.28 — 2026-08-04
+
+### Fixed
+- **Generated acceptance tests send a nullable (`set_null`) `belongs_to` fk as `null`, never a dangling id (#293).**
+  For an optional `belongs_to` whose `on_delete` is `set_null` (a nullable `Option<T>` column), `gen-tests` still
+  synthesized a non-null fixture id for the fk in the create probe body while the parent-seeding step skipped it —
+  that parent is frequently a reference entity with no create endpoint, so it cannot be seeded over HTTP at all. The
+  fabricated id then dangled, the same-module `FOREIGN KEY` rejected the insert with a `500` (`JC0510`), and the
+  happy-path `create_*_returns_201` probe — plus every probe that seeds a row through it (`show`, `share`, composite
+  `unique`) — became un-greenable, so `jerrycan check` could never reach `ok:true`. The probe now emits `null` for a
+  nullable `set_null` fk (which deserializes to `None` and never violates the constraint); a required
+  (`cascade`/`restrict`) fk keeps its seeded fixture id (#248). Residual of #248; distinct from the OpenAPI
+  nullability fix (#274).
+
 ## 0.7.27 — 2026-08-04
 
 ### Fixed
