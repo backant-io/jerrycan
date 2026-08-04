@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.27 — 2026-08-04
+
+### Fixed
+- **Generated acceptance tests seed a cross-unit parent under a parameterized ancestor with a concrete URL (#290).**
+  For a transitive tenant grandchild whose parent's creator lives in a param-mounted ancestor (e.g. `Team belongs_to
+  Club`, with `Club` under a `/{org_id}/clubs` mount), `gen-tests` emitted the parent-seed `POST` with the raw mount
+  base — `/orgs/{org_id}/clubs/` — so the parent row was never created (404), the grandchild's create then failed its
+  parent-membership check, and the probe could only reach 403/404: an un-greenable test. The cross-unit parent seed
+  now substitutes each `{param}` with `1` (as the immediate seed already did), posting `/orgs/1/clubs/`. Designs with
+  flat (non-parameterized) ancestor mounts are unaffected.
+
 ## 0.7.26 — 2026-08-03
 
 ### Fixed
