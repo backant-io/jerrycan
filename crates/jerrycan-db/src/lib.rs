@@ -267,22 +267,28 @@ pub fn translate_placeholders(query: &str, backend: Backend) -> String {
 }
 
 /// Map any sea-orm error to a stable JC code without leaking internals; the
-/// underlying detail goes to stderr for the operator. Unique-key violations
-/// are the client's fault (a re-POSTed id), not a server fault — they map to
-/// 409 JC0409 so duplicate writes can't pollute 5xx alerting.
+/// underlying detail goes to stderr for the operator. Constraint violations
+/// driven by client input are 4xx, not 5xx, so a bad write can't pollute 5xx
+/// alerting: a UNIQUE violation (a re-POSTed key) is 409 JC0409; a FOREIGN KEY
+/// violation (#296) — a client-supplied fk pointing at a row that does not
+/// exist — is 422 JC0422: the request is well-formed but references a
+/// nonexistent related record (mirroring the request validator's 422 for a
+/// value it can't process). Everything else is an opaque 500 JC0510.
 pub fn db_error(e: sea_orm::DbErr) -> Error {
     eprintln!("jerrycan-db: {e}");
-    if matches!(
-        e.sql_err(),
-        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
-    ) {
-        return Error::conflict("conflict: a row with this key already exists");
+    match e.sql_err() {
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => {
+            Error::conflict("conflict: a row with this key already exists")
+        }
+        Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_)) => {
+            Error::unprocessable("unprocessable: references a record that does not exist")
+        }
+        _ => Error::new(
+            jerrycan_core::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "JC0510",
+            "database error",
+        ),
     }
-    Error::new(
-        jerrycan_core::http::StatusCode::INTERNAL_SERVER_ERROR,
-        "JC0510",
-        "database error",
-    )
 }
 
 impl Extension for Db {
@@ -409,6 +415,35 @@ mod tests {
         let e = db_error(dup);
         assert_eq!(e.code(), "JC0409");
         assert_eq!(e.status().as_u16(), 409);
+        // Still no internals in the message.
+        assert!(!e.message().contains("sqlite"), "{}", e.message());
+    }
+
+    /// A client-supplied fk pointing at a nonexistent parent is the CLIENT's
+    /// fault: it must surface as 422 JC0422 (#296), not a 500 — a bad reference
+    /// must never trip server-fault alerting, mirroring the unique-violation rule.
+    #[tokio::test]
+    async fn foreign_key_violations_map_to_422_unprocessable() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        db.conn()
+            .execute_unprepared("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        db.conn()
+            .execute_unprepared(
+                "CREATE TABLE children (id INTEGER PRIMARY KEY, \
+                 parent_id INTEGER NOT NULL REFERENCES parents(id))",
+            )
+            .await
+            .unwrap();
+        let orphan = db
+            .conn()
+            .execute_unprepared("INSERT INTO children (id, parent_id) VALUES (1, 999)")
+            .await
+            .expect_err("an fk to a nonexistent parent must fail");
+        let e = db_error(orphan);
+        assert_eq!(e.code(), "JC0422");
+        assert_eq!(e.status().as_u16(), 422);
         // Still no internals in the message.
         assert!(!e.message().contains("sqlite"), "{}", e.message());
     }

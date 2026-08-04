@@ -16,7 +16,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.7.28"
+version = "0.7.29"
 edition = "2024"
 license = "MIT"
 homepage = "https://jerrycan.cc"
