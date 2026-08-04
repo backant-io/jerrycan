@@ -480,6 +480,16 @@ fn seed_parents(
             && let Some(parent) = parent_unit.entities.iter().find(|e| e.name == b.entity)
         {
             seen.push(b.entity.clone());
+            // #290: `find_creator_in_tree` returns the parent's RAW mount base, which
+            // carries `{param}` tokens when an ancestor is param-mounted (e.g.
+            // `/orgs/{org_id}/clubs`). Concretize it — substitute each `{param}` with
+            // id 1 — exactly as the immediate/same-module seed's `base` already is, so
+            // the cross-unit parent-seed POST hits `/orgs/1/clubs`, not the literal
+            // `/orgs/{org_id}/clubs` (a 404 → the parent row is never created → the
+            // grandchild's `create_for_memberships` parent check fails → an un-greenable
+            // 403/404 probe). Only THIS cross-unit `parent_base` was raw (#260 tests
+            // used flat ancestor mounts where `concrete_mount_base` is the identity).
+            let parent_base = concrete_mount_base(&parent_base);
             seed_parents(
                 design,
                 top,
@@ -3687,6 +3697,69 @@ mod tests {
         assert!(
             !orgs.contains(".expect(\"seed membership\")"),
             "the tenant module's app() must NOT gain a membership pre-seed (id-1 collision):\n{orgs}"
+        );
+    }
+
+    /// #290: a transitive tenant grandchild whose parent's creator lives in a
+    /// PARAM-MOUNTED cross-unit ancestor (`Team belongs_to Club`, `Club` in a subroute
+    /// mounted `/{org_id}/clubs`) must get a CONCRETE parent-seed URL. `seed_parents`'
+    /// cross-unit branch used the parent's RAW mount base from `find_creator_in_tree`
+    /// (carrying `{param}` tokens), so before the fix the parent seed POST hit
+    /// `/orgs/{org_id}/clubs/` — a 404 → the Club row was never created → the Team
+    /// probe's `create_for_memberships` parent-membership check failed → an
+    /// UN-GREENABLE 403/404 probe. It must now hit `/orgs/1/clubs/`, and no
+    /// unsubstituted `{param}` may leak into any generated URL. (Pre-#290 #260 tests
+    /// used FLAT ancestor mounts where `concrete_mount_base` is the identity, hiding
+    /// this.)
+    #[test]
+    fn cross_unit_parent_seed_concretizes_a_param_mounted_ancestor() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "leagues", "contract_version": 0,
+            "auth": { "model": "jwt", "roles": ["owner", "member"] },
+            "dependencies": ["db", "auth"],
+            "tenancy": { "entity": "Org", "member_roles": ["owner", "member"] },
+            "modules": [
+                { "name": "orgs",
+                  "entities": [{ "name": "Org", "fields": [{ "name": "name", "type": "string" }] }],
+                  "endpoints": [{ "operation_id": "create_org", "method": "POST", "path": "/",
+                      "auth_required": true, "request_body": { "entity": "Org" },
+                      "success": { "status": 201, "entity": "Org" } }],
+                  "subroutes": [
+                    { "name": "clubs", "mount": "/{org_id}/clubs",
+                      "entities": [{ "name": "Club", "belongs_to": [{ "entity": "Org" }],
+                          "fields": [{ "name": "name", "type": "string" }] }],
+                      "endpoints": [{ "operation_id": "create_club", "method": "POST", "path": "/",
+                          "auth_required": true, "request_body": { "entity": "Club" },
+                          "success": { "status": 201, "entity": "Club" } }],
+                      "subroutes": [
+                        { "name": "teams", "mount": "/{club_id}/teams",
+                          "entities": [{ "name": "Team", "belongs_to": [{ "entity": "Club" }],
+                              "fields": [{ "name": "name", "type": "string" }] }],
+                          "endpoints": [{ "operation_id": "create_team", "method": "POST", "path": "/",
+                              "auth_required": true, "request_body": { "entity": "Team" },
+                              "success": { "status": 201, "entity": "Team" } }] }
+                      ] }
+                  ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let (orgs, _) = render_acceptance(&d, &d.modules[0]);
+        // The cross-unit parent seed for the Team create probe seeds Club CONCRETELY.
+        assert!(
+            orgs.contains("\"/orgs/1/clubs/\"") && orgs.contains("// seed parent Club id 1"),
+            "the cross-unit parent seed URL must be concretized to /orgs/1/clubs/:\n{orgs}"
+        );
+        // NO unsubstituted mount param may leak into any generated seed/probe URL.
+        assert!(
+            !orgs.contains("{org_id}") && !orgs.contains("{club_id}"),
+            "no unsubstituted {{param}} may remain in a generated URL:\n{orgs}"
         );
     }
 
