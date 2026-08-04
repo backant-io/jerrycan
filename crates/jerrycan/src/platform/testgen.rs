@@ -213,11 +213,20 @@ fn fixture_json(
         .filter(|b| !(omit_identity_fk && design.is_identity_fk(b)))
         .filter(|b| !path_fks.contains(&b.fk_column()))
         .map(|b| {
-            format!(
-                "\"{}\": {}",
-                b.fk_column(),
+            // #293: a nullable (`set_null`) belongs_to fk is `Option<T>` in the DTO,
+            // and its parent is frequently an unseedable reference entity (no create
+            // endpoint) — `seed_parents` cannot create a row for it, so a fabricated
+            // id would dangle and the same-module DDL FOREIGN KEY would 500 (JC0510),
+            // making the happy-path create probe (and every row it seeds through)
+            // un-greenable. The minimal body sends `null` (deserializes to `None`),
+            // which never violates the fk. A required (cascade/restrict) fk keeps its
+            // seeded fixture id — its parent IS seeded (#248).
+            let value: &str = if b.on_delete == OnDelete::SetNull {
+                "null"
+            } else {
                 fk_fixture_value(design, &b.entity)
-            )
+            };
+            format!("\"{}\": {}", b.fk_column(), value)
         });
     // A STATIC `default` field (issue #53a) is server-owned on CREATE: the probe
     // omits it so the minimal client body proves the server applies the default (not
@@ -3578,6 +3587,73 @@ mod tests {
         assert!(
             !child.contains("// seed id 1"),
             "a child module's reject probe must NOT gain a seed (app() pre-seeds):\n{child}"
+        );
+    }
+
+    /// #293: a nullable (`set_null`) belongs_to fk must be sent as `null` in the
+    /// create probe body — never a fabricated id. Its parent (here `Mood`, a
+    /// reference entity with no create endpoint) is unseedable, so a non-null fk
+    /// would dangle and the same-module DDL FOREIGN KEY would 500 (JC0510), making
+    /// the happy-path `create_song_returns_201` probe — and every row seeded through
+    /// it — un-greenable. A REQUIRED (`cascade`) fk keeps its seeded fixture id (#248).
+    #[test]
+    fn nullable_set_null_fk_create_body_sends_null_not_a_dangling_id() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "catalog-api", "contract_version": 0,
+            "dependencies": ["db"],
+            "modules": [
+                { "name": "catalog",
+                  "entities": [
+                      { "name": "Genre", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string", "max_len": 50 } ] },
+                      { "name": "Mood", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "label", "type": "string", "max_len": 50 } ] },
+                      { "name": "Song",
+                        "belongs_to": [
+                            { "entity": "Genre", "on_delete": "cascade" },
+                            { "entity": "Mood", "on_delete": "set_null" } ],
+                        "fields": [
+                            { "name": "id", "type": "integer" },
+                            { "name": "title", "type": "string", "max_len": 50 } ] } ],
+                  "endpoints": [
+                      { "operation_id": "create_genre", "method": "POST", "path": "/genres",
+                        "request_body": { "entity": "Genre" },
+                        "success": { "status": 201, "entity": "Genre" } },
+                      { "operation_id": "create_song", "method": "POST", "path": "/songs",
+                        "request_body": { "entity": "Song" },
+                        "success": { "status": 201, "entity": "Song" } } ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let (catalog, _) = render_acceptance(&d, &d.modules[0]);
+        let create = section(&catalog, "create_song_returns_201");
+        // The nullable set_null fk is sent as null — never a dangling fabricated id.
+        assert!(
+            create.contains("\"mood_id\": null"),
+            "a nullable set_null fk must be sent as null in the create body:\n{create}"
+        );
+        assert!(
+            !create.contains("\"mood_id\": 1"),
+            "a nullable set_null fk must NOT carry a fabricated id (its parent is unseedable):\n{create}"
+        );
+        // The REQUIRED cascade fk keeps its seeded fixture id (#248) ...
+        assert!(
+            create.contains("\"genre_id\": 1"),
+            "a required cascade fk keeps its seeded fixture id:\n{create}"
+        );
+        // ... and only the required parent (Genre) is seeded; Mood never is.
+        assert!(
+            create.contains("/catalog/genres") && !create.contains("/catalog/moods"),
+            "the create seed must seed the required parent Genre, not the unseedable Mood:\n{create}"
         );
     }
 
