@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.30 — 2026-08-10
+
+### Fixed
+- **A create whose required `belongs_to` parent has no creator now emits an AGENT TODO, not an un-greenable probe (#298).**
+  When an entity has a **required** (`cascade`/`restrict`) same-module `belongs_to` to a parent that has **no POST
+  creator** anywhere in the design (a reference/lookup entity), the parent's `NOT NULL` DDL `FOREIGN KEY` can never be
+  satisfied — `gen-tests` cannot seed the parent over HTTP, so the generated `create_*_returns_201` probe (and every
+  `/{id}` probe seeding a row through it) could only ever `500`/`422`, making `jerrycan check` un-greenable with no
+  explanation. `gen-tests` now detects this (transitively) and emits an `AGENT TODO` naming the cause and the fixes
+  ("add a POST creator for the parent, make the `belongs_to` `set_null`, or hand-write the create") instead of a
+  permanently-red probe — the same discipline already applied to a credential-gated success or a creatorless `/{id}`
+  target. Byte-identical for every design whose required same-module parents all have creators (the overwhelming
+  majority); a `set_null` fk (sent as `null`, #293) and a cross-module fk (no DDL FK) are unaffected. Closes the last
+  known un-greenable-probe class surfaced by the testgen-greenability audit.
+
 ## 0.7.29 — 2026-08-04
 
 ### Fixed
