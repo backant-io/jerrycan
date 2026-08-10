@@ -327,6 +327,61 @@ fn param_count(ep: &Endpoint) -> usize {
     ep.path.matches('{').count()
 }
 
+/// #298: True when a create/seed of `entity` can reach a real row — every REQUIRED
+/// same-module `belongs_to` parent (transitively) has a POST creator, so
+/// `seed_parents` can seed it. A required same-module `belongs_to` to a CREATORLESS
+/// parent emits an enforced NOT-NULL DDL `FOREIGN KEY` that no HTTP seed can satisfy
+/// (the parent has no create endpoint), so the create probe would 500 forever and is
+/// un-greenable — the caller emits an AGENT TODO instead. The exclusions mirror
+/// `seed_parents`: a nullable (`set_null`) fk is sent as `null` (#293) and needs no
+/// parent; the identity fk is handler-injected; the tenancy entity is seeded by
+/// `tenant_seed`; a self-referential fk (entity in `seen`) greens by self-reference
+/// at id 1; a CROSS-module fk carries no DDL FK (enforced by handlers), so its
+/// unseeded value is inert. Byte-identical for every design whose required
+/// same-module parents all have creators (the overwhelming majority).
+fn entity_create_seedable(
+    design: &Design,
+    unit: &ModuleDesign,
+    entity: &Entity,
+    seen: &mut Vec<String>,
+) -> bool {
+    let tenancy = design.tenancy.as_ref().map(|t| t.entity.as_str());
+    for b in &entity.belongs_to {
+        if b.on_delete == OnDelete::SetNull
+            || design.is_identity_fk(b)
+            || Some(b.entity.as_str()) == tenancy
+            || seen.contains(&b.entity)
+        {
+            continue;
+        }
+        // Only a SAME-module belongs_to emits an enforced DDL FK that needs a seed.
+        if let Some(parent) = unit.entities.iter().find(|e| e.name == b.entity) {
+            if creator_for_entity(unit, &b.entity).is_none() {
+                return false;
+            }
+            seen.push(b.entity.clone());
+            if !entity_create_seedable(design, unit, parent, seen) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// #298: True when a POST `ep` creates an entity that is not seedable
+/// (`entity_create_seedable` false) — a required same-module `belongs_to` parent has
+/// no creator. The dispatch emits an AGENT TODO for such a create instead of an
+/// un-greenable 201 probe. False (byte-identical) for a list/inline body and for
+/// every create whose required parents are all seedable.
+fn create_target_unseedable(design: &Design, unit: &ModuleDesign, ep: &Endpoint) -> bool {
+    ep.request_body
+        .as_ref()
+        .filter(|rb| !rb.is_inline())
+        .and_then(|rb| rb.entity.as_deref())
+        .and_then(|n| unit.entities.iter().find(|e| e.name == n))
+        .is_some_and(|e| !entity_create_seedable(design, unit, e, &mut vec![e.name.clone()]))
+}
+
 /// The collection path a `/{id}` endpoint acts under: its path with the trailing
 /// `/{param}` segment removed (`/tasks/{id}` → `/tasks`, `/{id}` → `/`). The POST
 /// creator at THIS path seeds the row the probe addresses (#51).
@@ -409,6 +464,12 @@ fn seed_for_id_probe(
         .and_then(|rb| rb.entity.as_deref())
         .expect("creator has an entity body");
     let entity = unit.entities.iter().find(|e| e.name == entity_name)?;
+    // #298: if a REQUIRED same-module belongs_to parent has no creator, this row
+    // cannot be seeded (its NOT-NULL DDL FK can't be satisfied over HTTP) — return
+    // None so the caller emits an AGENT TODO instead of a guaranteed-red probe.
+    if !entity_create_seedable(design, unit, entity, &mut vec![entity.name.clone()]) {
+        return None;
+    }
 
     let mut seed = String::new();
     let mut seen = vec![entity.name.clone()];
@@ -957,6 +1018,31 @@ fn unit_tests(
             };
             out.todos.push(format!(
                 "// AGENT TODO: {fn_base} ({:?} {full_path}) {reason} — {ask}.",
+                ep.method
+            ));
+            if guarded {
+                push_401_test(
+                    design,
+                    out,
+                    unit,
+                    ep,
+                    &concrete_mount_base(&full_path),
+                    false,
+                );
+            }
+        } else if param_count(ep) == 0 && create_target_unseedable(design, unit, ep) {
+            // #298: a create whose entity has a REQUIRED same-module belongs_to to a
+            // CREATORLESS parent can never be seeded — the parent's NOT-NULL DDL FK
+            // dangles and the 201 probe 500s forever. Emit a TODO (add a POST creator
+            // for the parent, make the belongs_to `set_null`, or hand-write it). The
+            // guard test survives: a 401 precedes any insert (#123b).
+            let entity = ep
+                .request_body
+                .as_ref()
+                .and_then(|rb| rb.entity.as_deref())
+                .unwrap_or("entity");
+            out.todos.push(format!(
+                "// AGENT TODO: {fn_base} ({:?} {full_path}) creates `{entity}`, whose required `belongs_to` parent has no creator to seed it — its NOT-NULL foreign key can't be satisfied over HTTP. Add a POST creator for the parent, make the `belongs_to` `set_null`, or encode this create in your own test file.",
                 ep.method
             ));
             if guarded {
@@ -3724,6 +3810,57 @@ mod tests {
             create.contains("/catalog/categories")
                 && create.contains("\"id\": \"f47ac10b-58cc-4372-a567-0e02b2c3d479\""),
             "the parent seed must set the same uuid id the fk points at:\n{create}"
+        );
+    }
+
+    /// #298: a create whose entity has a REQUIRED same-module belongs_to to a
+    /// CREATORLESS parent (`Genre`, GET-only) is un-greenable — the parent's NOT-NULL
+    /// DDL `FOREIGN KEY` can't be seeded over HTTP. testgen must emit an AGENT TODO
+    /// for `create_song`, NOT a permanently-red 201 probe. A `set_null` fk (sent as
+    /// `null`) or a parent WITH a creator keeps its normal create probe.
+    #[test]
+    fn required_belongs_to_a_creatorless_parent_emits_a_todo_not_a_red_create_probe() {
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "catalog-api", "contract_version": 0,
+            "dependencies": ["db"],
+            "modules": [
+                { "name": "catalog",
+                  "entities": [
+                      { "name": "Genre", "fields": [
+                          { "name": "id", "type": "integer" },
+                          { "name": "name", "type": "string", "max_len": 50 } ] },
+                      { "name": "Song",
+                        "belongs_to": [ { "entity": "Genre", "on_delete": "cascade" } ],
+                        "fields": [
+                            { "name": "id", "type": "integer" },
+                            { "name": "title", "type": "string", "max_len": 50 } ] } ],
+                  "endpoints": [
+                      { "operation_id": "list_genres", "method": "GET", "path": "/genres",
+                        "success": { "status": 200, "entity": "Genre" } },
+                      { "operation_id": "create_song", "method": "POST", "path": "/songs",
+                        "request_body": { "entity": "Song" },
+                        "success": { "status": 201, "entity": "Song" } } ] }
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert!(
+            crate::platform::questions::validate(&d).is_empty(),
+            "fixture must validate clean: {:?}",
+            crate::platform::questions::validate(&d)
+        );
+        let (catalog, _) = render_acceptance(&d, &d.modules[0]);
+        // No permanently-red create_song 201 probe — Genre can't be seeded (no POST).
+        assert!(
+            !catalog.contains("async fn create_song_returns_201"),
+            "an un-greenable create (creatorless required parent) must NOT emit a 201 probe:\n{catalog}"
+        );
+        // A TODO explains why and how to fix it.
+        assert!(
+            catalog.contains("// AGENT TODO: create_song")
+                && catalog.contains("no creator to seed it"),
+            "the create must become an AGENT TODO naming the creatorless-parent cause:\n{catalog}"
         );
     }
 
