@@ -1,3 +1,5 @@
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fbackant-io%2Fjerrycan.svg)](https://mcptoplist.com/server/glama%2Fbackant-io%2Fjerrycan)
+
 <div align="center">
 
 <picture>
