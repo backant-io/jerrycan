@@ -229,6 +229,60 @@ fn build_one(
         return None;
     }
 
+    // Table-level composite `UNIQUE(a, b, …)` (#115): translate each group whose
+    // columns all survive as a declared field or a belongs_to fk column — the same
+    // shape JC0559 accepts, so the round-trip is validation-clean. A column that
+    // dropped out (e.g. an unmappable-type column) can't be indexed, so raise a
+    // gap for that constraint rather than silently dropping it (never guess).
+    let mut unique = Vec::new();
+    for group in &table.composite_uniques {
+        let missing: Vec<&str> = group
+            .iter()
+            .filter(|col| {
+                !fields.iter().any(|f| &f.name == *col)
+                    && !belongs_to.iter().any(|b| &b.fk_column() == *col)
+            })
+            .map(String::as_str)
+            .collect();
+        if missing.is_empty() {
+            unique.push(group.clone());
+        } else {
+            gaps.push(GapItem {
+                kind: GapKind::UnmappedType,
+                source: format!("{key} unique({})", group.join(", ")),
+                location: format!("schema.sql:{}", table.line),
+                reason: format!(
+                    "composite UNIQUE column(s) `{}` did not survive translation (dropped/unmapped), so the constraint can't be reproduced as a composite `unique` index",
+                    missing.join(", ")
+                ),
+                original: format!("unique ({})", group.join(", ")),
+                suggested:
+                    "map the missing column(s) to a field, then add the group to the entity's `unique`, or enforce the invariant in a handler"
+                        .into(),
+                severity: Severity::Blocking,
+            });
+        }
+    }
+
+    // A `CREATE UNIQUE INDEX` the translator can't reproduce as a plain composite
+    // `unique` (expression columns, or a partial `WHERE` predicate) still enforced
+    // uniqueness in the source: gap it rather than drop it (never guess).
+    for idx in &table.unrepresentable_uniques {
+        gaps.push(GapItem {
+            kind: GapKind::UnmappedType,
+            source: format!("{key} unique index {}", idx.name),
+            location: format!("schema.sql:{}", idx.line),
+            reason:
+                "an expression or partial (`WHERE`) UNIQUE INDEX constrains rows that a plain composite `unique` cannot express, so it can't be reproduced automatically"
+                    .into(),
+            original: idx.sql.clone(),
+            suggested:
+                "enforce the invariant in a handler, or keep the raw index in a hand-written migration"
+                    .into(),
+            severity: Severity::Blocking,
+        });
+    }
+
     // Preserve the source table name losslessly: pin `table` only when the
     // default (snake_case + pluralization) would NOT reproduce it, so a clean
     // name stays override-free while an irregular one round-trips exactly.
@@ -239,7 +293,7 @@ fn build_one(
         table,
         belongs_to,
         public_read: false,
-        unique: vec![],
+        unique,
         fields,
     })
 }
@@ -343,6 +397,126 @@ create table public.order_items (
             == crate::platform::migrate::gaps::GapKind::UnmappedType
             && g.source.contains("location")));
         assert!(!item.fields.iter().any(|f| f.name == "location"));
+    }
+
+    #[test]
+    fn composite_unique_survives_translation_and_an_unrepresentable_one_gaps() {
+        // WHY: docs/ai/19 promises the migrator never silently drops what it can't
+        // translate. A multi-column UNIQUE(a, b) IS translatable — jerrycan carries
+        // it as the entity's composite `unique` (#115). It must survive; a group over
+        // a dropped (unmappable-type) column must gap, not vanish.
+        let schema = r#"
+create table public.memberships (
+    id uuid primary key,
+    org_id uuid not null,
+    user_id uuid not null,
+    unique (org_id, user_id)
+);
+create table public.pins (
+    id uuid primary key,
+    label text not null,
+    spot point,
+    unique (label, spot)
+);
+"#;
+        let db = PgDatabase::fold(&parse::split_and_parse(schema));
+        let out = build_entities(&db);
+
+        let membership = out
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "Membership")
+            .map(|(_, e)| e)
+            .unwrap();
+        assert_eq!(
+            membership.unique,
+            vec![vec!["org_id".to_string(), "user_id".to_string()]],
+            "UNIQUE(org_id, user_id) must survive as the entity's composite `unique`"
+        );
+        // Each column names a declared field (the shape JC0559 accepts), so the
+        // group round-trips to a buildable `CREATE UNIQUE INDEX`.
+        for col in &membership.unique[0] {
+            assert!(membership.fields.iter().any(|f| &f.name == col));
+        }
+
+        // `spot point` is an unmappable type → dropped field + its composite unique
+        // over it can't be built, so the constraint gaps rather than silently drops.
+        let pin = out
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "Pin")
+            .map(|(_, e)| e)
+            .unwrap();
+        assert!(
+            pin.unique.is_empty(),
+            "a group over a dropped column must not be emitted"
+        );
+        assert!(
+            out.gaps.iter().any(|g| g.kind
+                == crate::platform::migrate::gaps::GapKind::UnmappedType
+                && g.source.contains("unique(label, spot)")
+                && g.reason.contains("spot")),
+            "the unrepresentable composite unique must raise a gap: {:?}",
+            out.gaps
+        );
+    }
+
+    #[test]
+    fn multi_column_unique_index_survives_and_a_partial_one_gaps() {
+        // WHY: pg_dump commonly emits uniqueness as `CREATE UNIQUE INDEX` — a
+        // different parse node than a table-level `UNIQUE(a, b)`, so it needs its
+        // own translation or the constraint vanishes (docs/ai/19: never silently
+        // drop). A partial (`WHERE`) unique must gap rather than be dropped OR
+        // promoted to an unconditional `unique`, which would reject rows the
+        // source allows. A non-unique index is a lookup hint, not a constraint.
+        fn find<'a>(out: &'a BuildResult, name: &str) -> &'a Entity {
+            out.entities
+                .iter()
+                .find(|(_, e)| e.name == name)
+                .map(|(_, e)| e)
+                .unwrap()
+        }
+        let schema = r#"
+create table public.memberships (id uuid primary key, org_id uuid not null, user_id uuid not null);
+create unique index memberships_org_user on public.memberships (org_id, user_id);
+create table public.profiles (id uuid primary key, username text not null, deleted_at timestamptz);
+create unique index profiles_username_live on public.profiles (username) where deleted_at is null;
+create table public.notes (id uuid primary key, title text not null, body text not null);
+create index notes_title_body on public.notes (title, body);
+"#;
+        let db = PgDatabase::fold(&parse::split_and_parse(schema));
+        let out = build_entities(&db);
+
+        assert_eq!(
+            find(&out, "Membership").unique,
+            vec![vec!["org_id".to_string(), "user_id".to_string()]],
+            "a multi-column CREATE UNIQUE INDEX must survive as the composite `unique`"
+        );
+
+        let username = find(&out, "Profile")
+            .fields
+            .iter()
+            .find(|f| f.name == "username")
+            .unwrap();
+        assert!(
+            !username.unique,
+            "a partial unique index constrains a subset of rows — an unconditional `unique` would over-constrain"
+        );
+        assert!(username.index, "it is still a real lookup index");
+        assert!(
+            out.gaps
+                .iter()
+                .any(|g| g.source.contains("profiles_username_live")
+                    && g.severity == Severity::Blocking),
+            "the partial unique index must gap, not vanish: {:?}",
+            out.gaps
+        );
+
+        // A non-unique composite index carries no constraint: unchanged, no gap.
+        let note = find(&out, "Note");
+        assert!(note.unique.is_empty());
+        assert!(!note.fields.iter().any(|f| f.index));
+        assert!(!out.gaps.iter().any(|g| g.source.contains("notes")));
     }
 
     #[test]
