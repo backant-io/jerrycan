@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.7.31 — 2026-09-01
+
+### Fixed
+- **A declared `id: integer` is server-assigned and out of the create body — exactly like an omitted `id` (#302).**
+  `docs/ai/00-designing.md` promised the two were equivalent; the generator honored it only for an *omitted* id, so a
+  declared integer pk leaked into `{Entity}Request` as required client data (`id: Set(item.id)`) — a client could not
+  `POST` and let the database assign the id, and a fixed-body bulk create collided on the pk. One shared discriminator
+  (`Entity::id_is_server_assigned`) now drives all six codegen sites (the model/DTO id default, both `active_sets`
+  variants, the OpenAPI component + create schema, and the testgen probes); `tenancy_create_pk_override` — the seed-dodge
+  that had kept this green — is gone. `string`/`uuid` pks are byte-identical.
+- **`migrate --from supabase`: native `CREATE TYPE … AS ENUM` columns translate to `field.values`, preserving their seed
+  data (#303).** A schema-defaulting asymmetry stored enum keys as `public.status` while an unqualified column type
+  resolved to bare `status`, so the common Supabase form never matched, hit the "no deterministic design type" dead end,
+  and left a hollow id-only entity that silently dropped those seed columns. Both enum forms now share the inline
+  `CHECK IN` path.
+- **`migrate --from supabase`: the `users` module + JWT auth are emitted only when `auth.users` is in the export.** They
+  were emitted unconditionally, handing a no-auth source `register`/`login`/JWT it never had. The gate also counts an fk
+  to `auth.users` or a `data/auth.users.csv` (a `--schema public` dump drops the DDL but keeps the references). A source
+  with RLS/tenancy but no `auth.users` keeps `jwt` without an identity surface and raises a blocking gap — never silently
+  dropped, never widened. Normal exports are byte-identical.
+- **`migrate --from supabase`: the pg_cron `jobname/schedule/command` dump the docs prescribe is accepted, alongside
+  `cron.schedule()`.** The documented `\copy … from cron.job` export emits TAB-separated rows the migrator rejected as a
+  blocking `cron_job` gap. Both forms share one `emit_job`; `cron.schedule()` output is byte-identical, line numbers
+  included.
+- **A multi-role `required_roles` emits a compilable `require_any_role` guard.** A 2+-role endpoint (accepted by
+  `check`) generated `require_role("admin", "editor")` — a call no signature accepts — steering an agent to a compile
+  error or to silently dropping roles. `jerrycan-auth` gains a free `require_any_role(actual, &[&str])` mirroring
+  `Tenant::require_any_role`; single-role output is byte-identical.
+- **`jerrycan-db`: the Postgres pool size is configurable via `JERRYCAN_DB_POOL_SIZE` (#305).** It was hardcoded to 5. A
+  positive value wins verbatim; unset, unparseable or zero falls back to `max(5, available_parallelism × 2)`. SQLite
+  stays single-connection.
+- **The manual matches shipped behavior.** A FK violation is `422 JC0422` (not `500`, since #296); the declarative field
+  constraints (`min`/`max`/`min_len`/`max_len`, #80) exist — `09-validation` claimed they did not; a non-`User` auth
+  identity is supported with full owner-scoping (#150) — `00-designing` said it MUST be `User`; the generated jobs
+  concurrency is 2. Embedded copies synced.
+- **`Cargo.lock`: `chacha20` 0.10.1 → 0.10.2.** The 0.10.1 release was yanked upstream (transitive via
+  `rand → tungstenite → jerrycan-realtime`) and `deny.toml`'s `yanked = "deny"` correctly failed every PR until the
+  bump. `jerrycan-auth`'s separate `chacha20 0.9.1` line is unaffected.
+
 ## 0.7.30 — 2026-08-10
 
 ### Fixed
