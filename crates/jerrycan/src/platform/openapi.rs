@@ -265,6 +265,19 @@ fn walk_schemas(design: &Design, m: &ModuleDesign, schemas: &mut serde_json::Map
             required.push(Value::String("id".into()));
         }
         for f in &e.fields {
+            // #302: a declared `integer` id is SERVER-assigned (DB autoincrement, `NotSet`
+            // on insert) — mark it `readOnly` + required so the component (which doubles as
+            // the plain CREATE body when no `{Entity}Request` is minted) documents it as
+            // response-only, never client-sent, byte-identical to the synthetic pk above. A
+            // declared `string`/`uuid` id is client-supplied and rides the normal loop.
+            if f.name == "id" && e.id_is_server_assigned() {
+                properties.insert(
+                    "id".into(),
+                    json!({ "type": "integer", "format": "int64", "readOnly": true }),
+                );
+                required.push(Value::String("id".into()));
+                continue;
+            }
             // #274: in db mode an optional field is `Option<T>` — it serializes `None`
             // as an explicit `null` and accepts `null` — so its schema must admit null.
             // Memory-mode optional fields are bare `T` with `#[serde(default)]` (a
@@ -414,11 +427,14 @@ fn request_schema(design: &Design, e: &Entity, for_update: bool) -> Value {
     // `now`-default timestamp (#110) is server-owned AND set-once, so it is dropped
     // from BOTH request schemas (immutable on update). The extra clause is inert for
     // every non-`now` field — designs without the sentinel stay byte-identical.
-    for f in e
-        .fields
-        .iter()
-        .filter(|f| (for_update || f.default.is_none()) && !Design::field_is_now_default(f))
-    {
+    for f in e.fields.iter().filter(|f| {
+        // #302: a server-assigned (synthetic/declared-`integer`) id is out of the create
+        // body — excluded here exactly as `request_dto_rs` drops it. A client-supplied
+        // `string`/`uuid` id stays (required client input).
+        !(f.name == "id" && e.id_is_server_assigned())
+            && (for_update || f.default.is_none())
+            && !Design::field_is_now_default(f)
+    }) {
         // #274: the db request DTO types an optional field as `Option<T>` (it accepts
         // `null`), so its schema must admit null. `request_schema` is only built in db
         // mode (gated at the call sites in `walk_schemas`), so this needs no db-check.
@@ -867,6 +883,9 @@ mod tests {
                     { "name": "Widget", "fields": [{ "name": "label", "type": "string" }] },
                     { "name": "Gadget", "fields": [
                         { "name": "id", "type": "integer" },
+                        { "name": "label", "type": "string" } ]},
+                    { "name": "Token", "fields": [
+                        { "name": "id", "type": "string" },
                         { "name": "label", "type": "string" } ]} ],
                 "endpoints": [
                     { "operation_id": "get_widget", "method": "GET", "path": "/{id}",
@@ -888,13 +907,16 @@ mod tests {
                 .any(|v| v == "id"),
             "synthetic id is required: {widget}"
         );
-        // Declared-id entity: `id` present exactly once (from its field, not doubled),
-        // and NOT readOnly — a declared id is client-supplied.
+        // #302: a declared INTEGER id is SERVER-assigned — identical to the synthetic
+        // pk above: integer, `readOnly`, required (present in the response, never sent
+        // on the plain-body create). `id` present exactly once (from its field, not
+        // doubled with a synthetic pk).
         let gadget = &d["components"]["schemas"]["Gadget"];
         assert_eq!(gadget["properties"]["id"]["type"], "integer");
-        assert!(
-            gadget["properties"]["id"].get("readOnly").is_none(),
-            "a declared id is client-supplied, never readOnly: {gadget}"
+        assert_eq!(gadget["properties"]["id"]["format"], "int64");
+        assert_eq!(
+            gadget["properties"]["id"]["readOnly"], true,
+            "a declared integer id is server-assigned, readOnly like the synthetic pk: {gadget}"
         );
         assert_eq!(
             gadget["required"]
@@ -905,6 +927,22 @@ mod tests {
                 .count(),
             1,
             "declared id is not duplicated: {gadget}"
+        );
+        // #302: a declared STRING/uuid id is CLIENT-supplied — present, required, and
+        // NOT readOnly (the client sends the pk on create).
+        let token = &d["components"]["schemas"]["Token"];
+        assert_eq!(token["properties"]["id"]["type"], "string");
+        assert!(
+            token["properties"]["id"].get("readOnly").is_none(),
+            "a declared string id is client-supplied, never readOnly: {token}"
+        );
+        assert!(
+            token["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "id"),
+            "client-supplied id is required: {token}"
         );
         // Memory mode: no synthetic id → the component stays fields-only.
         const MEM: &str = r#"{
