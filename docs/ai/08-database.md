@@ -357,9 +357,11 @@ that surface.
 
 ## Errors you'll hit
 - A unique-key violation surfaces as `409 JC0409` (a re-POSTed id is the
-  client's fault); every other database failure is `500 JC0510`. Neither leaks
-  internals in the body — the real SeaORM/sqlx error goes to stderr for the
-  operator. Always `.map_err(db_error)?` so both codes happen for free.
+  client's fault); a foreign-key violation — a client-supplied fk pointing at a
+  row that does not exist — is `422 JC0422` (the request is well-formed but
+  references a nonexistent record); every other database failure is `500 JC0510`.
+  None leaks internals in the body — the real SeaORM/sqlx error goes to stderr for
+  the operator. Always `.map_err(db_error)?` so all three codes happen for free.
 - A failing migration stops the run and is NOT recorded — fix it and rerun.
 
 ## Anti-patterns

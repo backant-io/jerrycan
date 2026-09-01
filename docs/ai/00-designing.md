@@ -324,11 +324,12 @@ Every entity has an `id` primary key; you usually do NOT declare it:
     entity RESPONSE shape is unchanged. Three drop reasons — a body can hit several at
     once:
     1. **Identity fk (guarded):** the body `belongs_to` the auth identity entity —
-       which MUST be named literally `User`, so the derived fk is `user_id` (see
-       10-auth.md: an identity named anything else gets NO owner-scoping and its fk
-       stays client-writable) — AND the endpoint is guarded → `user_id` is omitted; the
-       handler injects the session user's id. An unguarded endpoint keeps it (no session
-       to inject).
+       named by `auth.identity` (default `"User"`, so the derived fk is `user_id`;
+       set e.g. `auth.identity: "Account"` and the fk becomes `account_id`) — AND the
+       endpoint is guarded → the identity fk is omitted; the handler injects the
+       session principal's id. A non-`User` identity gets the SAME owner-scoping and
+       server-injected fk, derived from the name (see 10-auth.md). An unguarded
+       endpoint keeps it (no session to inject).
     2. **`default` field:** any field with a `default` is omitted; the server applies
        the declared value. Works on unguarded/public creates too — this is what lets
        `POST /subscribers { "email": … }` succeed while `confirmed` and `status` default

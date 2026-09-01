@@ -127,7 +127,7 @@ assert!(send_email(t.task_context()).await.is_ok());
 
 ## Variations
 - **Wiring**: the generated `crates/jobs/src/lib.rs` builds the extension —
-  `Jobs::postgres(db).queue("email", 4).register("send_email", f).cron("expire_trials", "0 * * * *", "billing")`
+  `Jobs::postgres(db).queue("email", 2).register("send_email", f).cron("expire_trials", "0 * * * *", "billing")`
   — and the app installs it with `app.extend(jobs(db))`. `cron(job, expr, queue)`
   takes the job name, the 5-field cron expression, and the queue it enqueues onto
   (it is a builder taking `self` and PANICS at build time on an invalid `expr`).
