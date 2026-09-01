@@ -163,6 +163,85 @@ fn uuid_membership_rows_seed_losslessly_and_are_not_gapped() {
     );
 }
 
+/// Regression for issue #303: a native `CREATE TYPE … AS ENUM` column (referenced
+/// unqualified, as Supabase dumps and hand-written schemas do) must translate to a
+/// `values`-constrained field — the same shape an inline `CHECK IN` produces — so
+/// the column survives as a real field AND its seed data is carried (before #303 the
+/// column dropped as "no deterministic design type", leaving a hollow id-only entity
+/// and silently dropping the seed column).
+#[test]
+fn native_enum_columns_translate_to_field_values_and_keep_their_seed() {
+    let src = tempfile::tempdir().unwrap();
+    let root = src.path();
+    std::fs::write(
+        root.join("schema.sql"),
+        "create type status as enum ('active', 'inactive');\n\
+         create table public.tasks (\n\
+             id uuid primary key,\n\
+             title text not null,\n\
+             status status not null\n\
+         );\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::write(
+        root.join("data/public.tasks.csv"),
+        "id,title,status\naaaaaaaa-0000-0000-0000-000000000001,ship it,active\n",
+    )
+    .unwrap();
+
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = run_migrate(&MigrateOptions {
+        export_dir: root.to_path_buf(),
+        out_dir: out_tmp.path().to_path_buf(),
+        name: Some("tasks-app".into()),
+        bulk_threshold: 100,
+    })
+    .expect("minimal enum export migrates");
+
+    // (a) The design has a real `status` field constrained to the enum labels —
+    //     not a dropped column / hollow id-only entity.
+    let entity = out
+        .design
+        .modules
+        .iter()
+        .flat_map(|m| &m.entities)
+        .find(|e| e.name == "Task")
+        .expect("tasks table modeled as an entity");
+    let status = entity
+        .fields
+        .iter()
+        .find(|f| f.name == "status")
+        .expect("native enum column survives as a field");
+    assert_eq!(
+        status.values.as_deref(),
+        Some(&["active".to_string(), "inactive".to_string()][..]),
+        "enum labels become field values"
+    );
+    assert!(
+        !out.gaps.iter().any(|g| g.source.contains("tasks.status")),
+        "the enum column must not gap: {:?}",
+        out.gaps.iter().map(|g| &g.source).collect::<Vec<_>>()
+    );
+
+    // (b) The emitted seed still carries the `status` column and its value.
+    let sql = std::fs::read_dir(out_tmp.path().join("seed/inline"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("tasks.sql"))
+        })
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .expect("a tasks inline seed file exists");
+    assert!(
+        sql.contains("status") && sql.contains("'active'"),
+        "seed carries the enum column and its value: {sql}"
+    );
+}
+
 #[test]
 fn the_bulk_table_took_the_resumable_path() {
     let tmp = tempfile::tempdir().unwrap();
