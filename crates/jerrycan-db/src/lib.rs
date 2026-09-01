@@ -43,7 +43,15 @@ pub struct Db {
 
 impl Db {
     /// Connect by URL: `sqlite::memory:`, `sqlite://path.db`, `postgres://…`.
+    /// Uses the default Postgres pool of 5; env-driven construction
+    /// ([`from_env`](Self::from_env)) honors `JERRYCAN_DB_POOL_SIZE` for tuning.
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_with_pg_pool(url, 5).await
+    }
+
+    /// Shared connector: `pg_pool` sizes the Postgres connection pool. SQLite is
+    /// always single-connection regardless (memory correctness + writer lock).
+    async fn connect_with_pg_pool(url: &str, pg_pool: u32) -> Result<Self> {
         let backend = if url.starts_with("postgres") {
             Backend::Postgres
         } else if url.starts_with("sqlite") {
@@ -54,10 +62,10 @@ impl Db {
             )));
         };
         // Decision #4: one connection for sqlite (memory correctness + writer lock),
-        // small default pool for postgres.
+        // configurable pool for postgres (`JERRYCAN_DB_POOL_SIZE`, resolved in `from_env`).
         let max = match backend {
             Backend::Sqlite => 1,
-            Backend::Postgres => 5,
+            Backend::Postgres => pg_pool,
         };
         let mut opts = sea_orm::ConnectOptions::new(url.to_string());
         opts.max_connections(max);
@@ -78,11 +86,18 @@ impl Db {
         })
     }
 
-    /// `JERRYCAN_DATABASE_URL`, defaulting to `sqlite::memory:` for dev.
+    /// `JERRYCAN_DATABASE_URL`, defaulting to `sqlite::memory:` for dev. The
+    /// Postgres pool size is read from `JERRYCAN_DB_POOL_SIZE` (default
+    /// `max(5, available_parallelism * 2)`; SQLite ignores it — always 1).
     pub async fn from_env() -> Result<Self> {
         let url = std::env::var("JERRYCAN_DATABASE_URL")
             .unwrap_or_else(|_| "sqlite::memory:".to_string());
-        Self::connect(&url).await
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let pool_env = std::env::var("JERRYCAN_DB_POOL_SIZE").ok();
+        let pg_pool = resolve_pg_pool_size(pool_env.as_deref(), cores);
+        Self::connect_with_pg_pool(&url, pg_pool).await
     }
 
     /// The underlying sea-orm connection. Generated repos and migrations execute
@@ -124,6 +139,19 @@ impl Db {
             Backend::Sqlite => sea_orm::DatabaseBackend::Sqlite,
             Backend::Postgres => sea_orm::DatabaseBackend::Postgres,
         }
+    }
+}
+
+/// Resolve the Postgres connection-pool size (`max_connections`) for env-driven
+/// construction. A positive `JERRYCAN_DB_POOL_SIZE` wins verbatim; anything
+/// unset, unparseable, or zero falls back to `max(5, cores * 2)` — 5 is the
+/// floor so a low-core box still gets a usable pool. SQLite ignores this (always
+/// single-connection). Pure over its inputs so it is testable without a live DB
+/// or mutating process env.
+fn resolve_pg_pool_size(env: Option<&str>, cores: usize) -> u32 {
+    match env.and_then(|s| s.trim().parse::<u32>().ok()) {
+        Some(n) if n > 0 => n,
+        _ => ((cores * 2) as u32).max(5),
     }
 }
 
@@ -333,6 +361,24 @@ mod tests {
             translate_placeholders("INSERT INTO t (a, b) VALUES (?, ?)", Backend::Sqlite),
             "INSERT INTO t (a, b) VALUES (?, ?)"
         );
+    }
+
+    /// The `JERRYCAN_DB_POOL_SIZE` knob (#305): a positive value wins verbatim;
+    /// unset/garbage/zero fall back to `max(5, cores * 2)` with 5 as the floor.
+    /// This encodes the intent — an operator can tune the Postgres pool, but a
+    /// bad value never yields a zero/tiny pool that would deadlock the app.
+    #[test]
+    fn pg_pool_size_honors_the_env_knob_with_a_cores_floor() {
+        // An explicit positive value wins verbatim (whitespace tolerated).
+        assert_eq!(resolve_pg_pool_size(Some("16"), 4), 16);
+        assert_eq!(resolve_pg_pool_size(Some("  7 "), 4), 7);
+        // Unset → cores * 2 (6*2 = 12), above the floor.
+        assert_eq!(resolve_pg_pool_size(None, 6), 12);
+        // Garbage or zero → the default; with 1 core the floor of 5 holds.
+        assert_eq!(resolve_pg_pool_size(Some("garbage"), 1), 5);
+        assert_eq!(resolve_pg_pool_size(Some("0"), 1), 5);
+        // The floor also protects a low-core box on the unset path.
+        assert_eq!(resolve_pg_pool_size(None, 1), 5);
     }
 
     #[tokio::test]
