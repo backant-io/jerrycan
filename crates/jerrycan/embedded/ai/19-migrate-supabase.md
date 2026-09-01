@@ -70,7 +70,12 @@ generated app; you rotate them and set fresh values.
   public read, authenticated). Anything else is a gap — never guessed.
 - **auth.users** → a `users` module + JWT auth + a user seed that preserves
   bcrypt hashes (migrated users log in unchanged; jerrycan upgrades the hash to
-  argon2 on the next login).
+  argon2 on the next login). It is a translation, not a default: an export with
+  no auth schema migrates to an app with no auth (and unguarded endpoints, like
+  its source). If the export restricts rows by the authenticated user
+  (`auth.uid()`, membership) but omits `auth.users`, the guards are kept and the
+  missing identity surface becomes a blocking gap — re-export with
+  `--schema public,auth,storage` and re-run.
 - **storage.buckets** → the `storage` block; **`supabase_realtime`** → the
   `realtime.changes` block; **pg_cron** → `jobs[]`.
 - **Not migrated:** the frontend (repoint it with the endpoint map in

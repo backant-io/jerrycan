@@ -154,6 +154,27 @@ pub(crate) struct FrontendInputs<'a> {
     pub seed: Option<&'a export::Export>,
 }
 
+/// M3: does the export actually carry `auth.users`? The `users` module and the
+/// JWT auth block are a TRANSLATION of that table, so they are emitted only when
+/// it is really there: its dumped DDL (the documented
+/// `--schema public,auth,storage` dump, and every `--live` read), a foreign key
+/// that references it (a `--schema public` dump keeps the reference), or its
+/// exported rows. `auth.uid()` in a policy names the identity but not the table —
+/// that goes to the gap queue instead of conjuring a user surface nobody asked for.
+fn export_has_auth_users(db: &pgmodel::PgDatabase, fe: &FrontendInputs) -> bool {
+    const AUTH_USERS: &str = "auth.users";
+    db.tables.contains_key(AUTH_USERS)
+        || db
+            .tables
+            .values()
+            .any(|t| t.fks.iter().any(|fk| fk.ref_table == AUTH_USERS))
+        || fe.seed.is_some_and(|e| {
+            e.data_files
+                .iter()
+                .any(|(schema, table, _)| schema == "auth" && table == "users")
+        })
+}
+
 fn emit_from_db(
     db: pgmodel::PgDatabase,
     opts: &MigrateOptions,
@@ -162,6 +183,22 @@ fn emit_from_db(
     let providers = fe.providers.clone();
     let det = tenancy::detect(&db);
     let access_map = tenancy::table_access(&db, &det);
+    // M3: the `users` module (User entity + register/login) is a translation of
+    // `auth.users` — emitted only when the export actually carries that table.
+    let auth_users = export_has_auth_users(&db, &fe);
+    // …but the AUTH MODEL is a separate question. A source that restricts rows
+    // with RLS (`auth.uid()`, membership) authenticates its callers, so the
+    // migrated guards need a session even when the export forgot the auth schema.
+    // Dropping the model there would silently unguard every restricted table, so
+    // the design keeps jwt auth WITHOUT an identity surface (questions.rs allows
+    // auth with no `User` entity — the external-IdP shape) and the mismatch goes
+    // to the gap queue. Neither half is guessed: no source auth at all ⇒ no auth.
+    let auth_needed = !auth_users
+        && (det.tenant_table.is_some()
+            || access_map
+                .values()
+                .any(|a| !matches!(a, TableAccess::NoRls)));
+    let auth_model = auth_users || auth_needed;
 
     // Entities: every public table except the membership table (tenancy owns it).
     let mut exclude = BTreeSet::new();
@@ -170,13 +207,24 @@ fn emit_from_db(
     }
     let mut build = entities::build_entities_filtered(&db, &exclude);
     let mut gaps: Vec<GapItem> = build.gaps.clone();
+    if auth_needed {
+        gaps.push(GapItem {
+            kind: GapKind::RlsPolicy,
+            source: "auth.users (missing from the export)".into(),
+            location: "schema.sql".into(),
+            reason: "the source restricts rows by the authenticated user (RLS/`auth.uid()`/membership) but the export carries no `auth.users` — the design keeps jwt auth so those guards survive, but declares NO identity entity and no register/login surface".into(),
+            original: String::new(),
+            suggested: "re-export including the auth schema (`supabase db dump --schema public,auth,storage`, plus data/auth.users.csv) and re-run, or wire the identity provider and its user surface by hand".into(),
+            severity: Severity::Blocking,
+        });
+    }
 
     // The auth mapping reserves the `User` entity (generated `users` module).
     // A public table that would also produce it (public.users) can't be
     // modeled mechanically — merging its columns into the auth-derived User is
     // agent judgment. Blocking gap + skip, not a hard abort.
     build.entities.retain(|(k, e)| {
-        if e.name == "User" {
+        if auth_users && e.name == "User" {
             gaps.push(GapItem {
                 kind: GapKind::UnmappedType,
                 source: k.clone(),
@@ -279,7 +327,14 @@ fn emit_from_db(
                 kind: GapKind::RlsPolicy,
                 source: format!("{tk} (no RLS)"),
                 location: "schema.sql".into(),
-                reason: "the source table has row-level security disabled; the migrated endpoints require auth by default (stricter than the source)".into(),
+                // M3: "stricter" holds only while there IS an auth model to guard
+                // with. An export with no auth at all migrates to an auth-less app,
+                // so those endpoints are as open as the source — say which it is.
+                reason: if auth_model {
+                    "the source table has row-level security disabled; the migrated endpoints require auth by default (stricter than the source)".into()
+                } else {
+                    "the source table has row-level security disabled and the export declares no auth at all (no `auth.users`, no RLS anywhere), so the migrated endpoints are UNGUARDED — as open as the source".to_string()
+                },
                 original: String::new(),
                 suggested: "mark reads public in the design if this data really is open".into(),
                 severity: Severity::Advisory,
@@ -293,11 +348,16 @@ fn emit_from_db(
         entities::entity_name(short)
     });
 
-    // Auth.
-    let auth_out = authmap::build_auth(&det.member_roles, &providers);
+    // Auth (M3): the MODEL whenever the source authenticates at all, the `users`
+    // MODULE only when the export carries the `auth.users` it translates.
+    let auth_out = auth_model.then(|| authmap::build_auth(&det.member_roles, &providers));
 
-    // Modules: users first, then FK-graph groups (hub = tenant table).
-    let mut modules: Vec<ModuleDesign> = vec![auth_out.users_module.clone()];
+    // Modules: users first (when there is one), then FK-graph groups (hub = tenant table).
+    let mut modules: Vec<ModuleDesign> = auth_out
+        .iter()
+        .filter(|_| auth_users)
+        .map(|a| a.users_module.clone())
+        .collect();
     let entity_tables: Vec<String> = build.entities.iter().map(|(k, _)| k.clone()).collect();
     let mut edges = Vec::new();
     for (k, _) in &build.entities {
@@ -318,7 +378,7 @@ fn emit_from_db(
     let groups: Vec<(String, Vec<String>)> = grouping::group_modules(&entity_tables, &edges, &hubs)
         .into_iter()
         .map(|(name, tables)| {
-            if name == "users" {
+            if auth_users && name == "users" {
                 ("users-tables".to_string(), tables)
             } else {
                 (name, tables)
@@ -383,6 +443,16 @@ fn emit_from_db(
                 });
             }
             let mut eps = crud::endpoints_for(&entity.name, access, &covered);
+            // M3: an auth-less design has no session to require, and a guarded
+            // endpoint without an auth model fails validation. Only reachable when
+            // the source itself had no auth AND no RLS (`auth_needed` keeps the
+            // model otherwise), so this matches the source instead of widening it.
+            if !auth_model {
+                for e in &mut eps {
+                    e.auth_required = false;
+                    e.required_roles.clear();
+                }
+            }
             // questions.rs forbids public on a tenant-owned entity: downgrade + advise.
             // #144: tenant ownership is TRANSITIVE (a grandchild is tenant-owned
             // through its parent chain), matching the framework's `Design::tenant_path`
@@ -426,7 +496,10 @@ fn emit_from_db(
     }
 
     // Dependencies: auth (+oauth) + db (tenancy/realtime/storage all need it).
-    let mut dep_set: BTreeSet<String> = auth_out.dependencies.iter().cloned().collect();
+    let mut dep_set: BTreeSet<String> = auth_out
+        .iter()
+        .flat_map(|a| a.dependencies.iter().cloned())
+        .collect();
     dep_set.insert("db".into());
     let dependencies: Vec<String> = dep_set.into_iter().collect();
 
@@ -452,7 +525,20 @@ fn emit_from_db(
     let realtime = if publications.contains_key("supabase_realtime") {
         let rt = realtimemap::build_realtime(&publications, &table_to_entity);
         gaps.extend(rt.gaps);
-        (!rt.changes.is_empty()).then_some(RealtimeDesign {
+        // M3: changes delivery is scope-filtered by the authenticated principal,
+        // which an auth-less design has none of — drop it, loudly.
+        if !auth_model && !rt.changes.is_empty() {
+            gaps.push(GapItem {
+                kind: GapKind::RealtimeChannel,
+                source: "supabase_realtime publication".into(),
+                location: "schema.sql".into(),
+                reason: "realtime change delivery is scope-filtered by the authenticated principal, but the export has no `auth.users` — the design declares no auth model, so no `realtime` block was emitted".into(),
+                original: String::new(),
+                suggested: "re-export including the auth schema (`--schema public,auth,storage`) and re-run".into(),
+                severity: Severity::Blocking,
+            });
+        }
+        (auth_model && !rt.changes.is_empty()).then_some(RealtimeDesign {
             changes: rt.changes,
             broadcast: vec![],
             presence: vec![],
@@ -461,12 +547,27 @@ fn emit_from_db(
         None
     };
 
-    // Storage.
+    // Storage. M3: the bucket owner is the `User` identity entity, which only the
+    // `auth.users` translation declares — without it there is nothing to own the
+    // folder-per-user policies, so the block is gapped rather than owner-less.
     let storage = if let Some(json) = &fe.buckets_json {
-        let so = storagemap::build_storage(json, &db, "User")?;
-        let design = so.to_design();
-        gaps.extend(so.gaps);
-        design
+        if auth_users {
+            let so = storagemap::build_storage(json, &db, "User")?;
+            let design = so.to_design();
+            gaps.extend(so.gaps);
+            design
+        } else {
+            gaps.push(GapItem {
+                kind: GapKind::RlsPolicy,
+                source: "storage.buckets".into(),
+                location: "storage/buckets.json".into(),
+                reason: "storage buckets are owned by the `User` identity entity (uploads/deletes are always guarded, folder-per-user policies scope by it), but the export has no `auth.users` to declare it — no `storage` block was emitted".into(),
+                original: String::new(),
+                suggested: "re-export including the auth schema (`--schema public,auth,storage`) and re-run".into(),
+                severity: Severity::Blocking,
+            });
+            None
+        }
     } else {
         None
     };
@@ -543,7 +644,7 @@ fn emit_from_db(
         // No CORS policy inferred from an import; add a `cors` block post-migration
         // if the migrated app serves a cross-origin SPA (issue #21).
         cors: None,
-        auth: Some(auth_out.auth.clone()),
+        auth: auth_out.as_ref().map(|a| a.auth.clone()),
         dependencies,
         tenancy,
         jobs,
@@ -1090,6 +1191,7 @@ mod tests {
         std::fs::write(
             root.join("schema.sql"),
             r#"
+create table auth.users (id uuid primary key, email text);
 create table public.workspaces (id uuid primary key, name text not null);
 create table public.workspace_members (
     workspace_id uuid not null references public.workspaces(id) on delete cascade,
@@ -1309,6 +1411,7 @@ create policy posts_delete on public.posts for delete using (user_id = auth.uid(
         std::fs::write(
             export_dir.join("schema.sql"),
             r#"
+create table auth.users (id uuid primary key, email text);
 create table public.users (id uuid primary key, handle text not null);
 create table public.users_settings (id uuid primary key, theme text not null);
 "#,
@@ -1561,6 +1664,7 @@ create table public.users_settings (id uuid primary key, theme text not null);
         std::fs::write(
             export_dir.join("schema.sql"),
             r#"
+create table auth.users (id uuid primary key, email text);
 create table public.workspaces (id uuid primary key, name text not null);
 create table public.workspace_members (
     workspace_id uuid not null references public.workspaces(id) on delete cascade,
@@ -1745,6 +1849,115 @@ create policy own on public.todos using (user_id = auth.uid());
         );
     }
 
+    /// M3: the `users` module + jwt auth are a TRANSLATION of `auth.users`, not a
+    /// default. A source with no auth must not grow a User entity and a
+    /// register/login surface it never had (an unrequested auth surface is the
+    /// same "guess" the translator refuses everywhere else) — and the inverse must
+    /// not happen either: an export that RESTRICTS rows by the auth identity while
+    /// omitting `auth.users` keeps its guards and gets a blocking gap naming the
+    /// mismatch, never a silently unguarded API.
+    #[test]
+    fn the_users_module_follows_auth_users_and_a_dangling_auth_reference_is_a_blocking_gap() {
+        // (a) No auth anywhere in the source → an auth-less app.
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(
+            export_dir.join("schema.sql"),
+            "create table public.todos(id bigserial primary key, title text);\n",
+        )
+        .unwrap();
+        let out = run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: tmp.path().join("app"),
+            name: Some("todo-app".into()),
+            bulk_threshold: 5000,
+        })
+        .expect("a table-only export migrates");
+        assert!(
+            out.design.auth.is_none(),
+            "no auth schema in the export ⇒ no auth block, got {:?}",
+            out.design.auth
+        );
+        assert!(
+            !out.design.dependencies.contains(&"auth".to_string()),
+            "no auth dependency: {:?}",
+            out.design.dependencies
+        );
+        let entities: Vec<&str> = out
+            .design
+            .modules
+            .iter()
+            .flat_map(|m| m.entities.iter())
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(
+            entities,
+            vec!["Todo"],
+            "one source table ⇒ one entity — no invented User"
+        );
+        assert!(
+            !out.design.modules.iter().any(|m| m.name == "users"),
+            "no register/login surface for a source that has none"
+        );
+        assert!(
+            out.design
+                .modules
+                .iter()
+                .flat_map(|m| m.endpoints.iter())
+                .all(|e| !e.is_guarded()),
+            "with no auth model there is no session to require"
+        );
+
+        // (c) The same table, now restricted by the auth identity, with `auth.users`
+        // still missing: the guards must survive (auth model kept, no identity
+        // surface invented) and the mismatch must be BLOCKING, not dropped.
+        let tmp = tempfile::tempdir().unwrap();
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(
+            export_dir.join("schema.sql"),
+            r#"
+create table public.todos(id bigserial primary key, user_id uuid, title text);
+alter table public.todos enable row level security;
+create policy own on public.todos using (user_id = auth.uid());
+"#,
+        )
+        .unwrap();
+        let out = run_migrate(&MigrateOptions {
+            export_dir,
+            out_dir: tmp.path().join("app"),
+            name: Some("todo-app".into()),
+            bulk_threshold: 5000,
+        })
+        .expect("a dangling auth reference gaps, it does not abort");
+        assert!(
+            !out.design.modules.iter().any(|m| m.name == "users"),
+            "still no users module — the export carries no auth.users to translate"
+        );
+        assert!(
+            out.design.auth.is_some(),
+            "the source authenticates (auth.uid()), so the model stays — dropping it would unguard every restricted table"
+        );
+        assert!(
+            out.design
+                .modules
+                .iter()
+                .flat_map(|m| m.endpoints.iter())
+                .all(|e| e.auth_required && !e.public),
+            "the source's restriction survives as a guard"
+        );
+        let gap = out
+            .gaps
+            .iter()
+            .find(|g| g.source.contains("auth.users") && g.severity == Severity::Blocking)
+            .expect("blocking gap naming the missing auth.users");
+        assert!(
+            gap.reason.contains("identity entity") && gap.suggested.contains("re-export"),
+            "the gap says what is missing and how to fix it: {gap:?}"
+        );
+    }
+
     #[test]
     fn an_owner_filter_folded_into_tenant_scope_is_an_advisory_gap() {
         // R3(a): owner-scoped table carrying the tenant fk translates to tenant
@@ -1756,6 +1969,7 @@ create policy own on public.todos using (user_id = auth.uid());
         std::fs::write(
             export_dir.join("schema.sql"),
             r#"
+create table auth.users (id uuid primary key, email text);
 create table public.workspaces (id uuid primary key, name text not null);
 create table public.workspace_members (
     workspace_id uuid not null references public.workspaces(id) on delete cascade,
