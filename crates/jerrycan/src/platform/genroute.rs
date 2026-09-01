@@ -1420,12 +1420,13 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design, auth: bool) -> Opti
         let snake = Design::to_snake(&e.name);
         let table = design.table_name(&e.name);
         let key = key_rust_type(e);
-        // The synthetic pk surfaces as a visible `id` field so POST bodies may
-        // omit it (`#[serde(default)]`); a declared id has no default.
-        let id_default = if declared_id(e).is_some() {
-            ""
-        } else {
+        // A server-assigned pk (synthetic OR a declared `integer`, issue #302)
+        // surfaces as a visible `id` field POST bodies MAY omit (`#[serde(default)]`)
+        // — the DB assigns it; a client-supplied `string`/`uuid` pk has no default.
+        let id_default = if e.id_is_server_assigned() {
             "        #[serde(default)]\n"
+        } else {
+            ""
         };
 
         let mut fields = String::new();
@@ -1587,10 +1588,13 @@ fn request_dto_rs(e: &Entity, design: &Design, for_update: bool) -> String {
         format!("{entity}Request")
     };
     let key = key_rust_type(e);
-    let id_default = if declared_id(e).is_some() {
-        ""
-    } else {
+    // A server-assigned pk (synthetic OR a declared `integer`, issue #302) is dropped
+    // from the create body — `#[serde(default)]` so a client MAY omit it and the DB
+    // assigns it; a client-supplied `string`/`uuid` pk stays required (no default).
+    let id_default = if e.id_is_server_assigned() {
         "    #[serde(default)]\n"
+    } else {
+        ""
     };
     // Identity fk is dropped only under auth (#34 injects the session user's id);
     // a path-redundant parent fk (#53b) is dropped regardless of auth.
@@ -1831,8 +1835,9 @@ fn model_field_names(e: &Entity) -> Vec<String> {
 }
 
 /// ActiveModel field assignments, one per line. `item` is consumed, so values
-/// move in (no clones). A synthetic pk (no declared `id`) is `NotSet` so the
-/// DB assigns the autoincrement id; a declared pk is `Set` from the item.
+/// move in (no clones). A server-assigned pk (synthetic OR a declared `integer`,
+/// issue #302) is `NotSet` so the DB assigns the autoincrement id; a client-supplied
+/// `string`/`uuid` pk is `Set` from the item.
 /// `with_id == false` omits the id line (the update path sets it explicitly).
 fn active_sets(e: &Entity, with_id: bool) -> String {
     let indent = "            ";
@@ -1842,10 +1847,10 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
             if !with_id {
                 continue;
             }
-            if declared_id(e).is_some() {
-                out.push_str(&format!("{indent}id: Set(item.id),\n"));
-            } else {
+            if e.id_is_server_assigned() {
                 out.push_str(&format!("{indent}id: sea_orm::ActiveValue::NotSet,\n"));
+            } else {
+                out.push_str(&format!("{indent}id: Set(item.id),\n"));
             }
         } else {
             // A keyword field is a raw identifier on both the ActiveModel field
@@ -1890,10 +1895,10 @@ fn active_sets_pinning(e: &Entity, with_id: bool, pin_col: &str, pin_expr: &str)
             if !with_id {
                 continue;
             }
-            if declared_id(e).is_some() {
-                out.push_str(&format!("{indent}id: Set(item.id),\n"));
-            } else {
+            if e.id_is_server_assigned() {
                 out.push_str(&format!("{indent}id: sea_orm::ActiveValue::NotSet,\n"));
+            } else {
+                out.push_str(&format!("{indent}id: Set(item.id),\n"));
             }
         } else {
             let ident = rust_ident(&name);
@@ -8734,6 +8739,69 @@ pub(crate) mod tests {
             "postgres serial pk: {pg}"
         );
         assert_eq!(pg.matches("\"id\"").count(), 1, "{pg}");
+    }
+
+    /// #302: `omit id` and `declare id:integer` must behave IDENTICALLY — both are a
+    /// SERVER-assigned pk (the DB autoincrements it). So a declared integer id is
+    /// dropped from the create body (`#[serde(default)]` on the Model AND the
+    /// `{Entity}Request`, so a client MAY omit it) and the insert leaves it `NotSet`.
+    /// A declared `string`/`uuid` id is CLIENT-supplied: required in the body, `Set`
+    /// from the item. Guards the four-surface agreement at its genroute source.
+    #[test]
+    fn create_body_drops_a_server_assigned_id_keeps_a_client_supplied_one() {
+        let id_field = |ty: FieldType| Field {
+            name: "id".into(),
+            field_type: ty,
+            required: true,
+            unique: false,
+            index: false,
+            values: None,
+            default: None,
+            min: None,
+            max: None,
+            min_len: None,
+            max_len: None,
+            write_only: false,
+            reserve_against: None,
+        };
+
+        // Declared INTEGER id → server-assigned, identical to a synthetic pk.
+        let mut mi = todos();
+        mi.entities[0]
+            .fields
+            .insert(0, id_field(FieldType::Integer));
+        let ei = &mi.entities[0];
+        let dto_i = request_dto_rs(ei, &demo(), false);
+        assert!(
+            dto_i.contains("#[serde(default)]\n    pub id: i64,"),
+            "integer id is droppable from the {{Entity}}Request body: {dto_i}"
+        );
+        let model_i = model_rs_db(&mi, &demo(), false).unwrap();
+        assert!(
+            model_i.contains("#[serde(default)]\n        pub id: i64,"),
+            "the Model (plain create body) also drops the integer id: {model_i}"
+        );
+        assert!(
+            active_sets(ei, true).contains("id: sea_orm::ActiveValue::NotSet,"),
+            "the insert leaves a server-assigned id NotSet: {}",
+            active_sets(ei, true)
+        );
+
+        // Declared UUID id → client-supplied, unchanged (required, Set from the item).
+        let mut mu = todos();
+        mu.entities[0].fields.insert(0, id_field(FieldType::Uuid));
+        let eu = &mu.entities[0];
+        let dto_u = request_dto_rs(eu, &demo(), false);
+        assert!(
+            dto_u.contains("    pub id: String,")
+                && !dto_u.contains("#[serde(default)]\n    pub id:"),
+            "a uuid id stays required client input (no serde default): {dto_u}"
+        );
+        assert!(
+            active_sets(eu, true).contains("id: Set(item.id),"),
+            "the insert Sets a client-supplied id: {}",
+            active_sets(eu, true)
+        );
     }
 
     /// Text ids (uuid/string) are the pk with their declared type, and the

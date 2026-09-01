@@ -172,7 +172,7 @@ fn constrained_seed_string_n(f: &Field, n: u32) -> String {
 /// ONLY to decide quoting — coincidentally correct for an integer pk (whose seed
 /// id is also `1`), but for a uuid/string-pk parent the seeded id is NOT `1`, so
 /// the child fk dangled, the same-module DDL FOREIGN KEY rejected the insert with
-/// a `500` (`JC0510`), and the create probe — plus every probe seeding a row
+/// a `422` (`JC0422`), and the create probe — plus every probe seeding a row
 /// through it — was un-greenable. Mirrors `target_key_rust_type`'s id-field
 /// lookup; the pk is unconstrained (JC0552), so `fixture_value` reduces to the
 /// plain type literal here. A synthetic pk (no declared `id`) or an unknown target
@@ -227,7 +227,7 @@ fn fixture_json(
             // #293: a nullable (`set_null`) belongs_to fk is `Option<T>` in the DTO,
             // and its parent is frequently an unseedable reference entity (no create
             // endpoint) — `seed_parents` cannot create a row for it, so a fabricated
-            // id would dangle and the same-module DDL FOREIGN KEY would 500 (JC0510),
+            // id would dangle and the same-module DDL FOREIGN KEY would 422 (JC0422),
             // making the happy-path create probe (and every row it seeds through)
             // un-greenable. The minimal body sends `null` (deserializes to `None`),
             // which never violates the fk. A required (cascade/restrict) fk keeps its
@@ -248,6 +248,10 @@ fn fixture_json(
     let cols = e
         .fields
         .iter()
+        // #302: a server-assigned (synthetic/declared-`integer`) id is NOT posted — the
+        // DB assigns it, exactly as the generated create body omits it. A client-supplied
+        // `string`/`uuid` id stays (the client sends the pk).
+        .filter(|f| !(f.name == "id" && e.id_is_server_assigned()))
         .filter(|f| (keep_defaults || f.default.is_none()) && !Design::field_is_now_default(f))
         .map(|f| {
             // `overrides` replaces named fields' literals: the reject probe corrupts
@@ -677,47 +681,6 @@ fn create_probe_parent_seed(
     seed
 }
 
-/// The distinct pk the tenancy entity's own create probe must post so it doesn't
-/// 409 against the tenant row app() auto-seeds (#249). `app()` seeds the tenant at
-/// id 1 (and id 2 for the isolation second tenant) whenever this module needs the
-/// tenant seed, so a create body reusing the fixture pk `1` collides. Returns
-/// `Some(("id", "3"))` — a pk past BOTH auto-seeded tenants — when: `ep` is a POST
-/// whose body IS the tenancy entity, this module seeds the tenant
-/// (`module_needs_tenant`, the SAME gate that also emits the second-tenant seed),
-/// and the tenancy entity carries an explicit integer `id` the create body posts.
-/// None otherwise — a synthetic-pk tenancy entity autoincrements past the seed for
-/// free, and a non-tenancy create is untouched — so every existing suite stays
-/// byte-identical.
-fn tenancy_create_pk_override(
-    design: &Design,
-    unit: &ModuleDesign,
-    ep: &Endpoint,
-) -> Option<(&'static str, &'static str)> {
-    if ep.method != HttpMethod::POST {
-        return None;
-    }
-    let tenancy = design.tenancy.as_ref()?;
-    let entity_name = ep
-        .request_body
-        .as_ref()
-        .and_then(|rb| rb.entity.as_deref())?;
-    if entity_name != tenancy.entity {
-        return None;
-    }
-    if !module_needs_tenant(design, unit) {
-        return None;
-    }
-    let entity = unit.entities.iter().find(|e| e.name == entity_name)?;
-    // Only when the body carries an explicit integer pk: a synthetic pk
-    // autoincrements past the seed on its own, and the integer-literal tenant seed
-    // (`tenant_row_cols_vals`) already assumes an integer tenancy pk.
-    entity
-        .fields
-        .iter()
-        .any(|f| f.name == "id" && matches!(f.field_type, FieldType::Integer))
-        .then_some(("id", "3"))
-}
-
 /// True when this endpoint's SUCCESS requires a credential/signature the generator
 /// cannot synthesize, so a minimal-body probe can never reach the designed success
 /// status. Two shapes: (a) a signature-authenticated webhook (Stripe-style — a bad
@@ -1056,33 +1019,22 @@ fn unit_tests(
                 );
             }
         } else if param_count(ep) == 0 {
-            // #249: the tenancy entity's own create probe must NOT reuse the pk
-            // app() auto-seeds for the tenant (id 1, and id 2 for the isolation
-            // second tenant) — that would 409 on the PK. Post a distinct pk so the
-            // create reaches its 201. None (byte-identical) for every non-tenancy
-            // create and for a synthetic-pk tenancy entity (whose create
-            // autoincrements past the seed for free).
-            let pk_override = tenancy_create_pk_override(design, unit, ep);
-            let overrides: Vec<(&str, &str)> = pk_override.into_iter().collect();
-            let request = request_expr(design, unit, ep, &full_path, guarded, &overrides);
+            // #302: with a server-assigned pk (synthetic OR declared `integer`) out of
+            // the create body, the tenancy entity's own create no longer reuses the pk
+            // app() seeds the tenant at (id 1) — the DB autoincrements past it, so the
+            // old #249 pk-bump is unnecessary. A client-supplied `string`/`uuid` tenancy
+            // pk posts its own fixture (no bump was ever emitted for it).
+            let request = request_expr(design, unit, ep, &full_path, guarded, &[]);
             // #248: a create whose body carries an enforced same-module belongs_to fk
             // (e.g. an fk-alias `Transfer belongs_to Account as from/to`) needs its
-            // parent rows seeded first, or the DDL FK violation 500s the 201 probe —
+            // parent rows seeded first, or the DDL FK violation 422s the 201 probe —
             // mirror the /{id} probe (`seed_parents`). Empty (byte-identical) for a
             // create without such a parent.
             let seed = create_probe_parent_seed(design, top, unit, &cbase, ep, auth);
-            // A creator that echoes its entity must echo the id it was given —
-            // catches inserts that return a backend default (0) instead. When the pk
-            // was bumped (#249) the echo asserts the bumped value, not the fixture.
-            // #263: skip the id-echo when `success.list` — a list creator responds with
-            // a JSON ARRAY (`Json<Vec<X>>` / the #259 `(StatusCode, Json<Vec<X>>)` tuple),
-            // so `body["id"]` (string-indexing an array) is always `null` and the probe
-            // could never green on a correct handler. A list response has no single
-            // canonical id to echo.
-            // #266: also skip when the success status returns NO JSON body — a 204
-            // (`NoContent`) or a 3xx (`Redirect`) has an EMPTY body, so
-            // `from_str(&res.text())` would panic on `""`. Only a 2xx that is not 204
-            // (200/201/202…) carries the JSON the echo reads.
+            // A creator that echoes its entity must echo an id. #263: skip when
+            // `success.list` — a JSON ARRAY has no canonical `body["id"]`. #266: skip a
+            // 204/3xx (`from_str` would panic on an empty body). Only a 2xx that is not
+            // 204 (200/201/202…) carries the JSON the echo reads.
             let body_bearing = (200..300).contains(&status) && status != 204;
             let id_echo = (ep.method == HttpMethod::POST && !ep.success.list && body_bearing)
                 .then_some(ep.request_body.as_ref())
@@ -1090,15 +1042,24 @@ fn unit_tests(
                 .and_then(|rb| rb.entity.as_deref())
                 .filter(|entity| ep.success.entity.as_deref() == Some(entity))
                 .and_then(|entity| unit.entities.iter().find(|e| e.name == entity))
-                .and_then(|e| e.fields.iter().find(|f| f.name == "id"))
-                .map(|f| {
-                    let echoed = pk_override
-                        .map(|(_, v)| v.to_string())
-                        .unwrap_or_else(|| fixture_value(f));
-                    format!(
-                        "    let body: serde_json::Value = serde_json::from_str(&res.text()).expect(\"json body\");\n    assert_eq!(body[\"id\"], serde_json::json!({echoed}), \"design: created {} echoes its id\");\n",
-                        ep.success.entity.as_deref().unwrap_or("entity")
-                    )
+                .and_then(|e| e.fields.iter().find(|f| f.name == "id").map(|f| (e, f)))
+                .map(|(e, f)| {
+                    let entity_name = ep.success.entity.as_deref().unwrap_or("entity");
+                    if e.id_is_server_assigned() {
+                        // #302: a declared `integer` id is SERVER-assigned — the probe
+                        // never posts it, so the create can't echo a client value. Assert
+                        // the server RETURNED a positive pk, still catching an insert that
+                        // returns null/0 (identical intent to the old id-echo).
+                        format!(
+                            "    let body: serde_json::Value = serde_json::from_str(&res.text()).expect(\"json body\");\n    assert!(body[\"id\"].as_i64().is_some_and(|id| id > 0), \"design: created {entity_name} is assigned a server id, got {{}}\", body[\"id\"]);\n"
+                        )
+                    } else {
+                        // A client-supplied `string`/`uuid` id is echoed verbatim.
+                        let echoed = fixture_value(f);
+                        format!(
+                            "    let body: serde_json::Value = serde_json::from_str(&res.text()).expect(\"json body\");\n    assert_eq!(body[\"id\"], serde_json::json!({echoed}), \"design: created {entity_name} echoes its id\");\n"
+                        )
+                    }
                 })
                 .unwrap_or_default();
             out.code.push_str(&format!(
@@ -3592,22 +3553,24 @@ mod tests {
             crate::platform::questions::validate(&d)
         );
         let (content, _) = render_acceptance(&d, &d.modules[0]);
-        // The 201 create keeps its id-echo (a JSON body to read).
+        // The 201 create keeps its id-echo (a JSON body to read). #302: Order's id is a
+        // declared INTEGER (server-assigned), so the echo asserts a server-returned pk,
+        // not a client-echoed value.
         let ok = section(&content, "create_order_returns_201");
         assert!(
-            ok.contains("echoes its id") && ok.contains("expect(\"json body\")"),
+            ok.contains("is assigned a server id") && ok.contains("expect(\"json body\")"),
             "a 201 create keeps the id-echo (body-bearing):\n{ok}"
         );
         // The 303 create has an EMPTY body — NO id-echo (would panic on from_str("")).
         let redir = section(&content, "create_order_redirect_returns_303");
         assert!(
-            !redir.contains("echoes its id") && !redir.contains("expect(\"json body\")"),
+            !redir.contains("expect(\"json body\")"),
             "a 303 create must NOT id-echo (empty Redirect body):\n{redir}"
         );
         // The 204 create likewise has no body — NO id-echo.
         let quiet = section(&content, "create_order_quiet_returns_204");
         assert!(
-            !quiet.contains("echoes its id") && !quiet.contains("expect(\"json body\")"),
+            !quiet.contains("expect(\"json body\")"),
             "a 204 create must NOT id-echo (empty NoContent body):\n{quiet}"
         );
     }
