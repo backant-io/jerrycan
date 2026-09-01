@@ -550,10 +550,23 @@ fn guard_comment(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
         return String::new();
     }
     let roles = ep.required_roles.join("\", \"");
+    // Multi-role (`required_roles.len() > 1`) needs the ANY-OF primitive: the
+    // single-role calls (`require_role`/`Tenant::require_role`) take ONE role, so
+    // interpolating a joined list produces an uncompilable 2-arg call that an agent
+    // either can't build or "fixes" by dropping every role but the first — silently
+    // narrowing the authorization set. Emit `require_any_role(&[...])` instead. A
+    // single role keeps the original guidance BYTE-IDENTICAL (the join is a no-op).
+    let multi = ep.required_roles.len() > 1;
     if endpoint_uses_tenant_guard(m, ep, design) {
-        format!(
-            "    // guard: requires role \"{roles}\" — call _tenant.require_role(\"{roles}\")? before proceeding\n"
-        )
+        if multi {
+            format!(
+                "    // guard: requires one of roles \"{roles}\" — call _tenant.require_any_role(&[\"{roles}\"])? before proceeding\n"
+            )
+        } else {
+            format!(
+                "    // guard: requires role \"{roles}\" — call _tenant.require_role(\"{roles}\")? before proceeding\n"
+            )
+        }
     } else if matches!(
         design.endpoint_tenant_shape(m, ep),
         TenantShape::MembershipSet
@@ -574,6 +587,10 @@ fn guard_comment(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
                 "    // guard: requires MEMBERSHIP role \"{roles}\" (issue #247) — this flat create has\n    // no row yet, so check the caller's role in the BODY's tenant via `{{tenant}}_members`,\n    // NOT the session role `_user.0.role` (a tenant owner's session role may differ).\n"
             )
         }
+    } else if multi {
+        format!(
+            "    // guard: requires one of roles \"{roles}\" — add `use jerrycan::auth::require_any_role;` and call require_any_role(&_user.0.role, &[\"{roles}\"])? before proceeding\n"
+        )
     } else {
         format!(
             "    // guard: requires role \"{roles}\" — add `use jerrycan::auth::require_role;` and call require_role(&_user.0.role, \"{roles}\")? before proceeding\n"
@@ -1420,12 +1437,13 @@ pub(crate) fn model_rs_db(m: &ModuleDesign, design: &Design, auth: bool) -> Opti
         let snake = Design::to_snake(&e.name);
         let table = design.table_name(&e.name);
         let key = key_rust_type(e);
-        // The synthetic pk surfaces as a visible `id` field so POST bodies may
-        // omit it (`#[serde(default)]`); a declared id has no default.
-        let id_default = if declared_id(e).is_some() {
-            ""
-        } else {
+        // A server-assigned pk (synthetic OR a declared `integer`, issue #302)
+        // surfaces as a visible `id` field POST bodies MAY omit (`#[serde(default)]`)
+        // — the DB assigns it; a client-supplied `string`/`uuid` pk has no default.
+        let id_default = if e.id_is_server_assigned() {
             "        #[serde(default)]\n"
+        } else {
+            ""
         };
 
         let mut fields = String::new();
@@ -1587,10 +1605,13 @@ fn request_dto_rs(e: &Entity, design: &Design, for_update: bool) -> String {
         format!("{entity}Request")
     };
     let key = key_rust_type(e);
-    let id_default = if declared_id(e).is_some() {
-        ""
-    } else {
+    // A server-assigned pk (synthetic OR a declared `integer`, issue #302) is dropped
+    // from the create body — `#[serde(default)]` so a client MAY omit it and the DB
+    // assigns it; a client-supplied `string`/`uuid` pk stays required (no default).
+    let id_default = if e.id_is_server_assigned() {
         "    #[serde(default)]\n"
+    } else {
+        ""
     };
     // Identity fk is dropped only under auth (#34 injects the session user's id);
     // a path-redundant parent fk (#53b) is dropped regardless of auth.
@@ -1831,8 +1852,9 @@ fn model_field_names(e: &Entity) -> Vec<String> {
 }
 
 /// ActiveModel field assignments, one per line. `item` is consumed, so values
-/// move in (no clones). A synthetic pk (no declared `id`) is `NotSet` so the
-/// DB assigns the autoincrement id; a declared pk is `Set` from the item.
+/// move in (no clones). A server-assigned pk (synthetic OR a declared `integer`,
+/// issue #302) is `NotSet` so the DB assigns the autoincrement id; a client-supplied
+/// `string`/`uuid` pk is `Set` from the item.
 /// `with_id == false` omits the id line (the update path sets it explicitly).
 fn active_sets(e: &Entity, with_id: bool) -> String {
     let indent = "            ";
@@ -1842,10 +1864,10 @@ fn active_sets(e: &Entity, with_id: bool) -> String {
             if !with_id {
                 continue;
             }
-            if declared_id(e).is_some() {
-                out.push_str(&format!("{indent}id: Set(item.id),\n"));
-            } else {
+            if e.id_is_server_assigned() {
                 out.push_str(&format!("{indent}id: sea_orm::ActiveValue::NotSet,\n"));
+            } else {
+                out.push_str(&format!("{indent}id: Set(item.id),\n"));
             }
         } else {
             // A keyword field is a raw identifier on both the ActiveModel field
@@ -1890,10 +1912,10 @@ fn active_sets_pinning(e: &Entity, with_id: bool, pin_col: &str, pin_expr: &str)
             if !with_id {
                 continue;
             }
-            if declared_id(e).is_some() {
-                out.push_str(&format!("{indent}id: Set(item.id),\n"));
-            } else {
+            if e.id_is_server_assigned() {
                 out.push_str(&format!("{indent}id: sea_orm::ActiveValue::NotSet,\n"));
+            } else {
+                out.push_str(&format!("{indent}id: Set(item.id),\n"));
             }
         } else {
             let ident = rust_ident(&name);
@@ -5574,6 +5596,77 @@ pub(crate) mod tests {
         );
     }
 
+    /// T1: a multi-role `required_roles` must emit a COMPILABLE any-of guard.
+    /// The single-role calls take ONE role, so a joined 2-role list produced an
+    /// uncompilable 2-arg `require_role(..)` call — an agent then drops all but the
+    /// first role, silently narrowing authorization. A `len() > 1` endpoint emits
+    /// `require_any_role`; a `len() == 1` endpoint stays byte-identical.
+    #[test]
+    fn multi_role_guard_comment_uses_require_any_role_single_is_unchanged() {
+        // (a) Session-role gate (Collection/None route). Multi-role → free
+        // `require_any_role`; single-role byte-identical to the pre-fix guidance.
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "admin-api", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin", "editor", "viewer"] },
+            "dependencies": ["auth"],
+            "modules": [{ "name": "posts",
+                "entities": [{ "name": "Post", "fields": [
+                    { "name": "id", "type": "integer" }, { "name": "title", "type": "string" } ]}],
+                "endpoints": [
+                    { "operation_id": "multi", "method": "POST", "path": "/", "auth_required": true,
+                      "required_roles": ["admin", "editor"],
+                      "success": { "status": 201, "entity": "Post" } },
+                    { "operation_id": "single", "method": "DELETE", "path": "/{id}", "auth_required": true,
+                      "required_roles": ["admin"], "success": { "status": 204 } } ] }]
+        }"#,
+        )
+        .unwrap();
+        let m = &d.modules[0];
+        let multi = guard_comment(m, &m.endpoints[0], &d);
+        assert!(
+            multi.contains("require_any_role(&_user.0.role, &[\"admin\", \"editor\"])?")
+                && multi.contains("use jerrycan::auth::require_any_role;"),
+            "multi-role session gate must steer to the any-of primitive: {multi}"
+        );
+        assert!(
+            !multi.contains("require_role(&_user.0.role"),
+            "multi-role must NOT emit the single-role call (drops all but the first): {multi}"
+        );
+        assert_eq!(
+            guard_comment(m, &m.endpoints[1], &d),
+            "    // guard: requires role \"admin\" — add `use jerrycan::auth::require_role;` and call require_role(&_user.0.role, \"admin\")? before proceeding\n",
+            "single-role session guidance must be byte-identical to the pre-fix output"
+        );
+
+        // (b) Path-scoped tenant gate (`Dep<Tenant>`). Multi → `_tenant.require_any_role`;
+        // single → `_tenant.require_role`, byte-identical.
+        let ts: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_UNDER_TENANT).unwrap();
+        let sc = &ts.modules[2];
+        assert!(
+            matches!(
+                ts.endpoint_tenant_shape(sc, &sc.endpoints[0]),
+                TenantShape::PathScoped { .. }
+            ),
+            "fixture precondition: contacts endpoint is path-scoped"
+        );
+        let mut ep_multi = sc.endpoints[0].clone();
+        ep_multi.required_roles = vec!["owner".to_string(), "member".to_string()];
+        let g_multi = guard_comment(sc, &ep_multi, &ts);
+        assert!(
+            g_multi.contains("_tenant.require_any_role(&[\"owner\", \"member\"])?")
+                && !g_multi.contains("_tenant.require_role("),
+            "multi-role path-scoped gate must steer to _tenant.require_any_role: {g_multi}"
+        );
+        let mut ep_single = sc.endpoints[0].clone();
+        ep_single.required_roles = vec!["owner".to_string()];
+        assert_eq!(
+            guard_comment(sc, &ep_single, &ts),
+            "    // guard: requires role \"owner\" — call _tenant.require_role(\"owner\")? before proceeding\n",
+            "single-role path-scoped guidance must be byte-identical to the pre-fix output"
+        );
+    }
+
     /// Issue #79 — MAKE THE PER-USER LEAK IMPOSSIBLE. A guarded entity that
     /// belongs_to the auth identity (Collection/Bookmark → `user_id`), in a
     /// non-tenancy auth design, gets ONLY the owner-scoped `*_for(user_id)`
@@ -8734,6 +8827,69 @@ pub(crate) mod tests {
             "postgres serial pk: {pg}"
         );
         assert_eq!(pg.matches("\"id\"").count(), 1, "{pg}");
+    }
+
+    /// #302: `omit id` and `declare id:integer` must behave IDENTICALLY — both are a
+    /// SERVER-assigned pk (the DB autoincrements it). So a declared integer id is
+    /// dropped from the create body (`#[serde(default)]` on the Model AND the
+    /// `{Entity}Request`, so a client MAY omit it) and the insert leaves it `NotSet`.
+    /// A declared `string`/`uuid` id is CLIENT-supplied: required in the body, `Set`
+    /// from the item. Guards the four-surface agreement at its genroute source.
+    #[test]
+    fn create_body_drops_a_server_assigned_id_keeps_a_client_supplied_one() {
+        let id_field = |ty: FieldType| Field {
+            name: "id".into(),
+            field_type: ty,
+            required: true,
+            unique: false,
+            index: false,
+            values: None,
+            default: None,
+            min: None,
+            max: None,
+            min_len: None,
+            max_len: None,
+            write_only: false,
+            reserve_against: None,
+        };
+
+        // Declared INTEGER id → server-assigned, identical to a synthetic pk.
+        let mut mi = todos();
+        mi.entities[0]
+            .fields
+            .insert(0, id_field(FieldType::Integer));
+        let ei = &mi.entities[0];
+        let dto_i = request_dto_rs(ei, &demo(), false);
+        assert!(
+            dto_i.contains("#[serde(default)]\n    pub id: i64,"),
+            "integer id is droppable from the {{Entity}}Request body: {dto_i}"
+        );
+        let model_i = model_rs_db(&mi, &demo(), false).unwrap();
+        assert!(
+            model_i.contains("#[serde(default)]\n        pub id: i64,"),
+            "the Model (plain create body) also drops the integer id: {model_i}"
+        );
+        assert!(
+            active_sets(ei, true).contains("id: sea_orm::ActiveValue::NotSet,"),
+            "the insert leaves a server-assigned id NotSet: {}",
+            active_sets(ei, true)
+        );
+
+        // Declared UUID id → client-supplied, unchanged (required, Set from the item).
+        let mut mu = todos();
+        mu.entities[0].fields.insert(0, id_field(FieldType::Uuid));
+        let eu = &mu.entities[0];
+        let dto_u = request_dto_rs(eu, &demo(), false);
+        assert!(
+            dto_u.contains("    pub id: String,")
+                && !dto_u.contains("#[serde(default)]\n    pub id:"),
+            "a uuid id stays required client input (no serde default): {dto_u}"
+        );
+        assert!(
+            active_sets(eu, true).contains("id: Set(item.id),"),
+            "the insert Sets a client-supplied id: {}",
+            active_sets(eu, true)
+        );
     }
 
     /// Text ids (uuid/string) are the pk with their declared type, and the

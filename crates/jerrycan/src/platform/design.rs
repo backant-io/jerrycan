@@ -224,6 +224,26 @@ pub struct Entity {
     pub fields: Vec<Field>,
 }
 
+impl Entity {
+    /// Whether this entity's `id` primary key is SERVER-ASSIGNED (issue #302). True
+    /// when `id` is OMITTED (a synthetic auto-increment pk is added) OR declared as
+    /// `integer` — in both the DB assigns the pk (`BIGSERIAL`/autoincrement), so it is
+    /// dropped from the create body (`#[serde(default)]` in the Model/`{Entity}Request`,
+    /// excluded from the OpenAPI create schema, `readOnly` on the response component),
+    /// inserted as `ActiveValue::NotSet`, and NOT posted by the generated create probe.
+    /// False for a declared `string`/`uuid` id — that is CLIENT-SUPPLIED (the client
+    /// sends it, the handler `Set`s it, the probe posts it). Contract:
+    /// docs/ai/00-designing.md:155-165 promises `omit id` and `declare id:integer`
+    /// behave identically; this is the single discriminator all four surfaces route
+    /// through (mirrors the DDL's `Some(t) if t != FieldType::Integer` pk branch).
+    pub fn id_is_server_assigned(&self) -> bool {
+        match self.fields.iter().find(|f| f.name == "id") {
+            None => true,
+            Some(f) => f.field_type == FieldType::Integer,
+        }
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

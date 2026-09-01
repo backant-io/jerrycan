@@ -3636,14 +3636,16 @@ fn create_probe_does_not_seed_cross_module_belongs_to() {
     );
 }
 
-/// #249: the tenancy entity's OWN create probe must not collide with the tenant
+/// #249/#302: the tenancy entity's OWN create probe must not collide with the tenant
 /// row `app()` auto-seeds, and its reserve counter must be seeded at its declared
 /// `default` (not the generic fixture that could equal capacity). WHY (Rule 9): in
 /// a module that also owns a tenant-owned child, `app()` seeds tenant id 1 (and id 2
-/// for the isolation second tenant); a `create_workspace` reusing pk `1` 409s on the
-/// PK, and a `seats_used default:0` counter seeded at the generic `1` is born AT a
-/// `seat_limit` of `1`, so its reserve probe 409s (Ok(false)) instead of the asserted
-/// 200. Both were un-greenable happy-path tests — a green-means-safe inverse.
+/// for the isolation second tenant). #302: `create_workspace` no longer posts an `id`
+/// (a declared integer pk is SERVER-assigned), so the DB autoincrements PAST the
+/// seeded tenants instead of 409-ing on a reused pk `1`. Separately, a
+/// `seats_used default:0` counter seeded at the generic `1` is born AT a `seat_limit`
+/// of `1`, so its reserve probe 409s (Ok(false)) instead of the asserted 200. Both
+/// were un-greenable happy-path tests — a green-means-safe inverse.
 #[test]
 fn tenancy_create_and_reserve_probes_are_greenable() {
     const SEATS: &str = r#"{
@@ -3692,19 +3694,17 @@ fn tenancy_create_and_reserve_probes_are_greenable() {
         "tenant 2's seat counter must ALSO seed at its default 0:\n{generated}"
     );
 
-    // (b) the create probe posts a pk PAST both seeded tenants (3), and echoes it.
+    // (b) #302: Workspace's id is a declared INTEGER — SERVER-assigned. The create
+    // probe posts NO id at all (the DB autoincrements past the seeded tenants 1 and 2
+    // for free, so it can never collide), and the id-echo asserts a server-returned pk.
     let create = test_body(&generated, "create_workspace_returns_201");
     assert!(
-        create.contains("\"id\": 3"),
-        "the tenancy create probe must post a non-colliding pk (past tenants 1 and 2):\n{create}"
+        !create.contains("\"id\":"),
+        "a server-assigned pk is NOT posted in the create body:\n{create}"
     );
     assert!(
-        create.contains("serde_json::json!(3)"),
-        "the id-echo must assert the bumped pk, not the fixture:\n{create}"
-    );
-    assert!(
-        !create.contains("\"id\": 1"),
-        "the tenancy create probe must NOT reuse the seeded tenant pk 1:\n{create}"
+        create.contains("is_some_and(|id| id > 0)"),
+        "the id-echo asserts the server assigned a pk, not a client-sent value:\n{create}"
     );
 
     // (c) the reserve probe operates on the app-seeded tenant (id 1), whose counter
@@ -3720,12 +3720,13 @@ fn tenancy_create_and_reserve_probes_are_greenable() {
     );
 }
 
-/// #249 byte-identity: a non-tenancy create with a defaulted field is UNCHANGED —
-/// the pk override fires only for the tenancy entity in a tenant-seeding module, and
-/// the create body still drops the defaulted field (server-owned), so the emission
-/// stays byte-identical to the pre-#249 generator.
+/// #302: a non-tenancy create with a declared INTEGER id drops BOTH the pk (SERVER-
+/// assigned — the DB autoincrements it) and a defaulted field (server-owned) from the
+/// create body; the id-echo asserts the server RETURNED a pk. Supersedes the #249
+/// pk-override byte-identity guard — that override is gone (a server-assigned integer
+/// pk is simply never posted, tenancy or not).
 #[test]
-fn non_tenancy_create_with_default_is_unchanged() {
+fn non_tenancy_integer_id_create_drops_id_and_default() {
     const PLAIN: &str = r#"{
         "name": "plain-api", "contract_version": 0, "dependencies": ["db"],
         "modules": [{
@@ -3743,11 +3744,15 @@ fn non_tenancy_create_with_default_is_unchanged() {
     let d: Design = serde_json::from_str(PLAIN).unwrap();
     let generated = testgen::acceptance_rs(&d, &d.modules[0]);
     let create = test_body(&generated, "create_item_returns_201");
-    // The pk stays the fixture 1 (no tenant to collide with) and the defaulted
-    // `active` is omitted from the create body (server-owned).
+    // #302: the server-assigned integer pk is NOT posted, and the defaulted `active`
+    // is omitted (server-owned). The id-echo asserts a server-returned pk.
     assert!(
-        create.contains("\"id\": 1") && create.contains("serde_json::json!(1)"),
-        "a non-tenancy create keeps the fixture pk 1:\n{create}"
+        !create.contains("\"id\":"),
+        "a server-assigned integer pk is not posted in the create body:\n{create}"
+    );
+    assert!(
+        create.contains("is_some_and(|id| id > 0)"),
+        "the id-echo asserts a server-assigned pk, not a client value:\n{create}"
     );
     assert!(
         !create.contains("active"),
