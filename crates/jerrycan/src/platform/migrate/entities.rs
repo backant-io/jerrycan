@@ -264,6 +264,25 @@ fn build_one(
         }
     }
 
+    // A `CREATE UNIQUE INDEX` the translator can't reproduce as a plain composite
+    // `unique` (expression columns, or a partial `WHERE` predicate) still enforced
+    // uniqueness in the source: gap it rather than drop it (never guess).
+    for idx in &table.unrepresentable_uniques {
+        gaps.push(GapItem {
+            kind: GapKind::UnmappedType,
+            source: format!("{key} unique index {}", idx.name),
+            location: format!("schema.sql:{}", idx.line),
+            reason:
+                "an expression or partial (`WHERE`) UNIQUE INDEX constrains rows that a plain composite `unique` cannot express, so it can't be reproduced automatically"
+                    .into(),
+            original: idx.sql.clone(),
+            suggested:
+                "enforce the invariant in a handler, or keep the raw index in a hand-written migration"
+                    .into(),
+            severity: Severity::Blocking,
+        });
+    }
+
     // Preserve the source table name losslessly: pin `table` only when the
     // default (snake_case + pluralization) would NOT reproduce it, so a clean
     // name stays override-free while an irregular one round-trips exactly.
@@ -440,6 +459,64 @@ create table public.pins (
             "the unrepresentable composite unique must raise a gap: {:?}",
             out.gaps
         );
+    }
+
+    #[test]
+    fn multi_column_unique_index_survives_and_a_partial_one_gaps() {
+        // WHY: pg_dump commonly emits uniqueness as `CREATE UNIQUE INDEX` — a
+        // different parse node than a table-level `UNIQUE(a, b)`, so it needs its
+        // own translation or the constraint vanishes (docs/ai/19: never silently
+        // drop). A partial (`WHERE`) unique must gap rather than be dropped OR
+        // promoted to an unconditional `unique`, which would reject rows the
+        // source allows. A non-unique index is a lookup hint, not a constraint.
+        fn find<'a>(out: &'a BuildResult, name: &str) -> &'a Entity {
+            out.entities
+                .iter()
+                .find(|(_, e)| e.name == name)
+                .map(|(_, e)| e)
+                .unwrap()
+        }
+        let schema = r#"
+create table public.memberships (id uuid primary key, org_id uuid not null, user_id uuid not null);
+create unique index memberships_org_user on public.memberships (org_id, user_id);
+create table public.profiles (id uuid primary key, username text not null, deleted_at timestamptz);
+create unique index profiles_username_live on public.profiles (username) where deleted_at is null;
+create table public.notes (id uuid primary key, title text not null, body text not null);
+create index notes_title_body on public.notes (title, body);
+"#;
+        let db = PgDatabase::fold(&parse::split_and_parse(schema));
+        let out = build_entities(&db);
+
+        assert_eq!(
+            find(&out, "Membership").unique,
+            vec![vec!["org_id".to_string(), "user_id".to_string()]],
+            "a multi-column CREATE UNIQUE INDEX must survive as the composite `unique`"
+        );
+
+        let username = find(&out, "Profile")
+            .fields
+            .iter()
+            .find(|f| f.name == "username")
+            .unwrap();
+        assert!(
+            !username.unique,
+            "a partial unique index constrains a subset of rows — an unconditional `unique` would over-constrain"
+        );
+        assert!(username.index, "it is still a real lookup index");
+        assert!(
+            out.gaps
+                .iter()
+                .any(|g| g.source.contains("profiles_username_live")
+                    && g.severity == Severity::Blocking),
+            "the partial unique index must gap, not vanish: {:?}",
+            out.gaps
+        );
+
+        // A non-unique composite index carries no constraint: unchanged, no gap.
+        let note = find(&out, "Note");
+        assert!(note.unique.is_empty());
+        assert!(!note.fields.iter().any(|f| f.index));
+        assert!(!out.gaps.iter().any(|g| g.source.contains("notes")));
     }
 
     #[test]

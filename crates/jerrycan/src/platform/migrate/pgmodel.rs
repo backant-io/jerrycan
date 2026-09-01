@@ -39,6 +39,12 @@ pub struct PgTable {
     /// carry the composite invariant a lone column cannot, emitted as the
     /// entity's composite `unique` (issue #115).
     pub composite_uniques: Vec<Vec<String>>,
+    /// `CREATE UNIQUE INDEX` statements whose uniqueness cannot be reproduced as
+    /// a jerrycan `unique` — an expression index (no column to hang it on) or a
+    /// partial `WHERE` index (constrains a subset of rows, so an unconditional
+    /// `unique` would reject rows the source allows). Carried so the translator
+    /// gaps them instead of dropping a constraint the source enforced.
+    pub unrepresentable_uniques: Vec<PgRawObject>,
     pub rls_enabled: bool,
     pub line: usize,
 }
@@ -245,14 +251,44 @@ impl PgDatabase {
             }
             Statement::CreateIndex(ci) => {
                 let table = object_name(&ci.table_name);
-                if ci.columns.len() == 1
-                    && let Some(col) = ident_of_expr(&ci.columns[0].column.expr)
-                    && let Some(t) = self.tables.get_mut(&table)
-                    && let Some(column) = t.columns.iter_mut().find(|c| c.name == col)
-                {
-                    column.indexed = true;
-                    if ci.unique {
-                        column.unique = true;
+                let cols: Vec<String> = ci
+                    .columns
+                    .iter()
+                    .filter_map(|c| ident_of_expr(&c.column.expr))
+                    .collect();
+                // A UNIQUE index is a constraint, not a lookup hint: it must be
+                // translated or gapped, never dropped. Reproducible as jerrycan
+                // uniqueness only when every column is a plain identifier (an
+                // expression index has no column to hang `unique` on) and the
+                // index is unconditional (a partial `WHERE` index constrains a
+                // subset of rows, so an unconditional `unique` would reject rows
+                // the source allows — over-constraining is guessing too).
+                let unique_reproducible =
+                    ci.unique && cols.len() == ci.columns.len() && ci.predicate.is_none();
+                if let Some(t) = self.tables.get_mut(&table) {
+                    if ci.unique && !unique_reproducible {
+                        t.unrepresentable_uniques.push(PgRawObject {
+                            name: ci
+                                .name
+                                .as_ref()
+                                .map_or_else(|| "(unnamed)".to_string(), object_name),
+                            sql: sql.to_string(),
+                            line,
+                        });
+                    }
+                    if cols.len() == 1
+                        && let Some(column) = t.columns.iter_mut().find(|c| c.name == cols[0])
+                    {
+                        column.indexed = true;
+                        if unique_reproducible {
+                            column.unique = true;
+                        }
+                    } else if unique_reproducible && cols.len() > 1 {
+                        // Multi-column `CREATE UNIQUE INDEX ON t (a, b)`: the same
+                        // composite invariant a table-level `UNIQUE(a, b)` carries
+                        // (#115), just a different parse node. pg_dump commonly
+                        // emits uniques in this form.
+                        t.composite_uniques.push(cols);
                     }
                 }
             }
