@@ -33,7 +33,7 @@ pub use api_key::{
     ApiKey, ApiKeyFuture, ApiKeyRecord, ApiKeyStore, ApiKeys, InMemoryApiKeyStore, MintedApiKey,
     hash_key, mint, require_scope, verify,
 };
-pub use guard::{Bearer, Session, require_role};
+pub use guard::{Bearer, Session, require_any_role, require_role};
 #[cfg(feature = "idtoken")]
 pub use idtoken::{HttpJwksSource, IdTokenClaims, Jwk, Jwks, JwksFuture, JwksSource, Verifier};
 #[cfg(any(all(test, feature = "oauth"), feature = "mock-idp"))]
