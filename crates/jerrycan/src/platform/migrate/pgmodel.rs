@@ -34,6 +34,11 @@ pub struct PgTable {
     pub columns: Vec<PgColumn>,
     pub pk: Vec<String>,
     pub fks: Vec<PgFk>,
+    /// Table-level multi-column `UNIQUE(a, b, …)` constraints (≥2 columns).
+    /// Single-column uniqueness stays on the column (`PgColumn.unique`); these
+    /// carry the composite invariant a lone column cannot, emitted as the
+    /// entity's composite `unique` (issue #115).
+    pub composite_uniques: Vec<Vec<String>>,
     pub rls_enabled: bool,
     pub line: usize,
 }
@@ -504,11 +509,26 @@ fn apply_table_constraint(table: &mut PgTable, constraint: &TableConstraint) {
             }
         }
         TableConstraint::Unique(u) => {
-            if u.columns.len() == 1
-                && let Some(name) = ident_of_expr(&u.columns[0].column.expr)
-                && let Some(col) = table.columns.iter_mut().find(|col| col.name == name)
-            {
-                col.unique = true;
+            if u.columns.len() == 1 {
+                if let Some(name) = ident_of_expr(&u.columns[0].column.expr)
+                    && let Some(col) = table.columns.iter_mut().find(|col| col.name == name)
+                {
+                    col.unique = true;
+                }
+            } else {
+                // Multi-column `UNIQUE(a, b, …)`: a composite invariant no single
+                // column carries — captured for the entity's composite `unique`
+                // (#115), never silently dropped. A UNIQUE constraint's columns are
+                // always plain identifiers, so all resolve; capture only a fully
+                // resolved group.
+                let cols: Vec<String> = u
+                    .columns
+                    .iter()
+                    .filter_map(|c| ident_of_expr(&c.column.expr))
+                    .collect();
+                if cols.len() == u.columns.len() && cols.len() >= 2 {
+                    table.composite_uniques.push(cols);
+                }
             }
         }
         TableConstraint::ForeignKey(fk) => {
