@@ -47,6 +47,18 @@ pub fn require_role(actual: &str, required: &str) -> Result<()> {
     }
 }
 
+/// Any-of role check for generated guards: `403` unless `actual` is one of
+/// `allowed` (the multi-role form of [`require_role`], emitted when an endpoint
+/// declares more than one `required_roles`). Mirrors `Tenant::require_any_role`
+/// on the path-scoped side.
+pub fn require_any_role(actual: &str, allowed: &[&str]) -> Result<()> {
+    if allowed.contains(&actual) {
+        Ok(())
+    } else {
+        Err(Error::forbidden())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +116,14 @@ mod tests {
         let res = t.get_with("/me", &[("cookie", &cookie)]).await;
         assert_eq!(res.status(), jerrycan_core::http::StatusCode::OK);
         assert_eq!(res.json::<String>(), "1");
+    }
+
+    #[test]
+    fn require_any_role_accepts_a_role_in_the_set_and_403s_the_rest() {
+        assert!(require_any_role("admin", &["admin", "editor"]).is_ok());
+        assert!(require_any_role("editor", &["admin", "editor"]).is_ok());
+        let err = require_any_role("viewer", &["admin", "editor"]).unwrap_err();
+        assert_eq!(err.code(), "JC0403");
     }
 
     #[tokio::test]

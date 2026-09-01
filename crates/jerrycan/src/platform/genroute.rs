@@ -550,10 +550,23 @@ fn guard_comment(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
         return String::new();
     }
     let roles = ep.required_roles.join("\", \"");
+    // Multi-role (`required_roles.len() > 1`) needs the ANY-OF primitive: the
+    // single-role calls (`require_role`/`Tenant::require_role`) take ONE role, so
+    // interpolating a joined list produces an uncompilable 2-arg call that an agent
+    // either can't build or "fixes" by dropping every role but the first — silently
+    // narrowing the authorization set. Emit `require_any_role(&[...])` instead. A
+    // single role keeps the original guidance BYTE-IDENTICAL (the join is a no-op).
+    let multi = ep.required_roles.len() > 1;
     if endpoint_uses_tenant_guard(m, ep, design) {
-        format!(
-            "    // guard: requires role \"{roles}\" — call _tenant.require_role(\"{roles}\")? before proceeding\n"
-        )
+        if multi {
+            format!(
+                "    // guard: requires one of roles \"{roles}\" — call _tenant.require_any_role(&[\"{roles}\"])? before proceeding\n"
+            )
+        } else {
+            format!(
+                "    // guard: requires role \"{roles}\" — call _tenant.require_role(\"{roles}\")? before proceeding\n"
+            )
+        }
     } else if matches!(
         design.endpoint_tenant_shape(m, ep),
         TenantShape::MembershipSet
@@ -574,6 +587,10 @@ fn guard_comment(m: &ModuleDesign, ep: &Endpoint, design: &Design) -> String {
                 "    // guard: requires MEMBERSHIP role \"{roles}\" (issue #247) — this flat create has\n    // no row yet, so check the caller's role in the BODY's tenant via `{{tenant}}_members`,\n    // NOT the session role `_user.0.role` (a tenant owner's session role may differ).\n"
             )
         }
+    } else if multi {
+        format!(
+            "    // guard: requires one of roles \"{roles}\" — add `use jerrycan::auth::require_any_role;` and call require_any_role(&_user.0.role, &[\"{roles}\"])? before proceeding\n"
+        )
     } else {
         format!(
             "    // guard: requires role \"{roles}\" — add `use jerrycan::auth::require_role;` and call require_role(&_user.0.role, \"{roles}\")? before proceeding\n"
@@ -5571,6 +5588,77 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("require_membership_role"),
             "a flat tenant entity with no role-gated route must NOT get the gate method"
+        );
+    }
+
+    /// T1: a multi-role `required_roles` must emit a COMPILABLE any-of guard.
+    /// The single-role calls take ONE role, so a joined 2-role list produced an
+    /// uncompilable 2-arg `require_role(..)` call — an agent then drops all but the
+    /// first role, silently narrowing authorization. A `len() > 1` endpoint emits
+    /// `require_any_role`; a `len() == 1` endpoint stays byte-identical.
+    #[test]
+    fn multi_role_guard_comment_uses_require_any_role_single_is_unchanged() {
+        // (a) Session-role gate (Collection/None route). Multi-role → free
+        // `require_any_role`; single-role byte-identical to the pre-fix guidance.
+        let d: Design = serde_json::from_str(
+            r#"{
+            "name": "admin-api", "contract_version": 1,
+            "auth": { "model": "session", "roles": ["admin", "editor", "viewer"] },
+            "dependencies": ["auth"],
+            "modules": [{ "name": "posts",
+                "entities": [{ "name": "Post", "fields": [
+                    { "name": "id", "type": "integer" }, { "name": "title", "type": "string" } ]}],
+                "endpoints": [
+                    { "operation_id": "multi", "method": "POST", "path": "/", "auth_required": true,
+                      "required_roles": ["admin", "editor"],
+                      "success": { "status": 201, "entity": "Post" } },
+                    { "operation_id": "single", "method": "DELETE", "path": "/{id}", "auth_required": true,
+                      "required_roles": ["admin"], "success": { "status": 204 } } ] }]
+        }"#,
+        )
+        .unwrap();
+        let m = &d.modules[0];
+        let multi = guard_comment(m, &m.endpoints[0], &d);
+        assert!(
+            multi.contains("require_any_role(&_user.0.role, &[\"admin\", \"editor\"])?")
+                && multi.contains("use jerrycan::auth::require_any_role;"),
+            "multi-role session gate must steer to the any-of primitive: {multi}"
+        );
+        assert!(
+            !multi.contains("require_role(&_user.0.role"),
+            "multi-role must NOT emit the single-role call (drops all but the first): {multi}"
+        );
+        assert_eq!(
+            guard_comment(m, &m.endpoints[1], &d),
+            "    // guard: requires role \"admin\" — add `use jerrycan::auth::require_role;` and call require_role(&_user.0.role, \"admin\")? before proceeding\n",
+            "single-role session guidance must be byte-identical to the pre-fix output"
+        );
+
+        // (b) Path-scoped tenant gate (`Dep<Tenant>`). Multi → `_tenant.require_any_role`;
+        // single → `_tenant.require_role`, byte-identical.
+        let ts: Design = serde_json::from_str(ORG_ACCOUNT_CONTACT_UNDER_TENANT).unwrap();
+        let sc = &ts.modules[2];
+        assert!(
+            matches!(
+                ts.endpoint_tenant_shape(sc, &sc.endpoints[0]),
+                TenantShape::PathScoped { .. }
+            ),
+            "fixture precondition: contacts endpoint is path-scoped"
+        );
+        let mut ep_multi = sc.endpoints[0].clone();
+        ep_multi.required_roles = vec!["owner".to_string(), "member".to_string()];
+        let g_multi = guard_comment(sc, &ep_multi, &ts);
+        assert!(
+            g_multi.contains("_tenant.require_any_role(&[\"owner\", \"member\"])?")
+                && !g_multi.contains("_tenant.require_role("),
+            "multi-role path-scoped gate must steer to _tenant.require_any_role: {g_multi}"
+        );
+        let mut ep_single = sc.endpoints[0].clone();
+        ep_single.required_roles = vec!["owner".to_string()];
+        assert_eq!(
+            guard_comment(sc, &ep_single, &ts),
+            "    // guard: requires role \"owner\" — call _tenant.require_role(\"owner\")? before proceeding\n",
+            "single-role path-scoped guidance must be byte-identical to the pre-fix output"
         );
     }
 
