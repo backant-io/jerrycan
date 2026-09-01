@@ -18,7 +18,17 @@ pub enum MappedType {
 }
 
 pub fn map_pg_type(pg: &str, enums: &BTreeMap<String, Vec<String>>) -> MappedType {
-    if let Some(labels) = enums.get(pg) {
+    // Native `CREATE TYPE … AS ENUM` columns take the same design shape an inline
+    // `CHECK (col IN (…))` produces — a `String` field constrained to `values`.
+    // Enum keys are always schema-qualified (CREATE TYPE defaults to `public.`),
+    // but a column may reference the type unqualified (`col status`), so a bare
+    // name also matches the `public.`-defaulted key.
+    let labels = enums.get(pg).or_else(|| {
+        enums
+            .get(&format!("public.{pg}"))
+            .filter(|_| !pg.contains('.'))
+    });
+    if let Some(labels) = labels {
         return MappedType::Field {
             field_type: FieldType::String,
             values: Some(labels.clone()),
@@ -116,6 +126,25 @@ mod tests {
                 assert_eq!(v, vec!["lead", "active"]);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unqualified_column_matches_a_public_defaulted_enum_key() {
+        // `CREATE TYPE status …` keys as `public.status`, but a column `col status`
+        // resolves to the bare `status` — the bare name must still find the enum
+        // (else the column drops as "no deterministic design type"). Issue #303.
+        let mut enums = BTreeMap::new();
+        enums.insert(
+            "public.status".to_string(),
+            vec!["active".into(), "inactive".into()],
+        );
+        match map_pg_type("status", &enums) {
+            MappedType::Field {
+                field_type: FieldType::String,
+                values: Some(v),
+            } => assert_eq!(v, vec!["active", "inactive"]),
+            other => panic!("bare enum ref must not be unmappable: {other:?}"),
         }
     }
 
