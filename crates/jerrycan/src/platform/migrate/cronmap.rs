@@ -1,7 +1,9 @@
-//! Spec §cron: `cron.schedule('<name>','<sched>',$$<body>$$)` calls → design
-//! `jobs[]`. The 5-field schedule check is textually identical to questions.rs
-//! (kept in lockstep). The job BODY is agent work — a `pg_function` gap; a
-//! non-5-field schedule (`@hourly` etc.) is a `cron_job` gap, never guessed.
+//! Spec §cron: `cron.schedule('<name>','<sched>',$$<body>$$)` calls — and the
+//! `jobname\tschedule\tcommand` dump docs/ai/19-migrate-supabase.md tells users
+//! to produce — → design `jobs[]`. The 5-field schedule check is textually
+//! identical to questions.rs (kept in lockstep). The job BODY is agent work — a
+//! `pg_function` gap; a non-5-field schedule (`@hourly` etc.) is a `cron_job`
+//! gap, never guessed.
 
 use super::gaps::{GapItem, GapKind, Severity};
 use super::parse::{self, RawStatement};
@@ -86,6 +88,66 @@ fn cron_schedule_args(stmt: &Statement) -> Option<(String, String, String)> {
     }
 }
 
+/// One row of the `\copy (select jobname, schedule, command from cron.job) to
+/// stdout` dump docs/ai/19-migrate-supabase.md tells users to produce: exactly
+/// three TAB-separated fields. Splitting only on TAB keeps a command that
+/// contains spaces intact; COPY TEXT escapes any real tab or newline in the
+/// data, so "exactly three fields" is exact, and a NULL arrives as `\N`.
+fn dump_row(line: &str) -> Option<[&str; 3]> {
+    let line = line.trim_end();
+    if line.is_empty() || line.to_ascii_lowercase().contains("cron.schedule(") {
+        return None;
+    }
+    match line.split('\t').collect::<Vec<_>>()[..] {
+        [name, sched, command] => Some([name, sched, command]),
+        _ => None,
+    }
+}
+
+/// Turn one recognized job (from either input form) into a `jobs[]` entry plus
+/// its body gap, or into a `cron_job` gap when the schedule is not 5-field.
+fn emit_job(
+    name: &str,
+    sched: String,
+    body: String,
+    line: usize,
+    jobs: &mut Vec<JobDesign>,
+    gaps: &mut Vec<GapItem>,
+) {
+    if cron_shaped(&sched) {
+        jobs.push(JobDesign {
+            name: snake(name),
+            schedule: Some(sched),
+            queue: None,
+        });
+        gaps.push(GapItem {
+            kind: GapKind::PgFunction,
+            source: format!("cron job `{name}`"),
+            location: format!("cron.sql:{line}"),
+            reason: "the scheduled SQL body is agent work — the generated task fn is a stub".into(),
+            original: body,
+            suggested: format!(
+                "implement crates/jobs task `{}` with this SQL's behavior",
+                snake(name)
+            ),
+            severity: Severity::Advisory,
+        });
+    } else {
+        gaps.push(GapItem {
+            kind: GapKind::CronJob,
+            source: format!("cron job `{name}`"),
+            location: format!("cron.sql:{line}"),
+            reason: format!(
+                "schedule `{sched}` is not a 5-field cron expression questions.rs accepts"
+            ),
+            original: sched,
+            suggested: "translate to a 5-field cron expression (minute hour day month weekday)"
+                .into(),
+            severity: Severity::Blocking,
+        });
+    }
+}
+
 pub fn build_jobs(cron_sql: &str) -> JobsOutput {
     let mut jobs = Vec::new();
     let mut gaps = Vec::new();
@@ -105,6 +167,55 @@ pub fn build_jobs(cron_sql: &str) -> JobsOutput {
                 .into(),
         severity: Severity::Blocking,
     };
+    // Pass 1: the tab-separated cron.job dump. A consumed row is blanked (not
+    // removed) so the SQL pass below still reports the cron.sql line numbers it
+    // always did; with no dump rows it sees the original text unchanged.
+    let mut without_rows = String::with_capacity(cron_sql.len());
+    let mut saw_dump_row = false;
+    for (idx, text) in cron_sql.lines().enumerate() {
+        match dump_row(text) {
+            Some(fields @ [name, sched, command]) => {
+                saw_dump_row = true;
+                if fields == ["jobname", "schedule", "command"] {
+                    // A header line the user added by hand — not a job.
+                } else if fields.iter().any(|f| f.is_empty() || *f == r"\N") {
+                    // A NULL/empty jobname, schedule or command is a job we
+                    // cannot name, schedule or run — gap it rather than guess.
+                    gaps.push(GapItem {
+                        kind: GapKind::CronJob,
+                        source: "cron.job dump row".into(),
+                        location: format!("cron.sql:{}", idx + 1),
+                        reason:
+                            r"the row has an empty or NULL (`\N`) jobname, schedule or command"
+                                .into(),
+                        original: text.trim_end().to_string(),
+                        suggested:
+                            "give the job a name and a 5-field schedule, then port the command by hand"
+                                .into(),
+                        severity: Severity::Blocking,
+                    });
+                } else {
+                    emit_job(
+                        name,
+                        sched.to_string(),
+                        command.to_string(),
+                        idx + 1,
+                        &mut jobs,
+                        &mut gaps,
+                    );
+                }
+            }
+            None => without_rows.push_str(text),
+        }
+        without_rows.push('\n');
+    }
+    let cron_sql = if saw_dump_row {
+        without_rows.as_str()
+    } else {
+        cron_sql
+    };
+
+    // Pass 2: cron.schedule() calls.
     for raw in parse::split_and_parse(cron_sql) {
         let RawStatement::Parsed { stmt, sql, line } = &raw else {
             let RawStatement::Unparsed { sql, line } = &raw else {
@@ -117,39 +228,7 @@ pub fn build_jobs(cron_sql: &str) -> JobsOutput {
             gaps.push(unrecognized(sql, *line));
             continue;
         };
-        if cron_shaped(&sched) {
-            jobs.push(JobDesign {
-                name: snake(&name),
-                schedule: Some(sched),
-                queue: None,
-            });
-            gaps.push(GapItem {
-                kind: GapKind::PgFunction,
-                source: format!("cron job `{name}`"),
-                location: format!("cron.sql:{line}"),
-                reason: "the scheduled SQL body is agent work — the generated task fn is a stub"
-                    .into(),
-                original: body,
-                suggested: format!(
-                    "implement crates/jobs task `{}` with this SQL's behavior",
-                    snake(&name)
-                ),
-                severity: Severity::Advisory,
-            });
-        } else {
-            gaps.push(GapItem {
-                kind: GapKind::CronJob,
-                source: format!("cron job `{name}`"),
-                location: format!("cron.sql:{line}"),
-                reason: format!(
-                    "schedule `{sched}` is not a 5-field cron expression questions.rs accepts"
-                ),
-                original: sched,
-                suggested: "translate to a 5-field cron expression (minute hour day month weekday)"
-                    .into(),
-                severity: Severity::Blocking,
-            });
-        }
+        emit_job(&name, sched, body, *line, &mut jobs, &mut gaps);
     }
     JobsOutput { jobs, gaps }
 }
@@ -180,6 +259,37 @@ select cron.schedule('hourly-sync', '@hourly', $$select public.sync()$$);
         assert!(out.gaps.iter().any(|g| g.kind
             == crate::platform::migrate::gaps::GapKind::CronJob
             && g.source.contains("hourly-sync")));
+    }
+
+    #[test]
+    fn the_prescribed_cron_job_dump_yields_the_same_job_as_the_cron_schedule_call() {
+        // docs/ai/19-migrate-supabase.md tells users to export pg_cron with
+        // `\copy (select jobname, schedule, command from cron.job) to stdout`,
+        // which emits TAB-separated rows — following the manual literally must
+        // migrate the jobs, not blow up into a blocking cron_job gap.
+        let dump = "jobname\tschedule\tcommand\n\
+                    nightly-digest\t0 3 * * *\tselect public.send_digest()\n\
+                    weekly-report\t0 0 * * 0\tselect public.build_report('weekly', now())\n";
+        let out = build_jobs(dump);
+        let calls = build_jobs(CRON_SQL);
+
+        assert_eq!(out.jobs.len(), 2, "{:?}", out.gaps);
+        // Same job as the cron.schedule() form: name snake_cased, schedule kept.
+        assert_eq!(out.jobs[0].name, calls.jobs[0].name);
+        assert_eq!(out.jobs[0].schedule, calls.jobs[0].schedule);
+        // The header row is not a job, and a command with spaces is not split.
+        assert_eq!(out.jobs[1].name, "weekly_report");
+        assert_eq!(out.jobs[1].schedule.as_deref(), Some("0 0 * * 0"));
+        assert!(out.gaps.iter().any(|g| g.kind
+            == crate::platform::migrate::gaps::GapKind::PgFunction
+            && g.original == "select public.build_report('weekly', now())"));
+        assert!(
+            !out.gaps
+                .iter()
+                .any(|g| g.kind == crate::platform::migrate::gaps::GapKind::CronJob),
+            "no job was lost: {:?}",
+            out.gaps
+        );
     }
 
     #[test]
