@@ -96,7 +96,7 @@ take no argument. `job_failed` carries code `JC0521` but responds with HTTP 500.
 | JC0409 | 409 | `Error::conflict` — unique-key violation (a re-POSTed id), version conflict |
 | JC0413 | 413 | Body over the limit (default 1 MiB) |
 | JC0415 | 415 | `Error::unsupported_media_type` — wrong content type (e.g. multipart without a boundary) |
-| JC0422 | 422 | JSON body failed to parse, or `Valid<T>` found violations (structured `details` array) |
+| JC0422 | 422 | JSON body failed to parse, `Valid<T>` found violations (structured `details` array), or a foreign-key violation — a client-supplied fk referencing a nonexistent record (jerrycan-db) |
 | JC0429 | 429 | `Error::too_many_requests` — rate limit exceeded (jerrycan::ratelimit) |
 | JC0500 | 500 | `Error::internal` / response serialization failure |
 | JC0503 | 503 | Handler exceeded its time budget (default 30s), or `Error::handler_timeout` |
