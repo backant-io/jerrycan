@@ -229,6 +229,41 @@ fn build_one(
         return None;
     }
 
+    // Table-level composite `UNIQUE(a, b, …)` (#115): translate each group whose
+    // columns all survive as a declared field or a belongs_to fk column — the same
+    // shape JC0559 accepts, so the round-trip is validation-clean. A column that
+    // dropped out (e.g. an unmappable-type column) can't be indexed, so raise a
+    // gap for that constraint rather than silently dropping it (never guess).
+    let mut unique = Vec::new();
+    for group in &table.composite_uniques {
+        let missing: Vec<&str> = group
+            .iter()
+            .filter(|col| {
+                !fields.iter().any(|f| &f.name == *col)
+                    && !belongs_to.iter().any(|b| &b.fk_column() == *col)
+            })
+            .map(String::as_str)
+            .collect();
+        if missing.is_empty() {
+            unique.push(group.clone());
+        } else {
+            gaps.push(GapItem {
+                kind: GapKind::UnmappedType,
+                source: format!("{key} unique({})", group.join(", ")),
+                location: format!("schema.sql:{}", table.line),
+                reason: format!(
+                    "composite UNIQUE column(s) `{}` did not survive translation (dropped/unmapped), so the constraint can't be reproduced as a composite `unique` index",
+                    missing.join(", ")
+                ),
+                original: format!("unique ({})", group.join(", ")),
+                suggested:
+                    "map the missing column(s) to a field, then add the group to the entity's `unique`, or enforce the invariant in a handler"
+                        .into(),
+                severity: Severity::Blocking,
+            });
+        }
+    }
+
     // Preserve the source table name losslessly: pin `table` only when the
     // default (snake_case + pluralization) would NOT reproduce it, so a clean
     // name stays override-free while an irregular one round-trips exactly.
@@ -239,7 +274,7 @@ fn build_one(
         table,
         belongs_to,
         public_read: false,
-        unique: vec![],
+        unique,
         fields,
     })
 }
@@ -343,6 +378,68 @@ create table public.order_items (
             == crate::platform::migrate::gaps::GapKind::UnmappedType
             && g.source.contains("location")));
         assert!(!item.fields.iter().any(|f| f.name == "location"));
+    }
+
+    #[test]
+    fn composite_unique_survives_translation_and_an_unrepresentable_one_gaps() {
+        // WHY: docs/ai/19 promises the migrator never silently drops what it can't
+        // translate. A multi-column UNIQUE(a, b) IS translatable — jerrycan carries
+        // it as the entity's composite `unique` (#115). It must survive; a group over
+        // a dropped (unmappable-type) column must gap, not vanish.
+        let schema = r#"
+create table public.memberships (
+    id uuid primary key,
+    org_id uuid not null,
+    user_id uuid not null,
+    unique (org_id, user_id)
+);
+create table public.pins (
+    id uuid primary key,
+    label text not null,
+    spot point,
+    unique (label, spot)
+);
+"#;
+        let db = PgDatabase::fold(&parse::split_and_parse(schema));
+        let out = build_entities(&db);
+
+        let membership = out
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "Membership")
+            .map(|(_, e)| e)
+            .unwrap();
+        assert_eq!(
+            membership.unique,
+            vec![vec!["org_id".to_string(), "user_id".to_string()]],
+            "UNIQUE(org_id, user_id) must survive as the entity's composite `unique`"
+        );
+        // Each column names a declared field (the shape JC0559 accepts), so the
+        // group round-trips to a buildable `CREATE UNIQUE INDEX`.
+        for col in &membership.unique[0] {
+            assert!(membership.fields.iter().any(|f| &f.name == col));
+        }
+
+        // `spot point` is an unmappable type → dropped field + its composite unique
+        // over it can't be built, so the constraint gaps rather than silently drops.
+        let pin = out
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "Pin")
+            .map(|(_, e)| e)
+            .unwrap();
+        assert!(
+            pin.unique.is_empty(),
+            "a group over a dropped column must not be emitted"
+        );
+        assert!(
+            out.gaps.iter().any(|g| g.kind
+                == crate::platform::migrate::gaps::GapKind::UnmappedType
+                && g.source.contains("unique(label, spot)")
+                && g.reason.contains("spot")),
+            "the unrepresentable composite unique must raise a gap: {:?}",
+            out.gaps
+        );
     }
 
     #[test]
